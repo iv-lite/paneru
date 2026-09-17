@@ -86,6 +86,10 @@ pub fn install(lua: &Lua, paneru: &Table, dispatch: &Dispatch) -> Result<()> {
         "next_display",
         verb(lua, dispatch, Command::Mouse(MouseMove::ToNextDisplay))?,
     )?;
+    mouse.set(
+        "previous_display",
+        verb(lua, dispatch, Command::Mouse(MouseMove::ToPreviousDisplay))?,
+    )?;
     paneru.set("mouse", mouse)?;
 
     paneru.set("quit", verb(lua, dispatch, Command::Quit)?)?;
@@ -174,6 +178,10 @@ fn window_table(lua: &Lua, dispatch: &Dispatch) -> Result<Table> {
     window.set(
         "next_display",
         follower(lua, dispatch, Operation::ToNextDisplay)?,
+    )?;
+    window.set(
+        "previous_display",
+        follower(lua, dispatch, Operation::ToPreviousDisplay)?,
     )?;
 
     for (name, operation) in [
@@ -517,6 +525,9 @@ mod tests {
             paneru.window.vertical_resize("shrink")
             paneru.window.next_display()
             paneru.window.next_display({ follow = false })
+            paneru.window.previous_display()
+            paneru.window.previous_display({ follow = false })
+            paneru.mouse.previous_display()
         "#)
         .unwrap();
 
@@ -528,6 +539,9 @@ mod tests {
                 Command::Window(Operation::ResizeVertical(ResizeDirection::Shrink)),
                 Command::Window(Operation::ToNextDisplay(MoveFocus::Follow)),
                 Command::Window(Operation::ToNextDisplay(MoveFocus::Stay)),
+                Command::Window(Operation::ToPreviousDisplay(MoveFocus::Follow)),
+                Command::Window(Operation::ToPreviousDisplay(MoveFocus::Stay)),
+                Command::Mouse(MouseMove::ToPreviousDisplay),
             ])
         );
     }

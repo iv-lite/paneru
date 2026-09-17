@@ -122,10 +122,6 @@ impl Display {
         bounds
     }
 
-    pub fn width(&self) -> i32 {
-        self.bounds().width()
-    }
-
     pub fn menubar_height(&self) -> i32 {
         self.menubar_height_override
             .unwrap_or(self.menubar_height)

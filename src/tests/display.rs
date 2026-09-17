@@ -10,6 +10,7 @@ use crate::ecs::{DockPosition, Timeout};
 use crate::events::Event;
 use crate::manager::{Display, Origin, Size, Window};
 use crate::platform::WinID;
+use crate::platform::WorkspaceId;
 use crate::{assert_not_on_workspace, assert_on_workspace, assert_window_at, assert_window_size};
 
 use super::*;
@@ -334,6 +335,256 @@ fn test_mouse_to_next_display() {
             let config = world.resource::<Config>();
             let bounds = display.actual_display_bounds(dock, config);
             assert_eq!(state.cursor_position(), bounds.center());
+        })
+        .run(commands);
+}
+
+#[test]
+fn test_previous_display_inserts_into_target_strip() {
+    let commands = vec![
+        Event::MenuOpened { window_id: 0 },
+        Event::Command {
+            command: Command::PrintState,
+        },
+        Event::Command {
+            command: Command::Window(Operation::ToPreviousDisplay(MoveFocus::Follow)),
+        },
+        Event::Command {
+            command: Command::PrintState,
+        },
+    ];
+
+    TestHarness::new()
+        .with_windows(1)
+        .with_display(
+            EXT_DISPLAY_ID,
+            IRect::new(0, -EXT_DISPLAY_HEIGHT, EXT_DISPLAY_WIDTH, 0),
+            vec![EXT_WORKSPACE_ID],
+        )
+        .on_iteration(1, move |world, _state| {
+            assert_on_workspace!(world, 0, TEST_WORKSPACE_ID);
+        })
+        .on_iteration(2, move |world, _state| {
+            assert_on_workspace!(world, 0, EXT_WORKSPACE_ID);
+            assert_not_on_workspace!(world, 0, TEST_WORKSPACE_ID);
+        })
+        .run(commands);
+}
+
+#[test]
+fn test_send_previous_display_stays_on_source() {
+    let mut harness = TestHarness::new();
+    harness.mock_state.add_display(
+        EXT_DISPLAY_ID,
+        IRect::new(0, -EXT_DISPLAY_HEIGHT, EXT_DISPLAY_WIDTH, 0),
+        vec![EXT_WORKSPACE_ID],
+    );
+
+    let origin = Origin::new(0, 0);
+    let size = Size::new(TEST_WINDOW_WIDTH, TEST_WINDOW_HEIGHT);
+    let frame = IRect::from_corners(origin, origin + size);
+
+    harness
+        .mock_state
+        .spawn_window(TEST_PROCESS_ID, TEST_WORKSPACE_ID, 101, frame);
+    harness
+        .mock_state
+        .spawn_window(TEST_PROCESS_ID, TEST_WORKSPACE_ID, 100, frame);
+
+    let commands = vec![
+        Event::MenuOpened { window_id: 101 },
+        Event::Command {
+            command: Command::PrintState,
+        },
+        Event::Command {
+            command: Command::Window(Operation::ToPreviousDisplay(MoveFocus::Stay)),
+        },
+        Event::Command {
+            command: Command::PrintState,
+        },
+    ];
+
+    harness
+        .on_iteration(1, move |world, _state| {
+            assert_on_workspace!(world, 100, TEST_WORKSPACE_ID);
+        })
+        .on_iteration(2, move |world, state| {
+            assert_on_workspace!(world, 100, EXT_WORKSPACE_ID);
+            assert_not_on_workspace!(world, 100, TEST_WORKSPACE_ID);
+            assert_eq!(state.active_display(), TEST_DISPLAY_ID);
+        })
+        .run(commands);
+}
+
+#[test]
+fn test_mouse_to_previous_display() {
+    let commands = vec![
+        Event::MenuOpened { window_id: 101 },
+        Event::Command {
+            command: Command::PrintState,
+        },
+        Event::Command {
+            command: Command::Mouse(MouseMove::ToPreviousDisplay),
+        },
+        Event::Command {
+            command: Command::PrintState,
+        },
+    ];
+    let origin = Origin::new(0, 0);
+    let size = Size::new(TEST_WINDOW_WIDTH, TEST_WINDOW_HEIGHT);
+    let frame = IRect::from_corners(origin, origin + size);
+    let display_bounds = IRect::new(0, -EXT_DISPLAY_HEIGHT, EXT_DISPLAY_WIDTH, 0);
+
+    TestHarness::new()
+        .with_display(EXT_DISPLAY_ID, display_bounds, vec![EXT_WORKSPACE_ID])
+        .with_window(100, |data| {
+            data.pid = TEST_PROCESS_ID;
+            data.workspace_id = TEST_WORKSPACE_ID;
+            data.frame = frame;
+        })
+        .on_iteration(1, move |world, state| {
+            let entity = find_window_entity(100, world);
+            let window = world.get::<Window>(entity).expect("need window");
+            assert_eq!(state.cursor_position(), window.frame().center());
+        })
+        .on_iteration(3, move |world, state| {
+            let mut query = world.query::<(&Display, Option<&DockPosition>)>();
+            let (display, dock) = query
+                .iter(world)
+                .find(|display| display.0.id() == EXT_DISPLAY_ID)
+                .expect("need display");
+            let config = world.resource::<Config>();
+            let bounds = display.actual_display_bounds(dock, config);
+            assert_eq!(state.cursor_position(), bounds.center());
+        })
+        .run(commands);
+}
+
+#[test]
+fn test_next_steps_forward_in_display_ring() {
+    // With three displays the ring is spatial (left-to-right, then
+    // top-to-bottom): EXT (above) -> TEST (active) -> THIRD (right), so
+    // next from TEST steps forward to THIRD.
+    const THIRD_DISPLAY_ID: u32 = 3;
+    const THIRD_WORKSPACE_ID: WorkspaceId = 30;
+
+    let commands = vec![
+        Event::MenuOpened { window_id: 0 },
+        Event::Command {
+            command: Command::PrintState,
+        },
+        Event::Command {
+            command: Command::Window(Operation::ToNextDisplay(MoveFocus::Follow)),
+        },
+        Event::Command {
+            command: Command::PrintState,
+        },
+    ];
+
+    TestHarness::new()
+        .with_windows(1)
+        .with_display(
+            EXT_DISPLAY_ID,
+            IRect::new(0, -EXT_DISPLAY_HEIGHT, EXT_DISPLAY_WIDTH, 0),
+            vec![EXT_WORKSPACE_ID],
+        )
+        .with_display(
+            THIRD_DISPLAY_ID,
+            IRect::new(
+                TEST_DISPLAY_WIDTH + EXT_DISPLAY_WIDTH,
+                0,
+                TEST_DISPLAY_WIDTH + EXT_DISPLAY_WIDTH + TEST_DISPLAY_WIDTH,
+                TEST_DISPLAY_HEIGHT,
+            ),
+            vec![THIRD_WORKSPACE_ID],
+        )
+        .on_iteration(2, move |world, _state| {
+            assert_on_workspace!(world, 0, THIRD_WORKSPACE_ID);
+            assert_not_on_workspace!(world, 0, TEST_WORKSPACE_ID);
+            assert_not_on_workspace!(world, 0, EXT_WORKSPACE_ID);
+        })
+        .run(commands);
+}
+
+#[test]
+fn test_previous_steps_backward_in_display_ring() {
+    // Same ring as above: previous from TEST steps back to EXT, not THIRD.
+    const THIRD_DISPLAY_ID: u32 = 3;
+    const THIRD_WORKSPACE_ID: WorkspaceId = 30;
+
+    let commands = vec![
+        Event::MenuOpened { window_id: 0 },
+        Event::Command {
+            command: Command::PrintState,
+        },
+        Event::Command {
+            command: Command::Window(Operation::ToPreviousDisplay(MoveFocus::Follow)),
+        },
+        Event::Command {
+            command: Command::PrintState,
+        },
+    ];
+
+    TestHarness::new()
+        .with_windows(1)
+        .with_display(
+            EXT_DISPLAY_ID,
+            IRect::new(0, -EXT_DISPLAY_HEIGHT, EXT_DISPLAY_WIDTH, 0),
+            vec![EXT_WORKSPACE_ID],
+        )
+        .with_display(
+            THIRD_DISPLAY_ID,
+            IRect::new(
+                TEST_DISPLAY_WIDTH + EXT_DISPLAY_WIDTH,
+                0,
+                TEST_DISPLAY_WIDTH + EXT_DISPLAY_WIDTH + TEST_DISPLAY_WIDTH,
+                TEST_DISPLAY_HEIGHT,
+            ),
+            vec![THIRD_WORKSPACE_ID],
+        )
+        .on_iteration(2, move |world, _state| {
+            assert_on_workspace!(world, 0, EXT_WORKSPACE_ID);
+            assert_not_on_workspace!(world, 0, TEST_WORKSPACE_ID);
+            assert_not_on_workspace!(world, 0, THIRD_WORKSPACE_ID);
+        })
+        .run(commands);
+}
+
+#[test]
+fn test_swap_fall_through_is_direction_aware() {
+    // A single window has nothing to swap with, so Swap falls through to the
+    // neighbouring display — but only in the matching direction. With EXT
+    // above TEST, South stays put while North moves the window there.
+    let commands = vec![
+        Event::MenuOpened { window_id: 0 },
+        Event::Command {
+            command: Command::PrintState,
+        },
+        Event::Command {
+            command: Command::Window(Operation::Swap(Direction::South)),
+        },
+        Event::Command {
+            command: Command::Window(Operation::Swap(Direction::North)),
+        },
+        Event::Command {
+            command: Command::PrintState,
+        },
+    ];
+
+    TestHarness::new()
+        .with_windows(1)
+        .with_display(
+            EXT_DISPLAY_ID,
+            IRect::new(0, -EXT_DISPLAY_HEIGHT, EXT_DISPLAY_WIDTH, 0),
+            vec![EXT_WORKSPACE_ID],
+        )
+        .on_iteration(2, move |world, _state| {
+            assert_on_workspace!(world, 0, TEST_WORKSPACE_ID);
+            assert_not_on_workspace!(world, 0, EXT_WORKSPACE_ID);
+        })
+        .on_iteration(3, move |world, _state| {
+            assert_on_workspace!(world, 0, EXT_WORKSPACE_ID);
+            assert_not_on_workspace!(world, 0, TEST_WORKSPACE_ID);
         })
         .run(commands);
 }

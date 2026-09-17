@@ -234,6 +234,8 @@ pub enum Operation {
     FullWidth,
     /// Moves the focused window to the next available display.
     ToNextDisplay(MoveFocus),
+    /// Moves the focused window to the previous available display.
+    ToPreviousDisplay(MoveFocus),
     /// Distributes heights equally among windows in the focused stack.
     Equalize,
     /// Makes all columns in the active strip the same width as the focused window.
@@ -285,6 +287,8 @@ pub enum Operation {
 pub enum MouseMove {
     /// Moves the mouse pointer to the next available display.
     ToNextDisplay,
+    /// Moves the mouse pointer to the previous available display.
+    ToPreviousDisplay,
 }
 
 /// Represents a command that can be issued to the window manager.

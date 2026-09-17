@@ -95,6 +95,8 @@ fn parse_operation(argv: &[&str]) -> Result<Operation> {
         "unstack" => Operation::Stack(false),
         "nextdisplay" => Operation::ToNextDisplay(MoveFocus::Follow),
         "nextdisplaysend" => Operation::ToNextDisplay(MoveFocus::Stay),
+        "previousdisplay" => Operation::ToPreviousDisplay(MoveFocus::Follow),
+        "previousdisplaysend" => Operation::ToPreviousDisplay(MoveFocus::Stay),
         "snap" => Operation::Snap,
         "copyrule" => Operation::CopyRule,
         // The `virtual*` verbs take either a direction or a workspace number,
@@ -144,6 +146,7 @@ fn virtual_target(
 fn parse_mouse_move(argv: &[&str]) -> Result<MouseMove> {
     match *argv.first().unwrap_or(&"") {
         "nextdisplay" => Ok(MouseMove::ToNextDisplay),
+        "previousdisplay" => Ok(MouseMove::ToPreviousDisplay),
         _ => Err(ParseError::new(format!("invalid mouse command '{argv:?}'"))),
     }
 }
@@ -163,6 +166,9 @@ impl Command {
             }
             Command::Mouse(MouseMove::ToNextDisplay) => {
                 vec!["mouse".to_string(), "nextdisplay".to_string()]
+            }
+            Command::Mouse(MouseMove::ToPreviousDisplay) => {
+                vec!["mouse".to_string(), "previousdisplay".to_string()]
             }
             Command::Quit => vec!["quit".to_string()],
             Command::Restart => vec!["restart".to_string()],
@@ -190,6 +196,8 @@ impl Operation {
             Operation::SetWidth(_) | Operation::FullWidth => owned(&["fullwidth"]),
             Operation::ToNextDisplay(MoveFocus::Follow) => owned(&["nextdisplay"]),
             Operation::ToNextDisplay(MoveFocus::Stay) => owned(&["nextdisplaysend"]),
+            Operation::ToPreviousDisplay(MoveFocus::Follow) => owned(&["previousdisplay"]),
+            Operation::ToPreviousDisplay(MoveFocus::Stay) => owned(&["previousdisplaysend"]),
             Operation::Equalize => owned(&["equalize"]),
             Operation::Balance => owned(&["balance"]),
             Operation::Manage => owned(&["manage"]),
@@ -248,6 +256,8 @@ mod tests {
             Operation::FullWidth,
             Operation::ToNextDisplay(MoveFocus::Follow),
             Operation::ToNextDisplay(MoveFocus::Stay),
+            Operation::ToPreviousDisplay(MoveFocus::Follow),
+            Operation::ToPreviousDisplay(MoveFocus::Stay),
             Operation::Equalize,
             Operation::Balance,
             Operation::Manage,
@@ -287,6 +297,7 @@ mod tests {
             Command::Restart,
             Command::PrintState,
             Command::Mouse(MouseMove::ToNextDisplay),
+            Command::Mouse(MouseMove::ToPreviousDisplay),
         ] {
             assert_eq!(
                 format!("{:?}", round_trip(&command)),

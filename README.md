@@ -283,6 +283,8 @@ $ paneru send-cmd <command> [args...]
 | `window unstack`           | Unstack the focused window into its own column   |
 | `window nextdisplay`       | Move the focused window to the next display      |
 | `window nextdisplaysend`   | Move the window to the next display but stay here |
+| `window previousdisplay`   | Move the focused window to the previous display  |
+| `window previousdisplaysend` | Move the window to the previous display but stay here |
 | `window virtual <dir>`     | Switch to the previous/next virtual workspace     |
 | `window virtualnum <n>`    | Switch directly to numbered virtual workspace    |
 | `window virtualmove <dir>` | Move the window to a different virtual workspace  |
@@ -291,6 +293,7 @@ $ paneru send-cmd <command> [args...]
 | `window virtualsendnum <n>` | Send the window to numbered virtual workspace but stay |
 | `window snap`              | Snap the focused window into the visible viewport |
 | `mouse nextdisplay`        | Warp the mouse pointer to the next display       |
+| `mouse previousdisplay`    | Warp the mouse pointer to the previous display   |
 | `printstate`               | Print the internal ECS state to the debug log    |
 | `quit`                     | Quit Paneru                                      |
 | `restart`                  | Restart the Paneru service                         |

@@ -195,7 +195,10 @@ https://github.com/karinushka/paneru/blob/3790b01f8d65df5d9000142db7cf25f9270dcc
 | `window_balance` | Make all columns in the strip the same width as the focused window. |
 | `window_nextdisplay` | Move focused window to the next monitor and follow it. |
 | `window_nextdisplaysend` | Move focused window to the next monitor but stay on current. |
+| `window_previousdisplay` | Move focused window to the previous monitor and follow it. |
+| `window_previousdisplaysend` | Move focused window to the previous monitor but stay on current. |
 | `mouse_nextdisplay` | Warp mouse cursor to the next monitor. |
+| `mouse_previousdisplay` | Warp mouse cursor to the previous monitor. |
 | `window_snap` | Snap an overflowing window into the viewport. |
 | `window_raise_floating` | Make the floating windows layer visible on the current workspace. |
 | `window_togglefloatlayer` | Selectively move the floating windows in front or behind of the workspace windows. |

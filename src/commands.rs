@@ -7,6 +7,7 @@ use bevy::ecs::message::MessageReader;
 use bevy::ecs::query::{Has, With, Without};
 use bevy::ecs::system::{Commands, Query, Res, ResMut, Single};
 use bevy::math::IRect;
+use objc2_core_graphics::CGDirectDisplayID;
 use tracing::{Level, instrument};
 use tracing::{debug, error, info};
 
@@ -19,11 +20,11 @@ use crate::ecs::focus::FocusHistory;
 use crate::ecs::layout::{
     Column, LayoutStrip, MIN_WINDOW_HEIGHT, StackItem, clamp_origin_to_viewport, strip_signature,
 };
-use crate::ecs::params::{ActiveDisplay, ActiveDisplayMut, Windows};
+use crate::ecs::params::{ActiveDisplay, ActiveDisplayMut, Windows, ring_neighbour_of_cursor};
 use crate::ecs::{
     ActiveDisplayMarker, ActiveWorkspaceMarker, Bounds, DockPosition, FocusedMarker,
     FullWidthMarker, ManualStripOffset, NativeFullscreenMarker, RaiseWindow, SelectedVirtualMarker,
-    SendMessageTrigger, SpawnCommandsExt, Timeout, Unmanaged,
+    SpawnCommandsExt, Timeout, Unmanaged,
 };
 use crate::events::Event;
 use crate::manager::{Application, Display, Origin, Size, Window, WindowManager, origin_from};
@@ -77,12 +78,12 @@ pub fn register_commands(app: &mut bevy::app::App) {
             command_quit_handler,
             command_restart_handler,
             print_internal_state_handler,
-            mouse_to_next_display,
+            mouse_to_adjacent_display,
             resize_window,
             resize_window_vertical,
             command_center_window,
             full_width_window,
-            to_next_display,
+            to_adjacent_display,
             equalize_column,
             balance_strip,
             manage_window,
@@ -260,10 +261,12 @@ fn nearest_float_in_direction(
 /// # Returns
 ///
 /// `Some(Entity)` with the entity of the newly focused window, otherwise `None`.
+#[allow(clippy::too_many_arguments)]
 fn command_move_focus(
     mut messages: MessageReader<Event>,
     windows: Windows,
     workspaces: Query<(&LayoutStrip, Entity, Option<&NativeFullscreenMarker>)>,
+    layout_strips: Query<(&LayoutStrip, Entity)>,
     active_display: ActiveDisplay,
     window_manager: Res<WindowManager>,
     mut focus_history: ResMut<FocusHistory>,
@@ -368,21 +371,25 @@ fn command_move_focus(
         return;
     }
 
-    // Check if the movement can switch to another display.
-    let Some(other_display) = active_display.other().next() else {
+    // Check if the movement can switch to another display: North moves
+    // focus to the nearest display above, South to the nearest below.
+    let north = match direction {
+        Direction::North => true,
+        Direction::South => false,
+        _ => return,
+    };
+    let Some((target_id, target_bounds)) = active_display.above_or_below(north) else {
         return;
     };
-    let change_display = match direction {
-        Direction::North => active_display.bounds().min.y > other_display.bounds().min.y,
-        Direction::South => active_display.bounds().min.y < other_display.bounds().min.y,
-        _ => false,
-    };
-    debug!("moving focus to another display: {change_display}");
-    if change_display {
-        commands.trigger(SendMessageTrigger(Event::Command {
-            command: Command::Mouse(MouseMove::ToNextDisplay),
-        }));
-    }
+    debug!("moving focus to display {target_id}");
+    warp_mouse_to_display(
+        target_id,
+        target_bounds,
+        &windows,
+        &layout_strips,
+        &window_manager,
+        &mut commands,
+    );
 }
 
 fn command_focus_unmanaged(
@@ -581,6 +588,9 @@ fn command_swap_focus(
     mut messages: MessageReader<Event>,
     windows: Windows,
     mut active_display: ActiveDisplayMut,
+    mut other_workspaces: OffscreenStrips,
+    window_manager: Res<WindowManager>,
+    config: Res<Config>,
     mut commands: Commands,
 ) {
     let Some(Operation::Swap(direction)) =
@@ -638,22 +648,28 @@ fn command_swap_focus(
     // neighbour left in that direction - which sent every successful vertical
     // swap straight on to the other display.
     if swapped.is_none() {
-        // Check if the movement can swap to another display.
-        let bounds = active_display.bounds();
-        let Some(other_display) = active_display.other().next() else {
+        // Direction-aware fall-through: move the focused window to the
+        // nearest display above (North) or below (South), following it.
+        let north = match direction {
+            Direction::North => true,
+            Direction::South => false,
+            _ => return,
+        };
+        let Some((target_id, target_bounds)) = active_display.above_or_below(north) else {
             return;
         };
-        let change_display = match direction {
-            Direction::North => bounds.min.y > other_display.bounds().min.y,
-            Direction::South => bounds.min.y < other_display.bounds().min.y,
-            _ => false,
-        };
-        debug!("swapping window to another display: {change_display}");
-        if change_display {
-            commands.trigger(SendMessageTrigger(Event::Command {
-                command: Command::Window(Operation::ToNextDisplay(MoveFocus::Follow)),
-            }));
-        }
+        debug!("swapping window to display {target_id}");
+        move_focused_window_to_display(
+            target_id,
+            target_bounds,
+            MoveFocus::Follow,
+            &windows,
+            &mut active_display,
+            &mut other_workspaces,
+            &window_manager,
+            &config,
+            &mut commands,
+        );
     }
 }
 
@@ -1087,16 +1103,11 @@ fn copy_window_rule(
     }
 }
 
-/// Moves the focused window to the next available display.
-/// The window will be repositioned to the center of the new display.
-///
-/// # Arguments
-///
-/// * `focused_entity` - The `Entity` of the currently focused window.
-/// * `windows` - A mutable query for `Window` components, their `Entity`, and whether they have the `Unmanaged` marker.
-/// * `active_display` - A mutable reference to the `ActiveDisplayMut` resource.
-/// * `commands` - Bevy commands to modify entities and trigger events.
-fn to_next_display(
+/// Moves the focused window to the next or previous display in the spatial
+/// ring (`next == true` steps forward). The window is repositioned to the
+/// center of the new display. `MoveFocus::Follow` warps the mouse along,
+/// `MoveFocus::Stay` keeps focus on the source display's neighbour.
+fn to_adjacent_display(
     mut messages: MessageReader<Event>,
     windows: Windows,
     mut active_display: ActiveDisplayMut,
@@ -1105,15 +1116,64 @@ fn to_next_display(
     config: Res<Config>,
     mut commands: Commands,
 ) {
-    let Some(Operation::ToNextDisplay(move_focus)) =
-        filter_window_operations(&mut messages, |op| {
-            matches!(op, Operation::ToNextDisplay(_))
-        })
-        .next()
-    else {
+    let Some(operation) = filter_window_operations(&mut messages, |op| {
+        matches!(
+            op,
+            Operation::ToNextDisplay(_) | Operation::ToPreviousDisplay(_)
+        )
+    })
+    .next() else {
+        return;
+    };
+    let (next, move_focus) = match operation {
+        Operation::ToNextDisplay(focus) => (true, *focus),
+        Operation::ToPreviousDisplay(focus) => (false, *focus),
+        _ => return,
+    };
+
+    let Some((target_id, target_bounds)) = active_display.adjacent(next) else {
+        debug!("no other display to move window to.");
         return;
     };
 
+    move_focused_window_to_display(
+        target_id,
+        target_bounds,
+        move_focus,
+        &windows,
+        &mut active_display,
+        &mut other_workspaces,
+        &window_manager,
+        &config,
+        &mut commands,
+    );
+}
+
+/// Moves the focused managed window to the explicitly targeted display.
+///
+/// # Arguments
+///
+/// * `target_id` - The `CGDirectDisplayID` of the destination display.
+/// * `target_bounds` - The bounds of the destination display.
+/// * `move_focus` - Whether focus (and the mouse) follows the window.
+/// * `windows` - A query for `Window` components and their focus state.
+/// * `active_display` - A mutable reference to the active display and strip.
+/// * `other_workspaces` - The selected-but-offscreen strips that receive the window.
+/// * `window_manager` - The non-send macOS bridge for spaces and mouse warps.
+/// * `config` - The resolved configuration for viewport padding.
+/// * `commands` - Bevy commands to modify entities and trigger events.
+#[allow(clippy::too_many_arguments)]
+fn move_focused_window_to_display(
+    target_id: CGDirectDisplayID,
+    target_bounds: IRect,
+    move_focus: MoveFocus,
+    windows: &Windows,
+    active_display: &mut ActiveDisplayMut,
+    other_workspaces: &mut OffscreenStrips,
+    window_manager: &WindowManager,
+    config: &Config,
+    commands: &mut Commands,
+) {
     let Some((window, entity, unmanaged)) = windows
         .focused()
         .and_then(|(_, entity)| windows.get_managed(entity))
@@ -1125,36 +1185,28 @@ fn to_next_display(
     }
 
     // Width relative to the source display's usable viewport (dock- and
-    // padding-adjusted). Captured before `other()` mutably borrows
-    // `active_display`. This matches how `resize_window` computes the ratio
+    // padding-adjusted). This matches how `resize_window` computes the ratio
     // against `actual_bounds`, so a fixed (non-auto-hiding) dock is accounted
     // for on both the source and target displays.
-    let source_viewport_width = active_display.actual_bounds(&config).width();
-
-    let Some(other) = active_display.other().next() else {
-        debug!("no other display to move window to.");
-        return;
-    };
+    let source_viewport_width = active_display.actual_bounds(config).width();
 
     debug!(
-        "moving window (id {}, {entity}) to display {}: {}.",
+        "moving window (id {}, {entity}) to display {target_id}: {}.",
         window.id(),
-        other.id(),
-        other.width() / 2,
+        target_bounds.width() / 2,
     );
-    let center = other.bounds().center().x;
-    let target_display_id = other.id();
+    let center = target_bounds.center().x;
 
     let Some(size) = windows.size(entity) else {
         return;
     };
     let width_ratio =
         (source_viewport_width > 0).then(|| f64::from(size.x) / f64::from(source_viewport_width));
-    let dest = other.bounds().min.with_x(center - size.x / 2);
+    let dest = target_bounds.min.with_x(center - size.x / 2);
     commands.reposition_entity(entity, dest);
 
     if matches!(move_focus, MoveFocus::Follow) {
-        window_manager.warp_mouse(other.bounds().center());
+        window_manager.warp_mouse(target_bounds.center());
     }
 
     // Remove the window from the source strip.
@@ -1174,7 +1226,7 @@ fn to_next_display(
     }
 
     // Insert into the target display's selected strip.
-    if let Ok(target_space_id) = window_manager.active_display_space(target_display_id)
+    if let Ok(target_space_id) = window_manager.active_display_space(target_id)
         && let Some((mut target_strip, child)) = other_workspaces
             .iter_mut()
             .find(|(strip, _)| strip.id() == target_space_id)
@@ -1207,13 +1259,15 @@ fn to_next_display(
             }
         };
         let system_id = commands.register_system(refresh_size);
-        Timeout::callback(Duration::from_millis(150), system_id, &mut commands);
+        Timeout::callback(Duration::from_millis(150), system_id, commands);
     }
 }
 
-/// Moves the mouse pointer to the next available display.
+/// Moves the mouse pointer to the next or previous display in the spatial
+/// ring (`next == true` steps forward), focusing the most visible window
+/// there — or the display center when it holds no windows.
 #[instrument(level = Level::DEBUG, skip_all)]
-fn mouse_to_next_display(
+fn mouse_to_adjacent_display(
     mut messages: MessageReader<Event>,
     windows: Windows,
     layout_strips: Query<(&LayoutStrip, Entity)>,
@@ -1221,36 +1275,69 @@ fn mouse_to_next_display(
     window_manager: Res<WindowManager>,
     mut commands: Commands,
 ) {
-    if !messages.read().any(|event| {
-        matches!(
-            event,
-            Event::Command {
-                command: Command::Mouse(MouseMove::ToNextDisplay),
-            }
-        )
-    }) {
+    let Some(next) = messages.read().find_map(|event| match event {
+        Event::Command {
+            command: Command::Mouse(MouseMove::ToNextDisplay),
+        } => Some(true),
+        Event::Command {
+            command: Command::Mouse(MouseMove::ToPreviousDisplay),
+        } => Some(false),
+        _ => None,
+    }) else {
         return;
-    }
+    };
 
     let Some(cursor_position) = window_manager.cursor_position().map(origin_from) else {
         return;
     };
-    let Some(other) = displays
-        .into_iter()
-        .find(|display| !display.bounds().contains(cursor_position))
-    else {
+    let Some((target_id, target_bounds)) = ring_neighbour_of_cursor(
+        displays
+            .iter()
+            .map(|display| (display.id(), display.bounds())),
+        cursor_position,
+        next,
+    ) else {
         debug!("no other display to move mouse to.");
         return;
     };
+    warp_mouse_to_display(
+        target_id,
+        target_bounds,
+        &windows,
+        &layout_strips,
+        &window_manager,
+        &mut commands,
+    );
+}
+
+/// Warps the mouse to the explicitly targeted display, focusing its most
+/// visible window — or the display center when it holds no windows.
+///
+/// # Arguments
+///
+/// * `target_id` - The `CGDirectDisplayID` of the destination display.
+/// * `target_bounds` - The bounds of the destination display.
+/// * `windows` - A query for window frames.
+/// * `layout_strips` - All layout strips, to find the target's workspace.
+/// * `window_manager` - The non-send macOS bridge for spaces and mouse warps.
+/// * `commands` - Bevy commands to focus the window under the cursor.
+fn warp_mouse_to_display(
+    target_id: CGDirectDisplayID,
+    target_bounds: IRect,
+    windows: &Windows,
+    layout_strips: &Query<(&LayoutStrip, Entity)>,
+    window_manager: &WindowManager,
+    commands: &mut Commands,
+) {
     let Some((other_strip, _)) = window_manager
-        .active_display_space(other.id())
+        .active_display_space(target_id)
         .ok()
         .and_then(|id| layout_strips.iter().find(|(strip, _)| strip.id() == id))
     else {
         return;
     };
 
-    let visible_width = |frame: IRect| other.bounds().intersect(frame).width();
+    let visible_width = |frame: IRect| target_bounds.intersect(frame).width();
     let Some((frame, entity)) = other_strip
         .all_windows()
         .iter()
@@ -1264,11 +1351,11 @@ fn mouse_to_next_display(
         })
     else {
         debug!("no suitable windows on the other display to move the mouse.");
-        window_manager.warp_mouse(other.bounds().center());
+        window_manager.warp_mouse(target_bounds.center());
         return;
     };
 
-    let visible_frame = other.bounds().intersect(frame);
+    let visible_frame = target_bounds.intersect(frame);
     debug!("warping mouse to {visible_frame:?}",);
     window_manager.warp_mouse(visible_frame.center());
 

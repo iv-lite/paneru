@@ -4,9 +4,8 @@ use bevy::{
         hierarchy::ChildOf,
         query::{With, Without},
         system::{Commands, Query, Res, ResMut, Single, SystemParam},
-        world::Mut,
     },
-    math::IRect,
+    math::{IRect, IVec2},
 };
 use objc2_core_graphics::CGDirectDisplayID;
 use tracing::warn;
@@ -78,6 +77,84 @@ impl GlobalState<'_> {
     }
 }
 
+/// A display's identity and bounds, copied out of the ECS so the display ring
+/// can be sorted without holding any borrow.
+pub type DisplaySnapshot = (CGDirectDisplayID, IRect);
+
+/// Sort key giving the display ring a deterministic spatial order:
+/// left-to-right, then top-to-bottom, ties broken by display id.
+fn ring_sort_key(bounds: IRect, id: CGDirectDisplayID) -> (i32, i32, u32) {
+    (bounds.min.x, bounds.min.y, id)
+}
+
+/// Orders the active display and all others into the spatial ring that
+/// `nextdisplay` / `previousdisplay` cycle through.
+pub fn ordered_display_ring(
+    active: DisplaySnapshot,
+    others: impl Iterator<Item = DisplaySnapshot>,
+) -> Vec<DisplaySnapshot> {
+    let mut all: Vec<DisplaySnapshot> = std::iter::once(active).chain(others).collect();
+    all.sort_by_key(|(id, bounds)| ring_sort_key(*bounds, *id));
+    all
+}
+
+/// The ring neighbour of `active_id`: the next entry for `next == true`,
+/// the previous one otherwise, wrapping around. `None` when the ring holds
+/// fewer than two displays or `active_id` is missing from it.
+pub fn ring_neighbour(
+    active_id: CGDirectDisplayID,
+    ordered: &[DisplaySnapshot],
+    next: bool,
+) -> Option<DisplaySnapshot> {
+    if ordered.len() < 2 {
+        return None;
+    }
+    let position = ordered.iter().position(|(id, _)| *id == active_id)?;
+    let offset = if next { 1 } else { ordered.len() - 1 };
+    Some(ordered[(position + offset) % ordered.len()])
+}
+
+/// The ring neighbour of the display containing `cursor`: the display the
+/// mouse would move to. `None` when the cursor is on no known display or no
+/// other display exists.
+pub fn ring_neighbour_of_cursor(
+    displays: impl Iterator<Item = DisplaySnapshot>,
+    cursor: IVec2,
+    next: bool,
+) -> Option<DisplaySnapshot> {
+    let mut ordered: Vec<DisplaySnapshot> = displays.collect();
+    ordered.sort_by_key(|(id, bounds)| ring_sort_key(*bounds, *id));
+    let (anchor_id, _) = ordered.iter().find(|(_, bounds)| bounds.contains(cursor))?;
+    ring_neighbour(*anchor_id, &ordered, next)
+}
+
+/// The nearest display strictly above (`north == true`) or below the active
+/// one, by vertical gap then horizontal gap then id. `None` when no display
+/// lies in that direction.
+fn nearest_display_above_or_below(
+    bounds: IRect,
+    others: impl Iterator<Item = DisplaySnapshot>,
+    north: bool,
+) -> Option<DisplaySnapshot> {
+    let mut candidates: Vec<DisplaySnapshot> = others
+        .filter(|(_, other)| {
+            if north {
+                other.min.y < bounds.min.y
+            } else {
+                other.min.y > bounds.min.y
+            }
+        })
+        .collect();
+    candidates.sort_by_key(|(id, other)| {
+        (
+            bounds.min.y.abs_diff(other.min.y),
+            bounds.min.x.abs_diff(other.min.x),
+            *id,
+        )
+    });
+    candidates.into_iter().next()
+}
+
 /// A Bevy `SystemParam` that provides immutable access to the currently active `Display` and other displays.
 /// It ensures that only one display is marked as active at any given time.
 #[derive(SystemParam)]
@@ -118,9 +195,17 @@ impl ActiveDisplay<'_, '_> {
         self.display.1
     }
 
-    /// Returns an iterator over immutable references to all other displays (non-active).
-    pub fn other(&self) -> impl Iterator<Item = &Display> {
-        self.other_displays.iter()
+    /// The nearest display strictly above (`north == true`) or below the
+    /// active one. Used by the direction-aware `Focus` and `Swap`
+    /// fall-throughs.
+    pub fn above_or_below(&self, north: bool) -> Option<DisplaySnapshot> {
+        nearest_display_above_or_below(
+            self.bounds(),
+            self.other_displays
+                .iter()
+                .map(|display| (display.id(), display.bounds())),
+            north,
+        )
     }
 
     pub fn active_strip(&self) -> &LayoutStrip {
@@ -176,9 +261,28 @@ impl ActiveDisplayMut<'_, '_> {
         self.display.2
     }
 
-    /// Returns an iterator over mutable references to all other displays (non-active).
-    pub fn other(&mut self) -> impl Iterator<Item = Mut<'_, Display>> {
-        self.other_displays.iter_mut()
+    /// The next (`next == true`) or previous display in the spatial ring —
+    /// true inverses of each other for any number of displays.
+    pub fn adjacent(&mut self, next: bool) -> Option<DisplaySnapshot> {
+        let ordered = ordered_display_ring(
+            (self.display().id(), self.bounds()),
+            self.other_displays
+                .iter_mut()
+                .map(|display| (display.id(), display.bounds())),
+        );
+        ring_neighbour(self.display().id(), &ordered, next)
+    }
+
+    /// The nearest display strictly above (`north == true`) or below the
+    /// active one. Used by the direction-aware `Swap` fall-through.
+    pub fn above_or_below(&mut self, north: bool) -> Option<DisplaySnapshot> {
+        nearest_display_above_or_below(
+            self.bounds(),
+            self.other_displays
+                .iter_mut()
+                .map(|display| (display.id(), display.bounds())),
+            north,
+        )
     }
 
     pub fn active_strip(&mut self) -> &mut LayoutStrip {
@@ -390,5 +494,99 @@ impl Windows<'_, '_> {
             .get(entity)
             .ok()
             .map(|(layout_position, _, _, _, _, _)| layout_position)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn a() -> DisplaySnapshot {
+        (1, IRect::new(0, 0, 100, 100))
+    }
+    fn b() -> DisplaySnapshot {
+        (2, IRect::new(100, 0, 200, 100))
+    }
+    fn c() -> DisplaySnapshot {
+        (3, IRect::new(0, -100, 100, 0))
+    }
+
+    fn ring() -> Vec<DisplaySnapshot> {
+        ordered_display_ring(a(), [b(), c()].into_iter())
+    }
+
+    #[test]
+    fn ring_orders_displays_spatially() {
+        let ids: Vec<u32> = ring().iter().map(|(id, _)| *id).collect();
+        assert_eq!(ids, vec![3, 1, 2]);
+    }
+
+    #[test]
+    fn ring_neighbours_wrap_around() {
+        let ordered = ring();
+        assert_eq!(ring_neighbour(2, &ordered, true), Some(c()));
+        assert_eq!(ring_neighbour(3, &ordered, false), Some(b()));
+    }
+
+    #[test]
+    fn next_and_previous_are_inverses_at_every_position() {
+        let ordered = ring();
+        for (id, _) in &ordered {
+            let next = ring_neighbour(*id, &ordered, true).expect("need next");
+            let back = ring_neighbour(next.0, &ordered, false).expect("need previous");
+            assert_eq!(back.0, *id, "previous must undo next from {id}");
+
+            let previous = ring_neighbour(*id, &ordered, false).expect("need previous");
+            let forward = ring_neighbour(previous.0, &ordered, true).expect("need next");
+            assert_eq!(forward.0, *id, "next must undo previous from {id}");
+        }
+    }
+
+    #[test]
+    fn ring_neighbour_needs_two_displays() {
+        let solo = ordered_display_ring(a(), std::iter::empty());
+        assert_eq!(ring_neighbour(1, &solo, true), None);
+        assert_eq!(ring_neighbour(1, &solo, false), None);
+        let ordered = ring();
+        assert_eq!(ring_neighbour(99, &ordered, true), None);
+    }
+
+    #[test]
+    fn cursor_neighbour_uses_containing_display() {
+        let displays = [a(), b(), c()].into_iter();
+        assert_eq!(
+            ring_neighbour_of_cursor(displays, IVec2::new(150, 50), true),
+            Some(c())
+        );
+        let displays = [a(), b(), c()].into_iter();
+        assert_eq!(
+            ring_neighbour_of_cursor(displays, IVec2::new(50, 50), false),
+            Some(c())
+        );
+        let displays = [a(), b(), c()].into_iter();
+        assert_eq!(
+            ring_neighbour_of_cursor(displays, IVec2::new(500, 500), true),
+            None
+        );
+    }
+
+    #[test]
+    fn above_or_below_picks_nearest_in_direction() {
+        let others = [b(), c()].into_iter();
+        assert_eq!(
+            nearest_display_above_or_below(a().1, others, true),
+            Some(c())
+        );
+
+        // B sits level with A, so nothing is below A.
+        let others = [b(), c()].into_iter();
+        assert_eq!(nearest_display_above_or_below(a().1, others, false), None);
+
+        // Both A and B are below C; A wins on the horizontal tiebreak.
+        let others = [a(), b()].into_iter();
+        assert_eq!(
+            nearest_display_above_or_below(c().1, others, false),
+            Some(a())
+        );
     }
 }
