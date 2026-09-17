@@ -48,10 +48,15 @@ jobs:
       - name: Show sccache stats
         run: sccache --show-stats
 
-  release:
+  # Builds the release binary concurrently with `test` instead of waiting
+  # for it: wall time becomes max(tests, build) rather than tests + build.
+  # Publishing stays gated on green tests in the `publish` job below, so a
+  # binary can compile while tests fail but never ships without them.
+  build-release:
     runs-on: macos-latest
     timeout-minutes: 60
-    needs: test
+    outputs:
+      tag: ${{ steps.release-info.outputs.tag }}
     # Plain branch pushes stop after the test job; release artifacts are
     # only built for version tags and manual dispatches.
     if: startsWith(github.ref, 'refs/tags/v') || github.event_name == 'workflow_dispatch'
@@ -102,7 +107,7 @@ jobs:
           grep '^version' Cargo.toml | head -1
 
       - name: Build the release binary
-        run: cargo build --release
+        run: cargo build --release --bin paneru
 
       - name: Show sccache stats
         run: sccache --show-stats
@@ -117,17 +122,27 @@ jobs:
           tar -tzf "$RUNNER_TEMP/paneru-aarch64-apple-darwin.tar.gz"
 
       - name: Upload build artifacts
-        if: github.event_name == 'workflow_dispatch'
         uses: actions/upload-artifact@v4
         with:
           name: paneru-macos
           path: ${{ runner.temp }}/paneru-aarch64-apple-darwin.tar.gz
 
+  publish:
+    runs-on: macos-latest
+    timeout-minutes: 15
+    needs: [test, build-release]
+    if: startsWith(github.ref, 'refs/tags/v') || github.event_name == 'workflow_dispatch'
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          name: paneru-macos
+          path: ${{ runner.temp }}
+
       - name: Create GitHub Release
-        if: steps.release-info.outputs.tag != ''
+        if: ${{ needs.build-release.outputs.tag != '' }}
         uses: softprops/action-gh-release@v2
         with:
-          tag_name: ${{ steps.release-info.outputs.tag }}
+          tag_name: ${{ needs.build-release.outputs.tag }}
           target_commitish: ${{ github.sha }}
           draft: false
           generate_release_notes: true
