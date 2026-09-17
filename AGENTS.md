@@ -99,6 +99,7 @@ Before concluding a task, creating a commit, or presenting work as complete, age
    ```sh
    RUST_LOG=debug cargo test <test_name> -- --nocapture
    ```
+   `cargo nextest run --workspace --all-targets` also works and is the CI runner. Each harness command gets a 200ms simulated window (`COMMAND_WINDOW` in `src/tests/harness.rs`, just above the 150ms delayed-refresh timeout); tests asserting exact rest positions of long-settling animations opt back into 500ms via `TestHarness::with_command_window`. Suite logs default to `warn` — `RUST_LOG` overrides still apply.
 
 ## 7. Contribution Workflow
 

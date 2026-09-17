@@ -2422,7 +2422,12 @@ fn test_stack_unstack_brings_focused_window_into_view() {
         .into();
 
     // 5 windows @ 400px = 2000px strip on a 1024px display → scrollable.
-    let harness = TestHarness::new().with_config(config).with_windows(5);
+    // The stack/unstack reshuffle animations assert exact rest positions,
+    // which need the legacy settling window to converge.
+    let harness = TestHarness::new()
+        .with_config(config)
+        .with_windows(5)
+        .with_command_window(Duration::from_millis(500));
 
     let commands = vec![
         Event::MenuOpened { window_id: 0 },

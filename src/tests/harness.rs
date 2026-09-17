@@ -34,19 +34,24 @@ use super::*;
 const FRAME: Duration = Duration::from_millis(20);
 
 /// How much simulated time each command in [`TestHarness::run`] is given to
-/// play out.
-const COMMAND_WINDOW: Duration = Duration::from_millis(500);
+/// play out. Kept just above the 150ms delayed-refresh `Timeout::callback`
+/// the display-move systems schedule, so size assertions after a move still
+/// observe the refresh inside the same command window.
+const COMMAND_WINDOW: Duration = Duration::from_millis(200);
 
 /// Derived rather than written out, so that retuning [`FRAME`] keeps the
 /// simulated time per command fixed instead of silently rescaling every
 /// timing-sensitive expectation in the suite.
-const UPDATES_PER_COMMAND: usize = (COMMAND_WINDOW.as_millis() / FRAME.as_millis()) as usize;
+fn updates_per_command(window: Duration) -> usize {
+    (window.as_millis() / FRAME.as_millis()) as usize
+}
 
 type VerifierFunc = Box<dyn FnMut(&mut World, MockState)>;
 pub(crate) struct TestHarness {
     pub(crate) app: App,
     pub(crate) mock_state: MockState,
     pub(crate) verifiers: HashMap<usize, VerifierFunc>,
+    command_window: Duration,
 }
 
 impl TestHarness {
@@ -80,6 +85,7 @@ impl TestHarness {
             app,
             mock_state,
             verifiers: HashMap::new(),
+            command_window: COMMAND_WINDOW,
         }
     }
 
@@ -177,6 +183,14 @@ impl TestHarness {
         self
     }
 
+    /// Overrides how much simulated time each command gets. Tests whose
+    /// assertions need long-settling animations to converge exactly keep the
+    /// legacy 500ms window; everything else runs on [`COMMAND_WINDOW`].
+    pub(crate) fn with_command_window(mut self, window: Duration) -> Self {
+        self.command_window = window;
+        self
+    }
+
     pub(crate) fn with_state(mut self, state: PaneruState) -> Self {
         self.app.world_mut().insert_resource(state);
         self
@@ -209,10 +223,11 @@ impl TestHarness {
     }
 
     pub(crate) fn run(&mut self, commands: Vec<Event>) {
+        let updates_per_command = updates_per_command(self.command_window);
         for (iteration, command) in commands.into_iter().enumerate() {
             self.app.world_mut().write_message::<Event>(command);
 
-            for _ in 0..UPDATES_PER_COMMAND {
+            for _ in 0..updates_per_command {
                 self.app.update();
 
                 // Drain and process events from our virtual OS
@@ -232,7 +247,7 @@ fn setup_world() -> App {
     static DONE: OnceLock<()> = OnceLock::new();
     DONE.get_or_init(|| {
         _ = tracing_subscriber::registry()
-            .with(EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new("info")))
+            .with(EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new("warn")))
             .with(
                 fmt::layer()
                     .with_level(true)
