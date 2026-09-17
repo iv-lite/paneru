@@ -1,0 +1,115 @@
+name: build-and-release
+
+on:
+  push:
+    branches: ["main"]
+    tags: ["v*"]
+  pull_request:
+    branches: ["main"]
+  workflow_dispatch:
+    inputs:
+      release_version:
+        description: Publish a release with this version (e.g. 0.5.1). Leave empty for artifacts only.
+        required: false
+        type: string
+
+permissions:
+  contents: write
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  test:
+    runs-on: macos-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+        with:
+          cache-on-failure: true
+      - name: Check formatting
+        run: cargo fmt --check
+      - name: Lint with Clippy
+        run: cargo clippy --all-targets -- -D warnings
+      - name: Run tests
+        run: cargo test --workspace --all-targets
+
+  release:
+    runs-on: macos-latest
+    needs: test
+    # Plain branch pushes stop after the test job; release artifacts are
+    # only built for version tags and manual dispatches.
+    if: startsWith(github.ref, 'refs/tags/v') || github.event_name == 'workflow_dispatch'
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+        with:
+          cache-on-failure: true
+
+      - name: Resolve release version and tag
+        id: release-info
+        run: |
+          if [[ "$GITHUB_EVENT_NAME" == "workflow_dispatch" && -n "$RELEASE_VERSION" ]]; then
+            echo "version=${RELEASE_VERSION}" >> "$GITHUB_OUTPUT"
+            echo "tag=v${RELEASE_VERSION}" >> "$GITHUB_OUTPUT"
+          elif [[ "$GITHUB_REF_TYPE" == "tag" ]]; then
+            echo "version=${GITHUB_REF_NAME#v}" >> "$GITHUB_OUTPUT"
+            echo "tag=${GITHUB_REF_NAME}" >> "$GITHUB_OUTPUT"
+          else
+            echo "version=" >> "$GITHUB_OUTPUT"
+            echo "tag=" >> "$GITHUB_OUTPUT"
+          fi
+        env:
+          RELEASE_VERSION: ${{ inputs.release_version }}
+
+      - name: Sync crate version to tag
+        if: steps.release-info.outputs.version != ''
+        run: |
+          VERSION="${{ steps.release-info.outputs.version }}"
+          python3 - "$VERSION" <<'EOF'
+          import re, sys
+          version = sys.argv[1]
+          if not re.fullmatch(r"[0-9]+\.[0-9]+\.[0-9]+", version):
+              raise SystemExit(f"refusing to stamp non-semver version {version!r}")
+          path = "Cargo.toml"
+          text = open(path).read()
+          # The [package] version is the first version key in the file.
+          new, count = re.subn(
+              r'^version = "[^"]+"', f'version = "{version}"', text, count=1, flags=re.M
+          )
+          assert count == 1
+          open(path, "w").write(new)
+          print(f"stamped Cargo.toml to {version}")
+          EOF
+          grep '^version' Cargo.toml | head -1
+
+      - name: Build the release binary
+        run: cargo build --release
+
+      - name: Stage release archive
+        run: |
+          STAGE="$RUNNER_TEMP/stage/paneru-aarch64-apple-darwin"
+          mkdir -p "$STAGE"
+          cp target/release/paneru "$STAGE/"
+          cp README.md CONFIGURATION.md SCRIPTING.md LICENSE.txt "$STAGE/"
+          tar -czf "$RUNNER_TEMP/paneru-aarch64-apple-darwin.tar.gz" -C "$RUNNER_TEMP/stage" paneru-aarch64-apple-darwin
+          tar -tzf "$RUNNER_TEMP/paneru-aarch64-apple-darwin.tar.gz"
+
+      - name: Upload build artifacts
+        if: github.event_name == 'workflow_dispatch'
+        uses: actions/upload-artifact@v4
+        with:
+          name: paneru-macos
+          path: ${{ runner.temp }}/paneru-aarch64-apple-darwin.tar.gz
+
+      - name: Create GitHub Release
+        if: steps.release-info.outputs.tag != ''
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: ${{ steps.release-info.outputs.tag }}
+          target_commitish: ${{ github.sha }}
+          draft: false
+          generate_release_notes: true
+          files: ${{ runner.temp }}/paneru-aarch64-apple-darwin.tar.gz
