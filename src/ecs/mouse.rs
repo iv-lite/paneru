@@ -3,15 +3,16 @@ use bevy::ecs::entity::Entity;
 use bevy::ecs::message::MessageReader;
 use bevy::ecs::query::With;
 use bevy::ecs::schedule::IntoScheduleConfigs as _;
-use bevy::ecs::system::{Commands, Local, Query, Res, Single};
+use bevy::ecs::system::{Commands, Local, Populated, Query, Res, Single};
 use bevy::time::Time;
 use std::time::{Duration, Instant};
 use tracing::{debug, trace, warn};
 
-use super::{MouseHeldMarker, Timeout};
+use super::{ActiveDisplayMarker, MouseHeldMarker, Timeout};
+use crate::commands::{OffscreenStrips, attach_window_to_display, detach_window_from_strip};
 use crate::config::Config;
 use crate::ecs::layout::LayoutStrip;
-use crate::ecs::params::{GlobalState, Windows};
+use crate::ecs::params::{ActiveDisplayMut, GlobalState, Windows};
 use crate::ecs::{
     ActiveWorkspaceMarker, DockPosition, MissionControlActive, Position, Scrolling,
     SpawnCommandsExt,
@@ -53,6 +54,13 @@ impl Plugin for MouseEventsPlugin {
                 horizontal_warp_mouse_trigger,
             )
                 .run_if(on_message::<InputEvent>),
+        );
+        // Ungated by input events — `WindowMoved` is a plain `Event`, and the
+        // `Populated` held-marker query keeps the system idle while nobody is
+        // dragging. Ordered after adoption so the hit-test reads fresh frames.
+        app.add_systems(
+            Update,
+            drag_window_across_display, // TEMP-PROBE
         );
     }
 }
@@ -271,6 +279,107 @@ fn mouse_up_trigger(
             if let Ok(mut entity_commands) = commands.get_entity(held_entity) {
                 entity_commands.try_despawn();
             }
+        }
+    }
+}
+
+/// Moves a mouse-dragged managed window across display boundaries.
+///
+/// While a `MouseHeldMarker` is live, every `WindowMoved` for the held window
+/// hit-tests the freshly adopted frame's center: once it lands inside another
+/// display, the window is detached from the active strip and appended to the
+/// target display's selected strip — live, like the keyboard move — keeping
+/// focus while the active display follows it along. Dragging back transfers
+/// it home symmetrically.
+///
+/// The dragged window is expected in the active strip (a real drag focuses
+/// its window first); otherwise there is nothing to detach from and the move
+/// is ignored. Floating, minimized and hidden windows already follow the
+/// cursor on their own and are ignored here, as are moves with no held
+/// button (those adopt and re-tile back onto their own strip).
+#[allow(clippy::too_many_arguments)]
+fn drag_window_across_display(
+    mut messages: MessageReader<Event>,
+    held: Populated<(Entity, &MouseHeldMarker)>,
+    windows: Windows,
+    mut active_display: ActiveDisplayMut,
+    mut offscreen: OffscreenStrips,
+    window_manager: Res<WindowManager>,
+    mut commands: Commands,
+) {
+    for event in messages.read() {
+        let Event::WindowMoved { window_id } = event else {
+            continue;
+        };
+        let Some((_, entity)) = windows.find(*window_id) else {
+            continue;
+        };
+        // Only while the button is held down on this very window.
+        if !held.iter().any(|(_, marker)| marker.0 == entity) {
+            continue;
+        }
+        // Floating/minimized/hidden windows follow the cursor by themselves.
+        let Some((_, _, unmanaged)) = windows.get_managed(entity) else {
+            continue;
+        };
+        if unmanaged.is_some() {
+            continue;
+        }
+        // Nothing to detach when the dragged window is not on the active
+        // strip.
+        if !active_display.active_strip().contains(entity) {
+            continue;
+        }
+        let Some(frame) = windows.frame(entity) else {
+            continue;
+        };
+        let center = frame.center();
+
+        // Target = another display containing the dragged center. Collected
+        // up front so no display borrow is held during the transfer below.
+        let active_id = active_display.id();
+        let target_id = active_display
+            .other()
+            .map(|display| (display.id(), display.bounds()))
+            .find_map(|(id, bounds)| (bounds.contains(center) && id != active_id).then_some(id));
+        let Some(target_id) = target_id else {
+            continue;
+        };
+
+        // Resolve the target strip first: detaching without a destination
+        // would strand the window outside every strip. The strip's parent is
+        // the target display entity, which takes the active marker below.
+        let Ok(target_space_id) = window_manager.active_display_space(target_id) else {
+            continue;
+        };
+        let Some(target_display_entity) = offscreen
+            .iter_mut()
+            .find_map(|(strip, child)| (strip.id() == target_space_id).then_some(child.parent()))
+        else {
+            continue;
+        };
+
+        debug!(
+            "dragging window (id {}, {entity}) to display {target_id}.",
+            window_id,
+        );
+        detach_window_from_strip(entity, active_display.active_strip(), &mut commands);
+        if !attach_window_to_display(
+            entity,
+            target_id,
+            None,
+            &mut offscreen,
+            &window_manager,
+            &mut commands,
+        ) {
+            continue;
+        }
+
+        // Focus follows the dragged window; the active display follows too
+        // (the marker observer clears the previous display).
+        commands.focus_entity(entity, true);
+        if let Ok(mut display_commands) = commands.get_entity(target_display_entity) {
+            display_commands.try_insert(ActiveDisplayMarker);
         }
     }
 }

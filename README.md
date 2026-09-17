@@ -28,7 +28,8 @@ https://github.com/user-attachments/assets/793e7eaa-7909-4086-8380-1fb7861f8780
   Paneru aims to bring a similar scrollable tiling workflow to MacOS.
 - **Works with MacOS workspaces:** You can use existing workspaces and switch
   between them with keyboard or touchpad gestures - with a separate window strip
-  on each. Drag and dropping windows between them works as well.
+  on each. Drag and dropping windows between them works as well: a dragged
+  window joins the display under its center live, keeping focus.
 - **Virtual Workspaces (Experimental):** Group your windows into tasks by
   stacking multiple horizontal strips (rows) within a single space. Use native
   macOS workspaces for broad segregation (e.g., 'Work', 'Personal') and virtual

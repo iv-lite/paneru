@@ -4,6 +4,7 @@ use bevy::{
         hierarchy::ChildOf,
         query::{With, Without},
         system::{Commands, Query, Res, ResMut, Single, SystemParam},
+        world::Mut,
     },
     math::{IRect, IVec2},
 };
@@ -257,8 +258,18 @@ impl ActiveDisplayMut<'_, '_> {
         &self.display.0
     }
 
+    /// Returns the `CGDirectDisplayID` of the active display.
+    pub fn id(&self) -> CGDirectDisplayID {
+        self.display.0.id()
+    }
+
     pub fn dock(&self) -> Option<&DockPosition> {
         self.display.2
+    }
+
+    /// Returns an iterator over mutable references to all other displays (non-active).
+    pub fn other(&mut self) -> impl Iterator<Item = Mut<'_, Display>> {
+        self.other_displays.iter_mut()
     }
 
     /// The next (`next == true`) or previous display in the spatial ring —

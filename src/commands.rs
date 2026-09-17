@@ -39,7 +39,7 @@ pub use paneru_shared_types::commands::{
 
 /// The strips that are selected on their display but not the one on screen —
 /// the parked virtual workspaces a window can be handed off to.
-type OffscreenStrips<'w, 's> = Query<
+pub(crate) type OffscreenStrips<'w, 's> = Query<
     'w,
     's,
     (&'static mut LayoutStrip, &'static ChildOf),
@@ -1210,14 +1210,8 @@ fn move_focused_window_to_display(
     }
 
     // Remove the window from the source strip.
-    let source_neighbour = active_display
-        .active_strip()
-        .left_neighbour(entity)
-        .or_else(|| active_display.active_strip().right_neighbour(entity));
-    active_display.active_strip().remove(entity);
-    if let Some(neighbour) = source_neighbour {
-        commands.reshuffle_around(neighbour);
-    }
+    let source_neighbour =
+        detach_window_from_strip(entity, active_display.active_strip(), commands);
 
     if matches!(move_focus, MoveFocus::Stay)
         && let Some(neighbour) = source_neighbour
@@ -1226,41 +1220,88 @@ fn move_focused_window_to_display(
     }
 
     // Insert into the target display's selected strip.
-    if let Ok(target_space_id) = window_manager.active_display_space(target_id)
-        && let Some((mut target_strip, child)) = other_workspaces
-            .iter_mut()
-            .find(|(strip, _)| strip.id() == target_space_id)
-    {
-        target_strip.append(entity);
-        commands.reshuffle_around(entity);
+    attach_window_to_display(
+        entity,
+        target_id,
+        width_ratio,
+        other_workspaces,
+        window_manager,
+        commands,
+    );
+}
 
-        // Add a delayed refresh of the window size - because the other display can have different bounds.
-        let display_entity = child.parent();
-        let moved_window = entity;
-        let refresh_size = move |windows: Query<&Bounds, With<Window>>,
-                                 displays: Query<(&Display, Option<&DockPosition>)>,
-                                 mut commands: Commands,
-                                 config: Res<Config>| {
-            let Ok((display, dock)) = displays.get(display_entity) else {
-                return;
-            };
-            let viewport_bounds = display.actual_display_bounds(dock, &config);
-            if let Ok(Bounds(bounds)) = windows.get(moved_window) {
-                debug!("Refreshing size of window {entity}");
-                // Preserve the window's width ratio relative to the target
-                // display's usable viewport (dock- and padding-adjusted), so a
-                // fixed dock is accounted for consistently with the source.
-                let width = width_ratio.map_or(bounds.x, |ratio| {
-                    round_px(ratio * f64::from(viewport_bounds.width()))
-                });
-                let size = Size::new(width, viewport_bounds.height());
-                commands.resize_entity(moved_window, size);
-                commands.reshuffle_around(moved_window);
-            }
-        };
-        let system_id = commands.register_system(refresh_size);
-        Timeout::callback(Duration::from_millis(150), system_id, commands);
+/// Removes `entity` from `strip`, reshuffling a neighbour into its place so
+/// the source display retiles. Returns the neighbour for follow-up focus
+/// handling. Shared by the keyboard display-move and mouse-drag paths.
+pub(crate) fn detach_window_from_strip(
+    entity: Entity,
+    strip: &mut LayoutStrip,
+    commands: &mut Commands,
+) -> Option<Entity> {
+    let neighbour = strip
+        .left_neighbour(entity)
+        .or_else(|| strip.right_neighbour(entity));
+    strip.remove(entity);
+    if let Some(neighbour) = neighbour {
+        commands.reshuffle_around(neighbour);
     }
+    neighbour
+}
+
+/// Appends `entity` to the target display's selected strip, reshuffles it
+/// into place, and schedules a delayed size refresh for differing display
+/// bounds. `width_ratio` preserves the window's width relative to the source
+/// viewport (`None` keeps the current width — the mouse-drag path, whose live
+/// position keeps following the cursor). Returns `false` when the target
+/// display has no selected strip, in which case nothing was done. Shared by
+/// the keyboard display-move and mouse-drag paths.
+pub(crate) fn attach_window_to_display(
+    entity: Entity,
+    target_id: CGDirectDisplayID,
+    width_ratio: Option<f64>,
+    other_workspaces: &mut OffscreenStrips,
+    window_manager: &WindowManager,
+    commands: &mut Commands,
+) -> bool {
+    let Ok(target_space_id) = window_manager.active_display_space(target_id) else {
+        return false;
+    };
+    let Some((mut target_strip, child)) = other_workspaces
+        .iter_mut()
+        .find(|(strip, _)| strip.id() == target_space_id)
+    else {
+        return false;
+    };
+    target_strip.append(entity);
+    commands.reshuffle_around(entity);
+
+    // Add a delayed refresh of the window size - because the other display can have different bounds.
+    let display_entity = child.parent();
+    let moved_window = entity;
+    let refresh_size = move |windows: Query<&Bounds, With<Window>>,
+                             displays: Query<(&Display, Option<&DockPosition>)>,
+                             mut commands: Commands,
+                             config: Res<Config>| {
+        let Ok((display, dock)) = displays.get(display_entity) else {
+            return;
+        };
+        let viewport_bounds = display.actual_display_bounds(dock, &config);
+        if let Ok(Bounds(bounds)) = windows.get(moved_window) {
+            debug!("Refreshing size of window {entity}");
+            // Preserve the window's width ratio relative to the target
+            // display's usable viewport (dock- and padding-adjusted), so a
+            // fixed dock is accounted for consistently with the source.
+            let width = width_ratio.map_or(bounds.x, |ratio| {
+                round_px(ratio * f64::from(viewport_bounds.width()))
+            });
+            let size = Size::new(width, viewport_bounds.height());
+            commands.resize_entity(moved_window, size);
+            commands.reshuffle_around(moved_window);
+        }
+    };
+    let system_id = commands.register_system(refresh_size);
+    Timeout::callback(Duration::from_millis(150), system_id, commands);
+    true
 }
 
 /// Moves the mouse pointer to the next or previous display in the spatial

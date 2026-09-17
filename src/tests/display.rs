@@ -6,12 +6,15 @@ use bevy::time::TimeUpdateStrategy;
 use crate::commands::{Command, Direction, MouseMove, MoveFocus, Operation};
 use crate::config::{Config, MainOptions};
 use crate::ecs::layout::{LayoutStrip, PARKED_STRIP_SLIVER};
-use crate::ecs::{DockPosition, Timeout};
+use crate::ecs::{ActiveDisplayMarker, DockPosition, Timeout};
 use crate::events::Event;
 use crate::manager::{Display, Origin, Size, Window};
+use crate::platform::Modifiers;
 use crate::platform::WinID;
 use crate::platform::WorkspaceId;
-use crate::{assert_not_on_workspace, assert_on_workspace, assert_window_at, assert_window_size};
+use crate::{assert_focused, assert_not_on_workspace, assert_on_workspace};
+use crate::{assert_window_at, assert_window_size};
+use objc2_core_foundation::CGPoint;
 
 use super::*;
 
@@ -585,6 +588,186 @@ fn test_swap_fall_through_is_direction_aware() {
         .on_iteration(3, move |world, _state| {
             assert_on_workspace!(world, 0, EXT_WORKSPACE_ID);
             assert_not_on_workspace!(world, 0, TEST_WORKSPACE_ID);
+        })
+        .run(commands);
+}
+
+/// Dragging a managed window so its frame center lands on another display
+/// moves it to that display's strip live: it keeps focus and the active
+/// display follows it. Dropping it there keeps it there.
+fn dragged_active_display_id(world: &mut World) -> u32 {
+    let entity = world
+        .query_filtered::<Entity, (With<Display>, With<ActiveDisplayMarker>)>()
+        .single(world)
+        .expect("exactly one active display");
+    world.get::<Display>(entity).expect("need display").id()
+}
+
+#[test]
+fn test_drag_window_across_display_transfers_strip() {
+    // Window 0 spawns at (0, 0, 400, 1000); grab its center.
+    let grab = CGPoint::new(200.0, 500.0);
+    // Lands the 400x1000 frame at (100, -1000): center (300, -500), inside
+    // the external display above and outside the test display.
+    let drop_origin = Origin::new(100, -1000);
+    let commands = vec![
+        Event::MenuOpened { window_id: 0 },
+        Event::MouseDown {
+            point: grab,
+            modifiers: Modifiers::empty(),
+        },
+        Event::Command {
+            command: Command::PrintState,
+        },
+        Event::Command {
+            command: Command::PrintState,
+        },
+        Event::MouseUp {
+            point: grab,
+            modifiers: Modifiers::empty(),
+        },
+        Event::Command {
+            command: Command::PrintState,
+        },
+    ];
+
+    TestHarness::new()
+        .with_windows(1)
+        .with_display(
+            EXT_DISPLAY_ID,
+            IRect::new(0, -EXT_DISPLAY_HEIGHT, EXT_DISPLAY_WIDTH, 0),
+            vec![EXT_WORKSPACE_ID],
+        )
+        .on_iteration(2, move |world, state| {
+            state.os_move_window(0, drop_origin);
+            assert_on_workspace!(world, 0, TEST_WORKSPACE_ID);
+        })
+        .on_iteration(3, move |world, _state| {
+            assert_on_workspace!(world, 0, EXT_WORKSPACE_ID);
+            assert_not_on_workspace!(world, 0, TEST_WORKSPACE_ID);
+            assert_focused!(world, 0);
+            assert_eq!(dragged_active_display_id(world), EXT_DISPLAY_ID);
+        })
+        .on_iteration(5, move |world, _state| {
+            assert_on_workspace!(world, 0, EXT_WORKSPACE_ID);
+            assert_not_on_workspace!(world, 0, TEST_WORKSPACE_ID);
+        })
+        .run(commands);
+}
+
+/// Pressing and releasing the button without crossing anywhere transfers
+/// nothing.
+#[test]
+fn test_click_without_drag_stays_put() {
+    let grab = CGPoint::new(200.0, 500.0);
+    let commands = vec![
+        Event::MenuOpened { window_id: 0 },
+        Event::MouseDown {
+            point: grab,
+            modifiers: Modifiers::empty(),
+        },
+        Event::MouseUp {
+            point: grab,
+            modifiers: Modifiers::empty(),
+        },
+        Event::Command {
+            command: Command::PrintState,
+        },
+    ];
+
+    TestHarness::new()
+        .with_windows(1)
+        .with_display(
+            EXT_DISPLAY_ID,
+            IRect::new(0, -EXT_DISPLAY_HEIGHT, EXT_DISPLAY_WIDTH, 0),
+            vec![EXT_WORKSPACE_ID],
+        )
+        .on_iteration(3, move |world, _state| {
+            assert_on_workspace!(world, 0, TEST_WORKSPACE_ID);
+            assert_not_on_workspace!(world, 0, EXT_WORKSPACE_ID);
+        })
+        .run(commands);
+}
+
+/// Floating windows already follow the cursor on their own: dragging one
+/// across must not hand it to any strip.
+#[test]
+fn test_drag_floating_window_ignores_transfer() {
+    use crate::ecs::Unmanaged;
+
+    let grab = CGPoint::new(200.0, 500.0);
+    let drop_origin = Origin::new(100, -1000);
+    let commands = vec![
+        Event::MenuOpened { window_id: 0 },
+        Event::Command {
+            command: Command::Window(Operation::Manage),
+        },
+        Event::MouseDown {
+            point: grab,
+            modifiers: Modifiers::empty(),
+        },
+        Event::Command {
+            command: Command::PrintState,
+        },
+        Event::MouseUp {
+            point: grab,
+            modifiers: Modifiers::empty(),
+        },
+        Event::Command {
+            command: Command::PrintState,
+        },
+    ];
+
+    TestHarness::new()
+        .with_windows(1)
+        .with_display(
+            EXT_DISPLAY_ID,
+            IRect::new(0, -EXT_DISPLAY_HEIGHT, EXT_DISPLAY_WIDTH, 0),
+            vec![EXT_WORKSPACE_ID],
+        )
+        .on_iteration(3, move |_world, state| {
+            state.os_move_window(0, drop_origin);
+        })
+        .on_iteration(4, move |world, _state| {
+            let entity = find_window_entity(0, world);
+            assert!(
+                world.get::<Unmanaged>(entity).is_some(),
+                "dragged window should still float"
+            );
+            assert_not_on_workspace!(world, 0, EXT_WORKSPACE_ID);
+            assert_not_on_workspace!(world, 0, TEST_WORKSPACE_ID);
+        })
+        .run(commands);
+}
+
+/// A foreign move with no held button is adopted and then re-tiled back onto
+/// its own strip — the window snaps back instead of transferring.
+#[test]
+fn test_foreign_move_without_hold_snaps_back() {
+    let drop_origin = Origin::new(100, -1000);
+    let commands = vec![
+        Event::MenuOpened { window_id: 0 },
+        Event::Command {
+            command: Command::PrintState,
+        },
+        Event::Command {
+            command: Command::PrintState,
+        },
+    ];
+
+    TestHarness::new()
+        .with_windows(1)
+        .with_display(
+            EXT_DISPLAY_ID,
+            IRect::new(0, -EXT_DISPLAY_HEIGHT, EXT_DISPLAY_WIDTH, 0),
+            vec![EXT_WORKSPACE_ID],
+        )
+        .on_iteration(1, move |_world, state| {
+            state.os_move_window(0, drop_origin);
+        })
+        .on_iteration(2, move |world, _state| {
+            assert_on_workspace!(world, 0, TEST_WORKSPACE_ID);
+            assert_not_on_workspace!(world, 0, EXT_WORKSPACE_ID);
         })
         .run(commands);
 }
