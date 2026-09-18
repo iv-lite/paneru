@@ -829,7 +829,7 @@ fn handle_virtual_window_moves(
 /// at `moved_left`. `scroll_x` is the strip's (intended) scroll offset.
 ///
 /// Returns `(insert_index, desired_scroll)`.
-fn mid_strip_slot(
+pub(crate) fn mid_strip_slot(
     strip: &LayoutStrip,
     scroll_x: i32,
     moved_left: i32,

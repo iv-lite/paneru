@@ -467,6 +467,13 @@ pub struct SkipReshuffle(pub bool);
 #[derive(Component)]
 pub struct MouseHeldMarker(pub Entity);
 
+/// Marker on a [`MouseHeldMarker`] holder arming display transfer for this
+/// drag: the grab happened with the configured drag shortcut held on a
+/// window. Without it, held drags pin their window to its slot instead of
+/// following the cursor across displays.
+#[derive(Component)]
+pub struct DragDisplayArmed;
+
 /// Resource indicating whether Mission Control is currently active.
 #[derive(Resource)]
 pub struct MissionControlActive(pub bool);

@@ -29,8 +29,11 @@ https://github.com/user-attachments/assets/793e7eaa-7909-4086-8380-1fb7861f8780
 - **Works with MacOS workspaces:** You can use existing workspaces and switch
   between them with keyboard or touchpad gestures - with a separate window strip
   on each. Drag and dropping windows between them works as well: holding the
-  `mouse_drag_display_modifier` shortcut while dragging moves a window to the
-  display under its center live, keeping focus (ordinary drags snap back).
+  `mouse_drag_display_modifier` shortcut while left-clicking a window arms the
+  drag, and crossing a display boundary moves it to that display's strip live,
+  keeping focus (lands in the nearest column with `insert_windows_mid_strip`).
+  Without the shortcut, tiled windows pin to their slot and cannot be
+  mouse-moved.
 - **Virtual Workspaces (Experimental):** Group your windows into tasks by
   stacking multiple horizontal strips (rows) within a single space. Use native
   macOS workspaces for broad segregation (e.g., 'Work', 'Personal') and virtual

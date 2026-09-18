@@ -1,18 +1,20 @@
 use bevy::app::{App, Plugin, Update};
 use bevy::ecs::entity::Entity;
 use bevy::ecs::message::MessageReader;
-use bevy::ecs::query::With;
+use bevy::ecs::query::{Has, With};
+use bevy::ecs::resource::Resource;
 use bevy::ecs::schedule::IntoScheduleConfigs as _;
-use bevy::ecs::system::{Commands, Local, Populated, Query, Res, Single};
+use bevy::ecs::system::{Commands, Local, Populated, Query, Res, ResMut, Single};
 use bevy::time::Time;
 use std::time::{Duration, Instant};
 use tracing::{debug, trace, warn};
 
-use super::{ActiveDisplayMarker, MouseHeldMarker, Timeout};
+use super::{ActiveDisplayMarker, DragDisplayArmed, MouseHeldMarker, Timeout};
 use crate::commands::{OffscreenStrips, attach_window_to_display, detach_window_from_strip};
 use crate::config::Config;
 use crate::ecs::layout::LayoutStrip;
 use crate::ecs::params::{ActiveDisplayMut, GlobalState, Windows};
+use crate::ecs::workspace::mid_strip_slot;
 use crate::ecs::{
     ActiveWorkspaceMarker, DockPosition, MissionControlActive, Position, Scrolling,
     SpawnCommandsExt,
@@ -58,9 +60,10 @@ impl Plugin for MouseEventsPlugin {
         // Ungated by input events — `WindowMoved` is a plain `Event`, and the
         // `Populated` held-marker query keeps the system idle while nobody is
         // dragging. Ordered after adoption so the hit-test reads fresh frames.
+        app.init_resource::<DragModifierState>();
         app.add_systems(
             Update,
-            drag_window_across_display, // TEMP-PROBE
+            drag_window_across_display.after(super::systems::window_moved_update_frame),
         );
     }
 }
@@ -222,7 +225,7 @@ fn mouse_down_trigger(
     mut commands: Commands,
 ) {
     for InputEvent(event) in messages.read() {
-        let Event::MouseDown { point, .. } = event else {
+        let Event::MouseDown { point, modifiers } = event else {
             continue;
         };
         trace!("{point:?}");
@@ -257,7 +260,17 @@ fn mouse_down_trigger(
             // Defer reshuffle until mouse-up so the window doesn't shift
             // mid-click. The Timeout auto-despawns if mouse-up is lost.
             let timeout = Timeout::new(Duration::from_secs(5), None, &mut commands);
-            commands.spawn((MouseHeldMarker(entity), timeout));
+            let mut holder = commands.spawn((MouseHeldMarker(entity), timeout));
+            // Arm display transfer only for the grab-time conjunction the
+            // user asked for: shortcut held while left-clicking a window.
+            // This holder defines the drag target; pressing the shortcut
+            // later in the drag never arms.
+            if config
+                .mouse_drag_display_modifier()
+                .is_some_and(|required| required.matches(*modifiers))
+            {
+                holder.try_insert(DragDisplayArmed);
+            }
         }
     }
 }
@@ -285,31 +298,34 @@ fn mouse_up_trigger(
 
 /// Modifiers held during the current mouse drag, tracked from the
 /// `MouseDown`/`MouseDragged` stream (the `WindowMoved` trigger carries none).
-/// The display transfer only fires while the configured
-/// `mouse_drag_display_modifier` matches these.
-#[derive(Debug)]
-struct DragModifierState {
-    modifiers: Modifiers,
+/// Read by the drag transfer and the adoption lock; reset on `MouseUp`.
+#[derive(Debug, Resource)]
+pub(crate) struct DragModifierState {
+    pub(crate) current: Modifiers,
 }
 
 impl Default for DragModifierState {
     fn default() -> Self {
         Self {
-            modifiers: Modifiers::empty(),
+            current: Modifiers::empty(),
         }
     }
 }
 
 /// Moves a mouse-dragged managed window across display boundaries.
 ///
-/// While a `MouseHeldMarker` is live **and** the configured
-/// `mouse_drag_display_modifier` is held, every `WindowMoved` for the held
-/// window hit-tests the freshly adopted frame's center: once it lands inside
-/// another display, the window is detached from the active strip and appended
-/// to the target display's selected strip — live, like the keyboard move —
-/// keeping focus while the active display follows it along. Dragging back
-/// transfers it home symmetrically. With the modifier unset (default) or
-/// released, the transfer never fires and dragged windows snap back.
+/// The transfer is armed at grab time: shortcut held while left-clicking a
+/// window (see `DragDisplayArmed`). While armed **and** the shortcut is still
+/// held, every `WindowMoved` for the held window hit-tests the freshly
+/// adopted frame's center: once it lands inside another display, the window
+/// is detached from the active strip and appended to the target display's
+/// selected strip — live, like the keyboard move — keeping focus while the
+/// active display follows it along. Dragging back transfers it home
+/// symmetrically.
+///
+/// A held drag that is not armed (or whose shortcut was released) pins its
+/// window instead: each foreign move reshuffles it straight back to its
+/// slot, so tiled windows cannot be mouse-moved without the shortcut.
 ///
 /// The dragged window is expected in the active strip (a real drag focuses
 /// its window first); otherwise there is nothing to detach from and the move
@@ -320,13 +336,13 @@ impl Default for DragModifierState {
 fn drag_window_across_display(
     mut messages: MessageReader<Event>,
     mut input: MessageReader<InputEvent>,
-    held: Populated<(Entity, &MouseHeldMarker)>,
+    held: Populated<(Entity, &MouseHeldMarker, Has<DragDisplayArmed>)>,
     windows: Windows,
     mut active_display: ActiveDisplayMut,
     mut offscreen: OffscreenStrips,
     window_manager: Res<WindowManager>,
     config: Res<Config>,
-    mut drag_modifiers: Local<DragModifierState>,
+    mut drag_modifiers: ResMut<DragModifierState>,
     mut commands: Commands,
 ) {
     // The OS window cannot cross displays without mouse motion, and motion
@@ -335,10 +351,10 @@ fn drag_window_across_display(
     for InputEvent(event) in input.read() {
         match event {
             Event::MouseDown { modifiers, .. } | Event::MouseDragged { modifiers, .. } => {
-                drag_modifiers.modifiers = *modifiers;
+                drag_modifiers.current = *modifiers;
             }
             Event::MouseUp { .. } => {
-                drag_modifiers.modifiers = Modifiers::empty();
+                drag_modifiers.current = Modifiers::empty();
             }
             _ => {}
         }
@@ -348,26 +364,31 @@ fn drag_window_across_display(
         let Event::WindowMoved { window_id } = event else {
             continue;
         };
-        // Display transfer is opt-in: without the configured shortcut held,
-        // the move adopts and re-tiles back onto its own strip below.
-        let Some(required) = config.mouse_drag_display_modifier() else {
-            continue;
-        };
-        if !required.matches(drag_modifiers.modifiers) {
-            continue;
-        }
         let Some((_, entity)) = windows.find(*window_id) else {
             continue;
         };
         // Only while the button is held down on this very window.
-        if !held.iter().any(|(_, marker)| marker.0 == entity) {
-            continue;
-        }
+        let armed = held
+            .iter()
+            .any(|(_, marker, armed)| marker.0 == entity && armed);
         // Floating/minimized/hidden windows follow the cursor by themselves.
         let Some((_, _, unmanaged)) = windows.get_managed(entity) else {
             continue;
         };
         if unmanaged.is_some() {
+            continue;
+        }
+        // Armed at grab time and shortcut still held: eligible for display
+        // transfer below. Anything else pins the window to its slot instead
+        // of following the cursor.
+        let transfer = armed
+            && config
+                .mouse_drag_display_modifier()
+                .is_some_and(|required| required.matches(drag_modifiers.current));
+        if !transfer {
+            if held.iter().any(|(_, marker, _)| marker.0 == entity) {
+                commands.reshuffle_around(entity);
+            }
             continue;
         }
         // Nothing to detach when the dragged window is not on the active
@@ -383,11 +404,11 @@ fn drag_window_across_display(
         // Target = another display containing the dragged center. Collected
         // up front so no display borrow is held during the transfer below.
         let active_id = active_display.id();
-        let target_id = active_display
+        let target = active_display
             .other()
             .map(|display| (display.id(), display.bounds()))
-            .find_map(|(id, bounds)| (bounds.contains(center) && id != active_id).then_some(id));
-        let Some(target_id) = target_id else {
+            .find(|(id, bounds)| bounds.contains(center) && *id != active_id);
+        let Some((target_id, target_bounds)) = target else {
             continue;
         };
 
@@ -408,11 +429,25 @@ fn drag_window_across_display(
             "dragging window (id {}, {entity}) to display {target_id}.",
             window_id,
         );
+        // With `insert_windows_mid_strip`, land in the column nearest the
+        // drop point instead of appending: columns are scroll-invariant, so
+        // the viewport-left origin picks the proportional column.
+        let mid_slot = config.insert_windows_mid_strip().then(|| {
+            offscreen
+                .iter_mut()
+                .find(|(strip, _)| strip.id() == target_space_id)
+                .and_then(|(strip, _)| {
+                    let drop_x = windows.frame(entity)?.min.x;
+                    Some(mid_strip_slot(&strip, target_bounds.min.x, drop_x, &windows).0)
+                })
+        });
+        let mid_slot = mid_slot.flatten();
         detach_window_from_strip(entity, active_display.active_strip(), &mut commands);
         if !attach_window_to_display(
             entity,
             target_id,
             None,
+            mid_slot,
             &mut offscreen,
             &window_manager,
             &mut commands,

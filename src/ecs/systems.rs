@@ -19,13 +19,15 @@ use std::time::{Duration, Instant};
 use tracing::{Level, debug, error, info, instrument, trace, warn};
 
 use super::{
-    ActiveDisplayMarker, BProcess, ExistingMarker, FreshMarker, RepositionMarker, ResizeMarker,
-    RetryFrontSwitch, SpawnWindowTrigger, Timeout, VerifyWindowPosition,
+    ActiveDisplayMarker, BProcess, DragDisplayArmed, ExistingMarker, FreshMarker, MouseHeldMarker,
+    RepositionMarker, ResizeMarker, RetryFrontSwitch, SpawnWindowTrigger, Timeout,
+    VerifyWindowPosition,
 };
 
 use crate::config::{Config, decorations::BorderRadiusOption};
 use crate::ecs::display::FloatingLayer;
 use crate::ecs::layout::{Column, LayoutStrip};
+use crate::ecs::mouse::DragModifierState;
 use crate::ecs::params::{ActiveDisplay, FrameActivity, Windows};
 use crate::ecs::{
     ActiveWorkspaceMarker, Bounds, BruteforceWindows, FlashMessage, FocusedMarker, Initializing,
@@ -34,7 +36,7 @@ use crate::ecs::{
 };
 use crate::events::{Event, InputEvent};
 use crate::manager::{
-    Application, Display, Process, Window, WindowManager, WindowOS, bruteforce_windows,
+    Application, Display, Origin, Process, Window, WindowManager, WindowOS, bruteforce_windows,
 };
 use crate::overlay::{FlashMessageManager, OverlayManager};
 use crate::platform::input::TapHealth;
@@ -55,6 +57,7 @@ type MovableWindows<'w, 's> = Query<
     'w,
     's,
     (
+        Entity,
         &'static mut Window,
         &'static mut Position,
         &'static Bounds,
@@ -569,6 +572,23 @@ fn ease_out_factor(rate: f64, delta: f64) -> f32 {
     (1.0 - (-rate * delta).exp()).clamp(0.0, 1.0) as f32
 }
 
+/// Jump-cuts instead of sliding whenever an animation would cross a display
+/// seam: sets the position straight to the target and drops the marker, so no
+/// intermediate frame ever paints onto a neighboring display. Points outside
+/// every known display (parked slivers in the gutter) never match, so those
+/// animations behave exactly as before.
+fn seam_snap_target(current: Origin, target: Origin, displays: &[IRect]) -> Option<Origin> {
+    let current_display = displays.iter().find(|bounds| bounds.contains(current));
+    let target_display = displays.iter().find(|bounds| bounds.contains(target));
+    match (current_display, target_display) {
+        (Some(current_bounds), Some(target_bounds)) if current_bounds != target_bounds => {
+            Some(target)
+        }
+        (Some(_), None) | (None, Some(_)) => Some(target),
+        _ => None,
+    }
+}
+
 /// This is a Bevy system that runs on `Update`. It smoothly moves windows to their target
 /// positions, as indicated by the `RepositionMarker` component.
 /// Animation speed is controlled by the `animation_speed` in the `Config`.
@@ -583,7 +603,8 @@ fn ease_out_factor(rate: f64, delta: f64) -> f32 {
 /// * `commands` - Bevy commands to remove the `RepositionMarker` when animation is complete.
 #[instrument(level = Level::TRACE, skip_all)]
 pub(super) fn animate_entities(
-    animate: Populated<(&mut Position, Entity, &RepositionMarker)>,
+    animate: Populated<(&mut Position, Entity, &RepositionMarker, Has<Window>)>,
+    displays: Query<&Display>,
     time: Res<Time>,
     config: Res<Config>,
     mut commands: Commands,
@@ -591,10 +612,23 @@ pub(super) fn animate_entities(
     // Frame-rate-independent exponential smoothing (ease-out).
     // `animation_speed` is the decay rate (per second); higher = snappier.
     let t = ease_out_factor(config.animation_speed(), time.delta_secs_f64());
+    let display_bounds: Vec<IRect> = displays.iter().map(Display::bounds).collect();
 
-    animate
-        .into_iter()
-        .for_each(|(mut position, entity, RepositionMarker(origin))| {
+    animate.into_iter().for_each(
+        |(mut position, entity, RepositionMarker(origin), is_window)| {
+            // Seam-snapping applies to windows, which paint: a strip
+            // scroll offset is not a frame, so strips always lerp (a
+            // negative scroll target is routine, not a seam crossing).
+            if is_window
+                && let Some(snapped) = seam_snap_target(position.0, *origin, &display_bounds)
+            {
+                trace!("entity {entity} seam-snapping to {snapped}");
+                position.0 = snapped;
+                if let Ok(mut entity_commands) = commands.get_entity(entity) {
+                    entity_commands.try_remove::<RepositionMarker>();
+                }
+                return;
+            }
             let target = origin.as_vec2();
             let current = position.0.as_vec2();
             let lerped = current.lerp(target, t);
@@ -616,7 +650,8 @@ pub(super) fn animate_entities(
             if finished && let Ok(mut entity_commands) = commands.get_entity(entity) {
                 entity_commands.try_remove::<RepositionMarker>();
             }
-        });
+        },
+    );
 }
 
 /// Animates window resizing.
@@ -858,19 +893,37 @@ pub(super) fn window_resized_update_frame(
 pub(crate) fn window_moved_update_frame(
     mut messages: MessageReader<Event>,
     mut windows: MovableWindows,
+    held: Query<(Entity, &MouseHeldMarker, Has<DragDisplayArmed>)>,
+    config: Res<Config>,
+    drag_modifiers: Res<DragModifierState>,
 ) {
     for event in messages.read() {
         let Event::WindowMoved { window_id } = event else {
             continue;
         };
 
-        let Some((mut window, mut position, bounds, unmanaged, repositioning)) = windows
+        let Some((entity, mut window, mut position, bounds, unmanaged, repositioning)) = windows
             .iter_mut()
-            .find(|window| window.0.id() == *window_id)
+            .find(|window| window.1.id() == *window_id)
         else {
             continue;
         };
         if matches!(unmanaged, Some(Unmanaged::Minimized | Unmanaged::Hidden)) {
+            continue;
+        }
+        // A managed window held without an armed display-drag stays pinned to
+        // its slot: skip adoption so layout/commit keep pushing it home
+        // instead of following the OS frame (see `drag_window_across_display`,
+        // which forces the re-tile). Armed drags with the shortcut held adopt
+        // normally — the center hit-test needs fresh frames.
+        let draggable = held
+            .iter()
+            .any(|(_, marker, armed)| marker.0 == entity && armed)
+            && config
+                .mouse_drag_display_modifier()
+                .is_some_and(|required| required.matches(drag_modifiers.current));
+        if unmanaged.is_none() && held.iter().any(|(_, marker, _)| marker.0 == entity) && !draggable
+        {
             continue;
         }
         // Our own move, echoed back: `animate_entities` lerps from the current
@@ -989,6 +1042,7 @@ pub(super) fn update_overlays(
     active_workspace: Populated<(Has<Scrolling>, &LayoutStrip), With<ActiveWorkspaceMarker>>,
     windows: Windows,
     applications: Query<&Application>,
+    displays: Query<(&Display, Has<ActiveDisplayMarker>)>,
     overlay_mgr: Option<NonSendMut<OverlayManager>>,
     mission_control_active: Res<MissionControlActive>,
     config: Res<Config>,
@@ -1056,7 +1110,17 @@ pub(super) fn update_overlays(
         ))
     };
 
-    let border_params = if border_enabled {
+    let border_params = if border_enabled && {
+        // Parked slivers physically sit inside abutting displays; drawing the
+        // focus border around one paints a stripe on the neighbor. The focused
+        // window belongs on screen, so a center outside the active display
+        // means it is parked or mid-transfer — skip the border either way.
+        let center = window.frame().center();
+        displays
+            .iter()
+            .find(|(_, active)| *active)
+            .is_none_or(|(display, _)| display.bounds().contains(center))
+    } {
         if window_config_cache.window_id != Some(focused_window_id) || config.is_changed() {
             let Some((window, _, parent)) = windows.find_parent(focused_window_id) else {
                 return;
@@ -1585,5 +1649,65 @@ mod tests {
         app.update();
 
         assert_eq!(tap_config.swipe_gesture_fingers(), Some(3));
+    }
+}
+
+#[cfg(test)]
+mod seam_tests {
+    use super::seam_snap_target;
+    use crate::manager::Origin;
+    use bevy::math::IRect;
+
+    fn a() -> IRect {
+        IRect::new(0, 0, 1024, 768)
+    }
+    fn b() -> IRect {
+        IRect::new(1024, 0, 2944, 768)
+    }
+    fn at(x: i32, y: i32) -> Origin {
+        Origin::new(x, y)
+    }
+
+    #[test]
+    fn same_display_slide_is_untouched() {
+        assert_eq!(
+            seam_snap_target(at(100, 100), at(600, 100), &[a(), b()]),
+            None
+        );
+    }
+
+    #[test]
+    fn cross_display_slide_jump_cuts() {
+        let target = at(1100, 100);
+        assert_eq!(
+            seam_snap_target(at(900, 100), target, &[a(), b()]),
+            Some(target)
+        );
+    }
+
+    #[test]
+    fn appearing_from_outside_snaps() {
+        let target = at(100, 100);
+        assert_eq!(
+            seam_snap_target(at(-500, 100), target, &[a(), b()]),
+            Some(target)
+        );
+    }
+
+    #[test]
+    fn disappearing_offscreen_snaps() {
+        let target = at(-500, 100);
+        assert_eq!(
+            seam_snap_target(at(100, 100), target, &[a(), b()]),
+            Some(target)
+        );
+    }
+
+    #[test]
+    fn gutter_to_gutter_is_untouched() {
+        assert_eq!(
+            seam_snap_target(at(-500, 100), at(-400, 100), &[a(), b()]),
+            None
+        );
     }
 }

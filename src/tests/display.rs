@@ -6,7 +6,7 @@ use bevy::time::TimeUpdateStrategy;
 use crate::commands::{Command, Direction, MouseMove, MoveFocus, Operation};
 use crate::config::{Config, MainOptions};
 use crate::ecs::layout::{LayoutStrip, PARKED_STRIP_SLIVER};
-use crate::ecs::{ActiveDisplayMarker, DockPosition, Timeout};
+use crate::ecs::{ActiveDisplayMarker, DockPosition, Position, Timeout};
 use crate::events::Event;
 use crate::manager::{Display, Origin, Size, Window};
 use crate::platform::Modifiers;
@@ -848,6 +848,328 @@ fn test_drag_floating_window_ignores_transfer() {
             );
             assert_not_on_workspace!(world, 0, EXT_WORKSPACE_ID);
             assert_not_on_workspace!(world, 0, TEST_WORKSPACE_ID);
+        })
+        .run(commands);
+}
+
+/// An unarmed held drag pins the window to its slot: while the OS frame
+/// sits on the other display, the ECS position never follows it.
+#[test]
+fn test_unarmed_drag_pins_window_to_slot() {
+    let grab = CGPoint::new(200.0, 500.0);
+    let drop_origin = Origin::new(100, -1000);
+    let commands = vec![
+        Event::MenuOpened { window_id: 0 },
+        Event::MouseDown {
+            point: grab,
+            modifiers: Modifiers::empty(),
+        },
+        Event::MouseDragged {
+            point: grab,
+            modifiers: Modifiers::empty(),
+        },
+        Event::Command {
+            command: Command::PrintState,
+        },
+        Event::MouseUp {
+            point: grab,
+            modifiers: Modifiers::empty(),
+        },
+        Event::Command {
+            command: Command::PrintState,
+        },
+    ];
+
+    TestHarness::new()
+        .with_config(drag_display_config())
+        .with_windows(1)
+        .with_display(
+            EXT_DISPLAY_ID,
+            IRect::new(0, -EXT_DISPLAY_HEIGHT, EXT_DISPLAY_WIDTH, 0),
+            vec![EXT_WORKSPACE_ID],
+        )
+        .on_iteration(3, move |_world, state| {
+            state.os_move_window(0, drop_origin);
+        })
+        .on_iteration(4, move |world, _state| {
+            // Still on the source strip, and pinned at its slot — the ECS
+            // position never follows the OS frame across the seam. (Checked
+            // against `Position`, not the OS frame, which is across by
+            // construction.)
+            assert_on_workspace!(world, 0, TEST_WORKSPACE_ID);
+            assert_not_on_workspace!(world, 0, EXT_WORKSPACE_ID);
+            let entity = find_window_entity(0, world);
+            let position = world.get::<Position>(entity).expect("need position").0;
+            assert_eq!(
+                position,
+                Origin::new(0, TEST_MENUBAR_HEIGHT),
+                "unarmed drag must pin the window to its slot"
+            );
+        })
+        .run(commands);
+}
+
+/// Pressing the shortcut mid-drag, after a plain grab, never arms the
+/// transfer: activation is the grab-time conjunction only.
+#[test]
+fn test_mid_drag_shortcut_does_not_arm_transfer() {
+    let grab = CGPoint::new(200.0, 500.0);
+    let drop_origin = Origin::new(100, -1000);
+    let commands = vec![
+        Event::MenuOpened { window_id: 0 },
+        Event::MouseDown {
+            point: grab,
+            modifiers: Modifiers::empty(),
+        },
+        Event::MouseDragged {
+            point: grab,
+            modifiers: Modifiers::ALT,
+        },
+        Event::Command {
+            command: Command::PrintState,
+        },
+        Event::MouseUp {
+            point: grab,
+            modifiers: Modifiers::ALT,
+        },
+        Event::Command {
+            command: Command::PrintState,
+        },
+    ];
+
+    TestHarness::new()
+        .with_config(drag_display_config())
+        .with_windows(1)
+        .with_display(
+            EXT_DISPLAY_ID,
+            IRect::new(0, -EXT_DISPLAY_HEIGHT, EXT_DISPLAY_WIDTH, 0),
+            vec![EXT_WORKSPACE_ID],
+        )
+        .on_iteration(3, move |_world, state| {
+            state.os_move_window(0, drop_origin);
+        })
+        .on_iteration(4, move |world, _state| {
+            assert_on_workspace!(world, 0, TEST_WORKSPACE_ID);
+            assert_not_on_workspace!(world, 0, EXT_WORKSPACE_ID);
+        })
+        .run(commands);
+}
+
+/// Window ids on a workspace strip, left to right.
+fn strip_window_ids(world: &mut World, workspace_id: WorkspaceId) -> Vec<WinID> {
+    let mut strips = world.query::<&LayoutStrip>();
+    let strip = strips
+        .iter(world)
+        .find(|strip| strip.id() == workspace_id)
+        .expect("need strip");
+    let entities = strip.all_windows();
+    let mut windows = world.query::<&Window>();
+    entities
+        .iter()
+        .map(|entity| windows.get(world, *entity).expect("need window").id())
+        .collect()
+}
+
+/// With `insert_windows_mid_strip`, a drag drop lands in the column nearest
+/// the drop point instead of appending: left drop goes first...
+#[test]
+fn test_drag_drop_lands_in_nearest_column() {
+    let grab = CGPoint::new(200.0, 500.0);
+    let drop_origin = Origin::new(100, -1000);
+    let commands = vec![
+        Event::MenuOpened { window_id: 0 },
+        Event::MouseDown {
+            point: grab,
+            modifiers: Modifiers::ALT,
+        },
+        Event::MouseDragged {
+            point: grab,
+            modifiers: Modifiers::ALT,
+        },
+        Event::Command {
+            command: Command::PrintState,
+        },
+        Event::Command {
+            command: Command::PrintState,
+        },
+        Event::MouseUp {
+            point: grab,
+            modifiers: Modifiers::ALT,
+        },
+        Event::Command {
+            command: Command::PrintState,
+        },
+    ];
+
+    let config: Config = (
+        MainOptions {
+            mouse_drag_display_modifier: Some(Modifiers::ALT),
+            insert_windows_mid_strip: Some(true),
+            ..Default::default()
+        },
+        vec![],
+    )
+        .into();
+
+    let mut harness = TestHarness::new().with_windows(1);
+    harness.mock_state.add_display(
+        EXT_DISPLAY_ID,
+        IRect::new(0, -EXT_DISPLAY_HEIGHT, EXT_DISPLAY_WIDTH, 0),
+        vec![EXT_WORKSPACE_ID],
+    );
+    let ext_frame = IRect::from_corners(
+        Origin::new(0, -EXT_DISPLAY_HEIGHT + TEST_MENUBAR_HEIGHT),
+        Origin::new(
+            TEST_WINDOW_WIDTH,
+            -EXT_DISPLAY_HEIGHT + TEST_MENUBAR_HEIGHT + 100,
+        ),
+    );
+    harness
+        .mock_state
+        .spawn_window(TEST_PROCESS_ID, EXT_WORKSPACE_ID, 100, ext_frame);
+    harness
+        .mock_state
+        .spawn_window(TEST_PROCESS_ID, EXT_WORKSPACE_ID, 101, ext_frame);
+
+    harness
+        .with_config(config)
+        .on_iteration(3, move |_world, state| {
+            state.os_move_window(0, drop_origin);
+        })
+        .on_iteration(4, move |world, _state| {
+            assert_eq!(strip_window_ids(world, EXT_WORKSPACE_ID), vec![0, 100, 101]);
+        })
+        .run(commands);
+}
+
+/// ...while a right drop goes last through the same slot machinery.
+#[test]
+fn test_drag_drop_right_lands_last() {
+    let grab = CGPoint::new(200.0, 500.0);
+    let drop_origin = Origin::new(1400, -1000);
+    let commands = vec![
+        Event::MenuOpened { window_id: 0 },
+        Event::MouseDown {
+            point: grab,
+            modifiers: Modifiers::ALT,
+        },
+        Event::MouseDragged {
+            point: grab,
+            modifiers: Modifiers::ALT,
+        },
+        Event::Command {
+            command: Command::PrintState,
+        },
+        Event::Command {
+            command: Command::PrintState,
+        },
+        Event::MouseUp {
+            point: grab,
+            modifiers: Modifiers::ALT,
+        },
+        Event::Command {
+            command: Command::PrintState,
+        },
+    ];
+
+    let config: Config = (
+        MainOptions {
+            mouse_drag_display_modifier: Some(Modifiers::ALT),
+            insert_windows_mid_strip: Some(true),
+            ..Default::default()
+        },
+        vec![],
+    )
+        .into();
+
+    let mut harness = TestHarness::new().with_windows(1);
+    harness.mock_state.add_display(
+        EXT_DISPLAY_ID,
+        IRect::new(0, -EXT_DISPLAY_HEIGHT, EXT_DISPLAY_WIDTH, 0),
+        vec![EXT_WORKSPACE_ID],
+    );
+    let ext_frame = IRect::from_corners(
+        Origin::new(0, -EXT_DISPLAY_HEIGHT + TEST_MENUBAR_HEIGHT),
+        Origin::new(
+            TEST_WINDOW_WIDTH,
+            -EXT_DISPLAY_HEIGHT + TEST_MENUBAR_HEIGHT + 100,
+        ),
+    );
+    harness
+        .mock_state
+        .spawn_window(TEST_PROCESS_ID, EXT_WORKSPACE_ID, 100, ext_frame);
+    harness
+        .mock_state
+        .spawn_window(TEST_PROCESS_ID, EXT_WORKSPACE_ID, 101, ext_frame);
+
+    harness
+        .with_config(config)
+        .on_iteration(3, move |_world, state| {
+            state.os_move_window(0, drop_origin);
+        })
+        .on_iteration(4, move |world, _state| {
+            assert_eq!(strip_window_ids(world, EXT_WORKSPACE_ID), vec![100, 101, 0]);
+        })
+        .run(commands);
+}
+
+/// Without the flag, the same left drop appends at the end as before.
+#[test]
+fn test_drag_drop_appends_by_default() {
+    let grab = CGPoint::new(200.0, 500.0);
+    let drop_origin = Origin::new(100, -1000);
+    let commands = vec![
+        Event::MenuOpened { window_id: 0 },
+        Event::MouseDown {
+            point: grab,
+            modifiers: Modifiers::ALT,
+        },
+        Event::MouseDragged {
+            point: grab,
+            modifiers: Modifiers::ALT,
+        },
+        Event::Command {
+            command: Command::PrintState,
+        },
+        Event::Command {
+            command: Command::PrintState,
+        },
+        Event::MouseUp {
+            point: grab,
+            modifiers: Modifiers::ALT,
+        },
+        Event::Command {
+            command: Command::PrintState,
+        },
+    ];
+
+    let mut harness = TestHarness::new().with_windows(1);
+    harness.mock_state.add_display(
+        EXT_DISPLAY_ID,
+        IRect::new(0, -EXT_DISPLAY_HEIGHT, EXT_DISPLAY_WIDTH, 0),
+        vec![EXT_WORKSPACE_ID],
+    );
+    let ext_frame = IRect::from_corners(
+        Origin::new(0, -EXT_DISPLAY_HEIGHT + TEST_MENUBAR_HEIGHT),
+        Origin::new(
+            TEST_WINDOW_WIDTH,
+            -EXT_DISPLAY_HEIGHT + TEST_MENUBAR_HEIGHT + 100,
+        ),
+    );
+    harness
+        .mock_state
+        .spawn_window(TEST_PROCESS_ID, EXT_WORKSPACE_ID, 100, ext_frame);
+    harness
+        .mock_state
+        .spawn_window(TEST_PROCESS_ID, EXT_WORKSPACE_ID, 101, ext_frame);
+
+    harness
+        .with_config(drag_display_config())
+        .on_iteration(3, move |_world, state| {
+            state.os_move_window(0, drop_origin);
+        })
+        .on_iteration(4, move |world, _state| {
+            assert_eq!(strip_window_ids(world, EXT_WORKSPACE_ID), vec![100, 101, 0]);
         })
         .run(commands);
 }

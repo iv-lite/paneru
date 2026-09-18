@@ -1224,6 +1224,7 @@ fn move_focused_window_to_display(
         entity,
         target_id,
         width_ratio,
+        None,
         other_workspaces,
         window_manager,
         commands,
@@ -1252,13 +1253,16 @@ pub(crate) fn detach_window_from_strip(
 /// into place, and schedules a delayed size refresh for differing display
 /// bounds. `width_ratio` preserves the window's width relative to the source
 /// viewport (`None` keeps the current width — the mouse-drag path, whose live
-/// position keeps following the cursor). Returns `false` when the target
+/// position keeps following the cursor). `mid_slot` inserts at a column index
+/// instead of appending (mouse-drag drops honoring `insert_windows_mid_strip`;
+/// the keyboard path passes `None`). Returns `false` when the target
 /// display has no selected strip, in which case nothing was done. Shared by
 /// the keyboard display-move and mouse-drag paths.
 pub(crate) fn attach_window_to_display(
     entity: Entity,
     target_id: CGDirectDisplayID,
     width_ratio: Option<f64>,
+    mid_slot: Option<usize>,
     other_workspaces: &mut OffscreenStrips,
     window_manager: &WindowManager,
     commands: &mut Commands,
@@ -1272,7 +1276,10 @@ pub(crate) fn attach_window_to_display(
     else {
         return false;
     };
-    target_strip.append(entity);
+    match mid_slot {
+        Some(slot) => target_strip.insert_at(slot, entity),
+        None => target_strip.append(entity),
+    }
     commands.reshuffle_around(entity);
 
     // Add a delayed refresh of the window size - because the other display can have different bounds.
