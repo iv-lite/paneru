@@ -9,12 +9,12 @@ use bevy::ecs::system::{Commands, Local, NonSendMut, Populated, Query, Res, ResM
 use bevy::math::IRect;
 use bevy::time::Time;
 use std::time::{Duration, Instant};
-use tracing::{debug, trace, warn};
+use tracing::{debug, info, trace, warn};
 
 use super::{ActiveDisplayMarker, DragDisplayArmed, MouseHeldMarker, Timeout};
 use crate::commands::{OffscreenStrips, attach_window_to_display, detach_window_from_strip};
 use crate::config::{Config, decorations::BorderRadiusOption};
-use crate::ecs::layout::LayoutStrip;
+use crate::ecs::layout::{Column, LayoutStrip, desired_window_frame};
 use crate::ecs::params::{ActiveDisplayMut, GlobalState, Windows};
 use crate::ecs::workspace::mid_strip_slot;
 use crate::ecs::{
@@ -23,9 +23,10 @@ use crate::ecs::{
 };
 use crate::manager::{Display, Origin, Size, Window, WindowManager, origin_from};
 use crate::overlay::{BorderParams, OverlayManager};
-use crate::platform::{Modifiers, WinID};
+use crate::platform::{Modifiers, WinID, WorkspaceId};
 use crate::util::round_px;
 use bevy::ecs::schedule::common_conditions::on_message;
+use objc2_core_graphics::CGDirectDisplayID;
 
 use crate::events::{Event, InputEvent};
 
@@ -231,6 +232,7 @@ fn mouse_moved_trigger(
 /// * `active_display` - A query for the active display.
 /// * `main_cid` - The main connection ID resource.
 /// * `commands` - Bevy commands to trigger a reshuffle.
+#[allow(clippy::too_many_arguments)]
 fn mouse_down_trigger(
     mut messages: MessageReader<InputEvent>,
     windows: Windows,
@@ -238,19 +240,30 @@ fn mouse_down_trigger(
     window_manager: Res<WindowManager>,
     config: Res<Config>,
     mouse_held: Query<Entity, With<MouseHeldMarker>>,
+    mut logged_config: Local<bool>,
     mut commands: Commands,
 ) {
+    if !*logged_config {
+        *logged_config = true;
+        info!(
+            "mouse drag config: drag_modifier={:?}, resize_modifier={:?}, warp={:?}",
+            config.mouse_drag_display_modifier(),
+            config.mouse_resize_modifier(),
+            config.horizontal_mouse_warp(),
+        );
+    }
     for InputEvent(event) in messages.read() {
         let Event::MouseDown { point, modifiers } = event else {
             continue;
         };
         trace!("{point:?}");
 
-        let Some((_, entity)) = window_manager
+        let Some((window, entity)) = window_manager
             .find_window_at_point(point)
             .ok()
             .and_then(|window_id| windows.find(window_id))
         else {
+            debug!("mouse down at {point:?}: no managed window under cursor, nothing held");
             continue;
         };
 
@@ -272,6 +285,10 @@ fn mouse_down_trigger(
 
         if config.window_hidden_ratio() >= 1.0 {
             // At max hidden ratio, never reshuffle on click.
+            debug!(
+                "mouse down on window {}: holding without arming (hidden ratio >= 1.0)",
+                window.id()
+            );
         } else {
             // Defer reshuffle until mouse-up so the window doesn't shift
             // mid-click. The Timeout auto-despawns if mouse-up is lost.
@@ -285,17 +302,37 @@ fn mouse_down_trigger(
                 .mouse_drag_display_modifier()
                 .is_some_and(|required| required.matches(*modifiers))
             {
+                debug!(
+                    "mouse drag armed on window {} with modifiers {modifiers:?}",
+                    window.id()
+                );
                 holder.try_insert(DragDisplayArmed);
+            } else {
+                debug!(
+                    "mouse down on window {}: held without arming (modifiers {modifiers:?} do not match drag shortcut)",
+                    window.id()
+                );
             }
         }
     }
 }
 
 /// Handles mouse-up events. Triggers the deferred reshuffle so the clicked
-/// window slides into view after the user releases the button.
+/// window slides into view after the user releases the button. A held window
+/// dropped away from its column (drag with no transfer, e.g. into a gap)
+/// instead glides home: its slot is recomputed with the audit's exact math
+/// and the window animates there, while the strip is left alone (reshuffling
+/// first would anchor the strip to the foreign frame and legitimize the
+/// drop).
+#[allow(clippy::too_many_arguments)]
 fn mouse_up_trigger(
     mut messages: MessageReader<InputEvent>,
     mouse_held: Query<(Entity, &MouseHeldMarker)>,
+    windows: Windows,
+    strips: PreviewStrips,
+    displays: PreviewDisplays,
+    scrolling: Query<Entity, With<Scrolling>>,
+    config: Res<Config>,
     mut commands: Commands,
 ) {
     for InputEvent(event) in messages.read() {
@@ -304,7 +341,45 @@ fn mouse_up_trigger(
         }
 
         for (held_entity, marker) in &mouse_held {
-            commands.reshuffle_around(marker.0);
+            // Home slot of the held window, if it still lives on a strip.
+            let home = strips
+                .iter()
+                .find(|(_, strip, _, _, _, _)| strip.contains(marker.0))
+                .and_then(|(strip_entity, strip, position, child, _, _)| {
+                    let layout = windows.layout_position(marker.0)?.0;
+                    let size = windows.size(marker.0)?;
+                    let frame = windows.frame(marker.0)?;
+                    let stacked = strip
+                        .index_of(marker.0)
+                        .ok()
+                        .and_then(|index| strip.get(index).ok())
+                        .is_some_and(|column| matches!(column, Column::Stack(_)));
+                    let (_, display, dock, _) = displays.get(child.parent()).ok()?;
+                    let viewport = display.actual_display_bounds(dock, &config);
+                    let window = windows.get(marker.0)?;
+                    let home = desired_window_frame(
+                        layout,
+                        size,
+                        position.0,
+                        stacked,
+                        scrolling.contains(strip_entity),
+                        viewport,
+                        window.horizontal_padding(),
+                        &config,
+                    );
+                    let drift = (frame.min - home.min).abs();
+                    (drift.x > 1 || drift.y > 1).then_some(home.min)
+                });
+            if let Some(home) = home {
+                debug!(
+                    "mouse up: window {} dropped off-slot, gliding home to {home:?}",
+                    marker.0
+                );
+                commands.reposition_entity(marker.0, home);
+            } else {
+                debug!("mouse up: click release on {}, reshuffling", marker.0);
+                commands.reshuffle_around(marker.0);
+            }
             if let Ok(mut entity_commands) = commands.get_entity(held_entity) {
                 entity_commands.try_despawn();
             }
@@ -435,6 +510,7 @@ fn drag_move_armed_window(
                 // base that jumps on re-entry.
                 let last = state.last.replace(pointer);
                 let Some(last) = last else {
+                    trace!("synthetic drag: no press point yet, skipping");
                     continue;
                 };
                 let delta = pointer - last;
@@ -446,20 +522,26 @@ fn drag_move_armed_window(
                     .find(|(_, _, armed)| *armed)
                     .map(|(_, marker, _)| marker.0)
                 else {
+                    trace!("synthetic drag: no armed holder, skipping move");
                     continue;
                 };
                 if config
                     .mouse_drag_display_modifier()
                     .is_none_or(|required| !required.matches(*modifiers))
                 {
+                    trace!(
+                        "synthetic drag: modifiers {modifiers:?} released mid-drag, holding position"
+                    );
                     continue;
                 }
                 let Some((window, entity, unmanaged)) =
                     windows.iter().find(|(_, entity, _)| *entity == target)
                 else {
+                    trace!("synthetic drag: held target {target} has no window, skipping");
                     continue;
                 };
                 if unmanaged.is_some() {
+                    trace!("synthetic drag: held target is unmanaged, skipping");
                     continue;
                 }
                 if let Ok(mut position) = positions.get_mut(entity) {
@@ -474,6 +556,34 @@ fn drag_move_armed_window(
             _ => {}
         }
     }
+}
+
+/// Resolves where an armed-dragged window whose center sits at `center`
+/// would land: the foreign display under it, that display's active space id
+/// (for the mid-strip slot), and the display entity taking the active
+/// marker. `None` covers every miss (no foreign display, no space, no
+/// strip) — the caller logs the center and moves on.
+fn resolve_drag_target(
+    center: Origin,
+    active_display: &mut ActiveDisplayMut,
+    offscreen: &mut OffscreenStrips,
+    window_manager: &WindowManager,
+) -> Option<(CGDirectDisplayID, IRect, WorkspaceId, Entity)> {
+    let active_id = active_display.id();
+    let (target_id, target_bounds) = active_display
+        .other()
+        .map(|display| (display.id(), display.bounds()))
+        .find(|(id, bounds)| bounds.contains(center) && *id != active_id)?;
+    let target_space_id = window_manager.active_display_space(target_id).ok()?;
+    let target_display_entity = offscreen
+        .iter_mut()
+        .find_map(|(strip, child)| (strip.id() == target_space_id).then_some(child.parent()))?;
+    Some((
+        target_id,
+        target_bounds,
+        target_space_id,
+        target_display_entity,
+    ))
 }
 
 /// Moves a mouse-dragged managed window across display boundaries.
@@ -551,6 +661,10 @@ fn drag_window_across_display(
                 .is_some_and(|required| required.matches(drag_modifiers.current));
         if !transfer {
             if held.iter().any(|(_, marker, _)| marker.0 == entity) {
+                trace!(
+                    "drag transfer: window (id {window_id}, {entity}) pinned (armed={armed}, modifiers={:?})",
+                    drag_modifiers.current
+                );
                 commands.reshuffle_around(entity);
             }
             continue;
@@ -565,30 +679,16 @@ fn drag_window_across_display(
         };
         let center = frame.center();
 
-        // Target = another display containing the dragged center. Collected
-        // up front so no display borrow is held during the transfer below.
-        let active_id = active_display.id();
-        let target = active_display
-            .other()
-            .map(|display| (display.id(), display.bounds()))
-            .find(|(id, bounds)| bounds.contains(center) && *id != active_id);
-        let Some((target_id, target_bounds)) = target else {
-            continue;
-        };
-
         // Resolve the target strip first: detaching without a destination
-        // would strand the window outside every strip. The strip's parent is
-        // the target display entity, which takes the active marker below.
-        let Ok(target_space_id) = window_manager.active_display_space(target_id) else {
-            continue;
-        };
-        let Some(target_display_entity) = offscreen
-            .iter_mut()
-            .find_map(|(strip, child)| (strip.id() == target_space_id).then_some(child.parent()))
+        // would strand the window outside every strip.
+        let Some((target_id, target_bounds, target_space_id, target_display_entity)) =
+            resolve_drag_target(center, &mut active_display, &mut offscreen, &window_manager)
         else {
+            trace!(
+                "drag transfer: window (id {window_id}) center {center:?} has no landing target"
+            );
             continue;
         };
-
         debug!(
             "dragging window (id {}, {entity}) to display {target_id}.",
             window_id,
@@ -667,9 +767,8 @@ type PreviewDisplays<'w, 's> = Query<
 >;
 
 /// The drop-preview ghost for the armed-dragged window `entity`: its landing
-/// slot rect plus border params — or `None` when no ghost should show
-/// (unmanaged window, unknown strip, cursor in a gap, shortcut released).
-/// Pure state lookup; the caller applies show/hide.
+/// slot rect plus border params — or the static reason no ghost shows.
+/// Pure state lookup; the caller applies show/hide and logs transitions.
 #[allow(clippy::too_many_arguments)]
 fn preview_ghost(
     entity: Entity,
@@ -679,22 +778,25 @@ fn preview_ghost(
     window_manager: &WindowManager,
     config: &Config,
     drag_modifiers: &DragModifierState,
-) -> Option<(IRect, BorderParams)> {
+) -> Result<(IRect, BorderParams), &'static str> {
     if config
         .mouse_drag_display_modifier()
         .is_none_or(|required| !required.matches(drag_modifiers.current))
     {
-        return None;
+        return Err("drag shortcut released or unconfigured");
     }
-    let (_, _, unmanaged) = windows.get_managed(entity)?;
+    let (_, _, unmanaged) = windows
+        .get_managed(entity)
+        .ok_or("held target is not a window")?;
     if unmanaged.is_some() {
-        return None;
+        return Err("held target is unmanaged");
     }
-    let frame = windows.frame(entity)?;
+    let frame = windows.frame(entity).ok_or("held target has no frame")?;
     let center = frame.center();
     let (hover_entity, hover_display, hover_dock, _) = displays
         .iter()
-        .find(|(_, display, _, _)| display.bounds().contains(center))?;
+        .find(|(_, display, _, _)| display.bounds().contains(center))
+        .ok_or("dragged center is in no display")?;
 
     let active_entity = displays
         .iter()
@@ -703,16 +805,21 @@ fn preview_ghost(
     // the strip the transfer would land in, with the same display-origin
     // scroll base the transfer uses, so ghost and landing agree.
     let (strip, strip_scroll_x) = if Some(hover_entity) == active_entity {
-        let (_, strip, position, _, _, _) =
-            strips.iter().find(|(_, _, _, _, active, _)| *active)?;
+        let (_, strip, position, _, _, _) = strips
+            .iter()
+            .find(|(_, _, _, _, active, _)| *active)
+            .ok_or("no active strip")?;
         (strip, position.0.x)
     } else {
         let space_id = window_manager
             .active_display_space(hover_display.id())
-            .ok()?;
-        let (_, strip, _, _, _, _) = strips.iter().find(|(_, strip, _, _, active, selected)| {
-            !active && *selected && strip.id() == space_id
-        })?;
+            .map_err(|_| "no active space for hovered display")?;
+        let (_, strip, _, _, _, _) = strips
+            .iter()
+            .find(|(_, strip, _, _, active, selected)| {
+                !active && *selected && strip.id() == space_id
+            })
+            .ok_or("no selected strip for hovered display")?;
         (strip, hover_display.bounds().min.x)
     };
 
@@ -739,7 +846,7 @@ fn preview_ghost(
         width: config.border_width(),
         radius,
     };
-    Some((rect, border))
+    Ok((rect, border))
 }
 
 /// Shows a filled-ghost outline of the landing slot throughout a
@@ -763,12 +870,19 @@ fn drag_drop_preview(
     drag_modifiers: Res<DragModifierState>,
     mission_control: Res<MissionControlActive>,
     mut preview: ResMut<DropPreviewState>,
+    mut was_shown: Local<bool>,
     overlay_mgr: Option<NonSendMut<OverlayManager>>,
 ) {
     use objc2_foundation::{NSPoint, NSRect, NSSize};
 
     let mut overlay_mgr = overlay_mgr;
-    let mut hide = || {
+    // Log only transitions: per-tick show/hide would flood the log while a
+    // drag runs for seconds.
+    let mut hide = |reason: &str, preview: &mut DropPreviewState, was_shown: &mut bool| {
+        if *was_shown {
+            debug!("drop preview hidden: {reason}");
+            *was_shown = false;
+        }
         preview.rect = None;
         if let Some(overlay_mgr) = &mut overlay_mgr {
             overlay_mgr.hide_drop_preview();
@@ -778,31 +892,36 @@ fn drag_drop_preview(
     // Release ends the drag even if the holder despawn lands on a later tick.
     for InputEvent(event) in input.read() {
         if matches!(event, Event::MouseUp { .. }) {
-            hide();
+            hide("mouse released", &mut preview, &mut was_shown);
             return;
         }
     }
     if mission_control.0 {
-        hide();
+        hide("mission control active", &mut preview, &mut was_shown);
         return;
     }
-    let ghost = held
+    let Some(armed_target) = held
         .iter()
         .find(|(_, _, armed)| *armed)
         .map(|(_, marker, _)| marker.0)
-        .and_then(|entity| {
-            preview_ghost(
-                entity,
-                &windows,
-                &strips,
-                &displays,
-                &window_manager,
-                &config,
-                &drag_modifiers,
-            )
-        });
-    match ghost {
-        Some((rect, border)) => {
+    else {
+        hide("no armed drag in progress", &mut preview, &mut was_shown);
+        return;
+    };
+    match preview_ghost(
+        armed_target,
+        &windows,
+        &strips,
+        &displays,
+        &window_manager,
+        &config,
+        &drag_modifiers,
+    ) {
+        Ok((rect, border)) => {
+            if !*was_shown {
+                debug!("drop preview shown at {rect:?}");
+                *was_shown = true;
+            }
             preview.rect = Some(rect);
             if let Some(overlay_mgr) = &mut overlay_mgr {
                 let nsrect = NSRect::new(
@@ -812,7 +931,7 @@ fn drag_drop_preview(
                 overlay_mgr.show_drop_preview(nsrect, &border);
             }
         }
-        None => hide(),
+        Err(reason) => hide(reason, &mut preview, &mut was_shown),
     }
 }
 
@@ -915,14 +1034,16 @@ pub(super) struct WarpVelocityState {
     last: Option<(Origin, Instant)>,
 }
 
-fn horizontal_warp_mouse_trigger(
-    mut messages: MessageReader<InputEvent>,
-    displays: Query<&Display>,
-    held: Query<(Entity, &MouseHeldMarker, Has<DragDisplayArmed>)>,
-    window_manager: Res<WindowManager>,
-    config: Res<Config>,
-    mut state: Local<WarpVelocityState>,
-) {
+/// Computes where an edge cursor warps to: the opposite edge of the nearest
+/// display in the warp direction, preserving relative Y with velocity
+/// carry-over. `None` (with the reason logged) when no warp applies.
+fn warp_landing(
+    point: Origin,
+    velocity_x: Option<f64>,
+    warp_direction: i16,
+    displays: &Query<&Display>,
+    config: &Config,
+) -> Option<Origin> {
     const EDGE_THRESHOLD: i32 = 3;
     /// Inset from the destination display's edge so the cursor doesn't land
     /// directly on the threshold and immediately re-warp back.
@@ -932,6 +1053,111 @@ fn horizontal_warp_mouse_trigger(
     const CARRY_DURATION: Duration = Duration::from_millis(30);
     /// Cap on how far the carry-over can push past the inset, in pixels.
     const MAX_CARRY_PX: i32 = 80;
+
+    let Some(current_display) = displays
+        .iter()
+        .find(|display| display.bounds().contains(point))
+    else {
+        trace!("mouse warp: cursor {point:?} in no display, skipping");
+        return None;
+    };
+
+    let on_left_edge = (point.x - current_display.bounds().min.x).abs() < EDGE_THRESHOLD;
+    let on_right_edge = (current_display.bounds().max.x - point.x).abs() < EDGE_THRESHOLD;
+    if !on_left_edge && !on_right_edge {
+        trace!("mouse warp: cursor not on an edge, skipping");
+        return None;
+    }
+
+    let mut target_displays = displays
+        .iter()
+        .filter(|display| {
+            let above = display.bounds().min.y < current_display.bounds().min.y;
+            let below = display.bounds().min.y > current_display.bounds().min.y;
+            if on_left_edge {
+                if warp_direction > 0 { below } else { above }
+            } else if warp_direction > 0 {
+                above
+            } else {
+                below
+            }
+        })
+        .collect::<Vec<_>>();
+
+    target_displays
+        .sort_by_key(|display| (display.bounds().min.y - current_display.bounds().min.y).abs());
+    let Some(warp_to) = target_displays.first() else {
+        debug!(
+            "mouse warp: on {} edge of display {} but no display in warp direction {}",
+            if on_left_edge { "left" } else { "right" },
+            current_display.id(),
+            warp_direction,
+        );
+        return None;
+    };
+    let target = warp_to.bounds();
+
+    // Land at the *opposite* edge so the cursor flow is continuous: leaving
+    // the right edge appears at the left edge of the target, and vice versa.
+    // Carry over horizontal velocity so the cursor does not feel "stuck" at
+    // the edge — extrapolate motion forward into the target display.
+    let carry = velocity_x
+        .map_or(0, |v| round_px(v * CARRY_DURATION.as_secs_f64()))
+        .clamp(-MAX_CARRY_PX, MAX_CARRY_PX);
+    let target_x = if on_left_edge {
+        // Cursor was moving leftward; carry is negative. Push further from
+        // the right edge of the target.
+        (target.max.x - LANDING_INSET + carry).clamp(target.min.x + 1, target.max.x - 1)
+    } else {
+        // Cursor was moving rightward; carry is positive. Push further from
+        // the left edge of the target.
+        (target.min.x + LANDING_INSET + carry).clamp(target.min.x + 1, target.max.x - 1)
+    };
+
+    // Preserve relative Y offset from the source display's top so vertical
+    // motion feels continuous (matches macOS's behavior for side-by-side
+    // displays). Apply the configured offset signed by warp direction:
+    // positive offset pushes the cursor lower when warping downward, and
+    // raises it when warping upward — matching the user's physical desk
+    // arrangement (e.g. monitor sitting below the laptop).
+    // If the equivalent position falls outside the target's Y range (e.g. a
+    // tall portrait monitor's bottom region maps off a shorter laptop's
+    // bottom), skip the warp — matches macOS native side-by-side behavior
+    // where the cursor can only cross at Y values where both displays exist.
+    let relative_y = point.y - current_display.bounds().min.y;
+    let direction_sign = if target.min.y > current_display.bounds().min.y {
+        1
+    } else {
+        -1
+    };
+    let signed_offset = config.horizontal_mouse_warp_offset() * direction_sign;
+    let target_y = target.min.y + relative_y + signed_offset;
+    if target_y < target.min.y || target_y >= target.max.y {
+        debug!(
+            "mouse warp: equivalent y {target_y} outside target display {}, skipping",
+            warp_to.id(),
+        );
+        return None;
+    }
+
+    let landing = Origin::new(target_x, target_y);
+    debug!(
+        "mouse warp: {} edge of display {} -> display {} at {landing:?}",
+        if on_left_edge { "left" } else { "right" },
+        current_display.id(),
+        warp_to.id(),
+    );
+    Some(landing)
+}
+
+fn horizontal_warp_mouse_trigger(
+    mut messages: MessageReader<InputEvent>,
+    displays: Query<&Display>,
+    held: Query<(Entity, &MouseHeldMarker, Has<DragDisplayArmed>)>,
+    window_manager: Res<WindowManager>,
+    config: Res<Config>,
+    mut state: Local<WarpVelocityState>,
+) {
     /// Stale velocity samples (e.g. from a prior gesture) shouldn't carry.
     const VELOCITY_FRESHNESS: Duration = Duration::from_millis(80);
 
@@ -969,87 +1195,18 @@ fn horizontal_warp_mouse_trigger(
         state.last = Some((point, now));
 
         let Some(warp_direction) = config.horizontal_mouse_warp() else {
+            trace!("mouse warp: horizontal_mouse_warp unset, skipping");
             return;
         };
         if displays.count() < 2 {
+            trace!("mouse warp: single display, skipping");
             return;
         }
 
-        let Some(current_display) = displays
-            .iter()
-            .find(|display| display.bounds().contains(point))
+        let Some(landing) = warp_landing(point, velocity_x, warp_direction, &displays, &config)
         else {
             return;
         };
-
-        let on_left_edge = (point.x - current_display.bounds().min.x).abs() < EDGE_THRESHOLD;
-        let on_right_edge = (current_display.bounds().max.x - point.x).abs() < EDGE_THRESHOLD;
-        if !on_left_edge && !on_right_edge {
-            return;
-        }
-
-        let mut target_displays = displays
-            .iter()
-            .filter(|display| {
-                let above = display.bounds().min.y < current_display.bounds().min.y;
-                let below = display.bounds().min.y > current_display.bounds().min.y;
-                if on_left_edge {
-                    if warp_direction > 0 { below } else { above }
-                } else if warp_direction > 0 {
-                    above
-                } else {
-                    below
-                }
-            })
-            .collect::<Vec<_>>();
-
-        target_displays
-            .sort_by_key(|display| (display.bounds().min.y - current_display.bounds().min.y).abs());
-        let Some(warp_to) = target_displays.first() else {
-            return;
-        };
-        let target = warp_to.bounds();
-
-        // Land at the *opposite* edge so the cursor flow is continuous: leaving
-        // the right edge appears at the left edge of the target, and vice versa.
-        // Carry over horizontal velocity so the cursor does not feel "stuck" at
-        // the edge — extrapolate motion forward into the target display.
-        let carry = velocity_x
-            .map_or(0, |v| round_px(v * CARRY_DURATION.as_secs_f64()))
-            .clamp(-MAX_CARRY_PX, MAX_CARRY_PX);
-        let target_x = if on_left_edge {
-            // Cursor was moving leftward; carry is negative. Push further from
-            // the right edge of the target.
-            (target.max.x - LANDING_INSET + carry).clamp(target.min.x + 1, target.max.x - 1)
-        } else {
-            // Cursor was moving rightward; carry is positive. Push further from
-            // the left edge of the target.
-            (target.min.x + LANDING_INSET + carry).clamp(target.min.x + 1, target.max.x - 1)
-        };
-
-        // Preserve relative Y offset from the source display's top so vertical
-        // motion feels continuous (matches macOS's behavior for side-by-side
-        // displays). Apply the configured offset signed by warp direction:
-        // positive offset pushes the cursor lower when warping downward, and
-        // raises it when warping upward — matching the user's physical desk
-        // arrangement (e.g. monitor sitting below the laptop).
-        // If the equivalent position falls outside the target's Y range (e.g. a
-        // tall portrait monitor's bottom region maps off a shorter laptop's
-        // bottom), skip the warp — matches macOS native side-by-side behavior
-        // where the cursor can only cross at Y values where both displays exist.
-        let relative_y = point.y - current_display.bounds().min.y;
-        let direction_sign = if target.min.y > current_display.bounds().min.y {
-            1
-        } else {
-            -1
-        };
-        let signed_offset = config.horizontal_mouse_warp_offset() * direction_sign;
-        let target_y = target.min.y + relative_y + signed_offset;
-        if target_y < target.min.y || target_y >= target.max.y {
-            return;
-        }
-
-        let landing = Origin::new(target_x, target_y);
         window_manager.warp_mouse(landing);
         // Reset the velocity sample to the landing point so the next motion
         // event computes velocity from the new position, not the pre-warp one.

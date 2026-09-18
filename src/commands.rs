@@ -20,11 +20,13 @@ use crate::ecs::focus::FocusHistory;
 use crate::ecs::layout::{
     Column, LayoutStrip, MIN_WINDOW_HEIGHT, StackItem, clamp_origin_to_viewport, strip_signature,
 };
+use crate::ecs::mouse::{DragModifierState, DropPreviewState};
 use crate::ecs::params::{ActiveDisplay, ActiveDisplayMut, Windows, ring_neighbour_of_cursor};
 use crate::ecs::{
-    ActiveDisplayMarker, ActiveWorkspaceMarker, Bounds, DockPosition, FocusedMarker,
-    FullWidthMarker, ManualStripOffset, NativeFullscreenMarker, RaiseWindow, SelectedVirtualMarker,
-    SpawnCommandsExt, Timeout, Unmanaged,
+    ActiveDisplayMarker, ActiveWorkspaceMarker, Bounds, DockPosition, DragDisplayArmed,
+    FocusedMarker, FullWidthMarker, ManualStripOffset, MissionControlActive, MouseHeldMarker,
+    NativeFullscreenMarker, RaiseWindow, SelectedVirtualMarker, SpawnCommandsExt, Timeout,
+    Unmanaged,
 };
 use crate::events::Event;
 use crate::manager::{Application, Display, Origin, Size, Window, WindowManager, origin_from};
@@ -1300,9 +1302,14 @@ pub(crate) fn attach_window_to_display(
             // Preserve the window's width ratio relative to the target
             // display's usable viewport (dock- and padding-adjusted), so a
             // fixed dock is accounted for consistently with the source.
-            let width = width_ratio.map_or(bounds.x, |ratio| {
-                round_px(ratio * f64::from(viewport_bounds.width()))
-            });
+            // Clamped to the viewport width (maximum ratio 1.0): a window
+            // wider than its source viewport must not overflow a smaller
+            // target display.
+            let width = width_ratio
+                .map_or(bounds.x, |ratio| {
+                    round_px(ratio * f64::from(viewport_bounds.width()))
+                })
+                .min(viewport_bounds.width());
             let size = Size::new(width, viewport_bounds.height());
             commands.resize_entity(moved_window, size);
             commands.reshuffle_around(moved_window);
@@ -1627,6 +1634,7 @@ pub fn command_restart_handler(mut messages: MessageReader<Event>) {
 }
 
 #[instrument(level = Level::DEBUG, skip_all)]
+#[allow(clippy::too_many_arguments)]
 fn print_internal_state_handler(
     mut messages: MessageReader<Event>,
     focused: Query<(&Window, Entity), With<FocusedMarker>>,
@@ -1634,6 +1642,11 @@ fn print_internal_state_handler(
     apps: Query<&Application>,
     workspaces: StripsWithVisibility,
     displays: Query<(&Display, Entity, Has<ActiveDisplayMarker>)>,
+    held: Query<(Entity, &MouseHeldMarker, Has<DragDisplayArmed>)>,
+    drag_modifiers: Res<DragModifierState>,
+    drop_preview: Res<DropPreviewState>,
+    mission_control: Res<MissionControlActive>,
+    config: Res<Config>,
 ) {
     if !messages.read().any(|event| {
         matches!(
@@ -1713,6 +1726,24 @@ fn print_internal_state_handler(
         .map(print_window)
         .collect::<Vec<_>>();
     info!("Remaining:\n{}", remaining.join("\n"));
+
+    // Drag lifecycle state: holders (with arming), tracked modifiers, ghost
+    // rect, and the resolved mouse config — everything needed to tell why a
+    // drag did or did not transfer, without guessing.
+    let holders = held
+        .iter()
+        .map(|(holder, marker, armed)| format!("{holder}->{} armed={armed}", marker.0))
+        .collect::<Vec<_>>();
+    info!(
+        "Drag: holders=[{}], modifiers={:?}, preview={:?}, mission_control={}, drag_modifier={:?}, resize_modifier={:?}, warp={:?}",
+        holders.join(", "),
+        drag_modifiers.current,
+        drop_preview.rect,
+        mission_control.0,
+        config.mouse_drag_display_modifier(),
+        config.mouse_resize_modifier(),
+        config.horizontal_mouse_warp(),
+    );
 
     if let Some(pool) = bevy::tasks::ComputeTaskPool::try_get() {
         info!("Running with {} threads", pool.thread_num());

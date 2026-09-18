@@ -2198,3 +2198,150 @@ fn test_armed_drag_transfers_display_without_native_move() {
         })
         .run(commands);
 }
+
+/// Dropping a held window where no transfer fires (a gap between displays)
+/// glides it home instead of stranding it: the slot is recomputed and the
+/// strip is left exactly where it was.
+#[test]
+fn test_gap_drop_glides_home_with_strip_unmoved() {
+    // Window 0 tiles into slot (0, 20); grab its center while holding Alt,
+    // then drag far right past the display edge into empty space.
+    let grab = CGPoint::new(200.0, 500.0);
+    let commands = vec![
+        Event::MenuOpened { window_id: 0 },
+        Event::MouseDown {
+            point: grab,
+            modifiers: Modifiers::ALT,
+        },
+        Event::MouseDragged {
+            point: CGPoint::new(2000.0, 500.0),
+            modifiers: Modifiers::ALT,
+        },
+        Event::MouseUp {
+            point: CGPoint::new(2000.0, 500.0),
+            modifiers: Modifiers::ALT,
+        },
+        Event::Command {
+            command: Command::PrintState,
+        },
+    ];
+
+    TestHarness::new()
+        .with_config(drag_display_config())
+        .with_windows(1)
+        .on_iteration(3, move |world, _state| {
+            // Home slot, and the strip never chased the foreign frame.
+            assert_window_at!(world, 0, 0, TEST_MENUBAR_HEIGHT);
+            let entity = find_window_entity(0, world);
+            let mut strips = world.query::<(&LayoutStrip, &Position)>();
+            let (_, position) = strips
+                .iter(world)
+                .find(|(strip, _)| strip.contains(entity))
+                .expect("need owning strip");
+            assert_eq!(position.0.x, 0);
+            assert_on_workspace!(world, 0, TEST_WORKSPACE_ID);
+        })
+        .run(commands);
+}
+
+/// Moving an oversized window to a smaller display clamps its width to the
+/// target viewport (maximum ratio 1.0) instead of overflowing it.
+#[test]
+fn test_display_move_clamps_width_to_target_viewport() {
+    use crate::commands::ResizeDirection;
+
+    let config: Config = (
+        MainOptions {
+            preset_column_widths: vec![2.0],
+            ..Default::default()
+        },
+        vec![],
+    )
+        .into();
+    let commands = vec![
+        Event::MenuOpened { window_id: 0 },
+        Event::Command {
+            command: Command::Window(Operation::Resize(ResizeDirection::Grow)),
+        },
+        Event::Command {
+            command: Command::Window(Operation::ToNextDisplay(MoveFocus::Follow)),
+        },
+        Event::Command {
+            command: Command::PrintState,
+        },
+        Event::Command {
+            command: Command::PrintState,
+        },
+    ];
+
+    TestHarness::new()
+        .with_config(config)
+        .with_windows(1)
+        .with_display(
+            EXT_DISPLAY_ID,
+            IRect::new(0, -EXT_DISPLAY_HEIGHT, EXT_DISPLAY_WIDTH, 0),
+            vec![EXT_WORKSPACE_ID],
+        )
+        .on_iteration(1, move |world, _state| {
+            let entity = find_window_entity(0, world);
+            let window = world.get::<Window>(entity).expect("need window");
+            assert!(
+                window.frame().width() > TEST_DISPLAY_WIDTH,
+                "setup: window must be oversized before the move"
+            );
+        })
+        .on_iteration(3, move |world, _state| {
+            assert_on_workspace!(world, 0, EXT_WORKSPACE_ID);
+            assert_window_size!(
+                world,
+                0,
+                EXT_DISPLAY_WIDTH,
+                EXT_DISPLAY_HEIGHT - TEST_MENUBAR_HEIGHT
+            );
+        })
+        .run(commands);
+}
+
+/// Diagonal multi-display arrangement (mirroring a real triple-monitor
+/// desk): an armed drag at the right edge warps down to the display below,
+/// landing at the opposite edge with preserved relative Y.
+#[test]
+fn test_armed_drag_warps_across_diagonal_displays() {
+    let config: Config = (
+        MainOptions {
+            horizontal_mouse_warp: Some(-1),
+            mouse_drag_display_modifier: Some(Modifiers::ALT),
+            ..Default::default()
+        },
+        vec![],
+    )
+        .into();
+    let grab = CGPoint::new(200.0, 500.0);
+    let commands = vec![
+        Event::MenuOpened { window_id: 0 },
+        Event::MouseDown {
+            point: grab,
+            modifiers: Modifiers::ALT,
+        },
+        Event::MouseDragged {
+            point: CGPoint::new(1022.0, 100.0),
+            modifiers: Modifiers::ALT,
+        },
+        Event::Command {
+            command: Command::PrintState,
+        },
+    ];
+
+    TestHarness::new()
+        .with_config(config)
+        .with_windows(1)
+        .with_display(2, IRect::new(1920, 1080, 3840, 2160), vec![20])
+        .with_display(3, IRect::new(3840, 2160, 4800, 2700), vec![30])
+        .on_iteration(2, move |_world, state| {
+            // Below display bounds start at y 1100 (20px menubar): landing
+            // x = left edge + inset (1920 + 6), landing y = 1100 +
+            // relative y (100 - 20).
+            assert_eq!(state.cursor_position(), Origin::new(1926, 1180));
+        })
+        .run(commands);
+}
