@@ -116,6 +116,7 @@ jobs:
         run: |
           codesign --force --sign - --identifier com.github.karinushka.paneru target/release/paneru
           codesign -dv target/release/paneru 2>&1 | grep 'Identifier=com.github.karinushka.paneru'
+          codesign --verify --strict target/release/paneru
 
       - name: Show sccache stats
         run: sccache --show-stats
