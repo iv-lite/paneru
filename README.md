@@ -32,6 +32,8 @@ https://github.com/user-attachments/assets/793e7eaa-7909-4086-8380-1fb7861f8780
   `mouse_drag_display_modifier` shortcut while left-clicking a window arms the
   drag, and crossing a display boundary moves it to that display's strip live,
   keeping focus (lands in the nearest column with `insert_windows_mid_strip`).
+  A filled ghost marks the landing slot throughout the drag, and the edge
+  warp carries the cursor across when `horizontal_mouse_warp` is set.
   Without the shortcut, tiled windows pin to their slot and cannot be
   mouse-moved.
 - **Virtual Workspaces (Experimental):** Group your windows into tasks by

@@ -1,30 +1,33 @@
 use bevy::app::{App, Plugin, Update};
 use bevy::ecs::entity::Entity;
+use bevy::ecs::hierarchy::ChildOf;
 use bevy::ecs::message::MessageReader;
 use bevy::ecs::query::{Has, With};
 use bevy::ecs::resource::Resource;
 use bevy::ecs::schedule::IntoScheduleConfigs as _;
-use bevy::ecs::system::{Commands, Local, Populated, Query, Res, ResMut, Single};
+use bevy::ecs::system::{Commands, Local, NonSendMut, Populated, Query, Res, ResMut, Single};
+use bevy::math::IRect;
 use bevy::time::Time;
 use std::time::{Duration, Instant};
 use tracing::{debug, trace, warn};
 
 use super::{ActiveDisplayMarker, DragDisplayArmed, MouseHeldMarker, Timeout};
 use crate::commands::{OffscreenStrips, attach_window_to_display, detach_window_from_strip};
-use crate::config::Config;
+use crate::config::{Config, decorations::BorderRadiusOption};
 use crate::ecs::layout::LayoutStrip;
 use crate::ecs::params::{ActiveDisplayMut, GlobalState, Windows};
 use crate::ecs::workspace::mid_strip_slot;
 use crate::ecs::{
     ActiveWorkspaceMarker, DockPosition, MissionControlActive, Position, Scrolling,
-    SpawnCommandsExt,
+    SelectedVirtualMarker, SpawnCommandsExt,
 };
+use crate::manager::{Display, Origin, Size, WindowManager, origin_from};
+use crate::overlay::{BorderParams, OverlayManager};
+use crate::platform::{Modifiers, WinID};
+use crate::util::round_px;
 use bevy::ecs::schedule::common_conditions::on_message;
 
 use crate::events::{Event, InputEvent};
-use crate::manager::{Display, Origin, WindowManager, origin_from};
-use crate::platform::{Modifiers, WinID};
-use crate::util::round_px;
 
 /// Bottom-right corner region (`NxN` pixels) where focus events are suppressed.
 /// Sized to a representative macOS title bar height — see karinushka/paneru#233:
@@ -54,6 +57,9 @@ impl Plugin for MouseEventsPlugin {
                     .run_if(mission_control_inactive),
                 mouse_up_trigger,
                 horizontal_warp_mouse_trigger,
+                // Outside the mission-control gate like `mouse_up_trigger`:
+                // it must still run to hide a stale ghost.
+                drag_drop_preview,
             )
                 .run_if(on_message::<InputEvent>),
         );
@@ -61,6 +67,7 @@ impl Plugin for MouseEventsPlugin {
         // `Populated` held-marker query keeps the system idle while nobody is
         // dragging. Ordered after adoption so the hit-test reads fresh frames.
         app.init_resource::<DragModifierState>();
+        app.init_resource::<DropPreviewState>();
         app.add_systems(
             Update,
             drag_window_across_display.after(super::systems::window_moved_update_frame),
@@ -312,6 +319,71 @@ impl Default for DragModifierState {
     }
 }
 
+/// Where a drop at on-screen x `drop_x` would land in `strip`: the column
+/// index plus that slot's on-screen left edge. Shared by the live transfer
+/// and the drop preview so the ghost always marks the real landing slot.
+///
+/// `strip_scroll_x` is the strip's on-screen origin (what `layout_x` offsets
+/// are relative to); the transfer passes the target display origin, the
+/// preview the hovered strip's true scroll — each matching what its own
+/// layout pass will use. With `use_mid_slot` off the window appends, so the
+/// slot is the end edge.
+pub(crate) fn drop_slot_index(
+    strip: &LayoutStrip,
+    strip_scroll_x: i32,
+    drop_x: i32,
+    use_mid_slot: bool,
+    windows: &Windows,
+) -> (usize, i32) {
+    if !use_mid_slot {
+        let end = strip
+            .all_columns()
+            .into_iter()
+            .filter_map(|column| {
+                let layout_x = windows.layout_position(column)?.0.x;
+                let width = windows
+                    .moving_frame(column)
+                    .map_or(0, |frame| frame.width());
+                Some(layout_x + width)
+            })
+            .max()
+            .unwrap_or(0);
+        return (strip.len(), end + strip_scroll_x);
+    }
+    let (index, desired_scroll) = mid_strip_slot(strip, strip_scroll_x, drop_x, windows);
+    let chosen_layout_x = drop_x - desired_scroll;
+    (index, chosen_layout_x + strip_scroll_x)
+}
+
+/// The filled-ghost rect for a landing slot: slot x from [`drop_slot_index`]
+/// clamped into the viewport (the reshuffle scrolls it into view on drop),
+/// full viewport height like every tiled window, dragged width.
+pub(crate) fn slot_preview_rect(slot_x: i32, viewport: IRect, size: Size) -> IRect {
+    let size = Size::new(size.x, viewport.height());
+    let min_x = slot_x.clamp(
+        viewport.min.x,
+        (viewport.max.x - size.x).max(viewport.min.x),
+    );
+    let min = Origin::new(min_x, viewport.min.y);
+    IRect::from_corners(min, min + size)
+}
+
+/// The drop-preview ghost for a window dropped at `drop_x` on `strip`:
+/// nearest column (or append end) via [`drop_slot_index`], drawn with
+/// [`slot_preview_rect`].
+pub(crate) fn drop_preview_rect(
+    strip: &LayoutStrip,
+    strip_scroll_x: i32,
+    viewport: IRect,
+    drop_x: i32,
+    dragged_size: Size,
+    use_mid_slot: bool,
+    windows: &Windows,
+) -> IRect {
+    let (_, slot_x) = drop_slot_index(strip, strip_scroll_x, drop_x, use_mid_slot, windows);
+    slot_preview_rect(slot_x, viewport, dragged_size)
+}
+
 /// Moves a mouse-dragged managed window across display boundaries.
 ///
 /// The transfer is armed at grab time: shortcut held while left-clicking a
@@ -431,14 +503,15 @@ fn drag_window_across_display(
         );
         // With `insert_windows_mid_strip`, land in the column nearest the
         // drop point instead of appending: columns are scroll-invariant, so
-        // the viewport-left origin picks the proportional column.
+        // the viewport-left origin picks the proportional column. Same
+        // `drop_slot_index` the preview uses, so the ghost marks this slot.
         let mid_slot = config.insert_windows_mid_strip().then(|| {
             offscreen
                 .iter_mut()
                 .find(|(strip, _)| strip.id() == target_space_id)
                 .and_then(|(strip, _)| {
                     let drop_x = windows.frame(entity)?.min.x;
-                    Some(mid_strip_slot(&strip, target_bounds.min.x, drop_x, &windows).0)
+                    Some(drop_slot_index(&strip, target_bounds.min.x, drop_x, true, &windows).0)
                 })
         });
         let mid_slot = mid_slot.flatten();
@@ -461,6 +534,193 @@ fn drag_window_across_display(
         if let Ok(mut display_commands) = commands.get_entity(target_display_entity) {
             display_commands.try_insert(ActiveDisplayMarker);
         }
+    }
+}
+
+/// Last computed drop-preview ghost rect, in absolute CG coords. Written by
+/// [`drag_drop_preview`] every input tick (shown or cleared), so harness
+/// tests — where the overlay manager is absent — can assert the state
+/// machine without pixels.
+#[derive(Debug, Resource, Default)]
+pub(crate) struct DropPreviewState {
+    pub(crate) rect: Option<IRect>,
+}
+
+/// Strips with the flags the drop preview needs to tell the live strip from
+/// a parked destination strip.
+type PreviewStrips<'w, 's> = Query<
+    'w,
+    's,
+    (
+        Entity,
+        &'static LayoutStrip,
+        &'static Position,
+        &'static ChildOf,
+        Has<ActiveWorkspaceMarker>,
+        Has<SelectedVirtualMarker>,
+    ),
+>;
+
+/// Displays with the flags the drop preview needs to tell the hovered
+/// display from the active one, plus dock edges for viewports.
+type PreviewDisplays<'w, 's> = Query<
+    'w,
+    's,
+    (
+        Entity,
+        &'static Display,
+        Option<&'static DockPosition>,
+        Has<ActiveDisplayMarker>,
+    ),
+>;
+
+/// The drop-preview ghost for the armed-dragged window `entity`: its landing
+/// slot rect plus border params — or `None` when no ghost should show
+/// (unmanaged window, unknown strip, cursor in a gap, shortcut released).
+/// Pure state lookup; the caller applies show/hide.
+#[allow(clippy::too_many_arguments)]
+fn preview_ghost(
+    entity: Entity,
+    windows: &Windows,
+    strips: &PreviewStrips,
+    displays: &PreviewDisplays,
+    window_manager: &WindowManager,
+    config: &Config,
+    drag_modifiers: &DragModifierState,
+) -> Option<(IRect, BorderParams)> {
+    if config
+        .mouse_drag_display_modifier()
+        .is_none_or(|required| !required.matches(drag_modifiers.current))
+    {
+        return None;
+    }
+    let (_, _, unmanaged) = windows.get_managed(entity)?;
+    if unmanaged.is_some() {
+        return None;
+    }
+    let frame = windows.frame(entity)?;
+    let center = frame.center();
+    let (hover_entity, hover_display, hover_dock, _) = displays
+        .iter()
+        .find(|(_, display, _, _)| display.bounds().contains(center))?;
+
+    let active_entity = displays
+        .iter()
+        .find_map(|(entity, _, _, active)| active.then_some(entity));
+    // Source display: the live strip and its true scroll. Any other display:
+    // the strip the transfer would land in, with the same display-origin
+    // scroll base the transfer uses, so ghost and landing agree.
+    let (strip, strip_scroll_x) = if Some(hover_entity) == active_entity {
+        let (_, strip, position, _, _, _) =
+            strips.iter().find(|(_, _, _, _, active, _)| *active)?;
+        (strip, position.0.x)
+    } else {
+        let space_id = window_manager
+            .active_display_space(hover_display.id())
+            .ok()?;
+        let (_, strip, _, _, _, _) = strips.iter().find(|(_, strip, _, _, active, selected)| {
+            !active && *selected && strip.id() == space_id
+        })?;
+        (strip, hover_display.bounds().min.x)
+    };
+
+    let viewport = hover_display.actual_display_bounds(hover_dock, config);
+    let rect = drop_preview_rect(
+        strip,
+        strip_scroll_x,
+        viewport,
+        frame.min.x,
+        frame.size(),
+        config.insert_windows_mid_strip(),
+        windows,
+    );
+    let radius = match config.border_radius() {
+        BorderRadiusOption::Auto => windows
+            .get(entity)
+            .and_then(|window| window.border_radius())
+            .unwrap_or(10.0),
+        BorderRadiusOption::Value(value) => value.max(0.0),
+    };
+    let border = BorderParams {
+        color: config.border_color(),
+        opacity: config.border_opacity(),
+        width: config.border_width(),
+        radius,
+    };
+    Some((rect, border))
+}
+
+/// Shows a filled-ghost outline of the landing slot throughout a
+/// shortcut-armed display drag, on whichever display the dragged center
+/// currently hovers (source or destination). Same slot math as the live
+/// transfer ([`drop_slot_index`]), so the ghost marks the real landing
+/// column. Hides on release, disarm, mission control, or whenever no armed
+/// drag is in progress.
+///
+/// Deliberately outside the `mission_control_inactive` gate (like
+/// `mouse_up_trigger`): it must still run to hide a stale ghost.
+#[allow(clippy::too_many_arguments)]
+fn drag_drop_preview(
+    mut input: MessageReader<InputEvent>,
+    held: Query<(Entity, &MouseHeldMarker, Has<DragDisplayArmed>)>,
+    windows: Windows,
+    strips: PreviewStrips,
+    displays: PreviewDisplays,
+    window_manager: Res<WindowManager>,
+    config: Res<Config>,
+    drag_modifiers: Res<DragModifierState>,
+    mission_control: Res<MissionControlActive>,
+    mut preview: ResMut<DropPreviewState>,
+    overlay_mgr: Option<NonSendMut<OverlayManager>>,
+) {
+    use objc2_foundation::{NSPoint, NSRect, NSSize};
+
+    let mut overlay_mgr = overlay_mgr;
+    let mut hide = || {
+        preview.rect = None;
+        if let Some(overlay_mgr) = &mut overlay_mgr {
+            overlay_mgr.hide_drop_preview();
+        }
+    };
+
+    // Release ends the drag even if the holder despawn lands on a later tick.
+    for InputEvent(event) in input.read() {
+        if matches!(event, Event::MouseUp { .. }) {
+            hide();
+            return;
+        }
+    }
+    if mission_control.0 {
+        hide();
+        return;
+    }
+    let ghost = held
+        .iter()
+        .find(|(_, _, armed)| *armed)
+        .map(|(_, marker, _)| marker.0)
+        .and_then(|entity| {
+            preview_ghost(
+                entity,
+                &windows,
+                &strips,
+                &displays,
+                &window_manager,
+                &config,
+                &drag_modifiers,
+            )
+        });
+    match ghost {
+        Some((rect, border)) => {
+            preview.rect = Some(rect);
+            if let Some(overlay_mgr) = &mut overlay_mgr {
+                let nsrect = NSRect::new(
+                    NSPoint::new(f64::from(rect.min.x), f64::from(rect.min.y)),
+                    NSSize::new(f64::from(rect.width()), f64::from(rect.height())),
+                );
+                overlay_mgr.show_drop_preview(nsrect, &border);
+            }
+        }
+        None => hide(),
     }
 }
 
@@ -553,6 +813,7 @@ pub(super) struct WarpVelocityState {
 fn horizontal_warp_mouse_trigger(
     mut messages: MessageReader<InputEvent>,
     displays: Query<&Display>,
+    held: Query<(Entity, &MouseHeldMarker, Has<DragDisplayArmed>)>,
     window_manager: Res<WindowManager>,
     config: Res<Config>,
     mut state: Local<WarpVelocityState>,
@@ -570,8 +831,21 @@ fn horizontal_warp_mouse_trigger(
     const VELOCITY_FRESHNESS: Duration = Duration::from_millis(80);
 
     for InputEvent(event) in messages.read() {
-        let Event::MouseMoved { point, .. } = event else {
-            continue;
+        // Edge-warp also fires mid-drag, but only for a shortcut-armed
+        // display drag in progress: other drags (text selection, resize
+        // handles) keep native edge behavior. The grab-time arming is what
+        // distinguishes them — see `DragDisplayArmed`.
+        let point = match event {
+            Event::MouseMoved { point, .. } => point,
+            Event::MouseDragged { point, modifiers }
+                if held.iter().any(|(_, _, armed)| armed)
+                    && config
+                        .mouse_drag_display_modifier()
+                        .is_some_and(|required| required.matches(*modifiers)) =>
+            {
+                point
+            }
+            _ => continue,
         };
 
         let now = Instant::now();
@@ -685,6 +959,34 @@ mod tests {
     use crate::ecs::DockPosition;
     use crate::manager::{Display, Origin};
     use bevy::math::IRect;
+
+    fn test_viewport() -> IRect {
+        IRect::new(0, 20, 1024, 768)
+    }
+
+    #[test]
+    fn slot_preview_keeps_onscreen_slot_and_forces_full_height() {
+        let rect = slot_preview_rect(100, test_viewport(), Size::new(400, 100));
+        assert_eq!(rect, IRect::new(100, 20, 500, 768));
+    }
+
+    #[test]
+    fn slot_preview_clamps_left_overhang_into_viewport() {
+        let rect = slot_preview_rect(-500, test_viewport(), Size::new(400, 300));
+        assert_eq!(rect, IRect::new(0, 20, 400, 768));
+    }
+
+    #[test]
+    fn slot_preview_clamps_right_overhang_into_viewport() {
+        let rect = slot_preview_rect(900, test_viewport(), Size::new(400, 300));
+        assert_eq!(rect, IRect::new(624, 20, 1024, 768));
+    }
+
+    #[test]
+    fn slot_preview_pins_oversized_ghost_to_viewport_origin() {
+        let rect = slot_preview_rect(100, test_viewport(), Size::new(2000, 300));
+        assert_eq!(rect, IRect::new(0, 20, 2000, 768));
+    }
 
     fn make_display() -> Display {
         // 1024x768 test display with a 20px menubar, mirrors the values in src/tests.rs.

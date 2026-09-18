@@ -6,6 +6,7 @@ use bevy::time::TimeUpdateStrategy;
 use crate::commands::{Command, Direction, MouseMove, MoveFocus, Operation};
 use crate::config::{Config, MainOptions};
 use crate::ecs::layout::{LayoutStrip, PARKED_STRIP_SLIVER};
+use crate::ecs::mouse::DropPreviewState;
 use crate::ecs::{
     ActiveDisplayMarker, DockPosition, Position, RepositionMarker, SpawnWindowTrigger, Timeout,
 };
@@ -1715,6 +1716,175 @@ fn test_empty_baseline_row_survives_display_removal() {
             assert!(
                 world.entity(entity).get::<ChildOf>().is_some(),
                 "row 0 should be re-parented to the returning display"
+            );
+        })
+        .run(commands);
+}
+
+/// A config enabling edge warp plus shortcut-armed display drags.
+fn warp_drag_config() -> Config {
+    (
+        MainOptions {
+            horizontal_mouse_warp: Some(1),
+            mouse_drag_display_modifier: Some(Modifiers::ALT),
+            ..Default::default()
+        },
+        vec![],
+    )
+        .into()
+}
+
+/// An armed Alt-drag hitting the display edge warps the cursor to the
+/// display above, like a free cursor: right edge + direction 1 lands at the
+/// opposite (left) edge, preserving relative Y.
+#[test]
+fn test_armed_drag_at_edge_warps_cursor() {
+    // Window 0 spawns at (0, 0, 400, 1000); grab its center while holding Alt.
+    let grab = CGPoint::new(200.0, 500.0);
+    // Right edge of the test display (bounds max.x 1024, threshold 3px).
+    let edge = CGPoint::new(1022.0, 100.0);
+    let commands = vec![
+        Event::MenuOpened { window_id: 0 },
+        Event::MouseDown {
+            point: grab,
+            modifiers: Modifiers::ALT,
+        },
+        Event::MouseDragged {
+            point: edge,
+            modifiers: Modifiers::ALT,
+        },
+        Event::Command {
+            command: Command::PrintState,
+        },
+    ];
+
+    TestHarness::new()
+        .with_config(warp_drag_config())
+        .with_windows(1)
+        .with_display(
+            EXT_DISPLAY_ID,
+            IRect::new(0, -EXT_DISPLAY_HEIGHT, EXT_DISPLAY_WIDTH, 0),
+            vec![EXT_WORKSPACE_ID],
+        )
+        .on_iteration(2, move |_world, state| {
+            // External display bounds start at y -1180 (20px menubar):
+            // landing x = left edge + inset (0 + 6), landing y = -1180 +
+            // relative y (100 - 20).
+            assert_eq!(state.cursor_position(), Origin::new(6, -1100));
+        })
+        .run(commands);
+}
+
+/// The same drag without the shortcut never warps: the cursor stays put.
+#[test]
+fn test_unarmed_drag_at_edge_does_not_warp() {
+    let grab = CGPoint::new(200.0, 500.0);
+    let edge = CGPoint::new(1022.0, 100.0);
+    let commands = vec![
+        Event::MenuOpened { window_id: 0 },
+        Event::MouseDown {
+            point: grab,
+            modifiers: Modifiers::empty(),
+        },
+        Event::MouseDragged {
+            point: edge,
+            modifiers: Modifiers::empty(),
+        },
+        Event::Command {
+            command: Command::PrintState,
+        },
+    ];
+
+    TestHarness::new()
+        .with_config(warp_drag_config())
+        .with_windows(1)
+        .with_display(
+            EXT_DISPLAY_ID,
+            IRect::new(0, -EXT_DISPLAY_HEIGHT, EXT_DISPLAY_WIDTH, 0),
+            vec![EXT_WORKSPACE_ID],
+        )
+        .on_iteration(2, move |world, state| {
+            // Focus-follow parks the cursor on the window center at menu
+            // open; without the shortcut no warp moves it from there.
+            let entity = find_window_entity(0, world);
+            let window = world.get::<Window>(entity).expect("need window");
+            assert_eq!(state.cursor_position(), window.frame().center());
+        })
+        .run(commands);
+}
+
+/// The drop preview shows throughout an armed drag: a ghost clamped into
+/// the hovered viewport with full tiled height.
+#[test]
+fn test_armed_drag_shows_drop_preview() {
+    let grab = CGPoint::new(200.0, 500.0);
+    let commands = vec![
+        Event::MenuOpened { window_id: 0 },
+        Event::MouseDown {
+            point: grab,
+            modifiers: Modifiers::ALT,
+        },
+        Event::MouseDragged {
+            point: grab,
+            modifiers: Modifiers::ALT,
+        },
+        Event::Command {
+            command: Command::PrintState,
+        },
+    ];
+
+    TestHarness::new()
+        .with_config(drag_display_config())
+        .with_windows(1)
+        .on_iteration(2, move |world, _state| {
+            let rect = world
+                .resource::<DropPreviewState>()
+                .rect
+                .expect("armed drag should show a drop preview");
+            assert_eq!(rect.min.y, TEST_MENUBAR_HEIGHT);
+            assert_eq!(
+                rect.height(),
+                TEST_DISPLAY_HEIGHT - TEST_MENUBAR_HEIGHT,
+                "ghost takes full tiled height"
+            );
+            assert!(
+                rect.min.x >= 0 && rect.max.x <= TEST_DISPLAY_WIDTH,
+                "ghost is clamped into the hovered viewport: {rect:?}"
+            );
+        })
+        .run(commands);
+}
+
+/// Releasing the button clears the drop preview.
+#[test]
+fn test_drop_preview_hides_on_release() {
+    let grab = CGPoint::new(200.0, 500.0);
+    let commands = vec![
+        Event::MenuOpened { window_id: 0 },
+        Event::MouseDown {
+            point: grab,
+            modifiers: Modifiers::ALT,
+        },
+        Event::MouseDragged {
+            point: grab,
+            modifiers: Modifiers::ALT,
+        },
+        Event::MouseUp {
+            point: grab,
+            modifiers: Modifiers::ALT,
+        },
+        Event::Command {
+            command: Command::PrintState,
+        },
+    ];
+
+    TestHarness::new()
+        .with_config(drag_display_config())
+        .with_windows(1)
+        .on_iteration(3, move |world, _state| {
+            assert!(
+                world.resource::<DropPreviewState>().rect.is_none(),
+                "release must clear the drop preview"
             );
         })
         .run(commands);

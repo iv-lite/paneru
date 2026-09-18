@@ -245,6 +245,8 @@ pub struct OverlayManager {
     /// screen's local coordinates. Indexed in lockstep with `NSScreen::screens`.
     overlays: Vec<(Retained<NSWindow>, DimParams)>,
     hidden: bool,
+    /// The drop-preview ghost shown during armed display drags, if any.
+    drop_preview: Option<(Retained<NSWindow>, NSRect, BorderParams)>,
 }
 
 impl OverlayManager {
@@ -253,6 +255,7 @@ impl OverlayManager {
             mtm,
             overlays: Vec::new(),
             hidden: false,
+            drop_preview: None,
         }
     }
 
@@ -344,6 +347,130 @@ impl OverlayManager {
         }
         self.hidden = true;
     }
+
+    /// Show the drop-preview ghost: a filled, border-stroked outline of the
+    /// landing slot, `abs_cg` in absolute CG coords. Reuses its window across
+    /// ticks, redrawing only when the rect or params change.
+    pub fn show_drop_preview(&mut self, abs_cg: NSRect, border: &BorderParams) {
+        let cocoa = cg_abs_to_cocoa(abs_cg, primary_screen_height(self.mtm));
+        if let Some((window, rect, params)) = &mut self.drop_preview {
+            if nsrect_eq(*rect, cocoa) && *params == *border {
+                window.orderFront(None::<&AnyObject>);
+                return;
+            }
+            let view = DropPreviewView::new(
+                self.mtm,
+                NSRect::new(NSPoint::new(0.0, 0.0), cocoa.size),
+                border,
+            );
+            window.setContentView(Some(&view));
+            window.setFrame_display(cocoa, true);
+            window.orderFront(None::<&AnyObject>);
+            *rect = cocoa;
+            *params = border.clone();
+            return;
+        }
+        let window = make_overlay_window(self.mtm, cocoa);
+        let view = DropPreviewView::new(
+            self.mtm,
+            NSRect::new(NSPoint::new(0.0, 0.0), cocoa.size),
+            border,
+        );
+        window.setContentView(Some(&view));
+        window.orderFront(None::<&AnyObject>);
+        self.drop_preview = Some((window, cocoa, border.clone()));
+    }
+
+    /// Remove the drop-preview ghost, if shown.
+    pub fn hide_drop_preview(&mut self) {
+        if let Some((window, _, _)) = self.drop_preview.take() {
+            window.orderOut(None::<&AnyObject>);
+        }
+    }
+}
+
+// ── DropPreview: filled ghost of the landing slot during armed drags ──
+
+/// Fill alpha of the drop-preview ghost. The border stroke uses full
+/// `BorderParams` opacity; the fill stays translucent so whatever is behind
+/// the future slot shows through.
+const DROP_PREVIEW_FILL_ALPHA: f64 = 0.25;
+
+#[derive(Debug, Clone)]
+struct DropPreviewViewIvars {
+    fill_r: f64,
+    fill_g: f64,
+    fill_b: f64,
+    fill_opacity: f64,
+    border_r: f64,
+    border_g: f64,
+    border_b: f64,
+    border_opacity: f64,
+    border_width: f64,
+    border_radius: f64,
+}
+
+define_class!(
+    #[unsafe(super(NSView))]
+    #[thread_kind = MainThreadOnly]
+    #[name = "PaneruDropPreviewView"]
+    #[ivars = DropPreviewViewIvars]
+    #[derive(Debug)]
+    struct DropPreviewView;
+
+    impl DropPreviewView {
+        #[unsafe(method(drawRect:))]
+        fn draw_rect(&self, _dirty_rect: NSRect) {
+            let ivars = self.ivars();
+            let bounds = self.bounds();
+            let radius = ivars.border_radius as CGFloat;
+            let path = NSBezierPath::bezierPathWithRoundedRect_xRadius_yRadius(
+                bounds, radius, radius,
+            );
+            NSColor::colorWithSRGBRed_green_blue_alpha(
+                ivars.fill_r as CGFloat,
+                ivars.fill_g as CGFloat,
+                ivars.fill_b as CGFloat,
+                CGFloat::from(ivars.fill_opacity),
+            )
+            .setFill();
+            path.fill();
+            path.setLineWidth(ivars.border_width as CGFloat);
+            NSColor::colorWithSRGBRed_green_blue_alpha(
+                ivars.border_r as CGFloat,
+                ivars.border_g as CGFloat,
+                ivars.border_b as CGFloat,
+                CGFloat::from(ivars.border_opacity),
+            )
+            .setStroke();
+            path.stroke();
+        }
+    }
+);
+
+impl DropPreviewView {
+    fn new(mtm: MainThreadMarker, frame: NSRect, border: &BorderParams) -> Retained<Self> {
+        let this = Self::alloc(mtm).set_ivars(DropPreviewViewIvars {
+            fill_r: border.color.0,
+            fill_g: border.color.1,
+            fill_b: border.color.2,
+            fill_opacity: DROP_PREVIEW_FILL_ALPHA,
+            border_r: border.color.0,
+            border_g: border.color.1,
+            border_b: border.color.2,
+            border_opacity: border.opacity,
+            border_width: border.width,
+            border_radius: border.radius,
+        });
+        unsafe { msg_send![super(this), initWithFrame: frame] }
+    }
+}
+
+fn nsrect_eq(a: NSRect, b: NSRect) -> bool {
+    a.origin.x == b.origin.x
+        && a.origin.y == b.origin.y
+        && a.size.width == b.size.width
+        && a.size.height == b.size.height
 }
 
 // ── FlashMessage ────────────────────────────────────────────────────────
