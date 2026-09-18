@@ -1,0 +1,7 @@
+[build]
+# Ad-hoc-sign the paneru binary with a stable identifier so macOS TCC
+# (Accessibility) grants survive rebuilds. The wrapper
+# (`assets/rustc-sign.sh`) passes everything else through untouched and
+# no-ops off macOS. An env `RUSTC_WRAPPER` (e.g. sccache) takes precedence
+# over this when set.
+rustc-wrapper = "assets/rustc-sign.sh"

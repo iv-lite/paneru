@@ -119,8 +119,10 @@ $ cargo install --path .
 A locally built binary carries a fresh ad-hoc signature every time, which
 macOS treats as a new app: after (re)installing, re-grant it Accessibility
 access (System Settings → Privacy & Security → Accessibility) and restart
-the service, or paneru will sit in the menu bar without tiling. To keep the
-grant across rebuilds, pin a stable code-signing identifier after installing:
+the service, or paneru will sit in the menu bar without tiling. Source
+builds pin a stable signing identifier automatically (via the `rustc`
+wrapper in `.cargo/config.toml`), so the grant survives rebuilds; for an
+already-installed binary, pin it by hand once:
 
 ```shell
 $ codesign --force --sign - --identifier com.github.karinushka.paneru "$(which paneru)"
