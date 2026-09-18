@@ -12,7 +12,7 @@ use std::time::{Duration, Instant};
 use tracing::{debug, info, trace, warn};
 
 use super::{ActiveDisplayMarker, DragDisplayArmed, MouseHeldMarker, Timeout};
-use crate::commands::{OffscreenStrips, attach_window_to_display, detach_window_from_strip};
+use crate::commands::{OffscreenStrips, attach_column_to_display, detach_column_from_strip};
 use crate::config::{Config, decorations::BorderRadiusOption};
 use crate::ecs::layout::{Column, LayoutStrip, desired_window_frame};
 use crate::ecs::params::{ActiveDisplayMut, GlobalState, Windows};
@@ -54,12 +54,12 @@ impl Plugin for MouseEventsPlugin {
                     mouse_moved_trigger,
                     mouse_resize_trigger,
                     mouse_down_trigger,
-                    // Synthetic armed-drag motion; gated like arming so no
+                    // Synthetic held-column motion; gated like arming so no
                     // window moves while Mission Control owns the screen.
                     // Ordered after adoption: adoption must read the last
                     // committed OS frame, never this tick's synthetic write,
                     // or it reverts the move from the stale frame.
-                    drag_move_armed_window.after(super::systems::window_moved_update_frame),
+                    drag_move_held_column.after(super::systems::window_moved_update_frame),
                 )
                     .run_if(mission_control_inactive),
                 mouse_up_trigger,
@@ -80,7 +80,7 @@ impl Plugin for MouseEventsPlugin {
             Update,
             drag_window_across_display
                 .after(super::systems::window_moved_update_frame)
-                .after(drag_move_armed_window),
+                .after(drag_move_held_column),
         );
     }
 }
@@ -318,22 +318,113 @@ fn mouse_down_trigger(
     }
 }
 
-/// Handles mouse-up events. Triggers the deferred reshuffle so the clicked
-/// window slides into view after the user releases the button. A held window
-/// dropped away from its column (drag with no transfer, e.g. into a gap)
-/// instead glides home: its slot is recomputed with the audit's exact math
-/// and the window animates there, while the strip is left alone (reshuffling
-/// first would anchor the strip to the foreign frame and legitimize the
-/// drop).
+/// Strips as the release path sees them: entity, mutable content for
+/// same-display reorder surgery, scroll offset, and parent display.
+type ReleaseStrips<'w, 's> = Query<
+    'w,
+    's,
+    (
+        Entity,
+        &'static mut LayoutStrip,
+        &'static Position,
+        &'static ChildOf,
+    ),
+>;
+
+/// Home slot of a released window on its current strip, recomputed with the
+/// audit's exact math — or `None` when it already sits in its slot (or
+/// lives on no strip). The strip is deliberately left alone: reshuffling
+/// first would anchor it to a foreign dropped frame and legitimize the drop.
+#[allow(clippy::too_many_arguments)]
+fn drop_home(
+    member: Entity,
+    strips: &ReleaseStrips,
+    displays: &PreviewDisplays,
+    scrolling: &Query<Entity, With<Scrolling>>,
+    windows: &Windows,
+    config: &Config,
+) -> Option<Origin> {
+    let (strip_entity, strip, position, child) = strips
+        .iter()
+        .find(|(_, strip, _, _)| strip.contains(member))?;
+    let layout = windows.layout_position(member)?.0;
+    let size = windows.size(member)?;
+    let frame = windows.frame(member)?;
+    let stacked = strip
+        .index_of(member)
+        .ok()
+        .and_then(|index| strip.get(index).ok())
+        .is_some_and(|column| matches!(column, Column::Stack(_)));
+    let (_, display, dock, _) = displays.get(child.parent()).ok()?;
+    let viewport = display.actual_display_bounds(dock, config);
+    let window = windows.get(member)?;
+    let home = desired_window_frame(
+        layout,
+        size,
+        position.0,
+        stacked,
+        scrolling.contains(strip_entity),
+        viewport,
+        window.horizontal_padding(),
+        config,
+    );
+    let drift = (frame.min - home.min).abs();
+    (drift.x > 1 || drift.y > 1).then_some(home.min)
+}
+
+/// Relocates the dragged column to the nearest slot on an armed
+/// same-display drop. Returns true when surgery happened (the layout chain
+/// animates members into place; the caller adds the scroll reshuffle).
+/// Pure strip surgery on `strips`; `None`/false leaves everything untouched.
+fn try_reorder_column(entity: Entity, strips: &mut ReleaseStrips, windows: &Windows) -> bool {
+    let Some((strip_entity, scroll_x)) =
+        strips
+            .iter()
+            .find_map(|(strip_entity, strip, position, _)| {
+                strip
+                    .contains(entity)
+                    .then_some((strip_entity, position.0.x))
+            })
+    else {
+        return false;
+    };
+    let Some(frame) = windows.frame(entity) else {
+        return false;
+    };
+    let Ok((_, strip, _, _)) = strips.get(strip_entity) else {
+        return false;
+    };
+    let (slot, _) = mid_strip_slot(strip, scroll_x, frame.min.x, windows);
+    let Ok(current) = strip.index_of(entity) else {
+        return false;
+    };
+    // `mid_strip_slot` counts the dragged column itself, so an index past
+    // it shifts down after removal. Compare post-adjustment: dropping back
+    // near its own slot must be a no-op, not a remove/insert cycle.
+    let adjusted = if slot > current { slot - 1 } else { slot };
+    if adjusted == current {
+        return false;
+    }
+    let Ok((_, mut strip_mut, _, _)) = strips.get_mut(strip_entity) else {
+        return false;
+    };
+    let Some(column) = strip_mut.remove_column_at(current) else {
+        return false;
+    };
+    strip_mut.insert_column_at(adjusted, column);
+    debug!("mouse up: armed drop relocates column to index {adjusted}");
+    true
+}
 #[allow(clippy::too_many_arguments)]
 fn mouse_up_trigger(
     mut messages: MessageReader<InputEvent>,
-    mouse_held: Query<(Entity, &MouseHeldMarker)>,
+    mouse_held: Query<(Entity, &MouseHeldMarker, Has<DragDisplayArmed>)>,
     windows: Windows,
-    strips: PreviewStrips,
+    mut strips: ReleaseStrips,
     displays: PreviewDisplays,
     scrolling: Query<Entity, With<Scrolling>>,
     config: Res<Config>,
+    drag_modifiers: Res<DragModifierState>,
     mut commands: Commands,
 ) {
     for InputEvent(event) in messages.read() {
@@ -341,52 +432,58 @@ fn mouse_up_trigger(
             continue;
         }
 
-        for (held_entity, marker) in &mouse_held {
-            // Home slot of the held window, if it still lives on a strip.
-            let home = strips
+        for (held_entity, marker, armed) in &mouse_held {
+            let entity = marker.0;
+            // Members of the dragged column (or the lone window).
+            let members: Vec<Entity> = strips
                 .iter()
-                .find(|(_, strip, _, _, _, _)| strip.contains(marker.0))
-                .and_then(|(strip_entity, strip, position, child, _, _)| {
-                    let layout = windows.layout_position(marker.0)?.0;
-                    let size = windows.size(marker.0)?;
-                    let frame = windows.frame(marker.0)?;
-                    let stacked = strip
-                        .index_of(marker.0)
+                .find_map(|(_, strip, _, _)| {
+                    strip
+                        .index_of(entity)
                         .ok()
                         .and_then(|index| strip.get(index).ok())
-                        .is_some_and(|column| matches!(column, Column::Stack(_)));
-                    let (_, display, dock, _) = displays.get(child.parent()).ok()?;
-                    let viewport = display.actual_display_bounds(dock, &config);
-                    let window = windows.get(marker.0)?;
-                    let home = desired_window_frame(
-                        layout,
-                        size,
-                        position.0,
-                        stacked,
-                        scrolling.contains(strip_entity),
-                        viewport,
-                        window.horizontal_padding(),
-                        &config,
-                    );
-                    let drift = (frame.min - home.min).abs();
-                    (drift.x > 1 || drift.y > 1).then_some(home.min)
-                });
-            if let Some(home) = home {
-                debug!(
-                    "mouse up: window {} dropped off-slot, gliding home to {home:?}",
-                    marker.0
-                );
-                commands.reposition_entity(marker.0, home);
-            } else if config.window_hidden_ratio() >= 1.0 {
-                // At max hidden ratio, clicks never reshuffle — but drop
-                // homing above still runs, so dangling drops glide home.
-                debug!(
-                    "mouse up: click release on {}, reshuffle suppressed (hidden ratio >= 1.0)",
-                    marker.0
-                );
-            } else {
-                debug!("mouse up: click release on {}, reshuffling", marker.0);
-                commands.reshuffle_around(marker.0);
+                })
+                .map_or_else(|| vec![entity], |column| column.window_iter().collect());
+
+            // Armed same-display drop with the shortcut still held:
+            // relocate the column to the nearest slot; the layout chain
+            // animates members into place. A released shortcut cancels the
+            // move instead — the column glides home below like an unarmed
+            // drop.
+            let shortcut_held = config
+                .mouse_drag_display_modifier()
+                .is_some_and(|required| required.matches(drag_modifiers.current));
+            let reordered =
+                armed && shortcut_held && try_reorder_column(entity, &mut strips, &windows);
+            if reordered {
+                commands.reshuffle_around(entity);
+            }
+
+            if !reordered {
+                let mut homed_any = false;
+                for member in members {
+                    if let Some(home) =
+                        drop_home(member, &strips, &displays, &scrolling, &windows, &config)
+                    {
+                        debug!(
+                            "mouse up: window {member} dropped off-slot, gliding home to {home:?}"
+                        );
+                        commands.reposition_entity(member, home);
+                        homed_any = true;
+                    }
+                }
+                if !homed_any {
+                    if config.window_hidden_ratio() >= 1.0 {
+                        // At max hidden ratio, clicks never reshuffle — but drop
+                        // homing above still runs, so dangling drops glide home.
+                        debug!(
+                            "mouse up: click release on {entity}, reshuffle suppressed (hidden ratio >= 1.0)"
+                        );
+                    } else {
+                        debug!("mouse up: click release on {entity}, reshuffling");
+                        commands.reshuffle_around(entity);
+                    }
+                }
             }
             if let Ok(mut entity_commands) = commands.get_entity(held_entity) {
                 entity_commands.try_despawn();
@@ -483,22 +580,26 @@ struct DragMoveState {
     last: Option<Origin>,
 }
 
-/// Moves a shortcut-armed held window synthetically from `MouseDragged`
-/// deltas, 1:1 with the cursor.
+/// Moves a held column synthetically from `MouseDragged` deltas, 1:1 with
+/// the cursor.
 ///
 /// macOS decides move-vs-resize natively by grab point (title bar moves,
 /// edges resize), so waiting for native `WindowMoved` makes the drag hostage
-/// to where the user grabbed. While armed (grab-time `DragDisplayArmed` +
-/// shortcut still held) paneru drives the window itself instead: grab point
-/// becomes irrelevant and a native edge-resize can no longer win. Direct
-/// `Position` assign tracks the finger in lockstep (swipe precedent), no
-/// animation lag; the existing transfer hit-test, preview and warp all read
-/// the frame this writes. Unarmed drags and floating/minimized/hidden
-/// windows are untouched (they keep native behavior plus the pin path).
-fn drag_move_armed_window(
+/// to where the user grabbed. While any window is held, paneru drives its
+/// whole column itself instead: every member follows the cursor, so the
+/// column moves as a unit and a native edge-resize can no longer split it.
+/// Direct `Position` assign tracks the finger in lockstep (swipe precedent),
+/// no animation lag; the transfer hit-test, preview and warp all read the
+/// frames this writes. Whether the column may *relocate* (reorder/transfer)
+/// or must glide home on release is decided downstream by arming, not here.
+/// Floating/minimized/hidden windows are untouched (they keep native
+/// behavior plus the pin path).
+#[allow(clippy::too_many_arguments)]
+fn drag_move_held_column(
     mut messages: MessageReader<InputEvent>,
     mut moved: MessageWriter<Event>,
     held: Query<(Entity, &MouseHeldMarker, Has<DragDisplayArmed>)>,
+    strips: Query<&LayoutStrip>,
     windows: Query<(&Window, Entity, Option<&Unmanaged>)>,
     mut positions: Query<&mut Position, With<Window>>,
     config: Res<Config>,
@@ -525,24 +626,12 @@ fn drag_move_armed_window(
                 if delta == Origin::ZERO {
                     continue;
                 }
-                let Some(target) = held
-                    .iter()
-                    .find(|(_, _, armed)| *armed)
-                    .map(|(_, marker, _)| marker.0)
-                else {
-                    trace!("synthetic drag: no armed holder, skipping move");
+                let Some((_, marker, armed)) = held.iter().next() else {
+                    trace!("synthetic drag: nothing held, skipping move");
                     continue;
                 };
-                if config
-                    .mouse_drag_display_modifier()
-                    .is_none_or(|required| !required.matches(*modifiers))
-                {
-                    trace!(
-                        "synthetic drag: modifiers {modifiers:?} released mid-drag, holding position"
-                    );
-                    continue;
-                }
-                let Some((window, entity, unmanaged)) =
+                let target = marker.0;
+                let Some((window, _, unmanaged)) =
                     windows.iter().find(|(_, entity, _)| *entity == target)
                 else {
                     trace!("synthetic drag: held target {target} has no window, skipping");
@@ -552,13 +641,37 @@ fn drag_move_armed_window(
                     trace!("synthetic drag: held target is unmanaged, skipping");
                     continue;
                 }
-                if let Ok(mut position) = positions.get_mut(entity) {
-                    position.0 += delta;
+                // Drive the whole column so stacked/tabbed mates follow the
+                // grab instead of tearing off.
+                let members: Vec<Entity> = strips
+                    .iter()
+                    .find_map(|strip| {
+                        strip
+                            .index_of(target)
+                            .ok()
+                            .and_then(|index| strip.get(index).ok())
+                    })
+                    .map_or_else(|| vec![target], |column| column.window_iter().collect());
+                let window_id = window.id();
+                let mut moved_any = false;
+                for member in members {
+                    if let Ok(mut position) = positions.get_mut(member) {
+                        position.0 += delta;
+                        moved_any = true;
+                    }
+                }
+                // Emit only when a transfer could follow (armed + shortcut
+                // held): the legacy pin path is gone — release homing owns
+                // snap-back — so unarmed motion must not wake it via a
+                // message that reads as foreign.
+                let eligible = armed
+                    && config
+                        .mouse_drag_display_modifier()
+                        .is_some_and(|required| required.matches(*modifiers));
+                if moved_any && eligible {
                     // Feed the existing pipeline (adoption no-op, transfer
                     // hit-test, preview) exactly as a native move would.
-                    moved.write(Event::WindowMoved {
-                        window_id: window.id(),
-                    });
+                    moved.write(Event::WindowMoved { window_id });
                 }
             }
             _ => {}
@@ -661,8 +774,9 @@ fn drag_window_across_display(
             continue;
         }
         // Armed at grab time and shortcut still held: eligible for display
-        // transfer below. Anything else pins the window to its slot instead
-        // of following the cursor.
+        // transfer below. Anything else is left alone here: an unarmed or
+        // released drag glides home on mouse-up instead of being pinned
+        // mid-drag (the legacy pin path fought homing via strip chase).
         let transfer = armed
             && config
                 .mouse_drag_display_modifier()
@@ -670,10 +784,8 @@ fn drag_window_across_display(
         if !transfer {
             if held.iter().any(|(_, marker, _)| marker.0 == entity) {
                 trace!(
-                    "drag transfer: window (id {window_id}, {entity}) pinned (armed={armed}, modifiers={:?})",
-                    drag_modifiers.current
+                    "drag transfer: window (id {window_id}, {entity}) not eligible (armed={armed}), skipping"
                 );
-                commands.reshuffle_around(entity);
             }
             continue;
         }
@@ -715,14 +827,23 @@ fn drag_window_across_display(
                 })
         });
         let mid_slot = mid_slot.flatten();
-        detach_window_from_strip(entity, active_display.active_strip(), &mut commands);
-        if !attach_window_to_display(
+        // Detach the whole column so stacked/tabbed mates travel with the
+        // grab instead of tearing off.
+        let Some((column, _)) =
+            detach_column_from_strip(entity, active_display.active_strip(), &mut commands)
+        else {
+            trace!("drag transfer: window (id {window_id}) has no column to detach");
+            continue;
+        };
+        if !attach_column_to_display(
+            column,
             entity,
             target_id,
-            None,
+            target_bounds,
             mid_slot,
             &mut offscreen,
             &window_manager,
+            &windows,
             &mut commands,
         ) {
             continue;
@@ -832,12 +953,32 @@ fn preview_ghost(
     };
 
     let viewport = hover_display.actual_display_bounds(hover_dock, config);
+    // The ghost spans the dragged column, not just the grabbed window, so
+    // stacked/tabbed mates are covered by the same outline. Single-window
+    // columns render exactly as before.
+    let column_width = strips
+        .iter()
+        .find_map(|(_, strip, _, _, _, _)| {
+            strip
+                .index_of(entity)
+                .ok()
+                .and_then(|index| strip.get(index).ok())
+        })
+        .and_then(|column| {
+            column
+                .window_iter()
+                .filter_map(|member| windows.moving_frame(member))
+                .map(|frame| frame.width())
+                .max()
+        })
+        .filter(|width| *width > 0)
+        .unwrap_or(frame.size().x);
     let rect = drop_preview_rect(
         strip,
         strip_scroll_x,
         viewport,
         frame.min.x,
-        frame.size(),
+        Size::new(column_width, frame.size().y),
         config.insert_windows_mid_strip(),
         windows,
     );

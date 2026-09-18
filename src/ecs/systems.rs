@@ -946,11 +946,12 @@ pub(crate) fn window_moved_update_frame(
         if matches!(unmanaged, Some(Unmanaged::Minimized | Unmanaged::Hidden)) {
             continue;
         }
-        // A managed window held without an armed display-drag stays pinned to
-        // its slot: skip adoption so layout/commit keep pushing it home
-        // instead of following the OS frame (see `drag_window_across_display`,
-        // which forces the re-tile). Armed drags with the shortcut held adopt
-        // normally — the center hit-test needs fresh frames.
+        // A managed window held without an armed display-drag keeps its
+        // synthetic position: skip adoption so the column drive (which
+        // already moved it) is never overwritten by a stale OS echo, and
+        // release homing — not a mid-drag pin — brings it home. Armed
+        // drags with the shortcut held adopt normally — the center
+        // hit-test needs fresh frames.
         let draggable = held
             .iter()
             .any(|(_, marker, armed)| marker.0 == entity && armed)

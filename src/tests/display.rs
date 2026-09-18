@@ -1777,7 +1777,9 @@ fn test_armed_drag_at_edge_warps_cursor() {
         .run(commands);
 }
 
-/// The same drag without the shortcut never warps: the cursor stays put.
+/// An unarmed drag at the edge moves the column with the cursor (all
+/// title-bar drags drive their column) but never warps: the cursor stays
+/// where focus parked it, and the drop will glide home.
 #[test]
 fn test_unarmed_drag_at_edge_does_not_warp() {
     let grab = CGPoint::new(200.0, 500.0);
@@ -1807,10 +1809,13 @@ fn test_unarmed_drag_at_edge_does_not_warp() {
         )
         .on_iteration(2, move |world, state| {
             // Focus-follow parks the cursor on the window center at menu
-            // open; without the shortcut no warp moves it from there.
+            // open; without the shortcut no warp moves it from there...
+            assert_eq!(state.cursor_position(), Origin::new(200, 394));
+            // ...but the column still followed the drag synthetically and
+            // will glide home on release.
             let entity = find_window_entity(0, world);
-            let window = world.get::<Window>(entity).expect("need window");
-            assert_eq!(state.cursor_position(), window.frame().center());
+            let position = world.get::<Position>(entity).expect("need position").0;
+            assert_eq!(position, Origin::new(822, -380));
         })
         .run(commands);
 }
@@ -2397,6 +2402,184 @@ fn test_hidden_ratio_max_still_arms_drag_transfer() {
         .on_iteration(5, move |world, _state| {
             assert_on_workspace!(world, 0, EXT_WORKSPACE_ID);
             assert_not_on_workspace!(world, 0, TEST_WORKSPACE_ID);
+        })
+        .run(commands);
+}
+
+/// Armed Alt-drag of a stacked window carries the whole column: both
+/// members land on the target display in one shared column.
+#[test]
+fn test_armed_drag_transfers_stacked_column_intact() {
+    // Stack windows 0 and 1 (the fused column sits at x=400, the focused
+    // window's old slot), grab window 0 near its top, and drag straight up
+    // past the external display's bottom edge.
+    let grab = CGPoint::new(600.0, 100.0);
+    let commands = vec![
+        Event::MenuOpened { window_id: 0 },
+        Event::Command {
+            command: Command::Window(Operation::Focus(Direction::Last)),
+        },
+        Event::Command {
+            command: Command::Window(Operation::Stack(true)),
+        },
+        Event::MouseDown {
+            point: grab,
+            modifiers: Modifiers::ALT,
+        },
+        Event::MouseDragged {
+            point: CGPoint::new(600.0, -600.0),
+            modifiers: Modifiers::ALT,
+        },
+        Event::Command {
+            command: Command::PrintState,
+        },
+        Event::Command {
+            command: Command::PrintState,
+        },
+    ];
+
+    TestHarness::new()
+        .with_config(drag_display_config())
+        .with_windows(2)
+        .with_display(
+            EXT_DISPLAY_ID,
+            IRect::new(0, -EXT_DISPLAY_HEIGHT, EXT_DISPLAY_WIDTH, 0),
+            vec![EXT_WORKSPACE_ID],
+        )
+        .on_iteration(5, move |world, _state| {
+            assert_on_workspace!(world, 0, EXT_WORKSPACE_ID);
+            assert_on_workspace!(world, 1, EXT_WORKSPACE_ID);
+            assert_not_on_workspace!(world, 0, TEST_WORKSPACE_ID);
+            assert_not_on_workspace!(world, 1, TEST_WORKSPACE_ID);
+            // Same column, not two singles: the stack survived the trip.
+            let first = find_window_entity(0, world);
+            let second = find_window_entity(1, world);
+            let mut strips = world.query::<&LayoutStrip>();
+            let strip = strips
+                .iter(world)
+                .find(|strip| strip.id() == EXT_WORKSPACE_ID)
+                .expect("need target strip");
+            assert_eq!(
+                strip.index_of(first).expect("leader placed"),
+                strip.index_of(second).expect("mate placed"),
+                "stacked mates must share one column after transfer"
+            );
+            assert_focused!(world, 0);
+        })
+        .run(commands);
+}
+
+/// An armed same-display drop relocates the column to the nearest slot
+/// instead of snapping back.
+#[test]
+fn test_armed_drop_reorders_column_to_nearest_slot() {
+    // Drag window 0 right past window 2's left edge: nearest boundary is
+    // the end, so the column lands last.
+    let grab = CGPoint::new(200.0, 200.0);
+    let commands = vec![
+        Event::MenuOpened { window_id: 0 },
+        Event::MouseDown {
+            point: grab,
+            modifiers: Modifiers::ALT,
+        },
+        Event::MouseDragged {
+            point: CGPoint::new(1300.0, 200.0),
+            modifiers: Modifiers::ALT,
+        },
+        Event::MouseUp {
+            point: CGPoint::new(1300.0, 200.0),
+            modifiers: Modifiers::ALT,
+        },
+        Event::Command {
+            command: Command::PrintState,
+        },
+    ];
+
+    TestHarness::new()
+        .with_config(drag_display_config())
+        .with_windows(3)
+        .on_iteration(3, move |world, _state| {
+            let first = find_window_entity(0, world);
+            let second = find_window_entity(1, world);
+            let third = find_window_entity(2, world);
+            let mut strips = world.query::<&LayoutStrip>();
+            let strip = strips
+                .iter(world)
+                .find(|strip| strip.id() == TEST_WORKSPACE_ID)
+                .expect("need strip");
+            assert_eq!(
+                strip.all_windows(),
+                vec![second, third, first],
+                "dropped column must reorder to the nearest slot"
+            );
+        })
+        .run(commands);
+}
+
+/// An unarmed drag moves the whole column visually, then glides every
+/// member home on release — the shortcut stays the relocation gate.
+#[test]
+fn test_unarmed_drag_moves_column_then_glides_home() {
+    // Stacked column sits at x=400 (see transfer test); grab window 0 and
+    // drag right without the shortcut.
+    let grab = CGPoint::new(600.0, 100.0);
+    let commands = vec![
+        Event::MenuOpened { window_id: 0 },
+        Event::Command {
+            command: Command::Window(Operation::Focus(Direction::Last)),
+        },
+        Event::Command {
+            command: Command::Window(Operation::Stack(true)),
+        },
+        Event::MouseDown {
+            point: grab,
+            modifiers: Modifiers::empty(),
+        },
+        Event::MouseDragged {
+            point: CGPoint::new(900.0, 100.0),
+            modifiers: Modifiers::empty(),
+        },
+        Event::Command {
+            command: Command::PrintState,
+        },
+        Event::MouseUp {
+            point: CGPoint::new(900.0, 100.0),
+            modifiers: Modifiers::empty(),
+        },
+        Event::Command {
+            command: Command::PrintState,
+        },
+    ];
+
+    TestHarness::new()
+        .with_config(drag_display_config())
+        .with_windows(2)
+        .on_iteration(4, move |world, _state| {
+            // Both stacked mates followed the (300, 0) drag delta from
+            // their x=400 slot.
+            for id in [0, 1] {
+                let entity = find_window_entity(id, world);
+                let position = world.get::<Position>(entity).expect("need position").0;
+                assert_eq!(position.x, 700, "stacked mate {id} must follow the drag");
+            }
+        })
+        .on_iteration(6, move |world, _state| {
+            // ...and both glided home on release (stack slot x=400), strip
+            // untouched at its post-stack offset.
+            let first = find_window_entity(0, world);
+            let position = world.get::<Position>(first).expect("need position").0;
+            assert_eq!(position, Origin::new(400, TEST_MENUBAR_HEIGHT));
+            let second = find_window_entity(1, world);
+            let position = world.get::<Position>(second).expect("need position").0;
+            assert_eq!(position.x, 400);
+            let mut strips = world.query::<(&LayoutStrip, &Position)>();
+            let (_, position) = strips
+                .iter(world)
+                .find(|(strip, _)| strip.contains(first))
+                .expect("need owning strip");
+            // Stack fusion parks the strip at +400 (pre-existing focus
+            // anchoring); the drag must leave it exactly there.
+            assert_eq!(position.0.x, 400);
         })
         .run(commands);
 }

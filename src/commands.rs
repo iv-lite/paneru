@@ -1204,6 +1204,9 @@ fn move_focused_window_to_display(
     };
     let width_ratio =
         (source_viewport_width > 0).then(|| f64::from(size.x) / f64::from(source_viewport_width));
+    // Clamp to the target width up front (maximum ratio 1.0) so the
+    // centering below and the attach use the landed size, not an overflow.
+    let size = Size::new(size.x.min(target_bounds.width()), size.y);
     let dest = target_bounds.min.with_x(center - size.x / 2);
     commands.reposition_entity(entity, dest);
 
@@ -1225,6 +1228,8 @@ fn move_focused_window_to_display(
     attach_window_to_display(
         entity,
         target_id,
+        target_bounds,
+        size,
         width_ratio,
         None,
         other_workspaces,
@@ -1253,18 +1258,47 @@ pub(crate) fn detach_window_from_strip(
     neighbour
 }
 
+/// Removes the whole column containing `entity` from `strip`, reshuffling a
+/// neighbour into its place so the source display retiles. Returns the
+/// column with `entity` as leader for follow-up focus handling. Unlike
+/// [`detach_window_from_strip`] (which splices one window out and collapses
+/// its siblings), the column travels intact — `Stack`/`Tabs` grouping is
+/// preserved for the drop. The reshuffle is forced like the single-window
+/// path so the vacated slot closes.
+pub(crate) fn detach_column_from_strip(
+    entity: Entity,
+    strip: &mut LayoutStrip,
+    commands: &mut Commands,
+) -> Option<(Column, Entity)> {
+    let neighbour = strip
+        .left_neighbour(entity)
+        .or_else(|| strip.right_neighbour(entity));
+    let index = strip.index_of(entity).ok()?;
+    let column = strip.remove_column_at(index)?;
+    if let Some(neighbour) = neighbour {
+        commands.reshuffle_around_forced(neighbour);
+    }
+    Some((column, entity))
+}
+
 /// Appends `entity` to the target display's selected strip, reshuffles it
 /// into place, and schedules a delayed size refresh for differing display
 /// bounds. `width_ratio` preserves the window's width relative to the source
 /// viewport (`None` keeps the current width — the mouse-drag path, whose live
 /// position keeps following the cursor). `mid_slot` inserts at a column index
 /// instead of appending (mouse-drag drops honoring `insert_windows_mid_strip`;
-/// the keyboard path passes `None`). Returns `false` when the target
+/// the keyboard path passes `None`). `target_bounds`/`current_size` clamp
+/// the width synchronously to at most the target display width (maximum
+/// ratio 1.0), so an oversized window never overflows — the delayed refresh
+/// then settles dock/padding-exact geometry. Returns `false` when the target
 /// display has no selected strip, in which case nothing was done. Shared by
 /// the keyboard display-move and mouse-drag paths.
+#[allow(clippy::too_many_arguments)]
 pub(crate) fn attach_window_to_display(
     entity: Entity,
     target_id: CGDirectDisplayID,
+    target_bounds: IRect,
+    current_size: Size,
     width_ratio: Option<f64>,
     mid_slot: Option<usize>,
     other_workspaces: &mut OffscreenStrips,
@@ -1283,6 +1317,9 @@ pub(crate) fn attach_window_to_display(
     match mid_slot {
         Some(slot) => target_strip.insert_at(slot, entity),
         None => target_strip.append(entity),
+    }
+    if current_size.x > target_bounds.width() {
+        commands.resize_entity(entity, Size::new(target_bounds.width(), current_size.y));
     }
     commands.reshuffle_around(entity);
 
@@ -1317,6 +1354,54 @@ pub(crate) fn attach_window_to_display(
     };
     let system_id = commands.register_system(refresh_size);
     Timeout::callback(Duration::from_millis(150), system_id, commands);
+    true
+}
+
+/// Appends a whole `column` (with `leader` as the focus/scroll anchor) to
+/// the target display's selected strip. Counterpart to
+/// [`attach_window_to_display`] for mouse-drag column moves: grouping
+/// travels intact, every member wider than the target is clamped
+/// synchronously to at most the target display width (maximum ratio 1.0),
+/// and arrival heights are left for the layout pass (which binpacks the
+/// column) instead of forcing full viewport height onto every member.
+/// `mid_slot`/`None` behave like the single-window version. Returns `false`
+/// when the target display has no selected strip.
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn attach_column_to_display(
+    column: Column,
+    leader: Entity,
+    target_id: CGDirectDisplayID,
+    target_bounds: IRect,
+    mid_slot: Option<usize>,
+    other_workspaces: &mut OffscreenStrips,
+    window_manager: &WindowManager,
+    windows: &Windows,
+    commands: &mut Commands,
+) -> bool {
+    let Ok(target_space_id) = window_manager.active_display_space(target_id) else {
+        return false;
+    };
+    let Some((mut target_strip, _)) = other_workspaces
+        .iter_mut()
+        .find(|(strip, _)| strip.id() == target_space_id)
+    else {
+        return false;
+    };
+    let members: Vec<Entity> = column.window_iter().collect();
+    if let Some(slot) = mid_slot {
+        target_strip.insert_column_at(slot, column);
+    } else {
+        let end = target_strip.len();
+        target_strip.insert_column_at(end, column);
+    }
+    for member in members {
+        if let Some(size) = windows.size(member)
+            && size.x > target_bounds.width()
+        {
+            commands.resize_entity(member, Size::new(target_bounds.width(), size.y));
+        }
+    }
+    commands.reshuffle_around(leader);
     true
 }
 

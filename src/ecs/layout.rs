@@ -657,6 +657,21 @@ impl LayoutStrip {
         self.columns.swap(left, right);
     }
 
+    /// Removes the whole column at `index`, preserving `Stack`/`Tabs`
+    /// grouping (unlike [`Self::remove`], which splices one window out and
+    /// collapses its siblings). Returns `None` when out of bounds.
+    /// Used to relocate an entire column within or across strips.
+    pub fn remove_column_at(&mut self, index: usize) -> Option<Column> {
+        self.columns.remove(index)
+    }
+
+    /// Inserts a whole `column` at `index`, clamping an out-of-range index
+    /// to the end. Counterpart to [`Self::remove_column_at`].
+    pub fn insert_column_at(&mut self, index: usize, column: Column) {
+        let index = index.min(self.len());
+        self.columns.insert(index, column);
+    }
+
     /// Returns the number of panels in the pane.
     ///
     /// # Returns
@@ -1909,6 +1924,35 @@ mod tests {
 
     fn test_viewport() -> IRect {
         IRect::new(0, 0, 1024, 768)
+    }
+
+    #[test]
+    fn column_remove_insert_round_trip_preserves_grouping() {
+        let mut world = World::new();
+        let a = world.spawn_empty().id();
+        let b = world.spawn_empty().id();
+        let c = world.spawn_empty().id();
+
+        let mut strip = LayoutStrip::new(2, 0);
+        strip.append(a);
+        strip.append(b);
+        strip.stack(b).expect("stack b onto a");
+        strip.append(c);
+        // Columns are now [Stack([a, b]), Single(c)]; a per-window remove
+        // would collapse the stack, so relocation must move the column.
+        let index = strip.index_of(b).expect("b present");
+        let column = strip.remove_column_at(index).expect("column");
+        assert!(matches!(column, Column::Stack(_)));
+        assert!(strip.index_of(b).is_err());
+        assert!(strip.index_of(a).is_err());
+
+        let mut other = LayoutStrip::new(20, 0);
+        other.insert_column_at(0, column);
+        assert_eq!(other.all_windows(), vec![a, b]);
+        // Out-of-range insert clamps to the end; out-of-range remove is None.
+        other.insert_column_at(99, Column::Single(c));
+        assert_eq!(other.all_windows(), vec![a, b, c]);
+        assert!(other.remove_column_at(7).is_none());
     }
 
     #[test]
