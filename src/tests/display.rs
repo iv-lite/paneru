@@ -2050,3 +2050,151 @@ fn test_audit_rehomes_window_on_wrong_display() {
     assert_on_workspace!(world, 1, EXT_WORKSPACE_ID);
     assert_not_on_workspace!(world, 1, TEST_WORKSPACE_ID);
 }
+
+/// The armed drag moves the window itself from drag deltas: no native OS
+/// move is needed for the frame to follow the cursor.
+#[test]
+fn test_armed_drag_follows_cursor_without_native_move() {
+    // Window 0 tiles into slot (0, 20); grab its center while holding Alt.
+    // Leading PrintStates let startup (incl. initial focus) settle so no
+    // focus-driven reshuffle can race the drag.
+    let grab = CGPoint::new(200.0, 500.0);
+    let commands = vec![
+        Event::MenuOpened { window_id: 0 },
+        Event::Command {
+            command: Command::PrintState,
+        },
+        Event::Command {
+            command: Command::PrintState,
+        },
+        Event::MouseDown {
+            point: grab,
+            modifiers: Modifiers::ALT,
+        },
+        Event::MouseDragged {
+            point: CGPoint::new(300.0, 600.0),
+            modifiers: Modifiers::ALT,
+        },
+        Event::Command {
+            command: Command::PrintState,
+        },
+    ];
+
+    TestHarness::new()
+        .with_config(drag_display_config())
+        .with_windows(1)
+        .on_iteration(4, move |world, _state| {
+            // Drag delta (100, 100) applied 1:1 onto the slot origin.
+            let entity = find_window_entity(0, world);
+            let position = world.get::<Position>(entity).expect("need position").0;
+            assert_eq!(position, Origin::new(100, 120));
+            assert_on_workspace!(world, 0, TEST_WORKSPACE_ID);
+        })
+        .run(commands);
+}
+
+/// A config where the resize modifier overlaps the drag modifier.
+fn drag_resize_overlap_config() -> Config {
+    (
+        MainOptions {
+            mouse_resize_modifier: Some(Modifiers::ALT),
+            mouse_drag_display_modifier: Some(Modifiers::ALT),
+            ..Default::default()
+        },
+        vec![],
+    )
+        .into()
+}
+
+/// With overlapping modifiers, an armed drag must not resize the dragged
+/// window: the drag owns the gesture.
+#[test]
+fn test_armed_drag_does_not_resize_with_overlapping_modifiers() {
+    let grab = CGPoint::new(200.0, 500.0);
+    let commands = vec![
+        Event::MenuOpened { window_id: 0 },
+        Event::MouseDown {
+            point: grab,
+            modifiers: Modifiers::ALT,
+        },
+        Event::MouseDragged {
+            point: CGPoint::new(300.0, 600.0),
+            modifiers: Modifiers::ALT,
+        },
+        // Jitter inside the (synthetically moved) window with Alt held:
+        // without the armed-drag guard the resize trigger would latch here
+        // and grow the window by dx * 5 on the next motion.
+        Event::MouseMoved {
+            point: CGPoint::new(210.0, 230.0),
+            modifiers: Modifiers::ALT,
+        },
+        Event::MouseMoved {
+            point: CGPoint::new(260.0, 230.0),
+            modifiers: Modifiers::ALT,
+        },
+        Event::Command {
+            command: Command::PrintState,
+        },
+    ];
+
+    TestHarness::new()
+        .with_config(drag_resize_overlap_config())
+        .with_windows(1)
+        .on_iteration(4, move |world, _state| {
+            assert_window_size!(
+                world,
+                0,
+                TEST_WINDOW_WIDTH,
+                TEST_DISPLAY_HEIGHT - TEST_MENUBAR_HEIGHT
+            );
+        })
+        .run(commands);
+}
+
+/// A pure drag-event stream carries the window across displays with no
+/// native OS move involved: synthetic motion feeds transfer and preview.
+#[test]
+fn test_armed_drag_transfers_display_without_native_move() {
+    // Window 0 tiles into slot (0, 20); grab its center while holding Alt,
+    // then drag straight up past the external display's bottom edge (y 0).
+    // Leading PrintStates let startup (incl. initial focus) settle so no
+    // focus-driven reshuffle can race the drag.
+    let grab = CGPoint::new(200.0, 500.0);
+    let commands = vec![
+        Event::MenuOpened { window_id: 0 },
+        Event::Command {
+            command: Command::PrintState,
+        },
+        Event::Command {
+            command: Command::PrintState,
+        },
+        Event::MouseDown {
+            point: grab,
+            modifiers: Modifiers::ALT,
+        },
+        Event::MouseDragged {
+            point: CGPoint::new(200.0, 0.0),
+            modifiers: Modifiers::ALT,
+        },
+        Event::Command {
+            command: Command::PrintState,
+        },
+        Event::Command {
+            command: Command::PrintState,
+        },
+    ];
+
+    TestHarness::new()
+        .with_config(drag_display_config())
+        .with_windows(1)
+        .with_display(
+            EXT_DISPLAY_ID,
+            IRect::new(0, -EXT_DISPLAY_HEIGHT, EXT_DISPLAY_WIDTH, 0),
+            vec![EXT_WORKSPACE_ID],
+        )
+        .on_iteration(5, move |world, _state| {
+            assert_on_workspace!(world, 0, EXT_WORKSPACE_ID);
+            assert_not_on_workspace!(world, 0, TEST_WORKSPACE_ID);
+        })
+        .run(commands);
+}

@@ -30,7 +30,9 @@ https://github.com/user-attachments/assets/793e7eaa-7909-4086-8380-1fb7861f8780
   between them with keyboard or touchpad gestures - with a separate window strip
   on each. Drag and dropping windows between them works as well: holding the
   `mouse_drag_display_modifier` shortcut while left-clicking a window arms the
-  drag, and crossing a display boundary moves it to that display's strip live,
+  drag (grab anywhere — paneru moves the window itself, so a native
+  edge-resize cannot win), and crossing a display boundary moves it to that
+  display's strip live,
   keeping focus (lands in the nearest column with `insert_windows_mid_strip`).
   A filled ghost marks the landing slot throughout the drag, and the edge
   warp carries the cursor across when `horizontal_mouse_warp` is set.

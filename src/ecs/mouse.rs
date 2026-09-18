@@ -1,7 +1,7 @@
 use bevy::app::{App, Plugin, Update};
 use bevy::ecs::entity::Entity;
 use bevy::ecs::hierarchy::ChildOf;
-use bevy::ecs::message::MessageReader;
+use bevy::ecs::message::{MessageReader, MessageWriter};
 use bevy::ecs::query::{Has, With};
 use bevy::ecs::resource::Resource;
 use bevy::ecs::schedule::IntoScheduleConfigs as _;
@@ -19,9 +19,9 @@ use crate::ecs::params::{ActiveDisplayMut, GlobalState, Windows};
 use crate::ecs::workspace::mid_strip_slot;
 use crate::ecs::{
     ActiveWorkspaceMarker, DockPosition, MissionControlActive, Position, Scrolling,
-    SelectedVirtualMarker, SpawnCommandsExt,
+    SelectedVirtualMarker, SpawnCommandsExt, Unmanaged,
 };
-use crate::manager::{Display, Origin, Size, WindowManager, origin_from};
+use crate::manager::{Display, Origin, Size, Window, WindowManager, origin_from};
 use crate::overlay::{BorderParams, OverlayManager};
 use crate::platform::{Modifiers, WinID};
 use crate::util::round_px;
@@ -53,6 +53,12 @@ impl Plugin for MouseEventsPlugin {
                     mouse_moved_trigger,
                     mouse_resize_trigger,
                     mouse_down_trigger,
+                    // Synthetic armed-drag motion; gated like arming so no
+                    // window moves while Mission Control owns the screen.
+                    // Ordered after adoption: adoption must read the last
+                    // committed OS frame, never this tick's synthetic write,
+                    // or it reverts the move from the stale frame.
+                    drag_move_armed_window.after(super::systems::window_moved_update_frame),
                 )
                     .run_if(mission_control_inactive),
                 mouse_up_trigger,
@@ -65,12 +71,15 @@ impl Plugin for MouseEventsPlugin {
         );
         // Ungated by input events — `WindowMoved` is a plain `Event`, and the
         // `Populated` held-marker query keeps the system idle while nobody is
-        // dragging. Ordered after adoption so the hit-test reads fresh frames.
+        // dragging. Ordered after adoption so the hit-test reads fresh frames,
+        // and after the synthetic move so transfer sees this tick's motion.
         app.init_resource::<DragModifierState>();
         app.init_resource::<DropPreviewState>();
         app.add_systems(
             Update,
-            drag_window_across_display.after(super::systems::window_moved_update_frame),
+            drag_window_across_display
+                .after(super::systems::window_moved_update_frame)
+                .after(drag_move_armed_window),
         );
     }
 }
@@ -382,6 +391,89 @@ pub(crate) fn drop_preview_rect(
 ) -> IRect {
     let (_, slot_x) = drop_slot_index(strip, strip_scroll_x, drop_x, use_mid_slot, windows);
     slot_preview_rect(slot_x, viewport, dragged_size)
+}
+
+/// Last cursor point seen during a drag, for synthetic armed-drag motion.
+/// Reset on press and release so deltas never span gestures.
+#[derive(Default)]
+struct DragMoveState {
+    last: Option<Origin>,
+}
+
+/// Moves a shortcut-armed held window synthetically from `MouseDragged`
+/// deltas, 1:1 with the cursor.
+///
+/// macOS decides move-vs-resize natively by grab point (title bar moves,
+/// edges resize), so waiting for native `WindowMoved` makes the drag hostage
+/// to where the user grabbed. While armed (grab-time `DragDisplayArmed` +
+/// shortcut still held) paneru drives the window itself instead: grab point
+/// becomes irrelevant and a native edge-resize can no longer win. Direct
+/// `Position` assign tracks the finger in lockstep (swipe precedent), no
+/// animation lag; the existing transfer hit-test, preview and warp all read
+/// the frame this writes. Unarmed drags and floating/minimized/hidden
+/// windows are untouched (they keep native behavior plus the pin path).
+fn drag_move_armed_window(
+    mut messages: MessageReader<InputEvent>,
+    mut moved: MessageWriter<Event>,
+    held: Query<(Entity, &MouseHeldMarker, Has<DragDisplayArmed>)>,
+    windows: Query<(&Window, Entity, Option<&Unmanaged>)>,
+    mut positions: Query<&mut Position, With<Window>>,
+    config: Res<Config>,
+    mut state: Local<DragMoveState>,
+) {
+    for InputEvent(event) in messages.read() {
+        match event {
+            Event::MouseDown { point, .. } => {
+                state.last = Some(origin_from(*point));
+            }
+            Event::MouseUp { .. } => {
+                state.last = None;
+            }
+            Event::MouseDragged { point, modifiers } => {
+                let pointer = origin_from(*point);
+                // Always refresh: a gated-out segment must not leave a stale
+                // base that jumps on re-entry.
+                let last = state.last.replace(pointer);
+                let Some(last) = last else {
+                    continue;
+                };
+                let delta = pointer - last;
+                if delta == Origin::ZERO {
+                    continue;
+                }
+                let Some(target) = held
+                    .iter()
+                    .find(|(_, _, armed)| *armed)
+                    .map(|(_, marker, _)| marker.0)
+                else {
+                    continue;
+                };
+                if config
+                    .mouse_drag_display_modifier()
+                    .is_none_or(|required| !required.matches(*modifiers))
+                {
+                    continue;
+                }
+                let Some((window, entity, unmanaged)) =
+                    windows.iter().find(|(_, entity, _)| *entity == target)
+                else {
+                    continue;
+                };
+                if unmanaged.is_some() {
+                    continue;
+                }
+                if let Ok(mut position) = positions.get_mut(entity) {
+                    position.0 += delta;
+                    // Feed the existing pipeline (adoption no-op, transfer
+                    // hit-test, preview) exactly as a native move would.
+                    moved.write(Event::WindowMoved {
+                        window_id: window.id(),
+                    });
+                }
+            }
+            _ => {}
+        }
+    }
 }
 
 /// Moves a mouse-dragged managed window across display boundaries.
@@ -730,10 +822,12 @@ pub(super) struct MouseResizeState {
     window_id: Option<WinID>,
 }
 
+#[allow(clippy::too_many_arguments)]
 fn mouse_resize_trigger(
     mut messages: MessageReader<InputEvent>,
     windows: Windows,
     active_workspace: Single<(Entity, &LayoutStrip, &Position), With<ActiveWorkspaceMarker>>,
+    held: Query<(Entity, &MouseHeldMarker, Has<DragDisplayArmed>)>,
     window_manager: Res<WindowManager>,
     config: Res<Config>,
     mut state: Local<MouseResizeState>,
@@ -778,6 +872,17 @@ fn mouse_resize_trigger(
         let Some((window, entity)) = windows.find(window_id) else {
             continue;
         };
+        // An armed display-drag owns the gesture: never resize the dragged
+        // window out from under it when modifiers overlap. The latch resets
+        // too, so no stale target resumes after the drag.
+        if held
+            .iter()
+            .any(|(_, marker, armed)| marker.0 == entity && armed)
+        {
+            state.last_point = None;
+            state.window_id = None;
+            continue;
+        }
         let (strip_entity, strip, strip_position) = *active_workspace;
         let floating = !strip.contains(entity);
 

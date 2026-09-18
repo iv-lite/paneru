@@ -838,6 +838,9 @@ pub(super) fn window_resized_update_frame(
     mut messages: MessageReader<Event>,
     mut windows: ResizableWindows,
     mut workspaces: Query<(&LayoutStrip, &mut Position)>,
+    held: Query<(Entity, &MouseHeldMarker, Has<DragDisplayArmed>)>,
+    config: Res<Config>,
+    drag_modifiers: Res<DragModifierState>,
 ) {
     for event in messages.read() {
         let Event::WindowResized { window_id } = event else {
@@ -851,6 +854,18 @@ pub(super) fn window_resized_update_frame(
             continue;
         };
         if matches!(unmanaged, Some(Unmanaged::Minimized | Unmanaged::Hidden)) {
+            continue;
+        }
+        // An armed display-drag owns the gesture: a simultaneous native
+        // edge-resize must not reshape the window mid-move (mirrors the
+        // move lock, which already ignores native moves for held windows).
+        if held
+            .iter()
+            .any(|(_, marker, armed)| marker.0 == entity && armed)
+            && config
+                .mouse_drag_display_modifier()
+                .is_some_and(|required| required.matches(drag_modifiers.current))
+        {
             continue;
         }
         // Our own resize, echoed back: `commit_window_size` requested this size
