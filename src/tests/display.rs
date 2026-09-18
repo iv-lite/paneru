@@ -1174,6 +1174,82 @@ fn test_drag_drop_appends_by_default() {
         .run(commands);
 }
 
+/// The consistency audit re-homes a managed window whose live position
+/// diverged from its slot with no animation in flight.
+#[test]
+fn test_audit_repairs_diverged_window_position() {
+    use bevy::ecs::system::RunSystemOnce as _;
+
+    let mut harness = TestHarness::new().with_windows(1);
+    harness.app.update();
+
+    let world = harness.world();
+    let entity = find_window_entity(0, world);
+    world
+        .entity_mut(entity)
+        .insert(crate::ecs::Position(Origin::new(5000, 5000)));
+
+    harness
+        .world()
+        .run_system_once(crate::ecs::layout::audit_window_positions)
+        .expect("running the audit");
+    // One more tick for the repair reposition to be picked up.
+    harness.app.update();
+
+    let world = harness.world();
+    let entity = find_window_entity(0, world);
+    let position = world.get::<Position>(entity).expect("need position").0;
+    assert_eq!(
+        position,
+        Origin::new(0, TEST_MENUBAR_HEIGHT),
+        "audit must restore the window to its slot"
+    );
+    assert_on_workspace!(world, 0, TEST_WORKSPACE_ID);
+}
+
+/// The audit collapses duplicate strip memberships, keeping the one on the
+/// display containing the window.
+#[test]
+fn test_audit_repairs_duplicate_membership() {
+    use bevy::ecs::system::RunSystemOnce as _;
+
+    let mut harness = TestHarness::new().with_windows(1);
+    harness.mock_state.add_display(
+        EXT_DISPLAY_ID,
+        IRect::new(0, -EXT_DISPLAY_HEIGHT, EXT_DISPLAY_WIDTH, 0),
+        vec![EXT_WORKSPACE_ID],
+    );
+    harness.app.update();
+
+    let world = harness.world();
+    let entity = find_window_entity(0, world);
+    let mut strips = world.query::<(Entity, &LayoutStrip)>();
+    let ext_strip = strips
+        .iter(world)
+        .find(|(_, strip)| strip.id() == EXT_WORKSPACE_ID)
+        .map(|(entity, _)| entity)
+        .expect("need external strip");
+    world
+        .entity_mut(ext_strip)
+        .get_mut::<LayoutStrip>()
+        .expect("need strip")
+        .append(entity);
+
+    harness
+        .world()
+        .run_system_once(crate::ecs::layout::audit_window_positions)
+        .expect("running the audit");
+
+    let world = harness.world();
+    let mut strips = world.query::<&LayoutStrip>();
+    let count = strips
+        .iter(world)
+        .filter(|strip| strip.index_of(entity).is_ok())
+        .count();
+    assert_eq!(count, 1, "audit must leave exactly one membership");
+    assert_on_workspace!(world, 0, TEST_WORKSPACE_ID);
+}
+
 /// A foreign move with no held button is adopted and then re-tiled back onto
 /// its own strip — the window snaps back instead of transferring.
 #[test]

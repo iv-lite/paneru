@@ -8,17 +8,19 @@ use bevy::ecs::schedule::IntoScheduleConfigs as _;
 use bevy::ecs::schedule::common_conditions::{not, resource_exists};
 use bevy::ecs::system::{Commands, ParamSet, Populated, Query, Res};
 use bevy::math::IRect;
+use bevy::time::common_conditions::on_timer;
 use std::collections::VecDeque;
+use std::time::Duration;
 use stdext::function_name;
-use tracing::{Level, instrument, trace};
+use tracing::{Level, instrument, trace, warn};
 
 use crate::config::Config;
 use crate::ecs::params::Windows;
 use crate::ecs::workspace::SnapStripMarker;
 use crate::ecs::{
     ActiveWorkspaceMarker, Bounds, DockPosition, EnsureVisibleMarker, Initializing, LayoutPosition,
-    ManualStripOffset, Position, RepositionMarker, ReshuffleAroundMarker, Scrolling,
-    SpawnCommandsExt,
+    ManualStripOffset, MouseHeldMarker, Position, RepositionMarker, ReshuffleAroundMarker,
+    ResizeMarker, Scrolling, SpawnCommandsExt, Unmanaged,
 };
 use crate::errors::{Error, Result};
 use crate::manager::{Display, Origin, Size, Window};
@@ -56,6 +58,39 @@ type StripPlacements<'w, 's> = Query<
 /// Displays paired with the Dock's current edge, which is what turns a display's
 /// raw bounds into the usable viewport.
 type DisplayViewports<'w, 's> = Query<'w, 's, (&'static Display, Option<&'static DockPosition>)>;
+
+/// Strips as the consistency audit sees them: entity, content, scroll offset,
+/// swipe state, and parent display. Mutable because duplicate memberships are
+/// repaired in place.
+type AuditStrips<'w, 's> = Query<
+    'w,
+    's,
+    (
+        Entity,
+        &'static mut LayoutStrip,
+        &'static Position,
+        Has<Scrolling>,
+        &'static ChildOf,
+    ),
+>;
+
+/// Managed windows as the consistency audit sees them: identity, slot, live
+/// frame, and everything that excuses a divergence (in-flight animation,
+/// held drag).
+type AuditedWindows<'w, 's> = Query<
+    'w,
+    's,
+    (
+        Entity,
+        &'static Window,
+        &'static LayoutPosition,
+        &'static Position,
+        &'static Bounds,
+        Option<&'static Unmanaged>,
+        Has<RepositionMarker>,
+        Has<ResizeMarker>,
+    ),
+>;
 
 /// A strip, its entity, its own scroll position, whether it's mid-swipe, and
 /// its parent display. Used by [`position_layout_windows`] to build each
@@ -187,6 +222,13 @@ impl Plugin for LayoutEventsPlugin {
                     .after(super::systems::finish_setup)
                     .after(super::triggers::apply_window_positions)
                     .before(super::workspace::show_active_workspace)
+                    .run_if(not(resource_exists::<Initializing>)),
+                // Slow consistency audit: repairs what the event-driven chain
+                // above missed (see `audit_window_positions`). Runs on its own
+                // timer so a diverged window cannot sit forever waiting for an
+                // event to touch its strip.
+                audit_window_positions
+                    .run_if(on_timer(Duration::from_secs(5)))
                     .run_if(not(resource_exists::<Initializing>)),
             ),
         );
@@ -1442,6 +1484,77 @@ fn insert_stack_item_window_contexts(
     }
 }
 
+/// The desired on-screen frame of a window from its strip slot, shared by
+/// [`position_layout_windows`] and the consistency audit so the two can never
+/// disagree about where a window belongs.
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn desired_window_frame(
+    layout_position: Origin,
+    size: Size,
+    strip_position: Origin,
+    stacked: bool,
+    swiping: bool,
+    viewport: IRect,
+    h_pad: i32,
+    config: &Config,
+) -> IRect {
+    let offscreen_sliver_width = config.sliver_width();
+    let (_, pad_right, _, pad_left) = config.edge_padding();
+    let mut frame = IRect::from_corners(layout_position, layout_position + size);
+    let width = frame.width();
+    frame.min += strip_position;
+    frame.max += strip_position;
+
+    let mut offscreen = false;
+    if frame.max.x <= viewport.min.x + h_pad {
+        // Window hidden to the left — position so exactly
+        // sliver_width CG pixels are visible from the real
+        // display edge.  The +h_pad accounts for the gap that
+        // reposition() adds, which can leave a window just
+        // inside the viewport edge while its CG frame is fully
+        // past it.
+        frame.min.x = viewport.min.x - width + offscreen_sliver_width - pad_left + h_pad;
+        offscreen = true;
+    } else if frame.min.x >= viewport.max.x - h_pad {
+        // Window hidden to the right — mirror of above.
+        frame.min.x = viewport.max.x - offscreen_sliver_width + pad_right - h_pad;
+        offscreen = true;
+    }
+    frame.max.x = frame.min.x + width;
+
+    // During swipe, keep full height. The vertical sliver inset only
+    // applies to horizontally off-screen windows, so they expose just
+    // a `sliver_height` fraction of their height at the viewport's
+    // vertical center.
+    if !swiping && offscreen {
+        // Don't compress stacked windows vertically when off-screen.
+        // The height reduction corrupts their proportions: when the
+        // column scrolls back on-screen, binpack_heights makes the
+        // last window absorb all remaining space.
+        if !stacked {
+            let inset =
+                round_px(f64::from(viewport.height()) * (1.0 - config.sliver_height()) / 2.0);
+            frame.min.y += inset;
+            frame.max.y += inset;
+        }
+    }
+
+    // Keep the window anchored to its own display. The parked strip origin
+    // only accounts for the first window: everything sitting below it in a
+    // stack picks up that offset on top of the corner and lands past the
+    // bottom edge, fully inside the display underneath. macOS then adopts
+    // the window onto that display, and showing the workspace again brings
+    // it back there instead of here. Park those at the corner as well.
+    let park_row = viewport.max.y - PARKED_STRIP_SLIVER;
+    if frame.min.y > park_row {
+        let height = frame.height();
+        frame.min.y = park_row;
+        frame.max.y = park_row + height;
+    }
+
+    frame
+}
+
 /// Reacts to changes of logical window layout in the strip and any have been changed, reposition
 /// the layout strip against the current display viewport.
 #[instrument(level = Level::DEBUG, skip_all)]
@@ -1453,8 +1566,6 @@ fn position_layout_windows(
     config: Res<Config>,
     mut commands: Commands,
 ) {
-    let offscreen_sliver_width = config.sliver_width();
-    let (_, pad_right, _, pad_left) = config.edge_padding();
     let mut strip_contexts = EntityHashMap::default();
     for (strip_entity, layout_strip, Position(strip_position), swiping, child_of) in &workspaces {
         let snap_settling = snap_guards.iter().any(|guard| guard.strip == strip_entity);
@@ -1470,10 +1581,12 @@ fn position_layout_windows(
 
     for (entity, window, layout_position, mut position, mut bounds) in positioned_windows {
         let Some(context) = strip_contexts.get(&entity) else {
-            return;
+            // One orphan or mid-transfer window must not abort the whole
+            // batch: skip it and keep positioning the rest.
+            continue;
         };
         let Ok((display, dock)) = displays.get(context.display_entity) else {
-            return;
+            continue;
         };
         let viewport = display.actual_display_bounds(dock, &config);
         // Gets 80% of the display height as threshold.
@@ -1485,57 +1598,16 @@ fn position_layout_windows(
         // h_pad to the virtual x, so subtract it here so the OS window
         // lands exactly sliver_width pixels from the screen edge.
         let h_pad = window.horizontal_padding();
-        let mut frame = IRect::from_corners(layout_position.0, layout_position.0 + bounds.0);
-        let width = frame.width();
-        frame.min += context.strip_position;
-        frame.max += context.strip_position;
-
-        let mut offscreen = false;
-        if frame.max.x <= viewport.min.x + h_pad {
-            // Window hidden to the left — position so exactly
-            // sliver_width CG pixels are visible from the real
-            // display edge.  The +h_pad accounts for the gap that
-            // reposition() adds, which can leave a window just
-            // inside the viewport edge while its CG frame is fully
-            // past it.
-            frame.min.x = viewport.min.x - width + offscreen_sliver_width - pad_left + h_pad;
-            offscreen = true;
-        } else if frame.min.x >= viewport.max.x - h_pad {
-            // Window hidden to the right — mirror of above.
-            frame.min.x = viewport.max.x - offscreen_sliver_width + pad_right - h_pad;
-            offscreen = true;
-        }
-        frame.max.x = frame.min.x + width;
-
-        // During swipe, keep full height. The vertical sliver inset only
-        // applies to horizontally off-screen windows, so they expose just
-        // a `sliver_height` fraction of their height at the viewport's
-        // vertical center.
-        if !context.swiping && offscreen {
-            // Don't compress stacked windows vertically when off-screen.
-            // The height reduction corrupts their proportions: when the
-            // column scrolls back on-screen, binpack_heights makes the
-            // last window absorb all remaining space.
-            if !context.stacked {
-                let inset =
-                    round_px(f64::from(viewport.height()) * (1.0 - config.sliver_height()) / 2.0);
-                frame.min.y += inset;
-                frame.max.y += inset;
-            }
-        }
-
-        // Keep the window anchored to its own display. The parked strip origin
-        // only accounts for the first window: everything sitting below it in a
-        // stack picks up that offset on top of the corner and lands past the
-        // bottom edge, fully inside the display underneath. macOS then adopts
-        // the window onto that display, and showing the workspace again brings
-        // it back there instead of here. Park those at the corner as well.
-        let park_row = viewport.max.y - PARKED_STRIP_SLIVER;
-        if frame.min.y > park_row {
-            let height = frame.height();
-            frame.min.y = park_row;
-            frame.max.y = park_row + height;
-        }
+        let frame = desired_window_frame(
+            layout_position.0,
+            bounds.0,
+            context.strip_position,
+            context.stacked,
+            context.swiping,
+            viewport,
+            h_pad,
+            &config,
+        );
 
         if bounds.0 != frame.size() {
             bounds.0 = frame.size();
@@ -1557,6 +1629,7 @@ fn position_layout_windows(
             // slot, which the distance threshold alone reads as an ordinary
             // layout change - they would slide across the screen while the
             // window above them teleports.
+            let park_row = viewport.max.y - PARKED_STRIP_SLIVER;
             let parking = frame.min.y >= park_row || position.0.y >= park_row;
             let offscreen_move =
                 parking || position.0.y.abs_diff(frame.min.y) > vertical_move_threshold;
@@ -1581,10 +1654,240 @@ fn position_layout_windows(
     }
 }
 
+/// Slow consistency audit over every managed window. The layout chain above
+/// is purely event-driven: a window whose `Position` diverges with no marker
+/// in flight and no event touching its strip would otherwise sit wrong
+/// forever. Every few seconds this re-derives each window's slot with the
+/// same [`desired_window_frame`] math and repairs strays:
+///
+/// * in zero strips — logs; the home is unknowable so nothing is moved;
+/// * in two or more strips — logs and keeps the membership on the display
+///   containing the window's center (active strip would need a param this
+///   system deliberately avoids; center is the honest tiebreak);
+/// * in exactly one strip but off its slot — `reposition_entity` home.
+///
+/// Skipped (never touched): windows with `RepositionMarker`/`ResizeMarker`
+/// in flight, `MouseHeldMarker` holders, windows on scrolling strips, and
+/// unmanaged (floating/minimized/hidden) windows, which live outside strips
+/// by design.
+#[instrument(level = Level::DEBUG, skip_all)]
+pub(crate) fn audit_window_positions(
+    mut strips: AuditStrips,
+    snap_guards: Query<&SnapStripMarker>,
+    displays: DisplayViewports,
+    windows: AuditedWindows,
+    held: Query<Entity, With<MouseHeldMarker>>,
+    config: Res<Config>,
+    mut commands: Commands,
+) {
+    let mut strip_contexts = EntityHashMap::default();
+    let mut membership: EntityHashMap<Vec<Entity>> = EntityHashMap::default();
+    for (strip_entity, strip, Position(strip_position), swiping, child_of) in &strips {
+        let snap_settling = snap_guards.iter().any(|guard| guard.strip == strip_entity);
+        insert_strip_window_contexts(
+            &mut strip_contexts,
+            strip,
+            *strip_position,
+            swiping,
+            child_of.parent(),
+            snap_settling,
+        );
+        for window in strip.all_windows() {
+            membership.entry(window).or_default().push(strip_entity);
+        }
+    }
+
+    for (entity, window, layout_position, position, bounds, unmanaged, repositioning, resizing) in
+        &windows
+    {
+        if unmanaged.is_some() {
+            continue;
+        }
+        let member_of = membership.get(&entity).map_or(&[][..], Vec::as_slice);
+        if member_of.len() != 1 {
+            if member_of.is_empty() {
+                warn!(
+                    "audit: managed window (id {}, {entity}) is in no strip; leaving it alone",
+                    window.id(),
+                );
+                continue;
+            }
+            // Keep the membership on the display containing the window's
+            // center; drop the rest.
+            let center = IRect::from_corners(position.0, position.0 + bounds.0).center();
+            let home = member_of
+                .iter()
+                .find(|strip_entity| {
+                    strips
+                        .get(**strip_entity)
+                        .ok()
+                        .and_then(|(_, _, _, _, child_of)| {
+                            displays
+                                .get(child_of.parent())
+                                .ok()
+                                .map(|(display, _)| display.bounds().contains(center))
+                        })
+                        .unwrap_or(false)
+                })
+                .or(member_of.first())
+                .copied();
+            if let Some(home) = home {
+                warn!(
+                    "audit: managed window (id {}, {entity}) in {} strips; keeping {}",
+                    window.id(),
+                    member_of.len(),
+                    home,
+                );
+                for strip_entity in member_of {
+                    if *strip_entity == home {
+                        continue;
+                    }
+                    if let Ok((_, mut strip, _, _, _)) = strips.get_mut(*strip_entity) {
+                        strip.remove(entity);
+                    }
+                }
+            }
+            continue;
+        }
+        if repositioning || resizing || held.contains(entity) {
+            continue;
+        }
+        let Some(context) = strip_contexts.get(&entity) else {
+            continue;
+        };
+        if context.swiping {
+            continue;
+        }
+        let Ok((display, dock)) = displays.get(context.display_entity) else {
+            continue;
+        };
+        let viewport = display.actual_display_bounds(dock, &config);
+        let desired = desired_window_frame(
+            layout_position.0,
+            bounds.0,
+            context.strip_position,
+            context.stacked,
+            context.swiping,
+            viewport,
+            window.horizontal_padding(),
+            &config,
+        );
+        // One pixel of tolerance for rounding in the animators.
+        let drift = (position.0 - desired.min).abs();
+        if drift.x > 1 || drift.y > 1 {
+            warn!(
+                "audit: managed window (id {}, {entity}) at {} but slot is {}; re-homing",
+                window.id(),
+                position.0,
+                desired.min,
+            );
+            commands.reposition_entity(entity, desired.min);
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use bevy::prelude::*;
+
+    fn test_viewport() -> IRect {
+        IRect::new(0, 0, 1024, 768)
+    }
+
+    #[test]
+    fn desired_frame_passes_onscreen_windows_through() {
+        let frame = desired_window_frame(
+            Origin::new(100, 100),
+            Size::new(200, 100),
+            Origin::new(0, 0),
+            false,
+            false,
+            test_viewport(),
+            0,
+            &Config::default(),
+        );
+        assert_eq!(frame, IRect::new(100, 100, 300, 200));
+    }
+
+    #[test]
+    fn desired_frame_parks_offscreen_windows_at_the_sliver() {
+        let config = Config::default();
+        let left = desired_window_frame(
+            Origin::new(-500, 100),
+            Size::new(200, 100),
+            Origin::new(0, 0),
+            false,
+            false,
+            test_viewport(),
+            0,
+            &config,
+        );
+        assert_eq!(left, IRect::new(-195, 100, 5, 200));
+        let right = desired_window_frame(
+            Origin::new(1100, 100),
+            Size::new(200, 100),
+            Origin::new(0, 0),
+            false,
+            false,
+            test_viewport(),
+            0,
+            &config,
+        );
+        assert_eq!(right, IRect::new(1019, 100, 1219, 200));
+    }
+
+    #[test]
+    fn desired_frame_clamps_to_the_park_row() {
+        let frame = desired_window_frame(
+            Origin::new(100, 900),
+            Size::new(200, 100),
+            Origin::new(0, 0),
+            false,
+            false,
+            test_viewport(),
+            0,
+            &Config::default(),
+        );
+        assert_eq!(frame, IRect::new(100, 758, 300, 858));
+    }
+
+    #[test]
+    fn desired_frame_compresses_only_unstacked_offscreen_windows() {
+        use crate::config::MainOptions;
+
+        let config: Config = (
+            MainOptions {
+                sliver_height: Some(0.5),
+                ..Default::default()
+            },
+            vec![],
+        )
+            .into();
+        // 768 * (1 - 0.5) / 2 = 192px vertical inset.
+        let plain = desired_window_frame(
+            Origin::new(-500, 100),
+            Size::new(200, 100),
+            Origin::new(0, 0),
+            false,
+            false,
+            test_viewport(),
+            0,
+            &config,
+        );
+        assert_eq!(plain, IRect::new(-195, 292, 5, 392));
+        let stacked = desired_window_frame(
+            Origin::new(-500, 100),
+            Size::new(200, 100),
+            Origin::new(0, 0),
+            true,
+            false,
+            test_viewport(),
+            0,
+            &config,
+        );
+        assert_eq!(stacked, IRect::new(-195, 100, 5, 200));
+    }
 
     #[test]
     fn signature_tolerates_pixel_drift_but_not_a_reshape() {

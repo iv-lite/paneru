@@ -1043,6 +1043,7 @@ pub(super) fn update_overlays(
     windows: Windows,
     applications: Query<&Application>,
     displays: Query<(&Display, Has<ActiveDisplayMarker>)>,
+    focus_markers: Query<(), With<FocusedMarker>>,
     overlay_mgr: Option<NonSendMut<OverlayManager>>,
     mission_control_active: Res<MissionControlActive>,
     config: Res<Config>,
@@ -1076,6 +1077,13 @@ pub(super) fn update_overlays(
     }
 
     let Some((window, entity)) = windows.focused() else {
+        // Distinguish a truly focusless world from the transient two-marker
+        // moment of a focus switch (`single()` fails on both): only the
+        // former hides, so a stale outline can never leak, while the latter
+        // holds its rect for a tick instead of hide/show flickering.
+        if focus_markers.is_empty() {
+            overlay_mgr.hide_all();
+        }
         return;
     };
     let focused_window_id = window.id();
@@ -1123,9 +1131,13 @@ pub(super) fn update_overlays(
     } {
         if window_config_cache.window_id != Some(focused_window_id) || config.is_changed() {
             let Some((window, _, parent)) = windows.find_parent(focused_window_id) else {
+                // Parent gone mid-focus: hide rather than freezing the old
+                // rect until the next dirty tick.
+                overlay_mgr.hide_all();
                 return;
             };
             let Ok(app) = applications.get(parent) else {
+                overlay_mgr.hide_all();
                 return;
             };
             let properties = WindowProperties::new(app, window, &config);

@@ -6,7 +6,7 @@ use bevy::app::App as BevyApp;
 use bevy::app::{First, Last, PostUpdate, PreUpdate, Startup};
 use bevy::ecs::hierarchy::ChildOf;
 use bevy::ecs::lifecycle::RemovedComponents;
-use bevy::ecs::query::{Added, Changed, With};
+use bevy::ecs::query::{Added, Changed, Or, With};
 use bevy::ecs::resource::Resource;
 use bevy::ecs::schedule::SystemCondition;
 use bevy::ecs::schedule::common_conditions::{not, resource_exists};
@@ -87,12 +87,13 @@ pub fn register_systems(app: &mut bevy::app::App) {
     // but also whenever focus moves — including focus *loss* (e.g. switching to
     // an empty virtual workspace), which otherwise leaves a stale outline.
     // Position changes on the focused window also dirty the overlay so that
-    // dragging a floating window moves the highlight with it.
+    // dragging a floating window moves the highlight with it; size changes do
+    // the same so the border tracks resizes instead of keeping a stale frame.
     let vw_indicator_dirty =
         |strip_changed: Query<(), (With<ActiveWorkspaceMarker>, Changed<LayoutStrip>)>,
          focus_gained: Query<(), Added<FocusedMarker>>,
          workspace_changed: Query<(), Added<ActiveWorkspaceMarker>>,
-         focused_moved: Query<(), (With<FocusedMarker>, Changed<Position>)>| {
+         focused_moved: Query<(), FocusedFrameChanged>| {
             !strip_changed.is_empty()
                 || !focus_gained.is_empty()
                 || !workspace_changed.is_empty()
@@ -234,6 +235,13 @@ pub fn register_triggers(app: &mut bevy::app::App) {
 /// Marker component for the currently focused window.
 #[derive(Component)]
 pub struct FocusedMarker;
+
+/// Filter matching the focused window when its frame moved or resized, so the
+/// overlay redraws on either rather than keeping a stale outline.
+pub type FocusedFrameChanged = (
+    With<FocusedMarker>,
+    Or<(Changed<Position>, Changed<Bounds>)>,
+);
 
 #[derive(Component)]
 pub struct ActiveWorkspaceMarker;
