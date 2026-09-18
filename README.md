@@ -116,6 +116,16 @@ $ cargo build --release
 $ cargo install --path .
 ```
 
+A locally built binary carries a fresh ad-hoc signature every time, which
+macOS treats as a new app: after (re)installing, re-grant it Accessibility
+access (System Settings → Privacy & Security → Accessibility) and restart
+the service, or paneru will sit in the menu bar without tiling. To keep the
+grant across rebuilds, pin a stable code-signing identifier after installing:
+
+```shell
+$ codesign --force --sign - --identifier com.github.karinushka.paneru "$(which paneru)"
+```
+
 By default, Paneru builds with the embedded Lua runtime using a vendored LuaJIT compiled from source, requiring no system-wide Lua installation or `pkg-config` setup.
 
 If you prefer to link against a system- or version-manager-installed Lua (e.g. via `mise`, `asdf`, or Homebrew), disable default features and pass `--features lua`, making sure `PKG_CONFIG_PATH` contains the directory with `luajit.pc`:
