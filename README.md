@@ -129,7 +129,8 @@ macOS treats as a new app: after (re)installing, re-grant it Accessibility
 access (System Settings → Privacy & Security → Accessibility) and restart
 the service, or paneru will sit in the menu bar without tiling. Source
 builds pin a stable signing identifier automatically (via the `rustc`
-wrapper in `.cargo/config.toml`), so the grant survives rebuilds; for an
+wrapper in `.cargo/config.toml`), but ad-hoc signatures still change hash
+per build, so currently every reinstall needs a fresh grant; for an
 already-installed binary, pin it by hand once:
 
 ```shell
