@@ -6,7 +6,8 @@ use bevy::ecs::lifecycle::Add;
 use bevy::ecs::message::{MessageReader, MessageWriter};
 use bevy::ecs::observer::On;
 use bevy::ecs::query::{Has, With};
-use bevy::ecs::system::{Commands, Local, NonSend, Query, Res};
+use bevy::ecs::schedule::IntoScheduleConfigs as _;
+use bevy::ecs::system::{Commands, Local, NonSend, Query, Res, ResMut};
 use bevy::math::IRect;
 use bevy::platform::collections::HashSet;
 use objc2_app_kit::NSScreen;
@@ -18,11 +19,15 @@ use tracing::{Level, debug, error, instrument, warn};
 
 use crate::config::Config;
 use crate::ecs::layout::LayoutStrip;
+use crate::ecs::mouse::DragModifierState;
+use crate::ecs::params::Windows;
+use crate::ecs::workspace::IgnoredMovedWindows;
 use crate::ecs::{
-    ActiveDisplayMarker, ReadDisplayProperties, SendMessageTrigger, SpawnCommandsExt, Timeout,
+    ActiveDisplayMarker, MouseHeldMarker, ReadDisplayProperties, SendMessageTrigger,
+    SpawnCommandsExt, Timeout,
 };
 use crate::events::Event;
-use crate::manager::{Display, WindowManager, irect_from};
+use crate::manager::{Application, Display, WindowManager, irect_from};
 use crate::platform::{PlatformCallbacks, WorkspaceId};
 use crate::util::{read_screen_property, round_px};
 
@@ -36,7 +41,69 @@ impl Plugin for DisplayEventsPlugin {
         app.add_systems(Update, reconcile_displays)
             .add_observer(read_display_properties_trigger)
             .add_observer(cleanup_active_display_marker);
+        // Runs after the display set is reconciled: heals everything sleep
+        // may have broken (dead AX observers, stale drag state, poisoned
+        // ignore-lists). See `wake_recovery`.
+        app.add_systems(Update, wake_recovery.after(reconcile_displays));
     }
+}
+
+/// Heals sleep-induced drift on wake: AX notification subscriptions registered
+/// once at startup go deaf across lock/sleep (`CannotComplete` is never
+/// retried on the normal path), drag state from a pre-sleep gesture is stale,
+/// and the moved-window ignore-list may outlive the processes it belonged to.
+/// Display-set reconciliation itself is handled by `reconcile_displays`
+/// (ordered before this); strip re-homing is the layout audit's job.
+#[instrument(level = Level::DEBUG, skip_all)]
+fn wake_recovery(
+    mut messages: MessageReader<Event>,
+    mut apps: Query<&mut Application>,
+    windows: Windows,
+    held: Query<Entity, With<MouseHeldMarker>>,
+    mut drag_modifiers: ResMut<DragModifierState>,
+    mut ignored_windows: ResMut<IgnoredMovedWindows>,
+    mut commands: Commands,
+) {
+    if !messages
+        .read()
+        .any(|event| matches!(event, Event::SystemWoke { .. }))
+    {
+        return;
+    }
+    debug!("recovering observers and transient state after wake");
+
+    // Re-subscribe every app and window: a failed call only logs, the next
+    // wake (or relaunch path) retries.
+    for mut app in &mut apps {
+        if app.observe().is_err() {
+            warn!("wake recovery: re-observing application failed");
+        }
+    }
+    for (window, entity, child_of) in windows.managed_iter() {
+        let window_id = window.id();
+        match apps.get_mut(child_of.parent()) {
+            Ok(mut app) => {
+                if app.observe_window(window).is_err() {
+                    warn!("wake recovery: re-observing window {window_id} failed");
+                }
+            }
+            Err(err) => warn!("wake recovery: window {entity} has no parent app: {err}"),
+        }
+    }
+
+    // No button can still be held after a sleep cycle: drop stale holders
+    // (whose deferred reshuffle is meaningless now) and clear modifiers, so
+    // the next WindowMoved can never transfer on a dead gesture.
+    for holder in &held {
+        if let Ok(mut holder_commands) = commands.get_entity(holder) {
+            holder_commands.try_despawn();
+        }
+    }
+    drag_modifiers.current = crate::platform::Modifiers::empty();
+
+    // Entries may outlive their processes across a sleep cycle; the next
+    // activation re-probes anything still missing.
+    ignored_windows.0.clear();
 }
 
 #[instrument(level = Level::DEBUG, skip_all, fields(trigger))]

@@ -7,9 +7,10 @@ use bevy::ecs::lifecycle::Add;
 use bevy::ecs::message::MessageReader;
 use bevy::ecs::observer::On;
 use bevy::ecs::query::{Added, Has, With, Without};
+use bevy::ecs::resource::Resource;
 use bevy::ecs::schedule::IntoScheduleConfigs as _;
 use bevy::ecs::schedule::common_conditions::{not, resource_exists};
-use bevy::ecs::system::{Commands, Local, ParamSet, Populated, Query, Res, ResMut, Single};
+use bevy::ecs::system::{Commands, ParamSet, Populated, Query, Res, ResMut, Single};
 use bevy::time::common_conditions::on_timer;
 use std::collections::HashSet;
 use std::time::Duration;
@@ -34,6 +35,15 @@ use crate::manager::{Application, Display, Origin, Window, WindowManager};
 use crate::platform::{WinID, WorkspaceId};
 
 pub struct WorkspaceEventsPlugin;
+
+/// Window IDs that `detect_moved_windows` probed but could not resolve to a
+/// spawned window (stale AX data during startup bruteforce). Retried on later
+/// activations — but as a resource (not a `Local`) so the wake sweep can
+/// clear it: entries outlive the processes they belonged to, and would
+/// otherwise poison every future detection forever. Cleared when it grows
+/// past a bound, so a pathological app can never grow it without limit.
+#[derive(Resource, Default)]
+pub(crate) struct IgnoredMovedWindows(pub HashSet<WinID>);
 
 /// The strip, its origin, whether it's visible, and its saved position, as
 /// [`handle_virtual_window_moves`] needs them to slide a strip to/from its
@@ -105,6 +115,7 @@ impl Plugin for WorkspaceEventsPlugin {
                     .run_if(on_timer(DISPLAY_CHANGE_CHECK_FREQ)),
             ),
         );
+        app.init_resource::<IgnoredMovedWindows>();
         app.add_systems(PostUpdate, workspace_destroyed_handler);
         app.add_observer(cleanup_active_workspace_marker)
             .add_observer(cleanup_selected_space_marker);
@@ -300,7 +311,7 @@ fn detect_moved_windows(
     mut workspaces: Query<(&mut LayoutStrip, Entity, Has<NativeFullscreenMarker>)>,
     apps: Query<&mut Application>,
     window_manager: Res<WindowManager>,
-    mut ignored_windows: Local<HashSet<WinID>>,
+    mut ignored_windows: ResMut<IgnoredMovedWindows>,
     mut ctx: WindowCtx,
 ) {
     let Ok(workspace_id) = workspaces
@@ -331,7 +342,7 @@ fn detect_moved_windows(
     };
     // Skip known, but unmanaged windows.
     unresolved.retain(|window_id| {
-        !ignored_windows.contains(window_id) && ctx.windows.find(*window_id).is_none()
+        !ignored_windows.0.contains(window_id) && ctx.windows.find(*window_id).is_none()
     });
 
     if !unresolved.is_empty() {
@@ -349,8 +360,14 @@ fn detect_moved_windows(
             })
             .collect::<Vec<_>>();
         if retry_windows.is_empty() {
+            // Bound the set: a pathological app must not grow it without
+            // limit. Clearing loses nothing — genuinely missing windows are
+            // simply re-probed (and re-ignored) on the next activation.
+            if ignored_windows.0.len() > 4096 {
+                ignored_windows.0.clear();
+            }
             for id in unresolved_ids {
-                ignored_windows.insert(id);
+                ignored_windows.0.insert(id);
             }
         } else {
             debug!(
@@ -501,14 +518,14 @@ fn windows_not_in_strips<F: Fn(WinID) -> Option<Entity>>(
 
 #[instrument(level = Level::DEBUG, skip_all)]
 fn find_orphaned_workspaces(
-    orphans: Populated<(&LayoutStrip, Entity, &Timeout, Option<&ChildOf>), With<Timeout>>,
+    orphans: Populated<(&mut LayoutStrip, Entity, &Timeout, Option<&ChildOf>), With<Timeout>>,
     displays: Populated<(&Display, Entity)>,
     window_manager: Res<WindowManager>,
     mut commands: Commands,
 ) {
     let present = window_manager.present_displays();
 
-    for (orphan, orphan_entity, timeout, child) in orphans {
+    for (mut orphan, orphan_entity, timeout, child) in orphans {
         // Row 0 is the row every space is created with, so it is re-parented
         // like a populated strip: despawning it leaves the space numbered from
         // "2" with no row that any switch or reap path recreates.
@@ -532,12 +549,21 @@ fn find_orphaned_workspaces(
         }
 
         if timeout.timer.is_finished() {
-            // Rescue windows from orphaned strips before despawning by floating them.
+            // No display owns this space anymore: rescue the windows as
+            // floating, detach them, and drop the strip. Previously this
+            // re-floated every tick forever without ever despawning, a
+            // permanent column loss after unplug/sleep. Row 0 needs no
+            // special case: `reparent_existing_workspaces` recreates it on
+            // demand when a display returns.
             debug!("Rescue windows from timed out orphan {}.", orphan.id());
             for lost_window in orphan.all_windows() {
+                orphan.remove(lost_window);
                 if let Ok(mut cmd) = commands.get_entity(lost_window) {
                     cmd.try_insert(Unmanaged::Floating);
                 }
+            }
+            if let Ok(mut cmd) = commands.get_entity(orphan_entity) {
+                cmd.try_despawn();
             }
             continue;
         }

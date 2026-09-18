@@ -273,8 +273,15 @@ pub struct RepositionMarker(pub Origin);
 pub struct ResizeMarker(pub Size);
 
 /// Marker component indicating that windows around the marked entity need to be reshuffled.
+/// When `force` is set (window detach after a cross-display move), the
+/// reshuffle skips the `ManualStripOffset` keep and the hidden-ratio
+/// early-returns and always re-clamps the strip: the vacated slot must close
+/// even when the neighbour is already visible. Plain `false` for every other
+/// caller, which keeps the existing guards.
 #[derive(Component)]
-pub struct ReshuffleAroundMarker;
+pub struct ReshuffleAroundMarker {
+    pub force: bool,
+}
 
 /// Marker component requesting that the strip scroll *minimally* to keep the
 /// entity's NEW layout position inside the viewport. Unlike
@@ -519,6 +526,12 @@ pub trait SpawnCommandsExt {
 
     fn reshuffle_around(&mut self, entity: Entity);
 
+    /// Like [`SpawnCommandsExt::reshuffle_around`], but forces the strip
+    /// scroll to re-clamp even when the guards would otherwise keep it (see
+    /// [`ReshuffleAroundMarker::force`]). Used after a window leaves its
+    /// strip so the neighbour slides back into the vacated slot.
+    fn reshuffle_around_forced(&mut self, entity: Entity);
+
     fn ensure_visible(&mut self, entity: Entity);
 
     /// Like [`SpawnCommandsExt::ensure_visible`], but `snap` controls whether
@@ -562,7 +575,14 @@ impl SpawnCommandsExt for Commands<'_, '_> {
     #[instrument(level = Level::TRACE, skip(self))]
     fn reshuffle_around(&mut self, entity: Entity) {
         if let Ok(mut entity_commands) = self.get_entity(entity) {
-            entity_commands.try_insert(ReshuffleAroundMarker);
+            entity_commands.try_insert(ReshuffleAroundMarker { force: false });
+        }
+    }
+
+    #[instrument(level = Level::TRACE, skip(self))]
+    fn reshuffle_around_forced(&mut self, entity: Entity) {
+        if let Ok(mut entity_commands) = self.get_entity(entity) {
+            entity_commands.try_insert(ReshuffleAroundMarker { force: true });
         }
     }
 

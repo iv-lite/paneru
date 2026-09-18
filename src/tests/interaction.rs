@@ -2232,7 +2232,7 @@ fn test_reshuffle_leftmost_pins_strip_to_left_edge_with_stale_frame() {
             )));
             e.remove::<RepositionMarker>();
             // Trigger a reshuffle around the leftmost window, as focus would.
-            e.insert(ReshuffleAroundMarker);
+            e.insert(ReshuffleAroundMarker { force: false });
         }
     }
 

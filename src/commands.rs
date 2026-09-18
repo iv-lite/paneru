@@ -1234,6 +1234,8 @@ fn move_focused_window_to_display(
 /// Removes `entity` from `strip`, reshuffling a neighbour into its place so
 /// the source display retiles. Returns the neighbour for follow-up focus
 /// handling. Shared by the keyboard display-move and mouse-drag paths.
+/// The reshuffle is forced: the vacated slot must close even when the
+/// neighbour is already visible (hidden-ratio) or carries a manual offset.
 pub(crate) fn detach_window_from_strip(
     entity: Entity,
     strip: &mut LayoutStrip,
@@ -1244,7 +1246,7 @@ pub(crate) fn detach_window_from_strip(
         .or_else(|| strip.right_neighbour(entity));
     strip.remove(entity);
     if let Some(neighbour) = neighbour {
-        commands.reshuffle_around(neighbour);
+        commands.reshuffle_around_forced(neighbour);
     }
     neighbour
 }

@@ -85,6 +85,12 @@ type ResizableWindows<'w, 's> = Query<
 >;
 
 const ANIAMTE_SNAP_THRESHOLD: f32 = 5.0;
+
+/// Cap for animation time steps. A main-thread stall (synchronous AX IPC)
+/// must shed time instead of teleporting: without the cap the next
+/// `ease_out_factor` evaluates near 1.0 and the window jumps. Matches the
+/// scroll integrator's step cap.
+const MAX_ANIMATION_DT_SECS: f64 = 1.0 / 30.0;
 const LOOP_MAX_TIMEOUT_FRAME_ACTIVE_MS: u32 = 16;
 const LOOP_MAX_TIMEOUT_LOWPOWER_MS: u32 = 2000;
 // Real events (input, IPC, workspace changes, ...) wake the pump immediately
@@ -623,7 +629,8 @@ pub(super) fn animate_entities(
 ) {
     // Frame-rate-independent exponential smoothing (ease-out).
     // `animation_speed` is the decay rate (per second); higher = snappier.
-    let t = ease_out_factor(config.animation_speed(), time.delta_secs_f64());
+    let dt = time.delta_secs_f64().min(MAX_ANIMATION_DT_SECS);
+    let t = ease_out_factor(config.animation_speed(), dt);
     let display_bounds: Vec<IRect> = displays.iter().map(Display::bounds).collect();
 
     animate.into_iter().for_each(
@@ -684,7 +691,8 @@ pub(super) fn animate_resize_entities(
     mut commands: Commands,
 ) {
     // Matches animate_entities: exponential ease-out, frame-rate independent.
-    let t = ease_out_factor(config.animation_speed(), time.delta_secs_f64());
+    let dt = time.delta_secs_f64().min(MAX_ANIMATION_DT_SECS);
+    let t = ease_out_factor(config.animation_speed(), dt);
 
     animate
         .into_iter()
@@ -1196,10 +1204,27 @@ pub(super) fn commit_window_position(
 
 #[instrument(level = Level::TRACE, skip_all)]
 pub(super) fn verify_window_position(
-    mut windows: Populated<(Entity, &mut Window, &Position, &mut VerifyWindowPosition)>,
+    mut windows: Populated<(
+        Entity,
+        &mut Window,
+        &Position,
+        &mut VerifyWindowPosition,
+        Has<RepositionMarker>,
+    )>,
     mut commands: Commands,
 ) {
-    for (entity, mut window, position, mut verification) in &mut windows {
+    for (entity, mut window, position, mut verification, repositioning) in &mut windows {
+        // While the animator is driving, re-pushing the target fights it and
+        // the optimistic frame already matches: only confirm once it lands.
+        // The lifetime still ticks so a stuck animation can't leak the marker.
+        if repositioning {
+            if verification.tick()
+                && let Ok(mut entity_commands) = commands.get_entity(entity)
+            {
+                entity_commands.try_remove::<VerifyWindowPosition>();
+            }
+            continue;
+        }
         if window
             .update_frame()
             .is_ok_and(|frame| frame.min == position.0)

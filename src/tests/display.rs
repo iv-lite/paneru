@@ -6,9 +6,11 @@ use bevy::time::TimeUpdateStrategy;
 use crate::commands::{Command, Direction, MouseMove, MoveFocus, Operation};
 use crate::config::{Config, MainOptions};
 use crate::ecs::layout::{LayoutStrip, PARKED_STRIP_SLIVER};
-use crate::ecs::mouse::DropPreviewState;
+use crate::ecs::mouse::{DragModifierState, DropPreviewState};
+use crate::ecs::workspace::IgnoredMovedWindows;
 use crate::ecs::{
-    ActiveDisplayMarker, DockPosition, Position, RepositionMarker, SpawnWindowTrigger, Timeout,
+    ActiveDisplayMarker, DockPosition, MouseHeldMarker, Position, RepositionMarker,
+    SpawnWindowTrigger, Timeout,
 };
 use crate::events::Event;
 use crate::manager::{Display, Origin, Size, Window};
@@ -1888,4 +1890,163 @@ fn test_drop_preview_hides_on_release() {
             );
         })
         .run(commands);
+}
+
+/// Moving the first window to another display must close the gap: the right
+/// neighbour slides back into the vacated slot on the source strip.
+#[test]
+fn test_next_display_closes_source_gap() {
+    let commands = vec![
+        Event::MenuOpened { window_id: 0 },
+        Event::Command {
+            command: Command::PrintState,
+        },
+        Event::Command {
+            command: Command::Window(Operation::ToNextDisplay(MoveFocus::Follow)),
+        },
+        Event::Command {
+            command: Command::PrintState,
+        },
+    ];
+
+    TestHarness::new()
+        .with_windows(3)
+        .with_display(
+            EXT_DISPLAY_ID,
+            IRect::new(0, -EXT_DISPLAY_HEIGHT, EXT_DISPLAY_WIDTH, 0),
+            vec![EXT_WORKSPACE_ID],
+        )
+        .on_iteration(2, move |world, _state| {
+            assert_on_workspace!(world, 0, EXT_WORKSPACE_ID);
+            assert_not_on_workspace!(world, 0, TEST_WORKSPACE_ID);
+            // Window 1 took window 0's slot at the strip origin.
+            let entity = find_window_entity(1, world);
+            let position = world.get::<Position>(entity).expect("need position").0;
+            assert_eq!(position, Origin::new(0, TEST_MENUBAR_HEIGHT));
+            let entity = find_window_entity(2, world);
+            let position = world.get::<Position>(entity).expect("need position").0;
+            assert_eq!(
+                position,
+                Origin::new(TEST_WINDOW_WIDTH, TEST_MENUBAR_HEIGHT)
+            );
+        })
+        .run(commands);
+}
+
+/// Moving the last window away from a scrolled strip must re-clamp the
+/// scroll: no trailing empty space may remain on the source display.
+#[test]
+fn test_next_display_reclamps_scrolled_source_strip() {
+    let commands = vec![
+        Event::MenuOpened { window_id: 0 },
+        Event::Command {
+            command: Command::Window(Operation::Focus(Direction::Last)),
+        },
+        Event::Command {
+            command: Command::Window(Operation::ToNextDisplay(MoveFocus::Follow)),
+        },
+        Event::Command {
+            command: Command::PrintState,
+        },
+    ];
+
+    TestHarness::new()
+        .with_windows(5)
+        .with_display(
+            EXT_DISPLAY_ID,
+            IRect::new(0, -EXT_DISPLAY_HEIGHT, EXT_DISPLAY_WIDTH, 0),
+            vec![EXT_WORKSPACE_ID],
+        )
+        .on_iteration(3, move |world, _state| {
+            assert_on_workspace!(world, 4, EXT_WORKSPACE_ID);
+            // 4 windows @ 400px remain on a 1024px display: the scroll must
+            // sit exactly at the clamp so the last column touches the right
+            // edge with no trailing gap.
+            let entity = find_window_entity(3, world);
+            let mut strips = world.query::<(&LayoutStrip, &Position)>();
+            let (_, position) = strips
+                .iter(world)
+                .find(|(strip, _)| strip.contains(entity))
+                .expect("need source strip");
+            assert_eq!(position.0.x, TEST_DISPLAY_WIDTH - 4 * TEST_WINDOW_WIDTH);
+        })
+        .run(commands);
+}
+
+/// Wake recovery heals sleep-induced staleness: the moved-window ignore-list
+/// is cleared, drag modifiers reset, and dead held-markers despawned.
+#[test]
+fn test_wake_recovery_clears_transient_state() {
+    let mut harness = TestHarness::new().with_windows(1);
+    harness.app.update();
+
+    let world = harness.world();
+    let entity = find_window_entity(0, world);
+    world.spawn((MouseHeldMarker(entity),));
+    world.resource_mut::<DragModifierState>().current = Modifiers::ALT;
+    world
+        .resource_mut::<IgnoredMovedWindows>()
+        .0
+        .insert(987_654);
+
+    let commands = vec![Event::SystemWoke { msg: String::new() }];
+    harness
+        .on_iteration(0, move |world, _state| {
+            assert!(
+                world.resource::<IgnoredMovedWindows>().0.is_empty(),
+                "wake must clear the moved-window ignore-list"
+            );
+            assert_eq!(
+                world.resource::<DragModifierState>().current,
+                Modifiers::empty(),
+                "wake must reset drag modifiers"
+            );
+            assert!(
+                world
+                    .query_filtered::<Entity, With<MouseHeldMarker>>()
+                    .iter(world)
+                    .next()
+                    .is_none(),
+                "wake must despawn stale held-markers"
+            );
+        })
+        .run(commands);
+}
+
+/// A managed window sitting on the wrong display for two consecutive audit
+/// ticks is re-homed to that display's strip. The displaced window must be
+/// unfocused: focusing it would (correctly) yank it back via reshuffle.
+/// Transient displacements settle before the second sighting and never move.
+#[test]
+fn test_audit_rehomes_window_on_wrong_display() {
+    let mut harness = TestHarness::new().with_windows(2).with_display(
+        EXT_DISPLAY_ID,
+        IRect::new(0, -EXT_DISPLAY_HEIGHT, EXT_DISPLAY_WIDTH, 0),
+        vec![EXT_WORKSPACE_ID],
+    );
+    // Settle focus on window 0 so nothing focus-driven touches window 1.
+    harness.run(vec![
+        Event::MenuOpened { window_id: 0 },
+        Event::Command {
+            command: Command::PrintState,
+        },
+    ]);
+
+    // Displace unfocused window 1 onto the external display without touching
+    // its strip membership. Pure position changes no longer re-run layout,
+    // so it sits until the audit sees it twice.
+    let world = harness.world();
+    let entity = find_window_entity(1, world);
+    world
+        .entity_mut(entity)
+        .insert(Position(Origin::new(100, -1000)));
+
+    // First audit period: sighting parked, no move. Second audit period:
+    // re-homed to the external strip.
+    harness.advance(Duration::from_secs(6));
+    harness.advance(Duration::from_secs(6));
+
+    let world = harness.world();
+    assert_on_workspace!(world, 1, EXT_WORKSPACE_ID);
+    assert_not_on_workspace!(world, 1, TEST_WORKSPACE_ID);
 }
