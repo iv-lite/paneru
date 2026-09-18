@@ -1,0 +1,36 @@
+name: cache-warmup
+
+# Keeps the release-profile compiler caches warm so tag/dispatch builds
+# hit instead of compiling all dependencies cold. The dev profile is warmed
+# by every push (test job); this exists only to feed the release compiler.
+# GHA caches evict after 7 days of disuse, hence the weekly heartbeat.
+on:
+  schedule:
+    - cron: "0 6 * * 1"
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+env:
+  CARGO_TERM_COLOR: always
+  SCCACHE_GHA_ENABLED: "true"
+  RUSTC_WRAPPER: "sccache"
+  CMAKE_C_COMPILER_LAUNCHER: "sccache"
+
+jobs:
+  warm-release-cache:
+    runs-on: macos-latest
+    timeout-minutes: 60
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: mozilla-actions/sccache-action@v0.0.9
+      - uses: Swatinem/rust-cache@v2
+        with:
+          shared-key: "paneru-build"
+          cache-on-failure: true
+      - name: Build the release binary
+        run: cargo build --release --bin paneru
+      - name: Show sccache stats
+        run: sccache --show-stats
