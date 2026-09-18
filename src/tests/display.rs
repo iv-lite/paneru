@@ -2345,3 +2345,58 @@ fn test_armed_drag_warps_across_diagonal_displays() {
         })
         .run(commands);
 }
+
+/// With `window_hidden_ratio` at max (lazy expose), an armed drag must still
+/// arm and transfer: the ratio gates click-reshuffles, never drag tracking.
+#[test]
+fn test_hidden_ratio_max_still_arms_drag_transfer() {
+    let config: Config = (
+        MainOptions {
+            mouse_drag_display_modifier: Some(Modifiers::ALT),
+            window_hidden_ratio: Some(1.0),
+            ..Default::default()
+        },
+        vec![],
+    )
+        .into();
+    // Window 0 tiles into slot (0, 20); grab its center while holding Alt,
+    // then drag straight up past the external display's bottom edge (y 0).
+    let grab = CGPoint::new(200.0, 500.0);
+    let commands = vec![
+        Event::MenuOpened { window_id: 0 },
+        Event::Command {
+            command: Command::PrintState,
+        },
+        Event::Command {
+            command: Command::PrintState,
+        },
+        Event::MouseDown {
+            point: grab,
+            modifiers: Modifiers::ALT,
+        },
+        Event::MouseDragged {
+            point: CGPoint::new(200.0, 0.0),
+            modifiers: Modifiers::ALT,
+        },
+        Event::Command {
+            command: Command::PrintState,
+        },
+        Event::Command {
+            command: Command::PrintState,
+        },
+    ];
+
+    TestHarness::new()
+        .with_config(config)
+        .with_windows(1)
+        .with_display(
+            EXT_DISPLAY_ID,
+            IRect::new(0, -EXT_DISPLAY_HEIGHT, EXT_DISPLAY_WIDTH, 0),
+            vec![EXT_WORKSPACE_ID],
+        )
+        .on_iteration(5, move |world, _state| {
+            assert_on_workspace!(world, 0, EXT_WORKSPACE_ID);
+            assert_not_on_workspace!(world, 0, TEST_WORKSPACE_ID);
+        })
+        .run(commands);
+}

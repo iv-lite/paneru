@@ -283,36 +283,37 @@ fn mouse_down_trigger(
             }
         }
 
+        // The holder is always tracked: display-drag arming, the adoption
+        // pin and drop homing all key off it. Only the click-reshuffle on
+        // release honors the hidden ratio (see `mouse_up_trigger`).
         if config.window_hidden_ratio() >= 1.0 {
-            // At max hidden ratio, never reshuffle on click.
             debug!(
-                "mouse down on window {}: holding without arming (hidden ratio >= 1.0)",
+                "mouse down on window {}: tracking without click-reshuffle (hidden ratio >= 1.0)",
                 window.id()
             );
+        }
+        // Defer reshuffle until mouse-up so the window doesn't shift
+        // mid-click. The Timeout auto-despawns if mouse-up is lost.
+        let timeout = Timeout::new(Duration::from_secs(5), None, &mut commands);
+        let mut holder = commands.spawn((MouseHeldMarker(entity), timeout));
+        // Arm display transfer only for the grab-time conjunction the
+        // user asked for: shortcut held while left-clicking a window.
+        // This holder defines the drag target; pressing the shortcut
+        // later in the drag never arms.
+        if config
+            .mouse_drag_display_modifier()
+            .is_some_and(|required| required.matches(*modifiers))
+        {
+            debug!(
+                "mouse drag armed on window {} with modifiers {modifiers:?}",
+                window.id()
+            );
+            holder.try_insert(DragDisplayArmed);
         } else {
-            // Defer reshuffle until mouse-up so the window doesn't shift
-            // mid-click. The Timeout auto-despawns if mouse-up is lost.
-            let timeout = Timeout::new(Duration::from_secs(5), None, &mut commands);
-            let mut holder = commands.spawn((MouseHeldMarker(entity), timeout));
-            // Arm display transfer only for the grab-time conjunction the
-            // user asked for: shortcut held while left-clicking a window.
-            // This holder defines the drag target; pressing the shortcut
-            // later in the drag never arms.
-            if config
-                .mouse_drag_display_modifier()
-                .is_some_and(|required| required.matches(*modifiers))
-            {
-                debug!(
-                    "mouse drag armed on window {} with modifiers {modifiers:?}",
-                    window.id()
-                );
-                holder.try_insert(DragDisplayArmed);
-            } else {
-                debug!(
-                    "mouse down on window {}: held without arming (modifiers {modifiers:?} do not match drag shortcut)",
-                    window.id()
-                );
-            }
+            debug!(
+                "mouse down on window {}: held without arming (modifiers {modifiers:?} do not match drag shortcut)",
+                window.id()
+            );
         }
     }
 }
@@ -376,6 +377,13 @@ fn mouse_up_trigger(
                     marker.0
                 );
                 commands.reposition_entity(marker.0, home);
+            } else if config.window_hidden_ratio() >= 1.0 {
+                // At max hidden ratio, clicks never reshuffle — but drop
+                // homing above still runs, so dangling drops glide home.
+                debug!(
+                    "mouse up: click release on {}, reshuffle suppressed (hidden ratio >= 1.0)",
+                    marker.0
+                );
             } else {
                 debug!("mouse up: click release on {}, reshuffling", marker.0);
                 commands.reshuffle_around(marker.0);
