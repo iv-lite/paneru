@@ -6,7 +6,9 @@ use bevy::time::TimeUpdateStrategy;
 use crate::commands::{Command, Direction, MouseMove, MoveFocus, Operation};
 use crate::config::{Config, MainOptions};
 use crate::ecs::layout::{LayoutStrip, PARKED_STRIP_SLIVER};
-use crate::ecs::{ActiveDisplayMarker, DockPosition, Position, Timeout};
+use crate::ecs::{
+    ActiveDisplayMarker, DockPosition, Position, RepositionMarker, SpawnWindowTrigger, Timeout,
+};
 use crate::events::Event;
 use crate::manager::{Display, Origin, Size, Window};
 use crate::platform::Modifiers;
@@ -1248,6 +1250,64 @@ fn test_audit_repairs_duplicate_membership() {
         .count();
     assert_eq!(count, 1, "audit must leave exactly one membership");
     assert_on_workspace!(world, 0, TEST_WORKSPACE_ID);
+}
+
+/// Windows spawn with scattered OS positions; the first layout pass must
+/// snap them straight into their columns — never slide them across the
+/// screen (or across displays) into place.
+#[test]
+fn test_startup_snaps_scattered_windows_to_columns() {
+    // Slow animation so a slide would still be visibly in flight (marker
+    // present, positions off-slot) after the first command window — the snap
+    // guards must place everything instantly regardless.
+    let config: Config = (
+        MainOptions {
+            animation_speed: Some(0.5),
+            ..Default::default()
+        },
+        vec![],
+    )
+        .into();
+
+    let mut harness = TestHarness::new().with_config(config);
+    // Same-display scatter: inside the viewport and under the offscreen-move
+    // threshold, so only the startup snap guards (not the seam snap or the
+    // offscreen heuristic) can place these instantly.
+    let scattered = [(0, Origin::new(600, 500)), (1, Origin::new(900, 300))];
+    let spawned = scattered
+        .iter()
+        .map(|(id, origin)| {
+            let frame = IRect::from_corners(*origin, *origin + Size::new(400, 100));
+            harness
+                .mock_state
+                .spawn_window(TEST_PROCESS_ID, TEST_WORKSPACE_ID, *id, frame)
+        })
+        .collect::<Vec<_>>();
+    harness.world().trigger(SpawnWindowTrigger(spawned));
+
+    let commands = vec![Event::Command {
+        command: Command::PrintState,
+    }];
+
+    harness
+        .on_iteration(0, move |world, _state| {
+            for (id, x) in [(0, 0), (1, 400)] {
+                let entity = find_window_entity(id, world);
+                let position = world.get::<Position>(entity).expect("need position").0;
+                assert_eq!(
+                    position,
+                    Origin::new(x, TEST_MENUBAR_HEIGHT),
+                    "window {id} must start in its column"
+                );
+                assert!(
+                    world.get::<RepositionMarker>(entity).is_none(),
+                    "window {id} must snap on startup, not animate into place"
+                );
+            }
+            assert_on_workspace!(world, 0, TEST_WORKSPACE_ID);
+            assert_on_workspace!(world, 1, TEST_WORKSPACE_ID);
+        })
+        .run(commands);
 }
 
 /// A foreign move with no held button is adopted and then re-tiled back onto

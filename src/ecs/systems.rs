@@ -269,7 +269,12 @@ pub(crate) fn finish_setup(
     windows: Windows,
     applications: Query<&Application>,
     mut bruteforce_tasks: Query<(Entity, &mut BruteforceWindows)>,
-    mut workspaces: Query<(&mut LayoutStrip, Has<ActiveWorkspaceMarker>, &ChildOf)>,
+    mut workspaces: Query<(
+        Entity,
+        &mut LayoutStrip,
+        Has<ActiveWorkspaceMarker>,
+        &ChildOf,
+    )>,
     window_manager: Res<WindowManager>,
     mut commands: Commands,
 ) {
@@ -298,7 +303,7 @@ pub(crate) fn finish_setup(
     );
 
     let mut focused_managed_window = false;
-    for (mut strip, active_strip, _) in &mut workspaces {
+    for (_strip_entity, mut strip, active_strip, _) in &mut workspaces {
         debug!("space {}: before refresh {strip:?}", strip.id());
         let workspace_windows = window_manager
             .windows_in_workspace(strip.id())
@@ -343,6 +348,13 @@ pub(crate) fn finish_setup(
             commands.focus_entity(entity, true);
             focused_managed_window = true;
         }
+    }
+
+    // Snap every strip into place on the first layout pass: windows spawn
+    // with scattered OS positions, and without a guard they would slide
+    // across the screen (and across displays) into their slots.
+    for (strip_entity, _, _, _) in &workspaces {
+        crate::ecs::workspace::spawn_snap_strip_guard(strip_entity, &mut commands);
     }
 
     // An all-floating workspace has no strip member to receive the initial

@@ -557,6 +557,11 @@ pub(super) fn restore_window_state(
         if !is_global_active {
             spawned.insert(previous);
         }
+
+        // Snap restored windows into their slots on the first layout pass,
+        // like fresh-launch windows (see `finish_setup`).
+        super::workspace::spawn_snap_strip_guard(spawned.id(), &mut ctx.commands);
+
         restored_strips += 1;
     }
 
