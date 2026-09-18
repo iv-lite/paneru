@@ -785,6 +785,21 @@ impl Config {
         self.options().auto_center.is_some_and(|center| center)
     }
 
+    pub fn center_single_column(&self) -> bool {
+        self.options()
+            .center_single_column
+            .is_some_and(|center| center)
+    }
+
+    /// Default width ratio for newly managed windows, if set. Clamped to
+    /// `(0.0, 1.0]`; non-positive values behave as unset.
+    pub fn default_ratio(&self) -> Option<f64> {
+        self.options()
+            .default_ratio
+            .filter(|ratio| *ratio > 0.0)
+            .map(|ratio| ratio.min(1.0))
+    }
+
     pub fn horizontal_mouse_warp(&self) -> Option<i16> {
         self.options().horizontal_mouse_warp
     }
@@ -1195,6 +1210,15 @@ pub struct MainOptions {
     pub animation_speed: Option<f64>,
     /// Automatically center the window when switching focus with keyboard.
     pub auto_center: Option<bool>,
+    /// Automatically center a lone column: when a strip holds exactly one
+    /// column narrower than the viewport, it is centered instead of pinned
+    /// to the left edge. Default: false (left-pin).
+    pub center_single_column: Option<bool>,
+    /// Default width ratio (fraction of the viewport width) for newly
+    /// managed windows. An explicit per-window rule `width` still wins;
+    /// unset means new windows keep their OS-given size. Clamped to
+    /// (0.0, 1.0]. Default: none.
+    pub default_ratio: Option<f64>,
     /// Height of off-screen window slivers as a ratio (0.0–1.0) of the display height.
     /// Lower values hide the window's corner radius at screen edges.
     /// Default: 1.0 (full height).

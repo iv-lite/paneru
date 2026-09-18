@@ -270,7 +270,14 @@ fn apply_snap_force(
     const CENTER_MAGNETIC_FORCE: f64 = 10.0;
     const SNAP_DISPLAY_RATIO: f64 = 0.45;
 
-    if !config.auto_center() {
+    // With `center_single_column`, a lone column gets the same magnetic
+    // centering so a swipe can't leave it off-center; the nearest-column
+    // math below reduces to centering the single column.
+    // Magnetic centering runs under `auto_center`; `center_single_column`
+    // extends it to lone columns only (the nearest-column math below then
+    // reduces to centering the single column, so a swipe can't leave it
+    // off-center).
+    if !(config.auto_center() || (config.center_single_column() && strip.0.len() == 1)) {
         return;
     }
 

@@ -784,7 +784,7 @@ pub(super) fn window_managed_trigger(
     {
         let properties = WindowProperties::new(app, window, &ctx.config);
 
-        if let Some(width_ratio) = properties.width_ratio() {
+        if let Some(width_ratio) = properties.width_ratio().or(ctx.config.default_ratio()) {
             let (_, pad_right, _, pad_left) = ctx.config.edge_padding();
             let padded_width = display_bounds.width() - pad_left - pad_right;
             let width = round_px(f64::from(padded_width) * width_ratio);
@@ -1147,18 +1147,22 @@ pub(super) fn apply_window_defaults(
         // Apply configured width AFTER update_frame so it isn't overwritten.
         // Use padded display width (matching window_resize command behavior).
         // Safe during init: this only resizes, it doesn't reposition, so a
-        // window on an inactive display stays put.
-        if let Some(width) = properties.width_ratio() {
+        // window on an inactive display stays put. An explicit per-window
+        // rule wins; otherwise the global default ratio applies.
+        if let Some(width) = properties.width_ratio().or(config.default_ratio()) {
             _ = window.update_frame().inspect_err(|err| error!("{err}"));
-            let bounds = active_display.actual_bounds(&config);
+            let viewport = active_display.actual_bounds(&config);
             let (_, pad_right, _, pad_left) = config.edge_padding();
-            let padded_width = bounds.width() - pad_left - pad_right;
+            let padded_width = viewport.width() - pad_left - pad_right;
             let new_width = round_px(f64::from(padded_width) * width);
             let height = window.frame().height();
             window.resize(Size::new(new_width, height));
             // Re-read the actual OS size: the app may enforce a minimum width
             // that differs from our request.
             _ = window.update_frame().inspect_err(|err| error!("{err}"));
+            // Sync the ECS components so first layout echoes the requested
+            // width instead of the stale OS size.
+            bounds.0 = Size::new(window.frame().width(), bounds.0.y);
         }
     }
 }

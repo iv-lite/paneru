@@ -30,6 +30,8 @@ General behavior settings for the window manager.
 | `preset_stack_heights` | Array (Float) | `[0.25, 0.33, 0.5, 0.66, 0.75]` | Ratios of the viewport height used by the `window_vertical_resize` command. Only applies to windows inside a stack; every window in the column is kept at least 200px tall, so a ratio that would starve a neighbour is clamped. |
 | `animation_speed` | Float | *None* | Speed of window animations. Comfortable range is from 8 to 20. Unset or set to a very high value to effectively disable animations. |
 | `auto_center` | Boolean | `false` | Automatically center the focused window on the screen when switching focus. |
+| `center_single_column` | Boolean | `false` | When a strip holds exactly one column narrower than the viewport, center it instead of pinning it to the left edge. Multi-column strips are unaffected. |
+| `default_ratio` | Float (0.0–1.0) | *None* | Default width ratio (fraction of the viewport width) for newly managed windows, e.g. `0.5` starts windows at half the viewport width. An explicit per-window rule `width` still wins; unset means new windows keep their OS-given size. Applies on first spawn and when a window is re-managed. |
 | `sliver_height` | Float (0.1–1.0) | `1.0` | Vertical ratio of off-screen windows kept visible to prevent macOS from relocating them. |
 | `sliver_width` | Integer (px) | `5` | Horizontal width of off-screen windows kept visible. Slivers physically sit past the viewport edge, so on abutting displays a few pixels remain visible on the neighbor; set to `0` to hide them entirely. |
 | `menubar_height` | Integer (px) | *Auto* | Manually override the detected macOS menubar height. |

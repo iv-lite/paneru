@@ -1221,28 +1221,37 @@ fn reshuffle_layout_strip(
             // window must touch the left edge and the rightmost the right edge
             // if more than 1 windows in workspace. Always enforced when
             // forced, so no trailing empty space survives a removal.
-            if (force || (!config.auto_center() && !config.continuous_swipe()))
-                && let Some(total_strip_width) = strip
-                    .last()
-                    .ok()
-                    .and_then(|column| column.top())
-                    .and_then(|last| {
-                        windows
-                            .layout_position(last)
-                            .map(|position| position.0.x)
-                            .zip(windows.moving_frame(last).map(|frame| frame.width()))
-                    })
-                    .map(|(last_x, last_width)| last_x + last_width)
+            // A lone column with `center_single_column` is centered instead
+            // of left-pinned, regardless of the swipe/center gates — it has
+            // no neighbour to anchor against, so there is nothing to fight.
+            if let Some(total_strip_width) = strip
+                .last()
+                .ok()
+                .and_then(|column| column.top())
+                .and_then(|last| {
+                    windows
+                        .layout_position(last)
+                        .map(|position| position.0.x)
+                        .zip(windows.moving_frame(last).map(|frame| frame.width()))
+                })
+                .map(|(last_x, last_width)| last_x + last_width)
             {
-                strip_position.x = if display_bounds.width() < total_strip_width {
-                    strip_position.x.clamp(
-                        display_bounds.max.x - total_strip_width,
-                        display_bounds.min.x,
-                    )
-                } else {
+                let apply_invariant =
+                    force || (!config.auto_center() && !config.continuous_swipe());
+                if display_bounds.width() < total_strip_width {
+                    if apply_invariant {
+                        strip_position.x = strip_position.x.clamp(
+                            display_bounds.max.x - total_strip_width,
+                            display_bounds.min.x,
+                        );
+                    }
+                } else if config.center_single_column() && strip.len() == 1 {
+                    strip_position.x =
+                        display_bounds.min.x + (display_bounds.width() - total_strip_width) / 2;
+                } else if apply_invariant {
                     // Strip fits entirely: pin the leftmost window to the left edge.
-                    display_bounds.min.x
-                };
+                    strip_position.x = display_bounds.min.x;
+                }
             }
 
             // Check how much of the window is hidden. Slivers don't count as

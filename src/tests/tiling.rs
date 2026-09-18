@@ -607,3 +607,211 @@ fn window_exists(world: &mut World, id: i32) -> bool {
     let mut query = world.query::<&crate::manager::Window>();
     query.iter(world).any(|window| window.id() == id)
 }
+
+#[test]
+fn test_default_ratio_sizes_new_windows() {
+    let config: Config = (
+        MainOptions {
+            default_ratio: Some(0.5),
+            ..Default::default()
+        },
+        vec![],
+    )
+        .into();
+    let commands = vec![
+        Event::MenuOpened { window_id: 0 },
+        Event::Command {
+            command: Command::PrintState,
+        },
+    ];
+
+    TestHarness::new()
+        .with_config(config)
+        .with_windows(1)
+        .on_iteration(1, |world, _state| {
+            // Half the 1024px viewport; height still comes from layout.
+            assert_window_size!(world, 0, 512, TEST_DISPLAY_HEIGHT - TEST_MENUBAR_HEIGHT);
+            assert_window_at!(world, 0, 0, TEST_MENUBAR_HEIGHT);
+        })
+        .run(commands);
+}
+
+#[test]
+fn test_default_ratio_explicit_rule_wins() {
+    let mut params = WindowParams::new(".*", None);
+    params.width = Some(0.75);
+    let config: Config = (
+        MainOptions {
+            default_ratio: Some(0.5),
+            ..Default::default()
+        },
+        vec![params],
+    )
+        .into();
+    let commands = vec![
+        Event::MenuOpened { window_id: 0 },
+        Event::Command {
+            command: Command::PrintState,
+        },
+    ];
+
+    TestHarness::new()
+        .with_config(config)
+        .with_windows(1)
+        .on_iteration(1, |world, _state| {
+            assert_window_size!(world, 0, 768, TEST_DISPLAY_HEIGHT - TEST_MENUBAR_HEIGHT);
+        })
+        .run(commands);
+}
+
+#[test]
+fn test_default_ratio_applies_on_remanage() {
+    let config: Config = (
+        MainOptions {
+            default_ratio: Some(0.5),
+            ..Default::default()
+        },
+        vec![],
+    )
+        .into();
+    let commands = vec![
+        Event::MenuOpened { window_id: 0 },
+        Event::Command {
+            command: Command::Window(Operation::Manage),
+        },
+        Event::Command {
+            command: Command::Window(Operation::Manage),
+        },
+        Event::Command {
+            command: Command::PrintState,
+        },
+    ];
+
+    TestHarness::new()
+        .with_config(config)
+        .with_windows(1)
+        .on_iteration(3, |world, _state| {
+            assert_window_size!(world, 0, 512, TEST_DISPLAY_HEIGHT - TEST_MENUBAR_HEIGHT);
+        })
+        .run(commands);
+}
+
+#[test]
+fn test_center_single_column_centers_lone_window() {
+    let config: Config = (
+        MainOptions {
+            center_single_column: Some(true),
+            ..Default::default()
+        },
+        vec![],
+    )
+        .into();
+    let commands = vec![
+        Event::MenuOpened { window_id: 0 },
+        Event::Command {
+            command: Command::PrintState,
+        },
+        Event::Command {
+            command: Command::PrintState,
+        },
+    ];
+
+    TestHarness::new()
+        .with_config(config)
+        .with_windows(1)
+        .on_iteration(2, |world, _state| {
+            // (1024 - 400) / 2 = 312.
+            assert_window_at!(world, 0, 312, TEST_MENUBAR_HEIGHT);
+        })
+        .run(commands);
+}
+
+#[test]
+fn test_center_single_column_off_stays_left_pinned() {
+    let commands = vec![
+        Event::MenuOpened { window_id: 0 },
+        Event::Command {
+            command: Command::PrintState,
+        },
+        Event::Command {
+            command: Command::PrintState,
+        },
+    ];
+
+    TestHarness::new()
+        .with_windows(1)
+        .on_iteration(2, |world, _state| {
+            assert_window_at!(world, 0, 0, TEST_MENUBAR_HEIGHT);
+        })
+        .run(commands);
+}
+
+#[test]
+fn test_center_single_column_ignores_multi_column_strips() {
+    let config: Config = (
+        MainOptions {
+            center_single_column: Some(true),
+            ..Default::default()
+        },
+        vec![],
+    )
+        .into();
+    let commands = vec![
+        Event::MenuOpened { window_id: 0 },
+        Event::Command {
+            command: Command::PrintState,
+        },
+        Event::Command {
+            command: Command::PrintState,
+        },
+    ];
+
+    TestHarness::new()
+        .with_config(config)
+        .with_windows(2)
+        .on_iteration(2, |world, _state| {
+            assert_window_at!(world, 0, 0, TEST_MENUBAR_HEIGHT);
+            assert_window_at!(world, 1, TEST_WINDOW_WIDTH, TEST_MENUBAR_HEIGHT);
+        })
+        .run(commands);
+}
+
+#[test]
+fn test_center_single_column_detach_lands_centered() {
+    use crate::commands::MoveFocus;
+
+    let config: Config = (
+        MainOptions {
+            center_single_column: Some(true),
+            ..Default::default()
+        },
+        vec![],
+    )
+        .into();
+    let commands = vec![
+        Event::MenuOpened { window_id: 0 },
+        Event::Command {
+            command: Command::Window(Operation::ToNextDisplay(MoveFocus::Follow)),
+        },
+        Event::Command {
+            command: Command::PrintState,
+        },
+        Event::Command {
+            command: Command::PrintState,
+        },
+    ];
+
+    TestHarness::new()
+        .with_config(config)
+        .with_windows(2)
+        .with_display(
+            EXT_DISPLAY_ID,
+            IRect::new(0, -EXT_DISPLAY_HEIGHT, EXT_DISPLAY_WIDTH, 0),
+            vec![EXT_WORKSPACE_ID],
+        )
+        .on_iteration(3, |world, _state| {
+            // Window 1 is now alone and centered: (1024 - 400) / 2 = 312.
+            assert_window_at!(world, 1, 312, TEST_MENUBAR_HEIGHT);
+        })
+        .run(commands);
+}
