@@ -687,6 +687,10 @@ impl Config {
         self.options().mouse_resize_modifier
     }
 
+    pub fn mouse_drag_display_modifier(&self) -> Option<Modifiers> {
+        self.options().mouse_drag_display_modifier
+    }
+
     pub fn restore_enabled(&self) -> bool {
         self.inner()
             .restore
@@ -1227,6 +1231,11 @@ pub struct MainOptions {
     /// The modifier key used for mouse-based window resizing.
     #[serde(default, deserialize_with = "deserialize_modifier")]
     pub mouse_resize_modifier: Option<Modifiers>,
+    /// The modifier key held to drag a tiled window across display
+    /// boundaries with the mouse. Unset (default) disables display transfer:
+    /// dragged windows snap back to their own strip like foreign moves.
+    #[serde(default, deserialize_with = "deserialize_modifier")]
+    pub mouse_drag_display_modifier: Option<Modifiers>,
     /// Override the system menubar height (in pixels).
     /// When set, this value is used instead of the height reported by macOS.
     pub menubar_height: Option<u16>,

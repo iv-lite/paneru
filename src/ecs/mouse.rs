@@ -21,7 +21,7 @@ use bevy::ecs::schedule::common_conditions::on_message;
 
 use crate::events::{Event, InputEvent};
 use crate::manager::{Display, Origin, WindowManager, origin_from};
-use crate::platform::WinID;
+use crate::platform::{Modifiers, WinID};
 use crate::util::round_px;
 
 /// Bottom-right corner region (`NxN` pixels) where focus events are suppressed.
@@ -283,14 +283,33 @@ fn mouse_up_trigger(
     }
 }
 
+/// Modifiers held during the current mouse drag, tracked from the
+/// `MouseDown`/`MouseDragged` stream (the `WindowMoved` trigger carries none).
+/// The display transfer only fires while the configured
+/// `mouse_drag_display_modifier` matches these.
+#[derive(Debug)]
+struct DragModifierState {
+    modifiers: Modifiers,
+}
+
+impl Default for DragModifierState {
+    fn default() -> Self {
+        Self {
+            modifiers: Modifiers::empty(),
+        }
+    }
+}
+
 /// Moves a mouse-dragged managed window across display boundaries.
 ///
-/// While a `MouseHeldMarker` is live, every `WindowMoved` for the held window
-/// hit-tests the freshly adopted frame's center: once it lands inside another
-/// display, the window is detached from the active strip and appended to the
-/// target display's selected strip — live, like the keyboard move — keeping
-/// focus while the active display follows it along. Dragging back transfers
-/// it home symmetrically.
+/// While a `MouseHeldMarker` is live **and** the configured
+/// `mouse_drag_display_modifier` is held, every `WindowMoved` for the held
+/// window hit-tests the freshly adopted frame's center: once it lands inside
+/// another display, the window is detached from the active strip and appended
+/// to the target display's selected strip — live, like the keyboard move —
+/// keeping focus while the active display follows it along. Dragging back
+/// transfers it home symmetrically. With the modifier unset (default) or
+/// released, the transfer never fires and dragged windows snap back.
 ///
 /// The dragged window is expected in the active strip (a real drag focuses
 /// its window first); otherwise there is nothing to detach from and the move
@@ -300,17 +319,43 @@ fn mouse_up_trigger(
 #[allow(clippy::too_many_arguments)]
 fn drag_window_across_display(
     mut messages: MessageReader<Event>,
+    mut input: MessageReader<InputEvent>,
     held: Populated<(Entity, &MouseHeldMarker)>,
     windows: Windows,
     mut active_display: ActiveDisplayMut,
     mut offscreen: OffscreenStrips,
     window_manager: Res<WindowManager>,
+    config: Res<Config>,
+    mut drag_modifiers: Local<DragModifierState>,
     mut commands: Commands,
 ) {
+    // The OS window cannot cross displays without mouse motion, and motion
+    // always produces a fresh drag event first — so the latest modifiers
+    // here are current enough to gate on. Reset on release.
+    for InputEvent(event) in input.read() {
+        match event {
+            Event::MouseDown { modifiers, .. } | Event::MouseDragged { modifiers, .. } => {
+                drag_modifiers.modifiers = *modifiers;
+            }
+            Event::MouseUp { .. } => {
+                drag_modifiers.modifiers = Modifiers::empty();
+            }
+            _ => {}
+        }
+    }
+
     for event in messages.read() {
         let Event::WindowMoved { window_id } = event else {
             continue;
         };
+        // Display transfer is opt-in: without the configured shortcut held,
+        // the move adopts and re-tiles back onto its own strip below.
+        let Some(required) = config.mouse_drag_display_modifier() else {
+            continue;
+        };
+        if !required.matches(drag_modifiers.modifiers) {
+            continue;
+        }
         let Some((_, entity)) = windows.find(*window_id) else {
             continue;
         };

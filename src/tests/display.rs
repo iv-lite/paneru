@@ -603,9 +603,21 @@ fn dragged_active_display_id(world: &mut World) -> u32 {
     world.get::<Display>(entity).expect("need display").id()
 }
 
+/// A config enabling display transfer while Alt is held.
+fn drag_display_config() -> Config {
+    (
+        MainOptions {
+            mouse_drag_display_modifier: Some(Modifiers::ALT),
+            ..Default::default()
+        },
+        vec![],
+    )
+        .into()
+}
+
 #[test]
 fn test_drag_window_across_display_transfers_strip() {
-    // Window 0 spawns at (0, 0, 400, 1000); grab its center.
+    // Window 0 spawns at (0, 0, 400, 1000); grab its center while holding Alt.
     let grab = CGPoint::new(200.0, 500.0);
     // Lands the 400x1000 frame at (100, -1000): center (300, -500), inside
     // the external display above and outside the test display.
@@ -614,10 +626,66 @@ fn test_drag_window_across_display_transfers_strip() {
         Event::MenuOpened { window_id: 0 },
         Event::MouseDown {
             point: grab,
-            modifiers: Modifiers::empty(),
+            modifiers: Modifiers::ALT,
+        },
+        Event::MouseDragged {
+            point: grab,
+            modifiers: Modifiers::ALT,
         },
         Event::Command {
             command: Command::PrintState,
+        },
+        Event::Command {
+            command: Command::PrintState,
+        },
+        Event::MouseUp {
+            point: grab,
+            modifiers: Modifiers::ALT,
+        },
+        Event::Command {
+            command: Command::PrintState,
+        },
+    ];
+
+    TestHarness::new()
+        .with_config(drag_display_config())
+        .with_windows(1)
+        .with_display(
+            EXT_DISPLAY_ID,
+            IRect::new(0, -EXT_DISPLAY_HEIGHT, EXT_DISPLAY_WIDTH, 0),
+            vec![EXT_WORKSPACE_ID],
+        )
+        .on_iteration(3, move |world, state| {
+            state.os_move_window(0, drop_origin);
+            assert_on_workspace!(world, 0, TEST_WORKSPACE_ID);
+        })
+        .on_iteration(4, move |world, _state| {
+            assert_on_workspace!(world, 0, EXT_WORKSPACE_ID);
+            assert_not_on_workspace!(world, 0, TEST_WORKSPACE_ID);
+            assert_focused!(world, 0);
+            assert_eq!(dragged_active_display_id(world), EXT_DISPLAY_ID);
+        })
+        .on_iteration(6, move |world, _state| {
+            assert_on_workspace!(world, 0, EXT_WORKSPACE_ID);
+            assert_not_on_workspace!(world, 0, TEST_WORKSPACE_ID);
+        })
+        .run(commands);
+}
+
+/// The same drag without the shortcut held snaps back: no transfer.
+#[test]
+fn test_drag_across_display_without_shortcut_snaps_back() {
+    let grab = CGPoint::new(200.0, 500.0);
+    let drop_origin = Origin::new(100, -1000);
+    let commands = vec![
+        Event::MenuOpened { window_id: 0 },
+        Event::MouseDown {
+            point: grab,
+            modifiers: Modifiers::empty(),
+        },
+        Event::MouseDragged {
+            point: grab,
+            modifiers: Modifiers::empty(),
         },
         Event::Command {
             command: Command::PrintState,
@@ -632,25 +700,64 @@ fn test_drag_window_across_display_transfers_strip() {
     ];
 
     TestHarness::new()
+        .with_config(drag_display_config())
         .with_windows(1)
         .with_display(
             EXT_DISPLAY_ID,
             IRect::new(0, -EXT_DISPLAY_HEIGHT, EXT_DISPLAY_WIDTH, 0),
             vec![EXT_WORKSPACE_ID],
         )
-        .on_iteration(2, move |world, state| {
+        .on_iteration(3, move |_world, state| {
             state.os_move_window(0, drop_origin);
+        })
+        .on_iteration(4, move |world, _state| {
             assert_on_workspace!(world, 0, TEST_WORKSPACE_ID);
+            assert_not_on_workspace!(world, 0, EXT_WORKSPACE_ID);
         })
-        .on_iteration(3, move |world, _state| {
-            assert_on_workspace!(world, 0, EXT_WORKSPACE_ID);
-            assert_not_on_workspace!(world, 0, TEST_WORKSPACE_ID);
-            assert_focused!(world, 0);
-            assert_eq!(dragged_active_display_id(world), EXT_DISPLAY_ID);
+        .run(commands);
+}
+
+/// With the modifier unconfigured (default), even a shortcut-held drag
+/// transfers nothing: the feature is strictly opt-in.
+#[test]
+fn test_drag_across_display_defaults_off() {
+    let grab = CGPoint::new(200.0, 500.0);
+    let drop_origin = Origin::new(100, -1000);
+    let commands = vec![
+        Event::MenuOpened { window_id: 0 },
+        Event::MouseDown {
+            point: grab,
+            modifiers: Modifiers::ALT,
+        },
+        Event::MouseDragged {
+            point: grab,
+            modifiers: Modifiers::ALT,
+        },
+        Event::Command {
+            command: Command::PrintState,
+        },
+        Event::MouseUp {
+            point: grab,
+            modifiers: Modifiers::ALT,
+        },
+        Event::Command {
+            command: Command::PrintState,
+        },
+    ];
+
+    TestHarness::new()
+        .with_windows(1)
+        .with_display(
+            EXT_DISPLAY_ID,
+            IRect::new(0, -EXT_DISPLAY_HEIGHT, EXT_DISPLAY_WIDTH, 0),
+            vec![EXT_WORKSPACE_ID],
+        )
+        .on_iteration(3, move |_world, state| {
+            state.os_move_window(0, drop_origin);
         })
-        .on_iteration(5, move |world, _state| {
-            assert_on_workspace!(world, 0, EXT_WORKSPACE_ID);
-            assert_not_on_workspace!(world, 0, TEST_WORKSPACE_ID);
+        .on_iteration(4, move |world, _state| {
+            assert_on_workspace!(world, 0, TEST_WORKSPACE_ID);
+            assert_not_on_workspace!(world, 0, EXT_WORKSPACE_ID);
         })
         .run(commands);
 }
@@ -704,14 +811,18 @@ fn test_drag_floating_window_ignores_transfer() {
         },
         Event::MouseDown {
             point: grab,
-            modifiers: Modifiers::empty(),
+            modifiers: Modifiers::ALT,
+        },
+        Event::MouseDragged {
+            point: grab,
+            modifiers: Modifiers::ALT,
         },
         Event::Command {
             command: Command::PrintState,
         },
         Event::MouseUp {
             point: grab,
-            modifiers: Modifiers::empty(),
+            modifiers: Modifiers::ALT,
         },
         Event::Command {
             command: Command::PrintState,
@@ -719,16 +830,17 @@ fn test_drag_floating_window_ignores_transfer() {
     ];
 
     TestHarness::new()
+        .with_config(drag_display_config())
         .with_windows(1)
         .with_display(
             EXT_DISPLAY_ID,
             IRect::new(0, -EXT_DISPLAY_HEIGHT, EXT_DISPLAY_WIDTH, 0),
             vec![EXT_WORKSPACE_ID],
         )
-        .on_iteration(3, move |_world, state| {
+        .on_iteration(4, move |_world, state| {
             state.os_move_window(0, drop_origin);
         })
-        .on_iteration(4, move |world, _state| {
+        .on_iteration(5, move |world, _state| {
             let entity = find_window_entity(0, world);
             assert!(
                 world.get::<Unmanaged>(entity).is_some(),
