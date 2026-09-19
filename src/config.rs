@@ -1268,9 +1268,10 @@ pub struct MainOptions {
     pub mouse_drag_display_modifier: Option<Modifiers>,
     /// When enabled (default), dragging a tiled window with the left mouse
     /// button — without the display-drag modifier held — scrolls the
-    /// workspace strip horizontally instead of moving the window, and the
-    /// native drag is swallowed so macOS can't move it either. Modifier-held
-    /// (armed) drags still move and transfer as before.
+    /// workspace strip through the shared modifier+scroll pipeline instead
+    /// of moving the window, and the native drag is swallowed so macOS
+    /// can't move it either. Modifier-held (armed) drags still move and
+    /// transfer as before.
     pub left_drag_scrolls_strip: Option<bool>,
     /// Override the system menubar height (in pixels).
     /// When set, this value is used instead of the height reported by macOS.

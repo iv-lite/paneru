@@ -28,7 +28,34 @@ use crate::util::round_px;
 
 pub struct ScrollEventsPlugin;
 
-/// Upper bound on the timestep used to *advance* the strip.
+/// Normalization: Touchpad deltas are typically small fractions.
+/// Scroll wheel deltas can be larger. We scale it down slightly
+/// to match the "feel" of a finger swipe.
+const SCROLL_SCALE_UPPER: f64 = 0.15;
+const SCROLL_SCALE_LOWER: f64 = 0.005;
+const SCROLL_FULL_RANGE: f64 = 2.0;
+
+/// Maps a horizontal pointer travel in pixels to a synthetic `Scroll` delta
+/// that moves the strip by the same amount through [`swipe_gesture`]: it
+/// inverts the `scroll_scale × viewport × direction × sensitivity` gain the
+/// gesture applies, so a left-drag pans 1:1 through the shared pipeline —
+/// same settings, same constraints, same release behavior as
+/// modifier+scroll. Returns `0.0` when the gain degenerates.
+pub(crate) fn px_to_scroll_delta(px: f64, viewport_width: f64, config: &Config) -> f64 {
+    let sensitivity = config.swipe_sensitivity();
+    let scroll_scale = SCROLL_SCALE_LOWER
+        + ((SCROLL_SCALE_UPPER - SCROLL_SCALE_LOWER) / SCROLL_FULL_RANGE) * sensitivity;
+    let direction = match config.swipe_gesture_direction() {
+        SwipeGestureDirection::Natural => -1.0,
+        SwipeGestureDirection::Reversed => 1.0,
+    };
+    let gain = scroll_scale * viewport_width * direction * sensitivity;
+    if gain.abs() < f64::EPSILON {
+        0.0
+    } else {
+        px / gain
+    }
+}
 ///
 /// `Time::<Virtual>` is deliberately given a 10s `max_delta` (see [`crate::ecs`])
 /// so `elapsed()` keeps tracking wall-clock across a stalled frame — the
@@ -109,12 +136,6 @@ fn swipe_gesture(
     let mut has_scroll_event = false;
     let mut has_gesture_event = false;
 
-    // Normalization: Touchpad deltas are typically small fractions.
-    // Scroll wheel deltas can be larger. We scale it down slightly
-    // to match the "feel" of a finger swipe.
-    const SCROLL_SCALE_UPPER: f64 = 0.15;
-    const SCROLL_SCALE_LOWER: f64 = 0.005;
-    const SCROLL_FULL_RANGE: f64 = 2.0;
     let scroll_scale = SCROLL_SCALE_LOWER
         + ((SCROLL_SCALE_UPPER - SCROLL_SCALE_LOWER) / SCROLL_FULL_RANGE) * swipe_sensitivity;
 

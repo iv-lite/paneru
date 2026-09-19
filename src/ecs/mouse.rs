@@ -2,7 +2,7 @@ use bevy::app::{App, Plugin, Update};
 use bevy::ecs::entity::Entity;
 use bevy::ecs::hierarchy::ChildOf;
 use bevy::ecs::message::{MessageReader, MessageWriter};
-use bevy::ecs::query::{Has, With, Without};
+use bevy::ecs::query::{Has, With};
 use bevy::ecs::resource::Resource;
 use bevy::ecs::schedule::IntoScheduleConfigs as _;
 use bevy::ecs::system::{Commands, Local, NonSendMut, Populated, Query, Res, ResMut, Single};
@@ -11,11 +11,12 @@ use bevy::time::Time;
 use std::time::{Duration, Instant};
 use tracing::{debug, info, trace, warn};
 
-use super::{ActiveDisplayMarker, DragDisplayArmed, ManualStripOffset, MouseHeldMarker, Timeout};
+use super::{ActiveDisplayMarker, DragDisplayArmed, MouseHeldMarker, Timeout};
 use crate::commands::{OffscreenStrips, attach_column_to_display, detach_column_from_strip};
 use crate::config::{Config, decorations::BorderRadiusOption};
 use crate::ecs::layout::{Column, LayoutStrip, desired_window_frame};
 use crate::ecs::params::{ActiveDisplayMut, GlobalState, Windows};
+use crate::ecs::scroll::px_to_scroll_delta;
 use crate::ecs::workspace::mid_strip_slot;
 use crate::ecs::{
     ActiveWorkspaceMarker, DockPosition, MissionControlActive, Position, Scrolling,
@@ -69,10 +70,6 @@ impl Plugin for MouseEventsPlugin {
                 )
                     .run_if(mission_control_inactive),
                 mouse_up_trigger,
-                // Outside the mission-control gate like `mouse_up_trigger`:
-                // a release must resync even mid-Mission-Control, and it only
-                // acts on members the release just recorded.
-                resync_scrolled_windows.after(mouse_up_trigger),
                 horizontal_warp_mouse_trigger,
                 // Outside the mission-control gate like `mouse_up_trigger`:
                 // it must still run to hide a stale ghost.
@@ -355,20 +352,6 @@ type ReleaseStrips<'w, 's> = Query<
     ),
 >;
 
-/// The active workspace strip with its scroll offset and scroll state, for
-/// strip-scroll drags. `Without<Window>` keeps the mutable `Position` access
-/// disjoint from the window `Position` query in the same system.
-type ActiveScrollStrip<'w, 's> = Query<
-    'w,
-    's,
-    (
-        Entity,
-        &'static mut Position,
-        Option<&'static mut Scrolling>,
-    ),
-    (With<ActiveWorkspaceMarker>, Without<Window>),
->;
-
 /// Home slot of a released window on its current strip, recomputed with the
 /// audit's exact math — or `None` when it already sits in its slot (or
 /// lives on no strip). The strip is deliberately left alone: reshuffling
@@ -477,6 +460,24 @@ fn mouse_up_trigger(
 
         for (held_entity, marker, armed) in &mouse_held {
             let entity = marker.0;
+            // A strip-scroll drag (unmodified left-drag that actually moved
+            // through the shared scroll pipeline): the new scroll offset is
+            // the intended result — no reorder, no homing, no
+            // click-reshuffle. The tap swallowed the native drag, so the OS
+            // windows never left their slots. A press without travel falls
+            // through to today's click behavior below.
+            if config.left_drag_scrolls_strip()
+                && !armed
+                && scroll_distance > DRAG_SCROLL_CLICK_THRESHOLD_PX
+            {
+                debug!(
+                    "mouse up: strip-scroll drag on {entity} traveled {scroll_distance:.0}px, keeping scroll offset"
+                );
+                if let Ok(mut entity_commands) = commands.get_entity(held_entity) {
+                    entity_commands.try_despawn();
+                }
+                continue;
+            }
             // Members of the dragged column (or the lone window).
             let members: Vec<Entity> = strips
                 .iter()
@@ -487,28 +488,6 @@ fn mouse_up_trigger(
                         .and_then(|index| strip.get(index).ok())
                 })
                 .map_or_else(|| vec![entity], |column| column.window_iter().collect());
-            // A strip-scroll drag (unmodified left-drag that actually moved):
-            // the new scroll offset is the intended result — no reorder, no
-            // homing, no click-reshuffle. A press without travel falls
-            // through to today's click behavior below.
-            if config.left_drag_scrolls_strip()
-                && !armed
-                && scroll_distance > DRAG_SCROLL_CLICK_THRESHOLD_PX
-            {
-                debug!(
-                    "mouse up: strip-scroll drag on {entity} traveled {scroll_distance:.0}px, keeping scroll offset"
-                );
-                // Hand the column to the post-release OS resync: a native
-                // slip through the press-frame race leaves the OS window
-                // displaced while layout stayed slot-relative, and nothing
-                // else re-reads or re-pushes it (see
-                // `resync_scrolled_windows`).
-                scroll_state.members = members;
-                if let Ok(mut entity_commands) = commands.get_entity(held_entity) {
-                    entity_commands.try_despawn();
-                }
-                continue;
-            }
 
             // Armed same-display drop with the shortcut still held:
             // relocate the column to the nearest slot; the layout chain
@@ -557,43 +536,6 @@ fn mouse_up_trigger(
     }
 }
 
-/// Snaps scroll-released windows back into their slots when the OS window
-/// drifted from the layout frame.
-///
-/// The tap swallows strip-scroll drags, but a drag slipping through the
-/// press-frame race starts a real native session the app may then honor
-/// over our AX pushes — and mid-scroll commits are blind to it: `reposition`
-/// early-returns on stale-cache equality while the adoption lock ignores
-/// the native echo. Layout stayed slot-relative throughout, so any OS-side
-/// drift is damage, never intent: re-read OS truth per recorded member and
-/// re-push the slot position when they disagree. Runs right after
-/// [`mouse_up_trigger`] recorded the members, so the commit chain picks the
-/// correction up the same frame.
-fn resync_scrolled_windows(
-    mut scroll_state: ResMut<DragScrollState>,
-    mut windows: Query<(&mut Window, &Position)>,
-    mut commands: Commands,
-) {
-    if scroll_state.members.is_empty() {
-        return;
-    }
-    for member in std::mem::take(&mut scroll_state.members) {
-        let Ok((mut window, position)) = windows.get_mut(member) else {
-            continue;
-        };
-        let Ok(live) = window.update_frame().inspect_err(|err| {
-            debug!("scroll release: re-reading OS frame for {member} failed: {err}");
-        }) else {
-            continue;
-        };
-        let drift = (live.min - position.0).abs();
-        if drift.x > 1 || drift.y > 1 {
-            debug!("scroll release: OS window {member} drifted {drift:?}, snapping back to slot");
-            commands.reposition_entity(member, position.0);
-        }
-    }
-}
-
 /// Modifiers held during the current mouse drag, tracked from the
 /// `MouseDown`/`MouseDragged` stream (the `WindowMoved` trigger carries none).
 /// Read by the drag transfer and the adoption lock; reset on `MouseUp`.
@@ -610,17 +552,14 @@ impl Default for DragModifierState {
     }
 }
 
-/// Accumulated travel of the current unmodified left-drag, in pixels, plus
-/// the members of its dragged column. Written by [`drag_move_held_column`]
-/// while a strip-scroll drag pans the active strip (members are recorded on
-/// release by [`mouse_up_trigger`); read on release to tell a scroll (keep
-/// the new scroll offset, no homing, no reshuffle — but resync any native
-/// slip, see [`resync_scrolled_windows`]) apart from a click (today's
-/// focus/reshuffle behavior). Reset on press and release.
+/// Accumulated travel of the current unmodified left-drag, in pixels.
+/// Written by [`drag_move_held_column`] while a strip-scroll drag feeds the
+/// shared scroll pipeline; read on release by [`mouse_up_trigger`] to tell a
+/// scroll (keep the new scroll offset, no homing, no reshuffle) apart from a
+/// click (today's focus/reshuffle behavior). Reset on press and release.
 #[derive(Debug, Resource, Default)]
 pub(crate) struct DragScrollState {
     pub(crate) distance_px: f64,
-    pub(crate) members: Vec<Entity>,
 }
 
 /// Where a drop at on-screen x `drop_x` would land in `strip`: the column
@@ -711,10 +650,11 @@ struct DragMoveState {
 /// behavior plus the pin path).
 ///
 /// Exception: an unmodified left-drag on a tiled window (see
-/// [`DragDisplayArmed`]) pans the active strip horizontally instead, 1:1
-/// with the cursor, when `left_drag_scrolls_strip` is enabled. The tap
-/// swallows the native drag for those grabs, so no `WindowMoved` echo and
-/// no adoption fight; armed modifier drags take the move path below.
+/// [`DragDisplayArmed`]) scrolls the columns through the shared
+/// modifier+scroll pipeline instead, when `left_drag_scrolls_strip` is
+/// enabled. The tap swallows the native drag for those grabs, so no
+/// `WindowMoved` echo and no adoption fight; armed modifier drags take the
+/// move path below.
 #[allow(clippy::too_many_arguments)]
 fn drag_move_held_column(
     mut messages: MessageReader<InputEvent>,
@@ -723,19 +663,17 @@ fn drag_move_held_column(
     strips: Query<&LayoutStrip>,
     windows: Query<(&Window, Entity, Option<&Unmanaged>)>,
     mut positions: Query<&mut Position, With<Window>>,
-    mut active_strip: ActiveScrollStrip,
+    displays: Query<(&Display, Has<ActiveDisplayMarker>)>,
     config: Res<Config>,
-    time: Res<Time>,
     mut scroll_state: ResMut<DragScrollState>,
-    mut commands: Commands,
     mut state: Local<DragMoveState>,
 ) {
     for InputEvent(event) in messages.read() {
         match event {
             Event::MouseDown { point, .. } => {
                 state.last = Some(origin_from(*point));
+                // Travel is per-gesture.
                 scroll_state.distance_px = 0.0;
-                scroll_state.members.clear();
             }
             Event::MouseUp { .. } => {
                 state.last = None;
@@ -768,42 +706,32 @@ fn drag_move_held_column(
                     trace!("synthetic drag: held target is unmanaged, skipping");
                     continue;
                 }
-                // Unmodified left-drag on a tiled window: pan the strip, 1:1
-                // with the cursor, instead of moving the column. The tap
+                // Unmodified left-drag on a tiled window scrolls the columns
+                // through the shared modifier+scroll pipeline instead of
+                // moving anything: the pointer delta is mapped to a `Scroll`
+                // event with the pipeline's own gain inverted, so the strip
+                // pans 1:1 under the cursor with identical scaling,
+                // direction, constraints and release behavior. The tap
                 // already swallowed the native drag for this grab, so the OS
                 // window never moves and no `WindowMoved` echo follows.
                 // Armed modifier drags keep the move path below.
                 if config.left_drag_scrolls_strip() && !armed {
                     scroll_state.distance_px += f64::from(delta.x.abs() + delta.y.abs());
-                    let Ok((strip_entity, mut strip_position, scrolling)) =
-                        active_strip.single_mut()
-                    else {
-                        trace!("strip scroll: no active strip, skipping");
-                        continue;
-                    };
-                    strip_position.0.x += delta.x;
-                    if let Ok(mut entity_commands) = commands.get_entity(strip_entity) {
-                        entity_commands.try_remove::<ManualStripOffset>();
-                    }
-                    let scrolled_x = strip_position.0.x;
-                    let now = time.elapsed();
-                    if let Some(mut scrolling) = scrolling {
-                        // Direct control while held: no inertia, so release
-                        // dead-stops instead of flinging. The constraints
-                        // pass still clamps the offset into the viewport.
-                        scrolling.velocity = 0.0;
-                        scrolling.is_user_swiping = true;
-                        scrolling.last_event = now;
-                        scrolling.position = f64::from(scrolled_x);
-                    } else if let Ok(mut entity_commands) = commands.get_entity(strip_entity) {
-                        entity_commands.try_insert(Scrolling {
-                            velocity: 0.0,
-                            position: f64::from(scrolled_x),
-                            is_user_swiping: true,
-                            last_event: now,
+                    // Horizontal columns only: vertical travel counts toward
+                    // the click threshold but never scrolls.
+                    if delta.x != 0
+                        && let Some(viewport_width) = displays
+                            .iter()
+                            .find_map(|(display, active)| active.then(|| display.bounds().width()))
+                    {
+                        moved.write(Event::Scroll {
+                            delta: px_to_scroll_delta(
+                                f64::from(delta.x),
+                                f64::from(viewport_width),
+                                &config,
+                            ),
                         });
                     }
-                    trace!("strip scroll: strip {strip_entity} follows drag to {scrolled_x}");
                     continue;
                 }
                 // Drive the whole column so stacked/tabbed mates follow the
