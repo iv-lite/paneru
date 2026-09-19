@@ -1592,33 +1592,40 @@ pub(super) fn commit_window_position(
         .for_each(|(mut window, position)| window.reposition(position.0));
 }
 
+/// Confirms OS positions against layout intent. Every driven move carries
+/// verification (see `reposition_entity`), so this is the universal drift
+/// backstop between commits and the 5s audit — throttled to ~100ms per
+/// window instead of every frame, since each check is a synchronous AX read.
 #[instrument(level = Level::TRACE, skip_all)]
-pub(super) fn verify_window_position(
+pub(crate) fn verify_window_position(
     mut windows: Populated<(
         Entity,
         &mut Window,
         &Position,
         &mut VerifyWindowPosition,
-        Has<RepositionMarker>,
+        Option<&RepositionMarker>,
     )>,
     mut commands: Commands,
 ) {
     for (entity, mut window, position, mut verification, repositioning) in &mut windows {
         // While the animator is driving, re-pushing the target fights it and
         // the optimistic frame already matches: only confirm once it lands.
-        // The lifetime still ticks so a stuck animation can't leak the marker.
-        if repositioning {
-            if verification.tick()
-                && let Ok(mut entity_commands) = commands.get_entity(entity)
-            {
-                entity_commands.try_remove::<VerifyWindowPosition>();
-            }
+        // No tick here either — the marker's life mirrors the animation's,
+        // which converges monotonically and drops the marker itself. The
+        // marker is optional (rather than required) precisely so the
+        // post-landing check below still sees the entity after animate
+        // removed it; otherwise verification would leak unconfirmed forever.
+        if repositioning.is_some() {
             continue;
         }
-        if window
-            .update_frame()
-            .is_ok_and(|frame| frame.min == position.0)
-        {
+        let Ok(live) = window.update_frame() else {
+            // Unreadable window (beachballed app): retry next throttled pass
+            // instead of burning lifetime on failures.
+            continue;
+        };
+        // 1px tolerance like the audit: OS rounding must converge, not spin.
+        let drift = (live.min - position.0).abs();
+        if drift.x <= 1 && drift.y <= 1 {
             if let Ok(mut entity_commands) = commands.get_entity(entity) {
                 entity_commands.try_remove::<VerifyWindowPosition>();
             }

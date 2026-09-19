@@ -26,8 +26,8 @@ use crate::ecs::state::PaneruState;
 use crate::ecs::workspace::RestoreFocusMarker;
 use crate::ecs::{
     ActiveWorkspaceMarker, Bounds, DockPosition, Initializing, LayoutPosition, Position,
-    ResizeMarker, RestoreWindowState, Scrolling, SendMessageTrigger, SpawnCommandsExt,
-    VerifyWindowPosition, WidthRatio, WindowProperties,
+    ResizeMarker, RestoreWindowState, Scrolling, SendMessageTrigger, SpawnCommandsExt, WidthRatio,
+    WindowProperties,
 };
 use crate::events::{DestroySource, Event};
 use crate::manager::{
@@ -856,10 +856,8 @@ pub(super) fn window_managed_trigger(
     }
 
     if let Some(origin) = ctx.windows.origin(entity) {
+        // `reposition_entity` already attaches verification.
         ctx.commands.reposition_entity(entity, origin);
-    }
-    if let Ok(mut entity_commands) = ctx.commands.get_entity(entity) {
-        entity_commands.try_insert(VerifyWindowPosition::default());
     }
     ctx.commands.reshuffle_around(entity);
 }

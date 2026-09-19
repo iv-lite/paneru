@@ -1493,6 +1493,85 @@ fn test_startup_places_unassigned_windows_on_live_display() {
     assert_not_on_workspace!(world, 100, TEST_WORKSPACE_ID);
 }
 
+/// A reconcile after wake/display events re-clamps persisting strips into
+/// the live viewport instead of leaving stale scrolled offsets the audit
+/// cannot even see (it derives from the same offsets).
+#[test]
+fn test_reconcile_retiles_stale_strip_offsets() {
+    let commands = vec![
+        Event::MenuOpened { window_id: 0 },
+        Event::Command {
+            command: Command::PrintState,
+        },
+        Event::SystemWoke { msg: String::new() },
+        Event::Command {
+            command: Command::PrintState,
+        },
+    ];
+
+    TestHarness::new()
+        .with_windows(2)
+        .on_iteration(1, move |world, _state| {
+            // Park the strip far outside the viewport: two 400px columns on
+            // a 1024px display clamp to [0, 224].
+            let strip = world
+                .query_filtered::<Entity, With<LayoutStrip>>()
+                .single(world)
+                .expect("one strip");
+            world
+                .entity_mut(strip)
+                .insert(Position(Origin::new(900, 20)));
+        })
+        .on_iteration(3, move |world, _state| {
+            let strip = world
+                .query_filtered::<Entity, With<LayoutStrip>>()
+                .single(world)
+                .expect("one strip");
+            let position = world.get::<Position>(strip).expect("need position").0;
+            assert_ne!(position.x, 900, "reconcile must re-tile the stale offset");
+            assert!(
+                (0..=TEST_DISPLAY_WIDTH - 2 * TEST_WINDOW_WIDTH).contains(&position.x),
+                "strip must land back inside the viewport, got {}",
+                position.x
+            );
+        })
+        .run(commands);
+}
+
+/// The audit converges promptly on display events instead of waiting for
+/// its 5s backstop: a natively moved window is re-homed after two
+/// event-triggered passes, with no time advance.
+#[test]
+fn test_audit_rehomes_on_display_changed_events() {
+    let ext_origin = Origin::new(100, -EXT_DISPLAY_HEIGHT + TEST_MENUBAR_HEIGHT);
+    let commands = vec![
+        Event::MenuOpened { window_id: 0 },
+        Event::DisplayChanged,
+        Event::DisplayChanged,
+        Event::Command {
+            command: Command::PrintState,
+        },
+    ];
+
+    TestHarness::new()
+        .with_windows(1)
+        .with_display(
+            EXT_DISPLAY_ID,
+            IRect::new(0, -EXT_DISPLAY_HEIGHT, EXT_DISPLAY_WIDTH, 0),
+            vec![EXT_WORKSPACE_ID],
+        )
+        .on_iteration(0, move |_world, state| {
+            // Native move behind paneru's back: adopted into place, but the
+            // strip membership still says TEST.
+            state.os_move_window(0, ext_origin);
+        })
+        .on_iteration(3, move |world, _state| {
+            assert_on_workspace!(world, 0, EXT_WORKSPACE_ID);
+            assert_not_on_workspace!(world, 0, TEST_WORKSPACE_ID);
+        })
+        .run(commands);
+}
+
 /// Waking from sleep (or a resolution/configuration change) with a monitor
 /// gone should reconcile the ECS display set against the OS even though no
 /// per-display `DisplayRemoved` flag arrives: the vanished display is removed

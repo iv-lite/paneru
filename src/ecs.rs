@@ -210,7 +210,10 @@ pub fn register_systems(app: &mut bevy::app::App) {
             (
                 systems::animate_entities,
                 systems::commit_window_position.run_if(not(resource_exists::<Initializing>)),
-                systems::verify_window_position.run_if(not(resource_exists::<Initializing>)),
+                // Throttled: each check is a synchronous AX read per window.
+                systems::verify_window_position
+                    .run_if(not(resource_exists::<Initializing>))
+                    .run_if(on_timer(Duration::from_millis(100))),
             )
                 .chain(),
             (
@@ -598,7 +601,12 @@ impl SpawnCommandsExt for Commands<'_, '_> {
     #[instrument(level = Level::TRACE, skip(self))]
     fn reposition_entity(&mut self, entity: Entity, origin: Origin) {
         if let Ok(mut entity_commands) = self.get_entity(entity) {
+            // Every driven move carries its own verification: without it a
+            // swallowed OS push (stale-cache equality, eaten AX call) drifts
+            // silently until the 5s audit. The verify pass is throttled and
+            // tolerant, so this costs one read per landing, not per frame.
             entity_commands.try_insert(RepositionMarker(origin));
+            entity_commands.try_insert(VerifyWindowPosition::default());
         }
     }
 

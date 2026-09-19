@@ -3,8 +3,10 @@ use bevy::ecs::change_detection::{DetectChanges, DetectChangesMut, Ref};
 use bevy::ecs::component::Component;
 use bevy::ecs::entity::{Entity, EntityHashMap, EntityHashSet};
 use bevy::ecs::hierarchy::ChildOf;
+use bevy::ecs::message::MessageReader;
 use bevy::ecs::query::{Changed, Has, With, Without};
 use bevy::ecs::schedule::IntoScheduleConfigs as _;
+use bevy::ecs::schedule::SystemCondition as _;
 use bevy::ecs::schedule::common_conditions::{not, resource_exists};
 use bevy::ecs::system::{Commands, Local, ParamSet, Populated, Query, Res};
 use bevy::math::IRect;
@@ -23,6 +25,7 @@ use crate::ecs::{
     ResizeMarker, Scrolling, SpawnCommandsExt, Unmanaged,
 };
 use crate::errors::{Error, Result};
+use crate::events::Event;
 use crate::manager::{Display, Origin, Size, Window, WindowManager};
 use crate::platform::{WinID, WorkspaceId};
 use crate::util::round_px;
@@ -200,6 +203,21 @@ pub(crate) fn origin_exposing(
 
 impl Plugin for LayoutEventsPlugin {
     fn build(&self, app: &mut App) {
+        // Wake/display/space transitions relocate windows outside any strip
+        // change, so converge promptly instead of waiting for the timer.
+        // Separate reader: consuming here must not starve the systems below.
+        let audit_triggered = |mut messages: MessageReader<Event>| {
+            messages.read().any(|event| {
+                matches!(
+                    event,
+                    Event::SystemWoke { .. }
+                        | Event::DisplayChanged
+                        | Event::SpaceChanged
+                        | Event::DisplayAdded { .. }
+                        | Event::DisplayRemoved { .. }
+                )
+            })
+        };
         app.add_systems(
             Update,
             (
@@ -221,9 +239,12 @@ impl Plugin for LayoutEventsPlugin {
                 // Slow consistency audit: repairs what the event-driven chain
                 // above missed (see `audit_window_positions`). Runs on its own
                 // timer so a diverged window cannot sit forever waiting for an
-                // event to touch its strip.
+                // event to touch its strip — plus once immediately on
+                // wake/display/space transitions, which relocate windows
+                // (the two-sighting rule still guards against transient
+                // moves; the timer remains the backstop).
                 audit_window_positions
-                    .run_if(on_timer(Duration::from_secs(5)))
+                    .run_if(on_timer(Duration::from_secs(5)).or_eager(audit_triggered))
                     .run_if(not(resource_exists::<Initializing>)),
             ),
         );

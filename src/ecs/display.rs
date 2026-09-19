@@ -283,6 +283,20 @@ pub(crate) fn reconcile_displays(
         );
     }
 
+    // Force re-tile of every persisting strip: bounds may have changed while
+    // asleep (resolution, arrangement, menubar), leaving scrolled offsets
+    // stale — and the audit derives from the same offsets, so it cannot see
+    // the problem. The forced reshuffle re-clamps each strip into the live
+    // viewport; members follow through layout → animate → commit → verify.
+    // Already-correct strips compute a no-op target (no visible motion, no
+    // AX beyond the routine commit path).
+    for (strip, _, _) in &workspaces {
+        let Some(member) = strip.all_columns().into_iter().next() else {
+            continue;
+        };
+        commands.reshuffle_around_forced(member);
+    }
+
     commands.trigger(SendMessageTrigger(Event::DisplayChanged));
 }
 
