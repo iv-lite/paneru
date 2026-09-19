@@ -42,6 +42,7 @@ pub(crate) struct MockWindowData {
     pub(crate) identifier: String,
     pub(crate) is_full_screen: bool,
     pub(crate) border_radius: Option<f64>,
+    pub(crate) toolbar_frame: Option<IRect>,
     pub(crate) horizontal_padding: i32,
     pub(crate) vertical_padding: i32,
     pub(crate) child_role: bool,
@@ -62,6 +63,7 @@ impl Default for MockWindowData {
             identifier: "testid".to_string(),
             is_full_screen: false,
             border_radius: None,
+            toolbar_frame: None,
             horizontal_padding: 0,
             vertical_padding: 0,
             child_role: false,
@@ -569,6 +571,15 @@ impl MockState {
                 .windows
                 .get(&id)
                 .and_then(|w| w.border_radius)
+        });
+
+        let s = self.clone();
+        mw.expect_toolbar_frame().returning(move || {
+            s.inner
+                .force_read()
+                .windows
+                .get(&id)
+                .and_then(|w| w.toolbar_frame)
         });
 
         // Fill in remaining defaults

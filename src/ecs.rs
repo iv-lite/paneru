@@ -502,6 +502,13 @@ pub struct MouseHeldMarker(pub Entity);
 #[derive(Component)]
 pub struct DragDisplayArmed;
 
+/// Marker on a [`MouseHeldMarker`] holder arming strip-scroll for this drag:
+/// the grab happened on the window's header (titlebar/toolbar, never content)
+/// with no drag shortcut held. Only such grabs scroll the columns and
+/// swallow the native drag; content grabs keep fully native behavior.
+#[derive(Component)]
+pub struct DragScrollArmed;
+
 /// Resource indicating whether Mission Control is currently active.
 #[derive(Resource)]
 pub struct MissionControlActive(pub bool);

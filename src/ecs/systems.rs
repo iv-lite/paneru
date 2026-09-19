@@ -27,7 +27,7 @@ use super::{
 use crate::config::{Config, decorations::BorderRadiusOption};
 use crate::ecs::display::FloatingLayer;
 use crate::ecs::layout::{Column, LayoutStrip};
-use crate::ecs::mouse::DragModifierState;
+use crate::ecs::mouse::{DragModifierState, DragScrollState};
 use crate::ecs::params::{ActiveDisplay, FrameActivity, Windows};
 use crate::ecs::{
     ActiveWorkspaceMarker, Bounds, BruteforceWindows, FlashMessage, FocusedMarker, Initializing,
@@ -978,6 +978,7 @@ pub(crate) fn window_moved_update_frame(
     held: Query<(Entity, &MouseHeldMarker, Has<DragDisplayArmed>)>,
     config: Res<Config>,
     drag_modifiers: Res<DragModifierState>,
+    scroll_grace: Res<DragScrollState>,
 ) {
     for event in messages.read() {
         let Event::WindowMoved { window_id } = event else {
@@ -1037,6 +1038,25 @@ pub(crate) fn window_moved_update_frame(
         let Ok(new_frame) = window.update_frame() else {
             continue;
         };
+
+        // Post-release grace for scroll-dragged columns: a lagging echo from
+        // a native session that slipped through before suppression must not
+        // rewrite the slot (the permanent-detach path). Push the slot back
+        // with the live frame in hand instead of adopting; the settle check
+        // owns any residue with no echo at all. Bounded by the deadline so
+        // a stuck list can never suppress adoption forever.
+        let in_grace = scroll_grace
+            .settle_deadline
+            .is_some_and(|deadline| Instant::now() < deadline)
+            && scroll_grace.members.contains(&entity);
+        if in_grace {
+            let drift = (new_frame.min - position.0).abs();
+            if drift.x > 1 || drift.y > 1 {
+                debug!("scroll grace: echo for {entity} drifted {drift:?}, pushing slot back");
+                window.reposition(position.0);
+            }
+            continue;
+        }
 
         let old_frame = IRect::from_corners(position.0, position.0 + bounds.0);
         if old_frame.min != new_frame.min {

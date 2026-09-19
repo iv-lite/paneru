@@ -1781,7 +1781,8 @@ fn test_armed_drag_at_edge_warps_cursor() {
 /// warps: the cursor stays where focus parked it, and the window never moves.
 #[test]
 fn test_unarmed_drag_at_edge_does_not_warp() {
-    let grab = CGPoint::new(200.0, 500.0);
+    // Grab the titlebar (window tiles at y=20, so y=25 is header).
+    let grab = CGPoint::new(200.0, 30.0);
     let edge = CGPoint::new(1022.0, 100.0);
     let commands = vec![
         Event::MenuOpened { window_id: 0 },
@@ -2598,9 +2599,10 @@ fn test_armed_drop_reorders_column_to_nearest_slot() {
 /// release (no homing, no reshuffle) — the shortcut stays the relocation gate.
 #[test]
 fn test_unarmed_drag_scrolls_strip() {
-    // Stacked column sits at x=400 (see transfer test); grab window 0 and
-    // drag right without the shortcut.
-    let grab = CGPoint::new(600.0, 100.0);
+    // Stacked column sits at x=400 (see transfer test); grab window 0's
+    // titlebar (slot y=20, so y=25 is header) and drag right without the
+    // shortcut.
+    let grab = CGPoint::new(600.0, 30.0);
     let commands = vec![
         Event::MenuOpened { window_id: 0 },
         Event::Command {
@@ -2614,14 +2616,14 @@ fn test_unarmed_drag_scrolls_strip() {
             modifiers: Modifiers::empty(),
         },
         Event::MouseDragged {
-            point: CGPoint::new(900.0, 100.0),
+            point: CGPoint::new(900.0, 30.0),
             modifiers: Modifiers::empty(),
         },
         Event::Command {
             command: Command::PrintState,
         },
         Event::MouseUp {
-            point: CGPoint::new(900.0, 100.0),
+            point: CGPoint::new(900.0, 30.0),
             modifiers: Modifiers::empty(),
         },
         Event::Command {
@@ -2667,6 +2669,274 @@ fn test_unarmed_drag_scrolls_strip() {
                 .find(|(strip, _)| strip.contains(first))
                 .expect("need owning strip");
             assert_eq!(position.0.x, 700);
+        })
+        .run(commands);
+}
+
+/// A content grab (below the header strip) scrolls nothing: the strip and
+/// the windows stay put, and release takes the normal click path instead of
+/// keeping a scroll offset. Native owns the interaction.
+#[test]
+fn test_content_drag_keeps_native_and_scrolls_nothing() {
+    // Stacked column sits at x=400; grab window 0's content (slot y=20, so
+    // y=100 is well below the 28px header) and drag right.
+    let grab = CGPoint::new(600.0, 100.0);
+    let commands = vec![
+        Event::MenuOpened { window_id: 0 },
+        Event::Command {
+            command: Command::Window(Operation::Focus(Direction::Last)),
+        },
+        Event::Command {
+            command: Command::Window(Operation::Stack(true)),
+        },
+        Event::MouseDown {
+            point: grab,
+            modifiers: Modifiers::empty(),
+        },
+        Event::MouseDragged {
+            point: CGPoint::new(900.0, 100.0),
+            modifiers: Modifiers::empty(),
+        },
+        Event::Command {
+            command: Command::PrintState,
+        },
+        Event::MouseUp {
+            point: CGPoint::new(900.0, 100.0),
+            modifiers: Modifiers::empty(),
+        },
+        Event::Command {
+            command: Command::PrintState,
+        },
+    ];
+
+    TestHarness::new()
+        .with_config(drag_display_config())
+        .with_windows(2)
+        .on_iteration(4, move |world, _state| {
+            // No Scroll was emitted: mates never left x=400...
+            for id in [0, 1] {
+                let entity = find_window_entity(id, world);
+                let position = world.get::<Position>(entity).expect("need position").0;
+                assert_eq!(position.x, 400, "content drag must not move mate {id}");
+            }
+            // ...and the strip never followed either.
+            let first = find_window_entity(0, world);
+            let mut strips = world.query::<(&LayoutStrip, &Position)>();
+            let (_, position) = strips
+                .iter(world)
+                .find(|(strip, _)| strip.contains(first))
+                .expect("need owning strip");
+            assert_eq!(position.0.x, 400);
+        })
+        .on_iteration(6, move |world, _state| {
+            // Release kept nothing: no scroll offset retained.
+            let first = find_window_entity(0, world);
+            let mut strips = world.query::<(&LayoutStrip, &Position)>();
+            let (_, position) = strips
+                .iter(world)
+                .find(|(strip, _)| strip.contains(first))
+                .expect("need owning strip");
+            assert_eq!(position.0.x, 400);
+        })
+        .run(commands);
+}
+
+/// A grab inside a tall AX toolbar (below the 28px fallback strip) still
+/// scroll-arms: the toolbar rect, not the fallback, defines the header.
+#[test]
+fn test_toolbar_grab_scrolls_strip() {
+    // Window 0 tiles at (0, 20); the mocked toolbar spans y=20..72, so
+    // y=60 is content for geometry but header for the toolbar rect.
+    let grab = CGPoint::new(200.0, 60.0);
+    let commands = vec![
+        Event::MenuOpened { window_id: 0 },
+        Event::MouseDown {
+            point: grab,
+            modifiers: Modifiers::empty(),
+        },
+        Event::MouseDragged {
+            point: CGPoint::new(500.0, 60.0),
+            modifiers: Modifiers::empty(),
+        },
+        Event::Command {
+            command: Command::PrintState,
+        },
+        Event::MouseUp {
+            point: CGPoint::new(500.0, 60.0),
+            modifiers: Modifiers::empty(),
+        },
+        Event::Command {
+            command: Command::PrintState,
+        },
+    ];
+
+    TestHarness::new()
+        .with_windows(1)
+        .on_iteration(0, move |_world, state| {
+            state.update_window(0, |window| {
+                window.toolbar_frame = Some(IRect::new(0, 20, 400, 72));
+            });
+        })
+        .on_iteration(3, move |world, _state| {
+            // The (300, 0) drag scrolled through the shared pipeline: a lone
+            // 400px column on a 1024px display caps at x=624.
+            let entity = find_window_entity(0, world);
+            let position = world.get::<Position>(entity).expect("need position").0;
+            assert_eq!(position, Origin::new(300, TEST_MENUBAR_HEIGHT));
+            let mut strips = world.query::<(&LayoutStrip, &Position)>();
+            let (_, position) = strips
+                .iter(world)
+                .find(|(strip, _)| strip.contains(entity))
+                .expect("need owning strip");
+            assert_eq!(position.0.x, 300);
+        })
+        .run(commands);
+}
+
+/// A grab inside the resize margin (here: 3px from the left edge, at header
+/// height) is a native resize, never a scroll: nothing moves.
+#[test]
+fn test_edge_margin_grab_keeps_native() {
+    let grab = CGPoint::new(3.0, 30.0);
+    let commands = vec![
+        Event::MenuOpened { window_id: 0 },
+        Event::MouseDown {
+            point: grab,
+            modifiers: Modifiers::empty(),
+        },
+        Event::MouseDragged {
+            point: CGPoint::new(303.0, 30.0),
+            modifiers: Modifiers::empty(),
+        },
+        Event::Command {
+            command: Command::PrintState,
+        },
+    ];
+
+    TestHarness::new()
+        .with_windows(1)
+        .on_iteration(2, move |world, _state| {
+            let entity = find_window_entity(0, world);
+            let position = world.get::<Position>(entity).expect("need position").0;
+            assert_eq!(position, Origin::new(0, TEST_MENUBAR_HEIGHT));
+            let mut strips = world.query::<(&LayoutStrip, &Position)>();
+            let (_, position) = strips
+                .iter(world)
+                .find(|(strip, _)| strip.contains(entity))
+                .expect("need owning strip");
+            assert_eq!(position.0.x, 0);
+        })
+        .run(commands);
+}
+
+/// A native echo landing after a scroll release (a session that slipped
+/// through before suppression) must not rewrite the slot: the grace pushes
+/// the slot back and the strip keeps its scroll offset.
+#[test]
+fn test_late_echo_heals_after_release() {
+    // Window 0 tiles at (0, 20); grab its titlebar and drag +100.
+    let grab = CGPoint::new(200.0, 30.0);
+    let commands = vec![
+        Event::MenuOpened { window_id: 0 },
+        Event::MouseDown {
+            point: grab,
+            modifiers: Modifiers::empty(),
+        },
+        Event::MouseDragged {
+            point: CGPoint::new(300.0, 30.0),
+            modifiers: Modifiers::empty(),
+        },
+        Event::Command {
+            command: Command::PrintState,
+        },
+        Event::MouseUp {
+            point: CGPoint::new(300.0, 30.0),
+            modifiers: Modifiers::empty(),
+        },
+        Event::Command {
+            command: Command::PrintState,
+        },
+    ];
+
+    TestHarness::new()
+        .with_windows(1)
+        .on_iteration(4, move |_world, state| {
+            // Release done: the slipped session ends late, displacing the
+            // OS window behind paneru's back.
+            state.os_move_window(0, Origin::new(50, 100));
+        })
+        .on_iteration(5, move |world, _state| {
+            // The echo was refused: ECS still says slot...
+            let entity = find_window_entity(0, world);
+            let position = world.get::<Position>(entity).expect("need position").0;
+            assert_eq!(position, Origin::new(100, TEST_MENUBAR_HEIGHT));
+            // ...and the OS window was pushed back into it...
+            let window = world.get::<Window>(entity).expect("need window");
+            assert_eq!(window.frame().min, position);
+            // ...while the strip kept its scroll offset.
+            let mut strips = world.query::<(&LayoutStrip, &Position)>();
+            let (_, position) = strips
+                .iter(world)
+                .find(|(strip, _)| strip.contains(entity))
+                .expect("need owning strip");
+            assert_eq!(position.0.x, 100);
+        })
+        .run(commands);
+}
+
+/// A displaced OS window with no echo at all is repaired by the settle
+/// check: silent drift behind paneru's back converges to the slot.
+#[test]
+fn test_settle_repairs_silent_drift() {
+    let grab = CGPoint::new(200.0, 30.0);
+    let commands = vec![
+        Event::MenuOpened { window_id: 0 },
+        Event::MouseDown {
+            point: grab,
+            modifiers: Modifiers::empty(),
+        },
+        Event::MouseDragged {
+            point: CGPoint::new(300.0, 30.0),
+            modifiers: Modifiers::empty(),
+        },
+        Event::Command {
+            command: Command::PrintState,
+        },
+        Event::MouseUp {
+            point: CGPoint::new(300.0, 30.0),
+            modifiers: Modifiers::empty(),
+        },
+        Event::Command {
+            command: Command::PrintState,
+        },
+        Event::Command {
+            command: Command::PrintState,
+        },
+    ];
+
+    TestHarness::new()
+        .with_windows(1)
+        .on_iteration(4, move |_world, state| {
+            // Release done: displace the mock frame with no notification,
+            // mimicking an eaten AX push.
+            state.update_window(0, |window| {
+                window.frame = IRect::from_corners(Origin::new(50, 100), Origin::new(450, 848));
+            });
+        })
+        .on_iteration(6, move |world, _state| {
+            // The settle check (200ms virtual) pushed the slot back...
+            let entity = find_window_entity(0, world);
+            let position = world.get::<Position>(entity).expect("need position").0;
+            assert_eq!(position, Origin::new(100, TEST_MENUBAR_HEIGHT));
+            let window = world.get::<Window>(entity).expect("need window");
+            assert_eq!(window.frame().min, position);
+            // ...and the strip kept its scroll offset.
+            let mut strips = world.query::<(&LayoutStrip, &Position)>();
+            let (_, position) = strips
+                .iter(world)
+                .find(|(strip, _)| strip.contains(entity))
+                .expect("need owning strip");
+            assert_eq!(position.0.x, 100);
         })
         .run(commands);
 }

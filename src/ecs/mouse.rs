@@ -11,7 +11,7 @@ use bevy::time::Time;
 use std::time::{Duration, Instant};
 use tracing::{debug, info, trace, warn};
 
-use super::{ActiveDisplayMarker, DragDisplayArmed, MouseHeldMarker, Timeout};
+use super::{ActiveDisplayMarker, DragDisplayArmed, DragScrollArmed, MouseHeldMarker, Timeout};
 use crate::commands::{OffscreenStrips, attach_column_to_display, detach_column_from_strip};
 use crate::config::{Config, decorations::BorderRadiusOption};
 use crate::ecs::layout::{Column, LayoutStrip, desired_window_frame};
@@ -28,6 +28,7 @@ use crate::platform::input::set_scroll_drag_suppress;
 use crate::platform::{Modifiers, WinID, WorkspaceId};
 use crate::util::round_px;
 use bevy::ecs::schedule::common_conditions::on_message;
+use objc2_core_foundation::CGPoint;
 use objc2_core_graphics::CGDirectDisplayID;
 
 use crate::events::{Event, InputEvent};
@@ -37,6 +38,47 @@ use crate::events::{Event, InputEvent};
 /// macOS prevents windows from being moved further down than a fully visible title bar,
 /// so the parked sliver of a hidden virtual workspace lives within this region.
 const CORNER_DEAD_ZONE_PX: i32 = 30;
+
+/// Height of the fallback header strip (px) used when the app exposes no
+/// `AXToolbar`: a representative macOS titlebar height.
+const TITLEBAR_HEIGHT_PX: i32 = 28;
+
+/// Presses within this distance of the window's left/right/top edges count as
+/// resize handles, never header grabs — the top edge sits inside the header
+/// strip and native edge resize must keep working.
+const RESIZE_MARGIN_PX: i32 = 6;
+
+/// Whether a press landed on the window's header (titlebar/toolbar) as
+/// opposed to its content. Only header grabs scroll the columns and swallow
+/// the native drag; content keeps fully native behavior (text selection,
+/// sliders, tab drags, ...).
+///
+/// Prefers the app's `AXToolbar` rect when exposed (unified toolbars taller
+/// than the fallback strip), else the top `TITLEBAR_HEIGHT_PX` of the
+/// window. Fullscreen windows and sheets/drawers never count — they have no
+/// draggable header. Best-effort: any AX failure falls back to geometry and
+/// a press outside the window can never classify, so this never blocks input.
+fn press_is_on_titlebar(point: &CGPoint, window: &Window) -> bool {
+    if window.is_full_screen() || window.child_role().unwrap_or(false) {
+        return false;
+    }
+    let frame = window.frame();
+    let cursor = origin_from(*point);
+    // CG edges of the OS window: the logical frame is padded outward.
+    let os_min_x = frame.min.x + window.horizontal_padding();
+    let os_min_y = frame.min.y + window.vertical_padding();
+    let os_max_x = frame.max.x - window.horizontal_padding();
+    if cursor.x < os_min_x + RESIZE_MARGIN_PX
+        || cursor.x >= os_max_x - RESIZE_MARGIN_PX
+        || cursor.y < os_min_y + RESIZE_MARGIN_PX
+    {
+        return false;
+    }
+    if let Some(toolbar) = window.toolbar_frame() {
+        return toolbar.contains(cursor);
+    }
+    cursor.y - os_min_y < TITLEBAR_HEIGHT_PX
+}
 
 /// Accumulated left-drag travel (px) in the current press, for telling a
 /// strip-scroll drag apart from a click on release. Written by
@@ -248,6 +290,7 @@ fn mouse_down_trigger(
     window_manager: Res<WindowManager>,
     config: Res<Config>,
     mouse_held: Query<Entity, With<MouseHeldMarker>>,
+    mut scroll_state: ResMut<DragScrollState>,
     mut logged_config: Local<bool>,
     mut commands: Commands,
 ) {
@@ -308,7 +351,13 @@ fn mouse_down_trigger(
         // mid-click. The Timeout auto-despawns if mouse-up is lost.
         let timeout = Timeout::new(Duration::from_secs(5), None, &mut commands);
         let mut holder = commands.spawn((MouseHeldMarker(entity), timeout));
-        // Arm display transfer only for the grab-time conjunction the
+        // A fresh press takes over from any previous release: the holder
+        // (and the adoption lock on it) owns echo handling from here, so a
+        // stale settle grace must not shadow it — notably an armed re-grab
+        // inside the grace window, whose transfer hit-test needs live
+        // adoption.
+        scroll_state.members.clear();
+        scroll_state.settle_deadline = None; // Arm display transfer only for the grab-time conjunction the
         // user asked for: shortcut held while left-clicking a window.
         // This holder defines the drag target; pressing the shortcut
         // later in the drag never arms.
@@ -327,15 +376,23 @@ fn mouse_down_trigger(
                 window.id()
             );
         }
-        // An unmodified grab on a tiled window pans the strip instead of
-        // moving the window: tell the tap to swallow the native drag so
-        // macOS can't move the OS window underneath. Armed grabs keep the
-        // native delivery (the move pipeline needs it), as do floating
-        // windows, which always keep native behavior.
+        // Scroll-drag arming: same grab-time philosophy, but for the header
+        // only. A tiled, unmodified header grab scrolls the columns and
+        // swallows the native drag; content grabs (and anything armed,
+        // floating or fullscreen) keep fully native behavior. The tap
+        // pre-suppresses broadly and this corrects it a frame later.
         let tiled = windows
             .get_managed(entity)
             .is_some_and(|(_, _, unmanaged)| unmanaged.is_none());
-        set_scroll_drag_suppress(config.left_drag_scrolls_strip() && tiled && !armed);
+        let scroll_armed = config.left_drag_scrolls_strip()
+            && tiled
+            && !armed
+            && press_is_on_titlebar(point, window);
+        if scroll_armed {
+            debug!("mouse drag scroll-armed on window {} header", window.id());
+            holder.try_insert(DragScrollArmed);
+        }
+        set_scroll_drag_suppress(scroll_armed);
     }
 }
 
@@ -439,7 +496,12 @@ fn try_reorder_column(entity: Entity, strips: &mut ReleaseStrips, windows: &Wind
 #[allow(clippy::too_many_arguments)]
 fn mouse_up_trigger(
     mut messages: MessageReader<InputEvent>,
-    mouse_held: Query<(Entity, &MouseHeldMarker, Has<DragDisplayArmed>)>,
+    mouse_held: Query<(
+        Entity,
+        &MouseHeldMarker,
+        Has<DragDisplayArmed>,
+        Has<DragScrollArmed>,
+    )>,
     windows: Windows,
     mut strips: ReleaseStrips,
     displays: PreviewDisplays,
@@ -458,21 +520,34 @@ fn mouse_up_trigger(
         set_scroll_drag_suppress(false);
         let scroll_distance = std::mem::take(&mut scroll_state.distance_px);
 
-        for (held_entity, marker, armed) in &mouse_held {
+        for (held_entity, marker, armed, scroll_armed) in &mouse_held {
             let entity = marker.0;
-            // A strip-scroll drag (unmodified left-drag that actually moved
-            // through the shared scroll pipeline): the new scroll offset is
-            // the intended result — no reorder, no homing, no
-            // click-reshuffle. The tap swallowed the native drag, so the OS
-            // windows never left their slots. A press without travel falls
-            // through to today's click behavior below.
-            if config.left_drag_scrolls_strip()
-                && !armed
-                && scroll_distance > DRAG_SCROLL_CLICK_THRESHOLD_PX
-            {
+            // A strip-scroll drag (header grab that actually moved through
+            // the shared scroll pipeline): the new scroll offset is the
+            // intended result — no reorder, no homing, no click-reshuffle.
+            // A press without travel falls through to today's click behavior
+            // below.
+            if scroll_armed && scroll_distance > DRAG_SCROLL_CLICK_THRESHOLD_PX {
                 debug!(
                     "mouse up: strip-scroll drag on {entity} traveled {scroll_distance:.0}px, keeping scroll offset"
                 );
+                // Record the column for the post-release grace: a native
+                // session that slipped through before suppression still ends
+                // with an echo that must not rewrite the slot (see the
+                // adoption grace in `window_moved_update_frame`), and any
+                // residue gets one settle check (see below).
+                scroll_state.members = strips
+                    .iter()
+                    .find_map(|(_, strip, _, _)| {
+                        strip
+                            .index_of(entity)
+                            .ok()
+                            .and_then(|index| strip.get(index).ok())
+                    })
+                    .map_or_else(|| vec![entity], |column| column.window_iter().collect());
+                scroll_state.settle_deadline = Some(Instant::now() + SCROLL_SETTLE_GRACE);
+                let system_id = commands.register_system(scroll_settle_check);
+                Timeout::callback(SCROLL_SETTLE_DELAY, system_id, &mut commands);
                 if let Ok(mut entity_commands) = commands.get_entity(held_entity) {
                     entity_commands.try_despawn();
                 }
@@ -552,14 +627,84 @@ impl Default for DragModifierState {
     }
 }
 
-/// Accumulated travel of the current unmodified left-drag, in pixels.
-/// Written by [`drag_move_held_column`] while a strip-scroll drag feeds the
-/// shared scroll pipeline; read on release by [`mouse_up_trigger`] to tell a
-/// scroll (keep the new scroll offset, no homing, no reshuffle) apart from a
-/// click (today's focus/reshuffle behavior). Reset on press and release.
+/// Accumulated travel of the current unmodified left-drag, in pixels, plus
+/// the members of the last released scroll-drag column and their settle
+/// deadline. Written while a header scroll-drag feeds the shared scroll
+/// pipeline; read on release to tell a scroll (keep the new scroll offset,
+/// no homing, no reshuffle) apart from a click (today's focus/reshuffle
+/// behavior). Members stay listed past release so a lagging native echo
+/// cannot rewrite their slots (see the adoption grace in
+/// `window_moved_update_frame`) until one settle check confirms them.
 #[derive(Debug, Resource, Default)]
 pub(crate) struct DragScrollState {
     pub(crate) distance_px: f64,
+    pub(crate) members: Vec<Entity>,
+    pub(crate) settle_deadline: Option<Instant>,
+}
+
+/// Delay after a scroll release before the settle check re-reads OS truth.
+const SCROLL_SETTLE_DELAY: Duration = Duration::from_millis(200);
+/// Re-arm step while displaced members persist.
+const SCROLL_SETTLE_STEP: Duration = Duration::from_millis(300);
+/// Wall-clock budget for post-release settling. Retries must not depend on
+/// frame counts: idle pump sleeps stretch frames to 500ms.
+const SCROLL_SETTLE_GRACE: Duration = Duration::from_secs(1);
+
+/// Re-reads OS truth for scroll-released column members once they have had a
+/// moment to land, pushing any displaced window back into its slot.
+///
+/// A native session that slipped through before suppression still ends with
+/// an echo the adoption grace refuses to legitimize — but if no echo ever
+/// arrives (a push the app ate with no notification), nothing would repair
+/// the OS side. This bounded check (first run +200ms, re-armed only while
+/// drift persists inside the deadline) closes that residue. Runs via
+/// `Timeout`, not every frame.
+fn scroll_settle_check(
+    mut scroll_state: ResMut<DragScrollState>,
+    mut windows: Query<(&mut Window, &Position)>,
+    mut commands: Commands,
+) {
+    if scroll_state.members.is_empty() {
+        scroll_state.settle_deadline = None;
+        return;
+    }
+    if scroll_state
+        .settle_deadline
+        .is_some_and(|deadline| Instant::now() >= deadline)
+    {
+        warn!(
+            "scroll release: {} window(s) still displaced after settle, giving up",
+            scroll_state.members.len()
+        );
+        scroll_state.members.clear();
+        scroll_state.settle_deadline = None;
+        return;
+    }
+    let mut pending = Vec::with_capacity(scroll_state.members.len());
+    for member in std::mem::take(&mut scroll_state.members) {
+        let Ok((mut window, position)) = windows.get_mut(member) else {
+            continue;
+        };
+        let Ok(live) = window.update_frame().inspect_err(|err| {
+            debug!("scroll settle: re-reading OS frame for {member} failed: {err}");
+        }) else {
+            pending.push(member);
+            continue;
+        };
+        let drift = (live.min - position.0).abs();
+        if drift.x > 1 || drift.y > 1 {
+            debug!("scroll settle: OS window {member} drifted {drift:?}, pushing slot");
+            window.reposition(position.0);
+            pending.push(member);
+        }
+    }
+    scroll_state.members = pending;
+    if scroll_state.members.is_empty() {
+        scroll_state.settle_deadline = None;
+    } else {
+        let system_id = commands.register_system(scroll_settle_check);
+        Timeout::callback(SCROLL_SETTLE_STEP, system_id, &mut commands);
+    }
 }
 
 /// Where a drop at on-screen x `drop_x` would land in `strip`: the column
@@ -649,17 +794,21 @@ struct DragMoveState {
 /// Floating/minimized/hidden windows are untouched (they keep native
 /// behavior plus the pin path).
 ///
-/// Exception: an unmodified left-drag on a tiled window (see
-/// [`DragDisplayArmed`]) scrolls the columns through the shared
-/// modifier+scroll pipeline instead, when `left_drag_scrolls_strip` is
-/// enabled. The tap swallows the native drag for those grabs, so no
-/// `WindowMoved` echo and no adoption fight; armed modifier drags take the
-/// move path below.
+/// Exception: a header scroll-drag (grab-time [`DragScrollArmed`]) feeds the
+/// pointer delta into the shared modifier+scroll pipeline instead, when
+/// `left_drag_scrolls_strip` is enabled. The tap swallows the native drag
+/// for those grabs, so no `WindowMoved` echo and no adoption fight; armed
+/// modifier drags take the move path below, content grabs stay fully native.
 #[allow(clippy::too_many_arguments)]
 fn drag_move_held_column(
     mut messages: MessageReader<InputEvent>,
     mut moved: MessageWriter<Event>,
-    held: Query<(Entity, &MouseHeldMarker, Has<DragDisplayArmed>)>,
+    held: Query<(
+        Entity,
+        &MouseHeldMarker,
+        Has<DragDisplayArmed>,
+        Has<DragScrollArmed>,
+    )>,
     strips: Query<&LayoutStrip>,
     windows: Query<(&Window, Entity, Option<&Unmanaged>)>,
     mut positions: Query<&mut Position, With<Window>>,
@@ -691,7 +840,7 @@ fn drag_move_held_column(
                 if delta == Origin::ZERO {
                     continue;
                 }
-                let Some((_, marker, armed)) = held.iter().next() else {
+                let Some((_, marker, armed, scroll_armed)) = held.iter().next() else {
                     trace!("synthetic drag: nothing held, skipping move");
                     continue;
                 };
@@ -706,16 +855,12 @@ fn drag_move_held_column(
                     trace!("synthetic drag: held target is unmanaged, skipping");
                     continue;
                 }
-                // Unmodified left-drag on a tiled window scrolls the columns
-                // through the shared modifier+scroll pipeline instead of
-                // moving anything: the pointer delta is mapped to a `Scroll`
-                // event with the pipeline's own gain inverted, so the strip
-                // pans 1:1 under the cursor with identical scaling,
-                // direction, constraints and release behavior. The tap
-                // already swallowed the native drag for this grab, so the OS
-                // window never moves and no `WindowMoved` echo follows.
-                // Armed modifier drags keep the move path below.
-                if config.left_drag_scrolls_strip() && !armed {
+                // Header scroll-drag (grab-time armed): feed the pointer delta
+                // into the shared modifier+scroll pipeline (see above).
+                // Armed modifier drags and legacy (scroll-disabled) drags
+                // take the move path below; content grabs with scrolling
+                // enabled are ignored entirely — native owns them.
+                if scroll_armed {
                     scroll_state.distance_px += f64::from(delta.x.abs() + delta.y.abs());
                     // Horizontal columns only: vertical travel counts toward
                     // the click threshold but never scrolls.
@@ -735,7 +880,12 @@ fn drag_move_held_column(
                     continue;
                 }
                 // Drive the whole column so stacked/tabbed mates follow the
-                // grab instead of tearing off.
+                // grab instead of tearing off. Reached for armed drags and
+                // for legacy scroll-disabled drags; content grabs with
+                // scrolling enabled fall through with no motion at all.
+                if !armed && config.left_drag_scrolls_strip() {
+                    continue;
+                }
                 let members: Vec<Entity> = strips
                     .iter()
                     .find_map(|strip| {
