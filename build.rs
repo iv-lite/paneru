@@ -29,6 +29,12 @@ lua_version_cfg_if!(
 );
 
 fn main() {
+    // Narrow rebuilds: without these, cargo conservatively reruns this script
+    // (and re-links dependents) when any package file changes. Outputs depend
+    // only on the script itself, the SDK dir, and the enabled lua feature
+    // (feature changes already invalidate the fingerprint on their own).
+    println!("cargo:rerun-if-changed=build.rs");
+    println!("cargo:rerun-if-env-changed=DEVELOPER_DIR");
     let sdk_dir = std::env::var("DEVELOPER_DIR").map_or_else(
         |_| "/Library/Developer/CommandLineTools/SDKs".to_string(),
         |x| format!("{x}/Platforms/MacOSX.platform/Developer/SDKs"),

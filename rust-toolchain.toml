@@ -1,3 +1,6 @@
 [toolchain]
-channel = "stable"
+# Pinned to the minor release: every `stable` bump silently invalidates the
+# whole target cache (full rebuild). Bump deliberately via `cargo update`-style
+# toolchain upgrades, not by surprise.
+channel = "1.98"
 profile = "default"

@@ -5,7 +5,6 @@ use bevy::ecs::resource::Resource;
 use bevy::math::{IRect, IVec2};
 use core::ptr::NonNull;
 use derive_more::{DerefMut, with_trait::Deref};
-use mockall::automock;
 use notify::{RecursiveMode, Watcher};
 use objc2_core_foundation::{
     CFArray, CFDictionary, CFMutableData, CFNumber, CFNumberType, CFRetained, CFString, CFType,
@@ -79,7 +78,7 @@ pub fn irect_from(rect: CGRect) -> IRect {
 }
 
 /// Defines the interface for a window manager, abstracting OS-specific operations.
-#[automock]
+#[cfg_attr(test, mockall::automock)]
 pub trait WindowManagerApi: Send + Sync {
     /// Creates a new `Application` instance from a given `ProcessApi`.
     ///

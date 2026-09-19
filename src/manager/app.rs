@@ -5,7 +5,6 @@ use accessibility_sys::{
 use bevy::ecs::component::Component;
 use core::ptr::NonNull;
 use derive_more::{DerefMut, with_trait::Deref};
-use mockall::automock;
 use objc2_core_foundation::{CFRetained, CFString, kCFRunLoopCommonModes};
 use std::ffi::c_void;
 use std::pin::Pin;
@@ -62,7 +61,7 @@ pub static AX_WINDOW_NOTIFICATIONS: LazyLock<Vec<&str>> = LazyLock::new(|| {
     ]
 });
 
-#[automock]
+#[cfg_attr(test, mockall::automock)]
 pub trait ApplicationApi: Send + Sync {
     /// Returns the process ID of the application.
     fn pid(&self) -> Pid;

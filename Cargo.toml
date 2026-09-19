@@ -82,6 +82,16 @@ codegen-units = 256
 lto = false
 debug = true
 
+# Local iteration: skip the `.dSYM` bundling step on every link (lldb still
+# finds symbols in the `.o` files) while keeping full debuginfo. Applies to
+# `cargo build`, `cargo test` and friends via `[profile.test]`.
+[profile.dev]
+split-debuginfo = "unpacked"
+incremental = true
+
+[profile.test]
+inherits = "dev"
+
 [profile.release]
 codegen-units = 1
 lto = true
@@ -165,7 +175,10 @@ tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 ctrlc = { version = "3.5", features = ["termination"] }
 xdg = "3.0"
-mockall = "0.15"
 async-mach-ports = { workspace = true }
+# Test-only mocks (`#[automock]` on the manager traits): kept out of normal
+# builds so the `check`/`build` inner loop skips the proc-macro expansion.
+[dev-dependencies]
+mockall = "0.15"
 [build-dependencies]
 cfg-if = { workspace = true}

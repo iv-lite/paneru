@@ -8,7 +8,6 @@ use bevy::ecs::component::Component;
 use bevy::math::IRect;
 use core::ptr::NonNull;
 use derive_more::{DerefMut, with_trait::Deref};
-use mockall::automock;
 use objc2_core_foundation::{
     CFArray, CFBoolean, CFNumber, CFRetained, CFString, CFType, CGPoint, CGRect, CGSize,
     kCFBooleanFalse, kCFBooleanTrue,
@@ -75,7 +74,7 @@ pub enum WindowPadding {
     Horizontal(i32),
 }
 
-#[automock]
+#[cfg_attr(test, mockall::automock)]
 pub trait WindowApi: Send + Sync {
     fn id(&self) -> WinID;
     fn frame(&self) -> IRect;

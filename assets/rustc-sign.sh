@@ -47,6 +47,13 @@ done
 
 "$RUSTC_BIN" "$@"
 status=$?
+# NOTE: sccache is intentionally NOT chained here. It only pays off for cold
+# builds and branch switches, while the incremental loop (this repo's hot
+# path) is served by cargo's own incremental cache — sccache would just add
+# hashing overhead per unit. For cold builds set `RUSTC_WRAPPER=sccache`
+# explicitly (env overrides this script per `.cargo/config.toml`), then
+# re-sign with `codesign --force --sign - --identifier
+# com.github.karinushka.paneru target/debug/paneru` as CI does.
 if [ "$status" -ne 0 ]; then
     exit "$status"
 fi
