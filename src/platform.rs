@@ -324,6 +324,10 @@ impl PlatformCallbacks {
 
         let config = Config::load(CONFIGURATION_FILE.as_deref())?;
         self.events.send(Event::InitialConfig(config.clone()))?;
+        // The tap pre-suppresses scroll-drags from its own gate copy because
+        // its `Config` snapshot is startup-only; refresh it here and on every
+        // reload (see `apply_config_side_effects`).
+        input::publish_scroll_drag_gate(&config);
         self.event_handler = Some(InputHandler::new(self.events.clone(), config).start()?);
 
         self.notify_handler = Some(NotifyHandler::new(self.events.clone()).start()?);

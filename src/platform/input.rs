@@ -113,6 +113,34 @@ pub fn set_lua_keybinds(keys: Vec<(u8, Modifiers, u32)>) {
     LUA_KEYBINDS.store(Arc::new(keys));
 }
 
+/// Gate for pre-suppressing native left-drags in the tap, before the ECS has
+/// seen the press. Mirrors the `mouse_down_trigger` scroll rule
+/// (`left_drag_scrolls_strip` on, drag shortcut not held); published from the
+/// ECS on startup and every config reload because the tap's own `Config`
+/// snapshot is startup-only. Slight staleness is harmless: the ECS remains
+/// authoritative per grab and corrects the flag a frame later.
+#[derive(Clone, Copy)]
+struct ScrollDragGate {
+    enabled: bool,
+    drag_modifier: Option<Modifiers>,
+}
+
+static SCROLL_DRAG_GATE: LazyLock<ArcSwap<ScrollDragGate>> = LazyLock::new(|| {
+    ArcSwap::from_pointee(ScrollDragGate {
+        enabled: true,
+        drag_modifier: None,
+    })
+});
+
+/// Publish the strip-scroll drag gate the tap checks on every left press.
+/// Called from the main thread on startup and config reload.
+pub(crate) fn publish_scroll_drag_gate(config: &Config) {
+    SCROLL_DRAG_GATE.store(Arc::new(ScrollDragGate {
+        enabled: config.left_drag_scrolls_strip(),
+        drag_modifier: config.mouse_drag_display_modifier(),
+    }));
+}
+
 const SWIPE_THRESHOLD: f64 = 0.001;
 const GESTURE_MINIMAL_FINGERS: usize = 3;
 
@@ -371,9 +399,30 @@ impl InputHandler {
         let result = match event_type {
             CGEventType::LeftMouseDown | CGEventType::RightMouseDown => {
                 let point = CGEvent::location(Some(event));
+                if matches!(event_type, CGEventType::LeftMouseDown) {
+                    // Pre-suppress synchronously: the ECS only learns about
+                    // the press (and sets the flag authoritatively) a frame
+                    // later, and any drag slipping through in between starts
+                    // a real native drag session. Assume a scroll grab until
+                    // the ECS rules otherwise — floating, armed and
+                    // window-less presses clear the flag a frame later, and a
+                    // release always clears it, so a wrong guess costs at
+                    // most a frame of swallowed motion, never a stuck tap.
+                    let gate = SCROLL_DRAG_GATE.load();
+                    if gate.enabled
+                        && gate
+                            .drag_modifier
+                            .is_none_or(|required| !required.matches(modifiers))
+                    {
+                        SCROLL_DRAG_SUPPRESS.store(true, Ordering::Release);
+                    }
+                }
                 events.send(Event::MouseDown { point, modifiers })
             }
             CGEventType::LeftMouseUp | CGEventType::RightMouseUp => {
+                // A release ends any drag: never let a lost press leave
+                // native drags swallowed.
+                SCROLL_DRAG_SUPPRESS.store(false, Ordering::Release);
                 let point = CGEvent::location(Some(event));
                 events.send(Event::MouseUp { point, modifiers })
             }

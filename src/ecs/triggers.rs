@@ -49,9 +49,10 @@ fn update_passthrough(window: &Window, app: &Application, config: &Config) {
 }
 
 /// Re-applies the configuration side effects that must follow any config change:
-/// the per-display menubar-height override and the focused window's passthrough
-/// keys. Shared by the TOML reload trigger ([`refresh_configuration_trigger`])
-/// and the Lua reload system so both config sources behave identically on reload.
+/// the per-display menubar-height override, the focused window's passthrough
+/// keys, and the tap's strip-scroll drag gate. Shared by the TOML reload trigger
+/// ([`refresh_configuration_trigger`]) and the Lua reload system so both config
+/// sources behave identically on reload.
 pub(crate) fn apply_config_side_effects(
     config: &Config,
     displays: &mut Query<&mut Display>,
@@ -62,6 +63,7 @@ pub(crate) fn apply_config_side_effects(
     for mut display in &mut *displays {
         display.set_menubar_height_override(height);
     }
+    crate::platform::input::publish_scroll_drag_gate(config);
 
     // Recompute passthrough keys for the currently focused window.
     if let Some((window, _, parent)) = windows

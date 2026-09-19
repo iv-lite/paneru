@@ -69,6 +69,10 @@ impl Plugin for MouseEventsPlugin {
                 )
                     .run_if(mission_control_inactive),
                 mouse_up_trigger,
+                // Outside the mission-control gate like `mouse_up_trigger`:
+                // a release must resync even mid-Mission-Control, and it only
+                // acts on members the release just recorded.
+                resync_scrolled_windows.after(mouse_up_trigger),
                 horizontal_warp_mouse_trigger,
                 // Outside the mission-control gate like `mouse_up_trigger`:
                 // it must still run to hide a stale ghost.
@@ -473,6 +477,16 @@ fn mouse_up_trigger(
 
         for (held_entity, marker, armed) in &mouse_held {
             let entity = marker.0;
+            // Members of the dragged column (or the lone window).
+            let members: Vec<Entity> = strips
+                .iter()
+                .find_map(|(_, strip, _, _)| {
+                    strip
+                        .index_of(entity)
+                        .ok()
+                        .and_then(|index| strip.get(index).ok())
+                })
+                .map_or_else(|| vec![entity], |column| column.window_iter().collect());
             // A strip-scroll drag (unmodified left-drag that actually moved):
             // the new scroll offset is the intended result — no reorder, no
             // homing, no click-reshuffle. A press without travel falls
@@ -484,21 +498,17 @@ fn mouse_up_trigger(
                 debug!(
                     "mouse up: strip-scroll drag on {entity} traveled {scroll_distance:.0}px, keeping scroll offset"
                 );
+                // Hand the column to the post-release OS resync: a native
+                // slip through the press-frame race leaves the OS window
+                // displaced while layout stayed slot-relative, and nothing
+                // else re-reads or re-pushes it (see
+                // `resync_scrolled_windows`).
+                scroll_state.members = members;
                 if let Ok(mut entity_commands) = commands.get_entity(held_entity) {
                     entity_commands.try_despawn();
                 }
                 continue;
             }
-            // Members of the dragged column (or the lone window).
-            let members: Vec<Entity> = strips
-                .iter()
-                .find_map(|(_, strip, _, _)| {
-                    strip
-                        .index_of(entity)
-                        .ok()
-                        .and_then(|index| strip.get(index).ok())
-                })
-                .map_or_else(|| vec![entity], |column| column.window_iter().collect());
 
             // Armed same-display drop with the shortcut still held:
             // relocate the column to the nearest slot; the layout chain
@@ -547,6 +557,43 @@ fn mouse_up_trigger(
     }
 }
 
+/// Snaps scroll-released windows back into their slots when the OS window
+/// drifted from the layout frame.
+///
+/// The tap swallows strip-scroll drags, but a drag slipping through the
+/// press-frame race starts a real native session the app may then honor
+/// over our AX pushes — and mid-scroll commits are blind to it: `reposition`
+/// early-returns on stale-cache equality while the adoption lock ignores
+/// the native echo. Layout stayed slot-relative throughout, so any OS-side
+/// drift is damage, never intent: re-read OS truth per recorded member and
+/// re-push the slot position when they disagree. Runs right after
+/// [`mouse_up_trigger`] recorded the members, so the commit chain picks the
+/// correction up the same frame.
+fn resync_scrolled_windows(
+    mut scroll_state: ResMut<DragScrollState>,
+    mut windows: Query<(&mut Window, &Position)>,
+    mut commands: Commands,
+) {
+    if scroll_state.members.is_empty() {
+        return;
+    }
+    for member in std::mem::take(&mut scroll_state.members) {
+        let Ok((mut window, position)) = windows.get_mut(member) else {
+            continue;
+        };
+        let Ok(live) = window.update_frame().inspect_err(|err| {
+            debug!("scroll release: re-reading OS frame for {member} failed: {err}");
+        }) else {
+            continue;
+        };
+        let drift = (live.min - position.0).abs();
+        if drift.x > 1 || drift.y > 1 {
+            debug!("scroll release: OS window {member} drifted {drift:?}, snapping back to slot");
+            commands.reposition_entity(member, position.0);
+        }
+    }
+}
+
 /// Modifiers held during the current mouse drag, tracked from the
 /// `MouseDown`/`MouseDragged` stream (the `WindowMoved` trigger carries none).
 /// Read by the drag transfer and the adoption lock; reset on `MouseUp`.
@@ -563,14 +610,17 @@ impl Default for DragModifierState {
     }
 }
 
-/// Accumulated travel of the current unmodified left-drag, in pixels.
-/// Written by [`drag_move_held_column`] while a strip-scroll drag pans the
-/// active strip; read on release by [`mouse_up_trigger`] to tell a scroll
-/// (keep the new scroll offset, no homing, no reshuffle) apart from a click
-/// (today's focus/reshuffle behavior). Reset on press and release.
+/// Accumulated travel of the current unmodified left-drag, in pixels, plus
+/// the members of its dragged column. Written by [`drag_move_held_column`]
+/// while a strip-scroll drag pans the active strip (members are recorded on
+/// release by [`mouse_up_trigger`); read on release to tell a scroll (keep
+/// the new scroll offset, no homing, no reshuffle — but resync any native
+/// slip, see [`resync_scrolled_windows`]) apart from a click (today's
+/// focus/reshuffle behavior). Reset on press and release.
 #[derive(Debug, Resource, Default)]
 pub(crate) struct DragScrollState {
     pub(crate) distance_px: f64,
+    pub(crate) members: Vec<Entity>,
 }
 
 /// Where a drop at on-screen x `drop_x` would land in `strip`: the column
@@ -685,6 +735,7 @@ fn drag_move_held_column(
             Event::MouseDown { point, .. } => {
                 state.last = Some(origin_from(*point));
                 scroll_state.distance_px = 0.0;
+                scroll_state.members.clear();
             }
             Event::MouseUp { .. } => {
                 state.last = None;
