@@ -739,7 +739,7 @@ pub(crate) fn demux_input_events(
 pub(crate) fn pump_events(
     mut exit: MessageWriter<AppExit>,
     mut messages: MessageWriter<Event>,
-    low_power_mode: Option<Res<LowPowerMode>>,
+    mut low_power_mode: Option<ResMut<LowPowerMode>>,
     incoming_events: Option<NonSend<Receiver<Event>>>,
     platform: Option<NonSendMut<Pin<Box<PlatformCallbacks>>>>,
     activity: FrameActivity,
@@ -761,6 +761,7 @@ pub(crate) fn pump_events(
     let mut received_events = Vec::new();
     let mut pending_mouse = None;
     let mut woke = false;
+    let mut display_changed = false;
 
     // `true` when the channel went quiet, `false` when a cap sent us home with
     // events still queued. Only the quiet case may back the poll timeout off.
@@ -789,6 +790,14 @@ pub(crate) fn pump_events(
             }
             Ok(event) => {
                 woke |= matches!(event, Event::SystemWoke { .. });
+                display_changed |= matches!(
+                    event,
+                    Event::DisplayAdded { .. }
+                        | Event::DisplayRemoved { .. }
+                        | Event::DisplayMoved { .. }
+                        | Event::DisplayResized { .. }
+                        | Event::DisplayConfigured { .. }
+                );
                 if matches!(event, Event::MouseMoved { .. }) {
                     pending_mouse = Some(event);
                 } else {
@@ -804,9 +813,21 @@ pub(crate) fn pump_events(
     received_events.extend(pending_mouse.take());
     messages.write_batch(received_events);
 
+    // Wake is handled before the backoff below: a stale `LowPowerMode` (polled
+    // every 60s) would otherwise keep the pump at a 2s sleep right when input
+    // must feel instant, and the timeout must not back off on the wake frame.
+    if woke {
+        if let Some(low_power) = low_power_mode.as_deref_mut() {
+            low_power.0 = objc2_foundation::NSProcessInfo::processInfo().isLowPowerModeEnabled();
+        }
+        *timeout = LOOP_TIMEOUT_STEP;
+    }
+
     if drained {
         let frame_active = activity.mid_frame();
-        let low_power = low_power_mode.is_some_and(|low_power| low_power.0);
+        let low_power = low_power_mode
+            .as_deref()
+            .is_some_and(|low_power| low_power.0);
         let timeout_limit = if frame_active {
             LOOP_MAX_TIMEOUT_FRAME_ACTIVE_MS
         } else if low_power {
@@ -823,12 +844,19 @@ pub(crate) fn pump_events(
     // macOS can invalidate the event tap while the machine sleeps without ever
     // notifying the callback, which kills every keybinding, click and swipe
     // while the socket and the layout engine carry on as normal. Waking is the
-    // usual trigger, so sweep on a slow timer too for the deaths without one.
-    if woke || last_tap_check.is_none_or(|last| last.elapsed() >= TAP_HEALTH_CHECK_INTERVAL) {
+    // usual trigger (display reconfiguration fires even when the workspace
+    // wake notification is dropped), so sweep on a slow timer too for the
+    // deaths without one.
+    if woke
+        || display_changed
+        || last_tap_check.is_none_or(|last| last.elapsed() >= TAP_HEALTH_CHECK_INTERVAL)
+    {
         *last_tap_check = Some(Instant::now());
         match platform.ensure_input_tap_alive() {
             TapHealth::Healthy => {}
-            health => warn!("input tap not healthy (woke={woke}), recovery: {health:?}"),
+            health => warn!(
+                "input tap not healthy (woke={woke}, display_changed={display_changed}), recovery: {health:?}"
+            ),
         }
     }
 }

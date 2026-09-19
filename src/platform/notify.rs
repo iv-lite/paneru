@@ -51,6 +51,10 @@ impl NotifyHandler {
             KnownCGSEvent::SpaceCurrentChanged,
             KnownCGSEvent::SpaceDestroyed,
             KnownCGSEvent::SpaceWindowDestroyed,
+            // Redundant wake signal: `NSWorkspaceDidWakeNotification` alone
+            // proved droppable across lid sleep, leaving the event tap dead.
+            KnownCGSEvent::DisplayDidWake,
+            KnownCGSEvent::DisplayWillSleep,
         ];
         for event in events {
             unsafe {
@@ -91,6 +95,14 @@ impl NotifyHandler {
         };
 
         match event {
+            KnownCGSEvent::DisplayDidWake => {
+                _ = self.events.send(Event::SystemWoke {
+                    msg: "SLS DisplayDidWake".to_string(),
+                });
+            }
+            KnownCGSEvent::DisplayWillSleep => {
+                debug!("display will sleep");
+            }
             KnownCGSEvent::SpaceCreated
             | KnownCGSEvent::SpaceDestroyed
             | KnownCGSEvent::SpaceCurrentChanged => {

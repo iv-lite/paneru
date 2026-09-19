@@ -15,7 +15,7 @@ use objc2_core_graphics::CGDirectDisplayID;
 use std::collections::HashMap;
 use std::pin::Pin;
 use std::time::Duration;
-use tracing::{Level, debug, error, instrument, warn};
+use tracing::{Level, debug, error, info, instrument, warn};
 
 use crate::config::Config;
 use crate::ecs::layout::LayoutStrip;
@@ -70,7 +70,21 @@ fn wake_recovery(
     {
         return;
     }
-    debug!("recovering observers and transient state after wake");
+    info!("recovering observers and transient state after wake");
+
+    // Cheap transient state first: even if the AX re-subscribe storm below
+    // blocks on dead processes, the next WindowMoved can never transfer on a
+    // dead pre-sleep gesture.
+    for holder in &held {
+        if let Ok(mut holder_commands) = commands.get_entity(holder) {
+            holder_commands.try_despawn();
+        }
+    }
+    drag_modifiers.current = crate::platform::Modifiers::empty();
+
+    // Entries may outlive their processes across a sleep cycle; the next
+    // activation re-probes anything still missing.
+    ignored_windows.0.clear();
 
     // Re-subscribe every app and window: a failed call only logs, the next
     // wake (or relaunch path) retries.
@@ -90,20 +104,6 @@ fn wake_recovery(
             Err(err) => warn!("wake recovery: window {entity} has no parent app: {err}"),
         }
     }
-
-    // No button can still be held after a sleep cycle: drop stale holders
-    // (whose deferred reshuffle is meaningless now) and clear modifiers, so
-    // the next WindowMoved can never transfer on a dead gesture.
-    for holder in &held {
-        if let Ok(mut holder_commands) = commands.get_entity(holder) {
-            holder_commands.try_despawn();
-        }
-    }
-    drag_modifiers.current = crate::platform::Modifiers::empty();
-
-    // Entries may outlive their processes across a sleep cycle; the next
-    // activation re-probes anything still missing.
-    ignored_windows.0.clear();
 }
 
 #[instrument(level = Level::DEBUG, skip_all, fields(trigger))]
@@ -176,16 +176,19 @@ pub(crate) fn reconcile_displays(
     const DISPLAY_RETRY_TIMEOUT: u64 = 5;
     const DISPLAY_RETRIES: u8 = 3;
 
+    let mut woke = false;
+    let mut display_event = false;
     let needs_reconcile = messages.read().any(|event| {
-        matches!(
+        woke |= matches!(event, Event::SystemWoke { .. });
+        display_event |= matches!(
             event,
-            Event::SystemWoke { .. }
-                | Event::DisplayAdded { .. }
+            Event::DisplayAdded { .. }
                 | Event::DisplayRemoved { .. }
                 | Event::DisplayMoved { .. }
                 | Event::DisplayResized { .. }
                 | Event::DisplayConfigured { .. }
-        )
+        );
+        woke || display_event
     });
     if !needs_reconcile {
         return;
@@ -200,9 +203,20 @@ pub(crate) fn reconcile_displays(
         .map(|(display, workspaces)| (display.id(), (display, workspaces)))
         .collect();
     if present_displays.is_empty() {
-        warn!("No present displays found... retrying again in {DISPLAY_RETRY_TIMEOUT} seconds.");
-        *retries = retries.saturating_sub(1);
+        // `CGGetActiveDisplayList` can come back transiently empty right after
+        // resume. `Local<u8>` defaults to 0, which is also the exhausted
+        // state, so an untouched counter means "first failure": seed it with
+        // the budget. (Previously `saturating_sub(1)` on 0 stayed 0, so the
+        // retry below never fired.)
+        if *retries == 0 {
+            *retries = DISPLAY_RETRIES;
+        }
         if *retries > 0 {
+            *retries -= 1;
+            warn!(
+                "No present displays found... retrying again in {DISPLAY_RETRY_TIMEOUT} seconds ({} left).",
+                *retries
+            );
             let retry_displays = move |mut messages: MessageWriter<Event>| {
                 messages.write(Event::SystemWoke {
                     msg: "Retrying display scan".to_string(),
@@ -214,9 +228,22 @@ pub(crate) fn reconcile_displays(
                 system_id,
                 &mut commands,
             );
+        } else {
+            error!(
+                "No present displays found and retry budget exhausted; keeping stale display set."
+            );
         }
+        // A bare wake with a transiently empty display list must not orphan
+        // every strip: leave ECS state untouched and let the retry re-run the
+        // diff. An explicit display add/remove in the same frame means a
+        // genuine removal (including the single-display harness case), so fall
+        // through and reconcile.
+        if !display_event {
+            return;
+        }
+    } else {
+        *retries = DISPLAY_RETRIES;
     }
-    *retries = DISPLAY_RETRIES;
 
     let existing_displays: HashMap<CGDirectDisplayID, _> = displays
         .iter()

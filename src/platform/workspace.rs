@@ -136,6 +136,25 @@ define_class!(
             _ = self.ivars().events.send(msg);
         }
 
+        /// Called when the screens wake. Redundant with [`Self::system_woke`]:
+        /// either notification alone is enough to revive the event tap, so a
+        /// dropped `NSWorkspaceDidWakeNotification` no longer leaves input dead.
+        #[unsafe(method(screensDidWake:))]
+        fn screens_did_wake(&self, notification: &NSObject) {
+            let msg = Event::SystemWoke {
+                msg: format!("WorkspaceObserver screensDidWake: {notification:?}"),
+            };
+            _ = self.ivars().events.send(msg);
+        }
+
+        /// Called when the system is about to sleep. No event is sent: waking
+        /// is what needs healing, and a premature `SystemWoke` would re-observe
+        /// AX subscriptions right before they go deaf anyway.
+        #[unsafe(method(willSleep:))]
+        fn will_sleep(&self, notification: &NSObject) {
+            debug!("system will sleep: {notification:?}");
+        }
+
         /// Called when the menu bar hiding state changes.
         ///
         /// # Arguments
@@ -289,6 +308,11 @@ impl WorkspaceObserver {
                 "NSWorkspaceDidUnhideApplicationNotification",
             ),
             (sel!(didWake:), "NSWorkspaceDidWakeNotification"),
+            (
+                sel!(screensDidWake:),
+                "NSWorkspaceScreensDidWakeNotification",
+            ),
+            (sel!(willSleep:), "NSWorkspaceWillSleepNotification"),
         ];
         let shared_ws = NSWorkspace::sharedWorkspace();
         let notification_center = shared_ws.notificationCenter();
