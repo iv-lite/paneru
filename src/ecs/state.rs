@@ -6,8 +6,9 @@ use std::time::{SystemTime, UNIX_EPOCH};
 use bevy::app::AppExit;
 use bevy::ecs::entity::Entity;
 use bevy::ecs::hierarchy::ChildOf;
+use bevy::ecs::lifecycle::RemovedComponents;
 use bevy::ecs::message::MessageReader;
-use bevy::ecs::query::Has;
+use bevy::ecs::query::{Added, Changed, Has, Or};
 use bevy::ecs::resource::Resource;
 use bevy::ecs::system::{Query, Res, SystemParam};
 use bevy::math::IRect;
@@ -18,8 +19,11 @@ use tracing::{debug, error, info, warn};
 use crate::config::Config;
 use crate::ecs::layout::{Column, LayoutStrip, StackItem};
 use crate::ecs::params::Windows;
-use crate::ecs::{ActiveDisplayMarker, ActiveWorkspaceMarker, SelectedVirtualMarker, Unmanaged};
-use crate::manager::{Application, Display, WindowManager};
+use crate::ecs::{
+    ActiveDisplayMarker, ActiveWorkspaceMarker, Bounds, Position, SelectedVirtualMarker, Unmanaged,
+};
+use crate::events::Event;
+use crate::manager::{Application, Display, Window, WindowManager};
 use crate::platform::{Pid, ProcessSerialNumber, WinID, WorkspaceId};
 use paneru_shared_types::windowset::WindowSet;
 
@@ -796,12 +800,47 @@ fn now_timestamp() -> u64 {
         .as_secs()
 }
 
+/// Change filters covering everything `PaneruState::extract` reads, so the
+/// periodic save can skip clean windows without paying the extract. Strip
+/// membership edits mutate the strip (firing `Changed<LayoutStrip>`) and
+/// display add/remove re-parents strips, so only strip removal needs a
+/// separate removed-component check; window titles arrive as messages.
+type SaveDirtyChanged<'w, 's> = Query<
+    'w,
+    's,
+    (),
+    Or<(
+        Changed<LayoutStrip>,
+        Changed<Position>,
+        Changed<Bounds>,
+        Changed<Display>,
+        Added<LayoutStrip>,
+        Added<Window>,
+        Added<ActiveWorkspaceMarker>,
+    )>,
+>;
+
 pub fn periodic_state_save(
+    dirty: SaveDirtyChanged<'_, '_>,
+    mut removed_strips: RemovedComponents<LayoutStrip>,
+    mut titles: MessageReader<Event>,
     workspaces: Query<(Option<&ChildOf>, &LayoutStrip, Has<ActiveWorkspaceMarker>)>,
     displays: Query<(&Display, Entity, Has<ActiveDisplayMarker>)>,
     windows: Windows,
     apps: Query<&Application>,
 ) {
+    // Skip the full extract + serialize + write when nothing could have
+    // changed since this system's last run (change detection is per-system,
+    // so a 5min cadence sees the whole 5min window). Mirrors the script
+    // state's dirty flag, but derived instead of tracked.
+    if dirty.is_empty()
+        && removed_strips.read().next().is_none()
+        && !titles
+            .read()
+            .any(|event| matches!(event, Event::WindowTitleChanged { .. }))
+    {
+        return;
+    }
     let state = PaneruState::extract(&workspaces, &displays, &windows, &apps);
     let path = PaneruState::default_state_file_path();
     if let Err(e) = state.save_to_file(&path) {

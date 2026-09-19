@@ -493,6 +493,42 @@ pub(crate) fn finish_setup(
     commands.trigger(RestoreWindowState);
 }
 
+/// Backoff state for the launch polls below: 200ms, 400ms, 800ms, then
+/// 1600ms within the 10s observability timeout. Resets whenever the fresh
+/// set changes size, so a new launch gets fast probing again. Per-system
+/// `Local` (not shared): process and application probing interleave, and a
+/// shared budget would starve one of them.
+#[derive(Debug, Default)]
+pub(super) struct LaunchBackoff {
+    attempts: u32,
+    last_elapsed: Option<f64>,
+    last_count: usize,
+}
+
+/// Whether a launch poll may run now (virtual time, so the harness stays
+/// deterministic). See `LaunchBackoff`.
+fn launch_poll_due(backoff: &mut LaunchBackoff, fresh_count: usize, time: &Time) -> bool {
+    if fresh_count != backoff.last_count {
+        backoff.attempts = 0;
+        backoff.last_count = fresh_count;
+    }
+    let wait_secs = match backoff.attempts {
+        0 => 0.2,
+        1 => 0.4,
+        2 => 0.8,
+        _ => 1.6,
+    };
+    if backoff
+        .last_elapsed
+        .is_some_and(|last| time.elapsed_secs_f64() - last < wait_secs)
+    {
+        return false;
+    }
+    backoff.last_elapsed = Some(time.elapsed_secs_f64());
+    backoff.attempts = backoff.attempts.saturating_add(1);
+    true
+}
+
 /// Handles the event when a new application is launched. It creates a `Process` and `Application` object,
 /// observes the application for events, and adds its windows to the manager.
 /// This system processes `BProcess` entities marked with `FreshMarker`.
@@ -508,9 +544,14 @@ pub(super) fn add_launched_process(
     window_manager: Res<WindowManager>,
     fresh_processes: Populated<(Entity, &mut BProcess, Has<Children>), With<FreshMarker>>,
     config: Res<Config>,
+    time: Res<Time>,
+    mut backoff: Local<LaunchBackoff>,
     mut commands: Commands,
 ) {
     const APP_OBSERVABLE_TIMEOUT: Duration = Duration::from_secs(10);
+    if !launch_poll_due(&mut backoff, fresh_processes.iter().count(), &time) {
+        return;
+    }
     let mut already_seen = HashSet::new();
 
     for (entity, mut process, children) in fresh_processes {
@@ -575,8 +616,13 @@ pub(super) fn add_launched_application(
     app_query: Populated<(&mut Application, Entity, Has<Children>), With<FreshMarker>>,
     windows: Windows,
     config: Res<Config>,
+    time: Res<Time>,
+    mut backoff: Local<LaunchBackoff>,
     mut commands: Commands,
 ) {
+    if !launch_poll_due(&mut backoff, app_query.iter().count(), &time) {
+        return;
+    }
     // TODO: maybe refactor this with add_existing_application_windows()
     let find_window = |window_id| windows.find(window_id);
 

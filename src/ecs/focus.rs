@@ -13,7 +13,7 @@ use bevy::ecs::system::{Commands, Populated, Query, Res, ResMut, Single};
 use bevy::math::IRect;
 use bevy::prelude::Event as BevyEvent;
 use bevy::time::common_conditions::on_timer;
-use tracing::{Level, debug, error, instrument, trace, warn};
+use tracing::{Level, debug, instrument, trace, warn};
 
 use super::{FocusedMarker, MouseHeldMarker, SystemTheme, Unmanaged};
 use crate::config::Config;
@@ -482,22 +482,15 @@ fn raise_window_trigger(
 }
 
 #[instrument(level = Level::DEBUG, skip_all)]
-fn recover_lost_focus(
-    windows: Windows,
-    active_workspace: Query<&LayoutStrip, With<ActiveWorkspaceMarker>>,
-    mut commands: Commands,
-) {
+fn recover_lost_focus(windows: Windows) {
     if windows.focused().is_some() {
         return;
     }
-    error!("Lost focus marker, recovering!");
-    if let Ok(strip) = active_workspace
-        .single()
-        .inspect_err(|err| error!("Unable to get current workspace: {err}"))
-        && let Some(entity) = strip.first().ok().and_then(|col| col.top())
-    {
-        commands.focus_entity(entity, false);
-    }
+    // Watchdog only: refocusing here would yank focus (plus autocenter,
+    // reshuffle and mouse-follow side effects) on top of whatever the user
+    // is doing, which reads as a random jump. Log loudly so the missing
+    // invariant gets fixed at its source instead.
+    warn!("Lost focus marker with managed windows present; leaving focus alone");
 }
 
 pub(super) fn stray_focus_observer(

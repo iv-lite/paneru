@@ -6,6 +6,7 @@ use bevy::app::App as BevyApp;
 use bevy::app::{First, Last, PostUpdate, PreUpdate, Startup};
 use bevy::ecs::hierarchy::ChildOf;
 use bevy::ecs::lifecycle::RemovedComponents;
+use bevy::ecs::message::MessageReader;
 use bevy::ecs::query::{Added, Changed, Or, With};
 use bevy::ecs::resource::Resource;
 use bevy::ecs::schedule::SystemCondition;
@@ -69,9 +70,7 @@ pub(crate) use triggers::apply_config_side_effects;
 /// * `app` - The Bevy application to register the systems with.
 #[allow(clippy::too_many_lines)]
 pub fn register_systems(app: &mut bevy::app::App) {
-    const CLOSED_WINDOW_CHECK_FREQ: Duration = Duration::from_millis(1000);
     const LOW_POWER_MODE_CHECK: Duration = Duration::from_secs(60);
-    const APP_OBSERVABILITY_CHECK_FREQ: Duration = Duration::from_millis(200);
 
     let not_swiping = |scrolling: Query<&Scrolling, With<ActiveWorkspaceMarker>>| {
         scrolling
@@ -136,6 +135,20 @@ pub fn register_systems(app: &mut bevy::app::App) {
         };
     let native_tabs_enabled =
         |config: Option<Res<Config>>| config.is_none_or(|config| config.native_tabs_enabled());
+    // Close/change signals that may strand windows without notification:
+    // a destroy to check siblings, a space/display change to re-verify.
+    // Separate reader: consuming here must not starve the systems below.
+    let window_closed_signals = |mut messages: MessageReader<Event>| {
+        messages.read().any(|event| {
+            matches!(
+                event,
+                Event::WindowDestroyed { .. } | Event::SpaceChanged | Event::DisplayChanged
+            )
+        })
+    };
+    // New windows are when stray native tabs can appear; the timer is only
+    // the backstop for tabs the OS assembles late.
+    let window_added = |added: Query<(), Added<Window>>| !added.is_empty();
 
     app.add_systems(
         Startup,
@@ -174,19 +187,22 @@ pub fn register_systems(app: &mut bevy::app::App) {
             )
                 .chain()
                 .run_if(resource_exists::<Initializing>),
-            systems::add_launched_process.run_if(on_timer(APP_OBSERVABILITY_CHECK_FREQ)),
-            systems::add_launched_application.run_if(on_timer(APP_OBSERVABILITY_CHECK_FREQ)),
+            systems::add_launched_process,
+            systems::add_launched_application,
             systems::fresh_marker_cleanup,
             systems::timeout_ticker,
             workspace::cleanup_unordered_windows
                 .run_if(not(resource_exists::<Initializing>))
-                .run_if(on_timer(CLOSED_WINDOW_CHECK_FREQ)),
+                .run_if(on_timer(Duration::from_secs(5)).or_eager(window_closed_signals)),
             systems::regroup_stray_native_tabs
                 .run_if(native_tabs_enabled)
                 .run_if(not(resource_exists::<Initializing>))
-                .run_if(on_timer(CLOSED_WINDOW_CHECK_FREQ)),
+                .run_if(not_swiping)
+                .run_if(on_timer(Duration::from_secs(5)).or_eager(window_added)),
             systems::auto_discover_unmanaged_focused_windows,
-            systems::retry_front_switch,
+            // Throttled: each attempt is AX round trips, and the 2s Timeout
+            // bounds the total storm.
+            systems::retry_front_switch.run_if(on_timer(Duration::from_millis(100))),
             systems::update_low_power_state
                 .run_if(resource_exists::<LowPowerMode>)
                 .run_if(on_timer(LOW_POWER_MODE_CHECK)),

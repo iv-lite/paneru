@@ -9,6 +9,7 @@ use bevy::ecs::observer::On;
 use bevy::ecs::query::{Added, Has, With, Without};
 use bevy::ecs::resource::Resource;
 use bevy::ecs::schedule::IntoScheduleConfigs as _;
+use bevy::ecs::schedule::SystemCondition as _;
 use bevy::ecs::schedule::common_conditions::{not, resource_exists};
 use bevy::ecs::system::{Commands, ParamSet, Populated, Query, Res, ResMut, Single};
 use bevy::time::common_conditions::on_timer;
@@ -90,7 +91,21 @@ type RenumberStrips<'w, 's> = ParamSet<
 
 impl Plugin for WorkspaceEventsPlugin {
     fn build(&self, app: &mut App) {
-        const DISPLAY_CHANGE_CHECK_FREQ: Duration = Duration::from_millis(1000);
+        // Orphans only ever come from display reconciliation (which ends by
+        // emitting `DisplayChanged`), so run promptly on display/wake events
+        // with a backstop well inside the 30s orphan expiry — never blindly
+        // every second with a full SLS enumeration.
+        let orphan_signals = |mut messages: MessageReader<Event>| {
+            messages.read().any(|event| {
+                matches!(
+                    event,
+                    Event::DisplayChanged
+                        | Event::SystemWoke { .. }
+                        | Event::DisplayAdded { .. }
+                        | Event::DisplayRemoved { .. }
+                )
+            })
+        };
 
         let reap_workspaces = |config: Option<Res<Config>>| {
             config.is_some_and(|config| config.reap_empty_workspaces())
@@ -112,7 +127,7 @@ impl Plugin for WorkspaceEventsPlugin {
                 detect_moved_windows.run_if(not(resource_exists::<Initializing>)),
                 find_orphaned_workspaces
                     .after(crate::ecs::display::reconcile_displays)
-                    .run_if(on_timer(DISPLAY_CHANGE_CHECK_FREQ)),
+                    .run_if(on_timer(Duration::from_secs(10)).or_eager(orphan_signals)),
             ),
         );
         app.init_resource::<IgnoredMovedWindows>();
