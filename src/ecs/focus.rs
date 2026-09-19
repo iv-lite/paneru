@@ -21,11 +21,11 @@ use crate::ecs::layout::LayoutStrip;
 use crate::ecs::params::{ActiveDisplay, GlobalState, WindowCtx, Windows};
 use crate::ecs::workspace::RestoreFocusMarker;
 use crate::ecs::{
-    ActiveWorkspaceMarker, Bounds, Position, RaiseWindow, ResizeMarker, Scrolling,
+    ActiveWorkspaceMarker, Bounds, DockPosition, Position, RaiseWindow, ResizeMarker, Scrolling,
     SendMessageTrigger, SpawnCommandsExt, StrayFocusEvent,
 };
 use crate::events::Event;
-use crate::manager::{Application, Display, Window, WindowManager};
+use crate::manager::{Application, Display, Window, WindowManager, origin_from};
 use crate::platform::WorkspaceId;
 
 const REFRESH_WINDOW_CHECK_FREQ_MS: u64 = 1000;
@@ -102,7 +102,12 @@ impl Plugin for FocusEventsPlugin {
             PostUpdate,
             (
                 autocenter_window_on_focus.after(super::systems::animate_resize_entities),
-                mouse_follows_focus.after(super::systems::animate_resize_entities),
+                // After autocenter: the warp reads `moving_frame`, which
+                // includes pending reposition markers — but only if
+                // autocenter/reshuffle has already issued them this tick.
+                // Otherwise the one-shot `Added` warp lands on the
+                // pre-recenter frame and never corrects itself.
+                mouse_follows_focus.after(autocenter_window_on_focus),
                 recover_lost_focus.run_if(on_timer(Duration::from_millis(
                     REFRESH_WINDOW_CHECK_FREQ_MS,
                 ))),
@@ -294,7 +299,7 @@ fn mouse_follows_focus(
     global_state: GlobalState,
     config: Res<Config>,
     window_manager: Res<WindowManager>,
-    displays: Query<&Display>,
+    displays: Query<(&Display, Option<&DockPosition>)>,
     workspaces: Query<(
         &LayoutStrip,
         &ChildOf,
@@ -321,24 +326,43 @@ fn mouse_follows_focus(
         global_state.skip_reshuffle(),
         global_state.ffm_flag()
     );
-    if config.mouse_follows_focus()
+    if !(config.mouse_follows_focus()
         && !global_state.skip_reshuffle()
-        && global_state.ffm_flag().is_none_or(|id| id != window.id())
-        && let Some(frame) = windows.moving_frame(entity)
-        && let Some(display_bounds) = workspaces
-            .into_iter()
-            .find_map(|(strip, child, _, _)| strip.contains(entity).then_some(child))
-            .and_then(|child| displays.get(child.parent()).ok())
-            .map(Display::bounds)
+        && global_state.ffm_flag().is_none_or(|id| id != window.id()))
     {
-        let visible = display_bounds.intersect(frame);
-        // If the overlap is smaller than 50x50, the window is probably hidden
-        // off screen, so do not move the mouse.
-        if visible.size().length_squared() > 5000 {
-            let origin = visible.center();
-            debug!("centering on {} {origin}", window.id());
-            window_manager.warp_mouse(origin);
-        }
+        return;
+    }
+    let Some(frame) = windows.moving_frame(entity) else {
+        return;
+    };
+    // Already there: a click focuses the window under the cursor, and a
+    // keyboard move into the window holding the cursor, must not yank it
+    // to the center.
+    if window_manager
+        .cursor_position()
+        .is_some_and(|point| frame.contains(origin_from(point)))
+    {
+        trace!(
+            "cursor already inside window {}, skipping warp",
+            window.id()
+        );
+        return;
+    }
+    let Some(display_bounds) = workspaces
+        .into_iter()
+        .find_map(|(strip, child, _, _)| strip.contains(entity).then_some(child))
+        .and_then(|child| displays.get(child.parent()).ok())
+        .map(|(display, dock)| display.actual_display_bounds(dock, &config))
+    else {
+        return;
+    };
+    let visible = display_bounds.intersect(frame);
+    // If the overlap is smaller than 50x50, the window is probably hidden
+    // off screen, so do not move the mouse.
+    if visible.size().length_squared() > 5000 {
+        let origin = visible.center();
+        debug!("centering on {} {origin}", window.id());
+        window_manager.warp_mouse(origin);
     }
 }
 

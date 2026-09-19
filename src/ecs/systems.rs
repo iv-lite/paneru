@@ -1101,13 +1101,15 @@ pub(super) struct OverlayWindowConfigCache {
 
 #[allow(clippy::too_many_arguments)]
 pub(super) fn update_overlays(
-    // Gating lives in the `overlay_dirty` run condition (strip change *or*
-    // focus change); this query just resolves the current active workspace.
+    // Gating lives in the overlay run conditions (dirty ticks plus every
+    // frame of scroll/drag motion); this query just resolves the current
+    // active workspace.
     active_workspace: Populated<(Has<Scrolling>, &LayoutStrip), With<ActiveWorkspaceMarker>>,
     windows: Windows,
     applications: Query<&Application>,
     displays: Query<(&Display, Has<ActiveDisplayMarker>)>,
     focus_markers: Query<(), With<FocusedMarker>>,
+    drag_held: Query<(), With<MouseHeldMarker>>,
     overlay_mgr: Option<NonSendMut<OverlayManager>>,
     mission_control_active: Res<MissionControlActive>,
     config: Res<Config>,
@@ -1165,9 +1167,20 @@ pub(super) fn update_overlays(
         return;
     }
 
-    // Find the focused managed window's absolute CG frame.
+    // The focused window's frame. While the strip is being scrolled or a
+    // drag is held, the cached OS frame lags behind AX commits, so the
+    // border would trail the motion and settle detached: use the live ECS
+    // layout frame instead — it is what the windows are being driven to.
+    // Otherwise the OS frame is fresher (native moves/resizes bypass ECS).
+    let tracking_live = swiping || !drag_held.is_empty();
+    let layout_frame = tracking_live
+        .then(|| windows.moving_frame(entity))
+        .flatten();
+    let frame = layout_frame.unwrap_or_else(|| window.frame());
+    if tracking_live && layout_frame.is_none() {
+        trace!("overlay tracking live but no layout frame, falling back to OS frame");
+    }
     let focused_abs_cg = {
-        let frame = window.frame();
         let h_pad = window.horizontal_padding();
         let v_pad = window.vertical_padding();
         Some(NSRect::new(
@@ -1187,7 +1200,7 @@ pub(super) fn update_overlays(
         // focus border around one paints a stripe on the neighbor. The focused
         // window belongs on screen, so a center outside the active display
         // means it is parked or mid-transfer — skip the border either way.
-        let center = window.frame().center();
+        let center = frame.center();
         displays
             .iter()
             .find(|(_, active)| *active)

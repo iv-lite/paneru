@@ -9,7 +9,7 @@ use crate::ecs::layout::{LayoutStrip, PARKED_STRIP_SLIVER};
 use crate::ecs::mouse::{DragModifierState, DropPreviewState};
 use crate::ecs::workspace::IgnoredMovedWindows;
 use crate::ecs::{
-    ActiveDisplayMarker, DockPosition, MouseHeldMarker, Position, RepositionMarker,
+    ActiveDisplayMarker, Bounds, DockPosition, MouseHeldMarker, Position, RepositionMarker,
     SpawnWindowTrigger, Timeout,
 };
 use crate::events::Event;
@@ -1822,6 +1822,77 @@ fn test_unarmed_drag_at_edge_does_not_warp() {
                 .find(|(strip, _)| strip.contains(entity))
                 .expect("need owning strip");
             assert_eq!(position.0.x, 822);
+        })
+        .run(commands);
+}
+
+/// `mouse_follows_focus` warps to the newly focused window's visible center
+/// on keyboard focus moves — but only when the cursor is outside it.
+#[test]
+fn test_mouse_follows_focus_warps_when_cursor_outside() {
+    let commands = vec![
+        Event::MenuOpened { window_id: 0 },
+        Event::Command {
+            command: Command::PrintState,
+        },
+        Event::Command {
+            command: Command::Window(Operation::Focus(Direction::East)),
+        },
+        Event::Command {
+            command: Command::PrintState,
+        },
+    ];
+
+    TestHarness::new()
+        .with_windows(2)
+        .on_iteration(3, move |world, state| {
+            assert_focused!(world, 1);
+            let entity = find_window_entity(1, world);
+            let position = world.get::<Position>(entity).expect("need position").0;
+            let size = world.get::<Bounds>(entity).expect("need bounds").0;
+            assert_eq!(
+                state.cursor_position(),
+                IRect::from_corners(position, position + size).center()
+            );
+        })
+        .run(commands);
+}
+
+/// ...while a cursor already inside the newly focused window stays put: no
+/// yank to the center on either click-focus or keyboard focus.
+#[test]
+fn test_mouse_follows_focus_skips_warp_when_cursor_inside() {
+    let commands = vec![
+        Event::MenuOpened { window_id: 0 },
+        Event::Command {
+            command: Command::PrintState,
+        },
+        Event::Command {
+            command: Command::Window(Operation::Focus(Direction::East)),
+        },
+        Event::Command {
+            command: Command::PrintState,
+        },
+    ];
+
+    TestHarness::new()
+        .with_windows(2)
+        .on_iteration(1, move |world, state| {
+            // Window 1 tiles into the (400, 20) slot: park the cursor
+            // inside it but off-center, before moving focus there.
+            let entity = find_window_entity(1, world);
+            let position = world.get::<Position>(entity).expect("need position").0;
+            state.set_cursor(Origin::new(position.x + 10, position.y + 10));
+        })
+        .on_iteration(3, move |world, state| {
+            assert_focused!(world, 1);
+            let entity = find_window_entity(1, world);
+            let position = world.get::<Position>(entity).expect("need position").0;
+            assert_eq!(
+                state.cursor_position(),
+                Origin::new(position.x + 10, position.y + 10),
+                "cursor already inside must not warp to the center"
+            );
         })
         .run(commands);
 }

@@ -404,6 +404,13 @@ impl MockState {
         self.inner.force_read().cursor_position
     }
 
+    /// Parks the mock cursor, e.g. to test cursor-inside guards. Shares the
+    /// inner state, so a verifier can set it for later iterations.
+    #[allow(unused)]
+    pub fn set_cursor(&self, position: Origin) {
+        self.inner.force_write().cursor_position = position;
+    }
+
     // --- Mock Factory Methods ---
 
     #[allow(clippy::too_many_lines)]

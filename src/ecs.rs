@@ -89,6 +89,10 @@ pub fn register_systems(app: &mut bevy::app::App) {
     // Position changes on the focused window also dirty the overlay so that
     // dragging a floating window moves the highlight with it; size changes do
     // the same so the border tracks resizes instead of keeping a stale frame.
+    // Scroll/drag motion gets its own condition below: a scrolling strip
+    // rewrites the focused window's frame a tick later via the layout pass,
+    // so gating only on the focused frame would lag the drag and settle
+    // detached after release.
     let vw_indicator_dirty =
         |strip_changed: Query<(), (With<ActiveWorkspaceMarker>, Changed<LayoutStrip>)>,
          focus_gained: Query<(), Added<FocusedMarker>>,
@@ -98,6 +102,15 @@ pub fn register_systems(app: &mut bevy::app::App) {
                 || !focus_gained.is_empty()
                 || !workspace_changed.is_empty()
                 || !focused_moved.is_empty()
+        };
+    // True every frame while the active strip is being scrolled or a mouse
+    // drag is held, so the border tracks the motion instead of the last
+    // dirty tick. Only the overlay uses this — the menu bar keeps the
+    // cheaper `vw_indicator_dirty` gate.
+    let overlay_tracking_motion =
+        |strip_scrolled: Query<(), (With<ActiveWorkspaceMarker>, Changed<Position>)>,
+         drag_held: Query<(), With<MouseHeldMarker>>| {
+            !strip_scrolled.is_empty() || !drag_held.is_empty()
         };
     // The menu bar additionally shows how many virtual workspaces exist, so it
     // has to redraw when one is created or reaped, neither of which touches the
@@ -195,7 +208,7 @@ pub fn register_systems(app: &mut bevy::app::App) {
                     .after(systems::animate_entities)
                     .after(systems::animate_resize_entities)
                     .run_if(dimming_enabled)
-                    .run_if(vw_indicator_dirty),
+                    .run_if(vw_indicator_dirty.or_eager(overlay_tracking_motion)),
                 systems::update_flash_messages,
             )
                 .chain(),
