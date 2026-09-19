@@ -642,6 +642,19 @@ pub(crate) struct DragScrollState {
     pub(crate) settle_deadline: Option<Instant>,
 }
 
+impl DragScrollState {
+    /// Whether a post-release settle grace is currently active: members are
+    /// listed and the wall-clock deadline has not passed. While active, the
+    /// adoption path refuses lagging native echoes for members and the
+    /// overlay keeps reading the live layout frame, so neither can freeze a
+    /// stale OS rect into place.
+    pub(crate) fn settle_active(&self) -> bool {
+        self.settle_deadline
+            .is_some_and(|deadline| Instant::now() < deadline)
+            && !self.members.is_empty()
+    }
+}
+
 /// Delay after a scroll release before the settle check re-reads OS truth.
 const SCROLL_SETTLE_DELAY: Duration = Duration::from_millis(200);
 /// Re-arm step while displaced members persist.
@@ -693,7 +706,11 @@ fn scroll_settle_check(
         };
         let drift = (live.min - position.0).abs();
         if drift.x > 1 || drift.y > 1 {
-            debug!("scroll settle: OS window {member} drifted {drift:?}, pushing slot");
+            // Info, not debug: a repair here means the OS really slipped
+            // (suppression leak or an eaten push), which is exactly the
+            // signal for whether native sessions are still starting.
+            // Human-rate releases keep this far from spammy.
+            info!("scroll settle: OS window {member} drifted {drift:?}, pushing slot");
             window.reposition(position.0);
             pending.push(member);
         }
@@ -1616,6 +1633,30 @@ mod tests {
 
     fn test_viewport() -> IRect {
         IRect::new(0, 20, 1024, 768)
+    }
+
+    #[test]
+    fn settle_grace_tracks_members_and_deadline() {
+        use bevy::ecs::entity::Entity;
+
+        let mut state = DragScrollState::default();
+        assert!(!state.settle_active(), "empty list is never active");
+        state.members.push(Entity::PLACEHOLDER);
+        assert!(
+            !state.settle_active(),
+            "members without a deadline are stale, not active"
+        );
+        state.settle_deadline = Some(Instant::now() + Duration::from_secs(1));
+        assert!(
+            state.settle_active(),
+            "pending members inside the deadline are active"
+        );
+        state.settle_deadline = Some(
+            Instant::now()
+                .checked_sub(Duration::from_secs(1))
+                .expect("test clock runs forward"),
+        );
+        assert!(!state.settle_active(), "an expired deadline ends the grace");
     }
 
     #[test]

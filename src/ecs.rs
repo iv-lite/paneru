@@ -80,8 +80,11 @@ pub fn register_systems(app: &mut bevy::app::App) {
             .is_none_or(|marker| !marker.is_user_swiping)
     };
     let dimming_enabled = |config: Option<Res<Config>>| {
-        config
-            .is_some_and(|config| config.has_dim_inactive_color() || config.border_active_window())
+        config.is_some_and(|config| {
+            config.has_dim_inactive_color()
+                || config.border_active_window()
+                || config.inactive_border_enabled()
+        })
     };
     // The overlay must refresh not just when the active strip's layout changes,
     // but also whenever focus moves — including focus *loss* (e.g. switching to
@@ -112,6 +115,18 @@ pub fn register_systems(app: &mut bevy::app::App) {
          drag_held: Query<(), With<MouseHeldMarker>>| {
             !strip_scrolled.is_empty() || !drag_held.is_empty()
         };
+    // Windows appearing or disappearing change the per-window border set
+    // (inactive borders), which no layout/focus tick necessarily accompanies.
+    // Overlay-only, like motion above.
+    let bordered_set_changed =
+        |spawned: Query<(), Added<Window>>, mut removed: RemovedComponents<Window>| {
+            !spawned.is_empty() || removed.read().next().is_some()
+        };
+    // A drag ending must re-run the overlay even when nothing else dirtied
+    // it: hides imposed mid-drag (armed column) would otherwise stick until
+    // the next focus/strip/position change. Overlay-only, like above.
+    let drag_ended =
+        |mut released: RemovedComponents<MouseHeldMarker>| released.read().next().is_some();
     // The menu bar additionally shows how many virtual workspaces exist, so it
     // has to redraw when one is created or reaped, neither of which touches the
     // active strip.
@@ -208,7 +223,12 @@ pub fn register_systems(app: &mut bevy::app::App) {
                     .after(systems::animate_entities)
                     .after(systems::animate_resize_entities)
                     .run_if(dimming_enabled)
-                    .run_if(vw_indicator_dirty.or_eager(overlay_tracking_motion)),
+                    .run_if(
+                        vw_indicator_dirty
+                            .or_eager(overlay_tracking_motion)
+                            .or_eager(bordered_set_changed)
+                            .or_eager(drag_ended),
+                    ),
                 systems::update_flash_messages,
             )
                 .chain(),

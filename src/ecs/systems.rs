@@ -11,8 +11,8 @@ use bevy::math::IRect;
 use bevy::tasks::AsyncComputeTaskPool;
 use bevy::tasks::futures_lite::future;
 use bevy::time::Time;
-use objc2_foundation::NSPoint;
-use std::collections::HashSet;
+use objc2_foundation::{NSPoint, NSRect, NSSize};
+use std::collections::{HashMap, HashSet};
 use std::pin::Pin;
 use std::sync::mpsc::{Receiver, RecvTimeoutError, TryRecvError};
 use std::time::{Duration, Instant};
@@ -126,9 +126,20 @@ pub fn gather_displays(window_manager: Res<WindowManager>, mut commands: Command
         error!("Unable to get active display id!");
         return;
     };
+    // Resolved once for the active display: `ActiveWorkspaceMarker` is
+    // global-single (see `ActiveDisplay`), so only the active display's
+    // space is ever marked — but a failure must not abort the remaining
+    // displays' strips entirely (the old early return did exactly that).
+    let active_space = window_manager
+        .active_display_space(active_display_id)
+        .inspect_err(|err| {
+            error!("Unable to get active space for display {active_display_id}: {err}");
+        })
+        .ok();
     for (display, workspaces) in window_manager.present_displays() {
         let origin = Position(display.bounds().min);
-        let entity = if display.id() == active_display_id {
+        let display_id = display.id();
+        let entity = if display_id == active_display_id {
             commands.spawn((display, ActiveDisplayMarker))
         } else {
             commands.spawn(display)
@@ -137,12 +148,8 @@ pub fn gather_displays(window_manager: Res<WindowManager>, mut commands: Command
 
         commands.trigger(ReadDisplayProperties(entity));
 
-        let Ok(active_space) = window_manager.active_display_space(active_display_id) else {
-            return;
-        };
-
         for id in workspaces {
-            let active = id == active_space;
+            let active = display_id == active_display_id && Some(id) == active_space;
             commands.spawn_layout_strip(LayoutStrip::new(id, 0), origin.0, entity, active);
             commands.spawn((FloatingLayer::new(id), ChildOf(entity)));
         }
@@ -269,7 +276,98 @@ pub(crate) fn add_existing_application(
 /// * `displays` - A query for all `Display` entities, including whether they have the `ActiveDisplayMarker`.
 /// * `window_manager` - The `WindowManager` resource for refreshing displays and getting active space information.
 /// * `commands` - Bevy commands to insert components like `FocusedMarker`.
+// Places startup windows onto their live display's strip by OS frame center.
+//
+// The space-membership pass in [`finish_setup`] is authoritative, and an
+// existing contract pins that: a window assigned to a strip stays there even
+// when its frame disagrees (see `test_init_keeps_windows_on_their_real_displays`).
+// This only places managed windows the pass left in NO strip (stale spaces,
+// discovery races), which would otherwise fall into the active strip on the
+// first post-init tick — piling every display's windows onto one display.
+// Runs before `Initializing` is removed; session restore runs after and keeps
+// precedence for anything it remaps. Windows already homed by the runtime
+// audit keep converging as before.
+// Unit-testable in isolation via `run_system_once`: pure query logic over
+// displays, strips and window frames, no messages or observers involved.
+pub(crate) fn place_startup_windows_on_live_displays(
+    windows: &Windows,
+    workspaces: &mut Query<(
+        Entity,
+        &mut LayoutStrip,
+        Has<ActiveWorkspaceMarker>,
+        &ChildOf,
+    )>,
+    displays: &Query<(&Display, Entity)>,
+    window_manager: &WindowManager,
+) {
+    if displays.is_empty() {
+        // Displays not gathered yet (transient empty enumeration at launch):
+        // leave everything for the next tick rather than placing windows
+        // onto nothing. `Initializing` stays set, so setup simply retries.
+        warn!("startup placement: no displays present yet, waiting for next tick");
+        return;
+    }
+    // Display entity -> its OS-active space strip. Queried live per display
+    // rather than via the global `ActiveWorkspaceMarker`, which marks exactly
+    // one strip — every other display still needs its own home strip here.
+    let mut home_strip_for_display: HashMap<Entity, Entity> = HashMap::new();
+    for (display, display_entity) in displays {
+        let Ok(space) = window_manager.active_display_space(display.id()) else {
+            continue;
+        };
+        if let Some((strip_entity, _, _, _)) = workspaces
+            .iter()
+            .find(|(_, strip, _, child)| strip.id() == space && child.parent() == display_entity)
+        {
+            home_strip_for_display.insert(display_entity, strip_entity);
+        }
+    }
+    // Window entity -> its current strip: assigned windows are left alone
+    // (see the contract note above).
+    let mut strip_of: HashMap<Entity, Entity> = HashMap::new();
+    for (strip_entity, strip, _, _) in &*workspaces {
+        for member in strip.all_windows() {
+            strip_of.insert(member, strip_entity);
+        }
+    }
+    let mut moves: Vec<(Entity, Entity)> = Vec::new();
+    for (_, entity, _) in windows.managed_iter() {
+        let Some(frame) = windows.frame(entity) else {
+            continue;
+        };
+        // Assigned windows stay put even when their frame disagrees:
+        // space membership is authoritative (see
+        // `test_init_keeps_windows_on_their_real_displays`). Only the
+        // unassigned get placed here.
+        if strip_of.contains_key(&entity) {
+            continue;
+        }
+        let center = frame.center();
+        let target = displays
+            .iter()
+            .find_map(|(display, display_entity)| {
+                display.bounds().contains(center).then_some(display_entity)
+            })
+            .and_then(|home| home_strip_for_display.get(&home).copied());
+        let Some(target) = target else {
+            // In a gap between displays, or no active strip there: leave
+            // for the existing fallbacks.
+            continue;
+        };
+        moves.push((entity, target));
+    }
+    for (entity, target) in moves {
+        if let Ok((_, mut strip, _, _)) = workspaces.get_mut(target) {
+            if !strip.contains(entity) {
+                strip.append(entity);
+            }
+            info!("startup: placed unassigned window {entity} onto its live display strip");
+        }
+    }
+}
+
 #[instrument(level = Level::DEBUG, skip_all)]
+#[allow(clippy::too_many_arguments)]
 pub(crate) fn finish_setup(
     process_query: Query<Entity, With<ExistingMarker>>,
     windows: Windows,
@@ -281,11 +379,19 @@ pub(crate) fn finish_setup(
         Has<ActiveWorkspaceMarker>,
         &ChildOf,
     )>,
+    displays: Query<(&Display, Entity)>,
     window_manager: Res<WindowManager>,
     mut commands: Commands,
 ) {
     if !process_query.is_empty() {
         // The other two add_* functions are still running..
+        return;
+    }
+
+    if displays.is_empty() {
+        // Displays not gathered yet (transient empty enumeration at launch):
+        // wait for the next tick rather than placing windows onto nothing.
+        warn!("finish_setup: no displays present yet, waiting for next tick");
         return;
     }
 
@@ -376,6 +482,12 @@ pub(crate) fn finish_setup(
     {
         entity_commands.try_insert(FocusedMarker);
     }
+
+    // Startup placement by live OS display (see
+    // `place_startup_windows_on_live_displays`): the space-membership pass
+    // above is authoritative, but geometry fixes what it missed before the
+    // first layout tick.
+    place_startup_windows_on_live_displays(&windows, &mut workspaces, &displays, &window_manager);
 
     commands.remove_resource::<Initializing>();
     commands.trigger(RestoreWindowState);
@@ -971,6 +1083,16 @@ fn adoption_distrusted(
     !unmanaged && !held && !repositioning && button_held
 }
 
+/// Whether the overlay should read the live ECS layout frame instead of the
+/// cached OS frame. True while scrolling, while any drag is held, or while a
+/// scroll release is still settling: in all three the OS position trails AX
+/// commits, and the cached frame would paint a detached border. Pure so the
+/// matrix is unit testable; the harness has no `OverlayManager`, so this is
+/// where the release-transition behavior is pinned, not in the loop.
+fn overlay_tracks_live(swiping: bool, drag_held: bool, settle_grace: bool) -> bool {
+    swiping || drag_held || settle_grace
+}
+
 #[instrument(level = Level::TRACE, skip_all)]
 pub(crate) fn window_moved_update_frame(
     mut messages: MessageReader<Event>,
@@ -1045,10 +1167,7 @@ pub(crate) fn window_moved_update_frame(
         // with the live frame in hand instead of adopting; the settle check
         // owns any residue with no echo at all. Bounded by the deadline so
         // a stuck list can never suppress adoption forever.
-        let in_grace = scroll_grace
-            .settle_deadline
-            .is_some_and(|deadline| Instant::now() < deadline)
-            && scroll_grace.members.contains(&entity);
+        let in_grace = scroll_grace.settle_active() && scroll_grace.members.contains(&entity);
         if in_grace {
             let drift = (new_frame.min - position.0).abs();
             if drift.x > 1 || drift.y > 1 {
@@ -1152,9 +1271,57 @@ pub(crate) fn gather_initial_processes(
 
 #[derive(Default)]
 pub(super) struct OverlayWindowConfigCache {
-    window_id: Option<WinID>,
-    focused_border_radius: Option<f64>,
-    detected_border_radius: Option<f64>,
+    /// Per-window (configured radius, detected radius), pruned to the
+    /// bordered set every tick the overlay runs. Hits avoid both the
+    /// `WindowProperties` build and the AX radius read; misses happen once
+    /// per window focus/config change.
+    radii: HashMap<WinID, (Option<f64>, Option<f64>)>,
+}
+
+/// Absolute CG rect of a layout frame, corrected for window padding.
+/// Shared by focused and inactive borders so both use identical math.
+fn abs_cg_rect(frame: IRect, window: &Window) -> NSRect {
+    use objc2_foundation::{NSPoint, NSRect};
+    let h_pad = window.horizontal_padding();
+    let v_pad = window.vertical_padding();
+    NSRect::new(
+        NSPoint::new(
+            f64::from(frame.min.x + h_pad),
+            f64::from(frame.min.y + v_pad),
+        ),
+        NSSize::new(
+            f64::from(frame.width() - 2 * h_pad),
+            f64::from(frame.height() - 2 * v_pad),
+        ),
+    )
+}
+
+/// Resolved corner radius for one bordered window, or `None` when its app is
+/// gone (caller skips the window). Refreshes the cache entry on miss.
+fn border_radius_for(
+    window_id: WinID,
+    windows: &Windows,
+    applications: &Query<&Application>,
+    config: &Config,
+    cache: &mut HashMap<WinID, (Option<f64>, Option<f64>)>,
+) -> Option<f64> {
+    /// Base radius from global config plus one window's detected corners.
+    fn base(config: &Config, detected: Option<f64>) -> f64 {
+        match config.border_radius() {
+            BorderRadiusOption::Auto => detected.unwrap_or(10.0),
+            BorderRadiusOption::Value(value) => value.max(0.0),
+        }
+    }
+    if let Some((configured, detected)) = cache.get(&window_id) {
+        return Some(configured.unwrap_or(base(config, *detected)));
+    }
+    let (window, _, parent) = windows.find_parent(window_id)?;
+    let app = applications.get(parent).ok()?;
+    let properties = WindowProperties::new(app, window, config);
+    let configured = properties.border_radius();
+    let detected = window.border_radius();
+    cache.insert(window_id, (configured, detected));
+    Some(configured.unwrap_or(base(config, detected)))
 }
 
 #[allow(clippy::too_many_arguments, clippy::too_many_lines)]
@@ -1165,10 +1332,12 @@ pub(super) fn update_overlays(
     active_workspace: Populated<(Has<Scrolling>, &LayoutStrip), With<ActiveWorkspaceMarker>>,
     windows: Windows,
     applications: Query<&Application>,
-    displays: Query<(&Display, Has<ActiveDisplayMarker>)>,
+    displays: Query<(Entity, &Display, Has<ActiveDisplayMarker>)>,
+    strips: Query<(&LayoutStrip, &ChildOf)>,
     focus_markers: Query<(), With<FocusedMarker>>,
     drag_held: Query<(), With<MouseHeldMarker>>,
     armed_drag: Query<(), (With<MouseHeldMarker>, With<DragDisplayArmed>)>,
+    scroll_grace: Res<DragScrollState>,
     overlay_mgr: Option<NonSendMut<OverlayManager>>,
     mission_control_active: Res<MissionControlActive>,
     config: Res<Config>,
@@ -1176,13 +1345,15 @@ pub(super) fn update_overlays(
     window_manager: Res<WindowManager>,
 ) {
     use crate::overlay::BorderParams;
-    use objc2_foundation::{NSPoint, NSRect, NSSize};
 
     let Some(mut overlay_mgr) = overlay_mgr else {
         return;
     };
 
-    let dim_opacity = config.dim_inactive_opacity();
+    // Hex alpha composes multiplicatively; f32 precision is plenty for an
+    // opacity in [0, 1].
+    #[allow(clippy::cast_possible_truncation)]
+    let dim_opacity = config.dim_inactive_opacity() * config.dim_alpha() as f32;
     let border_enabled = config.border_active_window();
 
     // Hide overlays during swipe, mission control, native fullscreen spaces,
@@ -1212,12 +1383,27 @@ pub(super) fn update_overlays(
         return;
     };
     let focused_window_id = window.id();
+    // The focused window's own strip — not necessarily the active one, since
+    // focus (and the mouse) roam across displays. Membership and the
+    // parked-sliver guard below are evaluated against the owner display, so
+    // round trips between displays keep their overlay instead of hiding
+    // everything off the menu-bar display.
+    let owner_display = strips
+        .iter()
+        .find_map(|(strip, child)| strip.contains(entity).then_some(child.parent()))
+        .and_then(|display_entity| displays.get(display_entity).ok())
+        .map(|(_, display, _)| display);
     let show_overlay = !window.is_full_screen()
-        && (active_strip.contains(entity)
-            // if the window is floating, check whether it's present in the workspace.
-            || window_manager
-                .windows_in_workspace(active_strip.id())
-                .is_ok_and(|ids| ids.contains(&focused_window_id)));
+        && (owner_display.is_some()
+            // Strip-less (floating): present in some display's visible
+            // workspace?
+            || displays.iter().any(|(_, display, _)| {
+                window_manager
+                    .active_display_space(display.id())
+                    .ok()
+                    .and_then(|space| window_manager.windows_in_workspace(space).ok())
+                    .is_some_and(|ids| ids.contains(&focused_window_id))
+            }));
 
     if !show_overlay {
         // No managed window on the active workspace has focus — hide the overlay rather than
@@ -1226,12 +1412,16 @@ pub(super) fn update_overlays(
         return;
     }
 
-    // The focused window's frame. While the strip is being scrolled or a
-    // drag is held, the cached OS frame lags behind AX commits, so the
-    // border would trail the motion and settle detached: use the live ECS
-    // layout frame instead — it is what the windows are being driven to.
-    // Otherwise the OS frame is fresher (native moves/resizes bypass ECS).
-    let tracking_live = swiping || !drag_held.is_empty();
+    // The focused window's frame. While the strip is being scrolled, a drag
+    // is held, or a scroll release is still settling, the cached OS frame
+    // lags behind AX commits, so the border would trail the motion and
+    // settle detached: use the live ECS layout frame instead — it is what
+    // the windows are being driven to. Otherwise the OS frame is fresher
+    // (native moves/resizes bypass ECS). The grace arm matters most on the
+    // release tick itself: without it the border snaps backward to the stale
+    // cache for one tick and then freezes there until the next dirty tick.
+    let tracking_live =
+        overlay_tracks_live(swiping, !drag_held.is_empty(), scroll_grace.settle_active());
     let layout_frame = tracking_live
         .then(|| windows.moving_frame(entity))
         .flatten();
@@ -1239,20 +1429,7 @@ pub(super) fn update_overlays(
     if tracking_live && layout_frame.is_none() {
         trace!("overlay tracking live but no layout frame, falling back to OS frame");
     }
-    let focused_abs_cg = {
-        let h_pad = window.horizontal_padding();
-        let v_pad = window.vertical_padding();
-        Some(NSRect::new(
-            NSPoint::new(
-                f64::from(frame.min.x + h_pad),
-                f64::from(frame.min.y + v_pad),
-            ),
-            NSSize::new(
-                f64::from(frame.width() - 2 * h_pad),
-                f64::from(frame.height() - 2 * v_pad),
-            ),
-        ))
-    };
+    let focused_abs_cg = abs_cg_rect(frame, window);
 
     // The border belongs to the focused window at rest: hide it for the
     // duration of an armed column drag rather than tracking a window
@@ -1262,59 +1439,148 @@ pub(super) fn update_overlays(
     if dragging_column {
         trace!("hiding border for armed column drag");
     }
-    let border_params = if border_enabled && !dragging_column && {
+    let want_border = border_enabled && !dragging_column && {
         // Parked slivers physically sit inside abutting displays; drawing the
         // focus border around one paints a stripe on the neighbor. The focused
-        // window belongs on screen, so a center outside the active display
+        // window belongs on screen, so a center outside its owner display
         // means it is parked or mid-transfer — skip the border either way.
+        // Strip-less (floating) windows fall back to any display: layout
+        // never parks them.
         let center = frame.center();
-        displays
-            .iter()
-            .find(|(_, active)| *active)
-            .is_none_or(|(display, _)| display.bounds().contains(center))
-    } {
-        if window_config_cache.window_id != Some(focused_window_id) || config.is_changed() {
-            let Some((window, _, parent)) = windows.find_parent(focused_window_id) else {
-                // Parent gone mid-focus: hide rather than freezing the old
-                // rect until the next dirty tick.
-                overlay_mgr.hide_all();
-                return;
-            };
-            let Ok(app) = applications.get(parent) else {
-                overlay_mgr.hide_all();
-                return;
-            };
-            let properties = WindowProperties::new(app, window, &config);
-            window_config_cache.window_id = Some(focused_window_id);
-            window_config_cache.focused_border_radius = properties.border_radius();
-            window_config_cache.detected_border_radius = window.border_radius();
+        match owner_display {
+            Some(display) => display.bounds().contains(center),
+            None => displays
+                .iter()
+                .any(|(_, display, _)| display.bounds().contains(center)),
         }
+    };
+    // The corner radius feeds every bordered window plus the dim cutout
+    // hole, so a config change invalidates the whole cache at once.
+    if config.is_changed() {
+        window_config_cache.radii.clear();
+    }
 
-        let calculated_radius = match config.border_radius() {
-            BorderRadiusOption::Auto => window_config_cache.detected_border_radius.unwrap_or(10.0),
-            BorderRadiusOption::Value(value) => value.max(0.0),
+    // Desired borders: the focused window with active styling, plus — when
+    // inactive borders are enabled — every on-screen tiled window with
+    // inactive styling. Computed fresh every overlay tick; the manager turns
+    // the diff into moves, reskins and removals (O(changed), never O(all)).
+    let mut desired: Vec<(WinID, NSRect, BorderParams)> = Vec::new();
+    if want_border {
+        let Some(radius) = border_radius_for(
+            focused_window_id,
+            &windows,
+            &applications,
+            &config,
+            &mut window_config_cache.radii,
+        ) else {
+            // Parent gone mid-focus: hide rather than freezing the old
+            // rect until the next dirty tick.
+            overlay_mgr.hide_all();
+            return;
         };
-
-        Some(BorderParams {
-            color: config.border_color(),
-            opacity: config.border_opacity(),
-            width: config.border_width(),
-            radius: window_config_cache
-                .focused_border_radius
-                .unwrap_or(calculated_radius),
-        })
+        desired.push((
+            focused_window_id,
+            focused_abs_cg,
+            BorderParams {
+                color: config.border_color(),
+                opacity: config.border_opacity() * config.border_alpha(),
+                width: config.border_width(),
+                radius,
+            },
+        ));
+    }
+    // Inactive borders (opt-in) need the on-screen set; without it only the
+    // focused entry above applies — dim below still updates either way.
+    let on_screen: Option<HashSet<WinID>> = if config.inactive_border_enabled() {
+        if let Some(ids) = window_manager.windows_on_screen() {
+            Some(ids.into_iter().collect())
+        } else {
+            trace!("inactive borders: on-screen set unavailable, focused only");
+            None
+        }
     } else {
-        window_config_cache.window_id = None;
         None
     };
+    if let Some(on_screen) = &on_screen {
+        for (window, entity, _) in windows.managed_iter() {
+            let window_id = window.id();
+            // The focused window is governed solely by the active path
+            // above (including its armed-drag and parked hides): it must
+            // never pick up an inactive border instead.
+            if window_id == focused_window_id {
+                continue;
+            }
+            if window.is_full_screen() || !on_screen.contains(&window_id) {
+                continue;
+            }
+            let window_frame = if tracking_live {
+                windows
+                    .moving_frame(entity)
+                    .unwrap_or_else(|| window.frame())
+            } else {
+                window.frame()
+            };
+            // Parked-sliver guard, generalized per window across displays.
+            if !displays
+                .iter()
+                .any(|(_, display, _)| display.bounds().contains(window_frame.center()))
+            {
+                continue;
+            }
+            let Some(radius) = border_radius_for(
+                window_id,
+                &windows,
+                &applications,
+                &config,
+                &mut window_config_cache.radii,
+            ) else {
+                continue;
+            };
+            desired.push((
+                window_id,
+                abs_cg_rect(window_frame, window),
+                BorderParams {
+                    color: config.inactive_border_color(),
+                    opacity: config.border_opacity() * config.inactive_border_alpha(),
+                    width: config.border_width(),
+                    radius,
+                },
+            ));
+        }
+    }
+    overlay_mgr.sync_borders(&desired);
 
-    let dim_color = config.dim_inactive_color();
-    overlay_mgr.update(
-        dim_opacity,
-        dim_color,
-        focused_abs_cg,
-        border_params.as_ref(),
-    );
+    if dim_opacity > 0.0 {
+        overlay_mgr.update(
+            dim_opacity,
+            config.dim_inactive_color(),
+            Some(focused_abs_cg),
+            // Best effort: never hides the dim for a radius miss.
+            border_radius_for(
+                focused_window_id,
+                &windows,
+                &applications,
+                &config,
+                &mut window_config_cache.radii,
+            )
+            .unwrap_or(10.0),
+        );
+    } else {
+        // No dimming configured: leave no transparent fullscreen surfaces
+        // around consuming backing stores.
+        overlay_mgr.remove_dim_overlays();
+    }
+    // Prune radii the desired set (plus the dim cutout lookup above) no
+    // longer references. Runs last so a dim-only tick does not
+    // evict-then-reread the focused entry (an AX call) every frame.
+    let wanted: HashSet<WinID> = desired
+        .iter()
+        .map(|(id, _, _)| *id)
+        .chain((dim_opacity > 0.0).then_some(focused_window_id))
+        .collect();
+    window_config_cache
+        .radii
+        .retain(|id, _| wanted.contains(id));
 }
 
 #[instrument(level = Level::TRACE, skip_all)]
@@ -1796,6 +2062,7 @@ mod tests {
 
     use super::adoption_distrusted;
     use super::gather_initial_processes;
+    use super::overlay_tracks_live;
     use crate::config::Config;
     use crate::events::Event;
 
@@ -1840,6 +2107,17 @@ mod tests {
         assert!(!adoption_distrusted(false, false, true, true));
         assert!(!adoption_distrusted(true, false, false, true));
         assert!(!adoption_distrusted(false, false, false, false));
+    }
+
+    #[test]
+    fn overlay_reads_live_while_moving_or_settling() {
+        // Scrolling, held drag, or post-release grace: the OS frame trails,
+        // so the border must come from the layout frame.
+        assert!(overlay_tracks_live(true, false, false));
+        assert!(overlay_tracks_live(false, true, false));
+        assert!(overlay_tracks_live(false, false, true));
+        // At rest with no grace: the OS frame is fresher.
+        assert!(!overlay_tracks_live(false, false, false));
     }
 }
 

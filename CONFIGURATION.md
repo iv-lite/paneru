@@ -445,7 +445,12 @@ color = "#000000"
 ```
 
 ### Active Window Border
-Draws a colored border around the currently focused window.
+Draws a colored border around the currently focused window. The border lives
+in its own small GPU-composited window hugging the app window (no fullscreen
+repaints), so it tracks the window every frame it moves.
+
+Colors accept an alpha channel (`#RRGGBBAA`), which multiplies with `opacity`
+(e.g. `#FF000080` at opacity `0.5` renders at 0.25).
 
 | Option | Type | Default | Description |
 | :--- | :--- | :--- | :--- |
@@ -462,6 +467,25 @@ enabled = true
 color = "#89b4fa"
 width = 2.0
 radius = 12.0
+```
+
+### Inactive Window Borders
+Draws borders around unfocused tiled windows on every display and workspace.
+Opt-in (off unless enabled); tracked for all tiled windows, drawn only where
+visible. Shares the active border's width, radius and opacity settings — only
+the color differs (hex alpha works here too, so subtlety needs no extra
+option).
+
+| Option | Type | Default | Description |
+| :--- | :--- | :--- | :--- |
+| `enabled` | Boolean | `false` | Enable inactive window borders. |
+| `color` | String (Hex) | active color | Hex color for inactive window borders. |
+
+**Example:**
+```toml
+[decorations.inactive.border]
+enabled = true
+color = "#FFFFFF66"
 ```
 
 > **Tip:** You can override the `border_radius` for specific applications in the `[windows]` section. See [Window Rules](#6-window-rules).

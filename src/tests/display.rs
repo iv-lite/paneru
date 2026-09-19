@@ -13,7 +13,7 @@ use crate::ecs::{
     SpawnWindowTrigger, Timeout,
 };
 use crate::events::Event;
-use crate::manager::{Display, Origin, Size, Window};
+use crate::manager::{Application, Display, Origin, Size, Window};
 use crate::platform::Modifiers;
 use crate::platform::WinID;
 use crate::platform::WorkspaceId;
@@ -1397,6 +1397,100 @@ fn test_init_keeps_windows_on_their_real_displays() {
             assert_window_at!(world, 100, ext_origin.x, ext_origin.y);
         })
         .run(commands);
+}
+
+/// Windows the space-membership pass leaves unassigned (stale spaces,
+/// discovery races) are placed onto their live display's strip at startup —
+/// never piled onto the active strip. Drives the extracted placement
+/// function directly: neither the builder trigger (observers build on first
+/// update) nor discovery (filters by known spaces) can surface an
+/// unknown-space window, which is exactly the unassigned case.
+#[test]
+fn test_startup_places_unassigned_windows_on_live_display() {
+    use bevy::ecs::system::RunSystemOnce as _;
+
+    use crate::ecs::layout::LayoutStrip;
+    use crate::ecs::params::Windows;
+    use crate::ecs::systems::place_startup_windows_on_live_displays;
+    use crate::ecs::{ActiveWorkspaceMarker, LayoutPosition, WidthRatio};
+    use crate::manager::WindowManager;
+
+    fn place_once(
+        windows: Windows,
+        mut workspaces: Query<(
+            Entity,
+            &mut crate::ecs::layout::LayoutStrip,
+            Has<ActiveWorkspaceMarker>,
+            &ChildOf,
+        )>,
+        displays: Query<(&Display, Entity)>,
+        window_manager: Res<WindowManager>,
+    ) {
+        place_startup_windows_on_live_displays(
+            &windows,
+            &mut workspaces,
+            &displays,
+            &window_manager,
+        );
+    }
+
+    // Frame sits on the external display.
+    let ext_origin = Origin::new(100, -EXT_DISPLAY_HEIGHT + TEST_MENUBAR_HEIGHT);
+    let size = Size::new(TEST_WINDOW_WIDTH, TEST_WINDOW_HEIGHT);
+
+    let mut harness = TestHarness::new()
+        .with_display(
+            EXT_DISPLAY_ID,
+            IRect::new(0, -EXT_DISPLAY_HEIGHT, EXT_DISPLAY_WIDTH, 0),
+            vec![EXT_WORKSPACE_ID],
+        )
+        .with_windows(1);
+    harness.run(vec![
+        Event::MenuOpened { window_id: 0 },
+        Event::Command {
+            command: Command::PrintState,
+        },
+    ]);
+
+    // Spawn an assigned-to-nothing window directly: mock record plus ECS
+    // entity with layout components, in no strip.
+    let window = harness.mock_state.spawn_window(
+        TEST_PROCESS_ID,
+        EXT_WORKSPACE_ID + 1000,
+        100,
+        IRect::from_corners(ext_origin, ext_origin + size),
+    );
+    let world = harness.world();
+    let app_entity = world
+        .query_filtered::<Entity, With<Application>>()
+        .iter(world)
+        .next()
+        .expect("need app entity");
+    let entity = world
+        .spawn((
+            window,
+            Position(ext_origin),
+            Bounds(size),
+            LayoutPosition(ext_origin),
+            WidthRatio(1.0),
+            ChildOf(app_entity),
+        ))
+        .id();
+    assert!(
+        !world
+            .query::<&LayoutStrip>()
+            .iter(world)
+            .any(|strip| strip.contains(entity)),
+        "precondition: window starts in no strip"
+    );
+
+    world
+        .run_system_once(place_once)
+        .expect("running startup placement");
+
+    let world = harness.world();
+    assert_on_workspace!(world, 100, EXT_WORKSPACE_ID);
+    assert_not_on_workspace!(world, 100, TEST_WORKSPACE_ID);
 }
 
 /// Waking from sleep (or a resolution/configuration change) with a monitor

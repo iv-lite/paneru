@@ -591,6 +591,32 @@ impl Config {
             .unwrap_or(false)
     }
 
+    /// Whether inactive windows get their own border. Opt-in (default off);
+    /// geometry (width/radius/opacity) is shared with the active border, only
+    /// the color differs.
+    pub fn inactive_border_enabled(&self) -> bool {
+        self.inner()
+            .decorations
+            .as_ref()
+            .and_then(|decorations| decorations.inactive.as_ref())
+            .and_then(|inactive| inactive.border.as_ref())
+            .and_then(|border| border.enabled)
+            .unwrap_or(false)
+    }
+
+    /// Inactive border color; defaults to the active border color. Hex alpha
+    /// composes with the shared border opacity, so subtlety needs no extra
+    /// option (e.g. reuse the active `#FFFFFF` at `#FFFFFF66`).
+    pub fn inactive_border_color(&self) -> (f64, f64, f64) {
+        self.inner()
+            .decorations
+            .as_ref()
+            .and_then(|decorations| decorations.inactive.as_ref())
+            .and_then(|inactive| inactive.border.as_ref())
+            .and_then(|border| border.color.as_deref())
+            .map_or_else(|| self.border_color(), parse_hex_color)
+    }
+
     pub fn border_color(&self) -> (f64, f64, f64) {
         let config = self.inner();
         config
@@ -614,6 +640,31 @@ impl Config {
             .or(config.options.border_opacity)
             .unwrap_or(1.0)
             .clamp(0.0, 1.0)
+    }
+
+    /// Alpha channel of the resolved border color (`#RRGGBBAA`, else `1.0`).
+    /// Multiplied into the opacity wherever a `BorderParams` is built, so hex
+    /// alpha composes with the opacity option instead of replacing it.
+    pub fn border_alpha(&self) -> f64 {
+        active_border_color_str(&self.inner()).map_or(1.0, parse_hex_alpha)
+    }
+
+    /// Alpha channel of the resolved inactive border color, for the same
+    /// composition as [`Self::border_alpha`] with the shared opacity.
+    pub fn inactive_border_alpha(&self) -> f64 {
+        self.inner()
+            .decorations
+            .as_ref()
+            .and_then(|decorations| decorations.inactive.as_ref())
+            .and_then(|inactive| inactive.border.as_ref())
+            .and_then(|border| border.color.as_deref())
+            .map_or(1.0, parse_hex_alpha)
+    }
+
+    /// Alpha channel of the resolved dim color, composed with
+    /// [`Self::dim_inactive_opacity`] at the call site.
+    pub fn dim_alpha(&self) -> f64 {
+        dim_color_str(&self.inner()).map_or(1.0, parse_hex_alpha)
     }
 
     pub fn border_width(&self) -> f64 {
@@ -1009,7 +1060,9 @@ fn resolve_menubar_color(hex: &str) -> (f64, f64, f64) {
 
 fn parse_hex_color(hex: &str) -> (f64, f64, f64) {
     let hex = hex.strip_prefix('#').unwrap_or(hex);
-    if hex.len() != 6 {
+    // An 8-digit `#RRGGBBAA` carries alpha for `parse_hex_alpha` below; the
+    // channels always come from the first three pairs.
+    if hex.len() != 6 && hex.len() != 8 {
         return (1.0, 1.0, 1.0);
     }
     let r = u8::from_str_radix(&hex[0..2], 16).unwrap_or(255);
@@ -1020,6 +1073,39 @@ fn parse_hex_color(hex: &str) -> (f64, f64, f64) {
         f64::from(g) / 255.0,
         f64::from(b) / 255.0,
     )
+}
+
+/// Alpha channel of a hex color: the last pair of `#RRGGBBAA`, or `1.0` for
+/// plain 6-digit colors and anything unparseable. Multiplied into the
+/// matching opacity option, so `#FF000080` at opacity `0.5` renders at 0.25.
+fn parse_hex_alpha(hex: &str) -> f64 {
+    let hex = hex.strip_prefix('#').unwrap_or(hex);
+    if hex.len() != 8 {
+        return 1.0;
+    }
+    f64::from(u8::from_str_radix(&hex[6..8], 16).unwrap_or(255)) / 255.0
+}
+
+/// Resolved border color string, if any, for alpha composition.
+fn active_border_color_str(config: &InnerConfig) -> Option<&str> {
+    config
+        .decorations
+        .as_ref()
+        .and_then(|decorations| decorations.active.as_ref())
+        .and_then(|active| active.border.as_ref())
+        .and_then(|border| border.color.as_deref())
+        .or(config.options.border_color.as_deref())
+}
+
+/// Resolved dim color string, if any, for alpha composition.
+fn dim_color_str(config: &InnerConfig) -> Option<&str> {
+    config
+        .decorations
+        .as_ref()
+        .and_then(|decorations| decorations.inactive.as_ref())
+        .and_then(|inactive| inactive.dim.as_ref())
+        .and_then(|dim| dim.color.as_deref())
+        .or(config.options.dim_inactive_color.as_deref())
 }
 
 impl Default for Config {
@@ -1932,6 +2018,22 @@ fn test_virtual_keymap() -> Vec<(String, u8)> {
     virtual_keycode()
         .map(|(key, code)| ((*key).to_string(), *code))
         .collect()
+}
+
+#[test]
+#[allow(clippy::float_cmp)]
+fn test_hex_color_alpha() {
+    // 6-digit colors carry no alpha and parse channels as before.
+    assert_eq!(parse_hex_color("#FF0000"), (1.0, 0.0, 0.0));
+    assert_eq!(parse_hex_alpha("#FF0000"), 1.0);
+    // 8-digit colors parse the same channels plus the alpha pair.
+    assert_eq!(parse_hex_color("#FF000080"), (1.0, 0.0, 0.0));
+    assert_eq!(parse_hex_alpha("#FF000080"), 128.0 / 255.0);
+    assert_eq!(parse_hex_alpha("#00FF00FF"), 1.0);
+    assert_eq!(parse_hex_alpha("#00FF0000"), 0.0);
+    // Garbage stays safe: white channels, opaque.
+    assert_eq!(parse_hex_color("nope"), (1.0, 1.0, 1.0));
+    assert_eq!(parse_hex_alpha("nope"), 1.0);
 }
 
 #[test]

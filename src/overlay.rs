@@ -10,6 +10,9 @@ use objc2_core_foundation::CGFloat;
 use objc2_foundation::{
     NSAttributedString, NSDictionary, NSMutableCopying, NSPoint, NSRect, NSSize, NSString,
 };
+use std::collections::HashMap;
+
+use crate::platform::WinID;
 
 #[derive(Clone, PartialEq)]
 pub struct BorderParams {
@@ -19,7 +22,8 @@ pub struct BorderParams {
     pub radius: f64,
 }
 
-/// Parameters for the fullscreen dim + cutout overlay.
+/// Parameters for the fullscreen dim overlay. The border lives in its own
+/// layer-backed window (`update_focused_border`), never in this surface.
 #[derive(Clone, PartialEq)]
 pub struct DimParams {
     pub opacity: f32,
@@ -27,7 +31,8 @@ pub struct DimParams {
     /// The focused window rect to cut out (in Cocoa screen coordinates).
     /// `None` means dim everything (no focused window).
     pub cutout: Option<NSRect>,
-    pub border: Option<BorderParams>,
+    /// Corner radius of the cutout hole (the window's own radius).
+    pub cutout_radius: f64,
 }
 
 // ── DimView: fullscreen dark overlay with a transparent cutout + border ──
@@ -44,14 +49,8 @@ struct DimViewIvars {
     cutout_w: f64,
     cutout_h: f64,
     has_cutout: bool,
-    // Border params (only drawn if has_border is true).
-    has_border: bool,
-    border_r: f64,
-    border_g: f64,
-    border_b: f64,
-    border_opacity: f64,
-    border_width: f64,
-    border_radius: f64,
+    // Corner radius of the cutout hole (the window's own radius).
+    cutout_radius: f64,
 }
 
 define_class!(
@@ -79,48 +78,21 @@ define_class!(
             NSBezierPath::fillRect(bounds);
 
             if ivars.has_cutout {
-                let half = if ivars.has_border { ivars.border_width / 2.0 } else { 0.0 };
-                let radius = ivars.border_radius as CGFloat;
-
-                // Expand the cutout by half the border width so the clear hole
-                // extends just past the window edge. The border straddles the
-                // window edge: outer half visible in the cutout, inner half
-                // hidden behind the window.
-                let cutout = NSRect::new(
-                    NSPoint::new(ivars.cutout_x - half, ivars.cutout_y - half),
-                    NSSize::new(ivars.cutout_w + ivars.border_width, ivars.cutout_h + ivars.border_width),
-                );
-
-                // Punch a rounded transparent hole using Clear compositing.
+                // Punch a transparent hole using Clear compositing. Kept
+                // rounded to the window's corner radius so no dim bleeds in
+                // at the corners.
                 if let Some(ctx) = NSGraphicsContext::currentContext() {
                     ctx.setCompositingOperation(NSCompositingOperation::Clear);
                     let hole = NSBezierPath::bezierPathWithRoundedRect_xRadius_yRadius(
-                        cutout, radius, radius,
+                        NSRect::new(
+                            NSPoint::new(ivars.cutout_x, ivars.cutout_y),
+                            NSSize::new(ivars.cutout_w, ivars.cutout_h),
+                        ),
+                        ivars.cutout_radius as CGFloat,
+                        ivars.cutout_radius as CGFloat,
                     );
                     hole.fill();
                     ctx.setCompositingOperation(NSCompositingOperation::SourceOver);
-                }
-
-                // Draw border centered on the window edge — half grows
-                // outward (visible in the cutout), half grows inward (behind
-                // the window).
-                if ivars.has_border {
-                    let border_rect = NSRect::new(
-                        NSPoint::new(ivars.cutout_x, ivars.cutout_y),
-                        NSSize::new(ivars.cutout_w, ivars.cutout_h),
-                    );
-                    let path = NSBezierPath::bezierPathWithRoundedRect_xRadius_yRadius(
-                        border_rect, radius, radius,
-                    );
-                    path.setLineWidth(ivars.border_width as CGFloat);
-                    let border_color = NSColor::colorWithSRGBRed_green_blue_alpha(
-                        ivars.border_r as CGFloat,
-                        ivars.border_g as CGFloat,
-                        ivars.border_b as CGFloat,
-                        ivars.border_opacity as CGFloat,
-                    );
-                    border_color.setStroke();
-                    path.stroke();
                 }
             }
         }
@@ -137,15 +109,6 @@ impl DimView {
         let (has_cutout, cx, cy, cw, ch) = params.cutout.map_or((false, 0.0, 0.0, 0.0, 0.0), |r| {
             (true, r.origin.x, r.origin.y, r.size.width, r.size.height)
         });
-        let (has_border, br, bg, bb, bo, bw, brad) =
-            params
-                .border
-                .as_ref()
-                .map_or((false, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0), |b| {
-                    (
-                        true, b.color.0, b.color.1, b.color.2, b.opacity, b.width, b.radius,
-                    )
-                });
         let this = Self::alloc(mtm).set_ivars(DimViewIvars {
             opacity: params.opacity,
             dim_r: params.color.0,
@@ -156,13 +119,7 @@ impl DimView {
             cutout_w: cw,
             cutout_h: ch,
             has_cutout,
-            has_border,
-            border_r: br,
-            border_g: bg,
-            border_b: bb,
-            border_opacity: bo,
-            border_width: bw,
-            border_radius: brad,
+            cutout_radius: params.cutout_radius,
         });
         unsafe { msg_send![super(this), initWithFrame: frame] }
     }
@@ -208,6 +165,74 @@ fn rects_intersect(a: NSRect, b: NSRect) -> bool {
         && b.origin.y < a.origin.y + a.size.height
 }
 
+/// Geometry of a border-only window: the app window rect inflated outward by
+/// half the border width. A `CALayer` border draws centered on the layer
+/// edge with its outer half unclipped, so inflating by half the width lands
+/// the visible stroke exactly at `[edge, edge+width]` — flush with the glass
+/// on all sides (inflating by the full width leaves a `width/2` hairline
+/// gap), without covering app pixels the way the old centered `drawRect`
+/// stroke did. Pure math: unit-tested, no `AppKit` involved.
+pub(crate) fn border_window_rect(window: NSRect, width: f64) -> NSRect {
+    let half = width / 2.0;
+    NSRect::new(
+        NSPoint::new(window.origin.x - half, window.origin.y - half),
+        NSSize::new(window.size.width + width, window.size.height + width),
+    )
+}
+
+/// Applies border styling to a (layer-backed) window's content view. Layer
+/// properties are GPU-composited: changing them never repaints, and moving
+/// the window never touches them — unlike the old fullscreen `drawRect`.
+fn apply_border_layer(window: &NSWindow, params: &BorderParams) {
+    let Some(view) = window.contentView() else {
+        return;
+    };
+    view.setWantsLayer(true);
+    let Some(layer) = view.layer() else {
+        return;
+    };
+    let color = NSColor::colorWithSRGBRed_green_blue_alpha(
+        params.color.0 as CGFloat,
+        params.color.1 as CGFloat,
+        params.color.2 as CGFloat,
+        params.opacity as CGFloat,
+    );
+    layer.setBackgroundColor(Some(NSColor::clearColor().CGColor().as_ref()));
+    layer.setBorderWidth(params.width as CGFloat);
+    layer.setBorderColor(Some(color.CGColor().as_ref()));
+    // Outer corner stays concentric with the window's rounded corner at half
+    // the stroke out from the glass.
+    layer.setCornerRadius((params.radius + params.width / 2.0) as CGFloat);
+}
+
+/// A border-only overlay window: small (window-sized, not fullscreen),
+/// layer-backed, never repainted. Reused across moves; layer properties are
+/// only rewritten when the params actually change.
+struct BorderOverlay {
+    window: Retained<NSWindow>,
+    /// Cocoa frame as currently set.
+    rect: NSRect,
+    params: BorderParams,
+}
+
+/// Builds a fresh border window: small overlay window + layer-backed content
+/// view with the border styling applied once at creation.
+fn make_border_window(
+    mtm: MainThreadMarker,
+    cocoa: NSRect,
+    params: &BorderParams,
+) -> Retained<NSWindow> {
+    let window = make_overlay_window(mtm, cocoa);
+    let view: Retained<NSView> = unsafe {
+        msg_send![NSView::alloc(mtm), initWithFrame: NSRect::new(NSPoint::new(0.0, 0.0), cocoa.size)]
+    };
+    view.setWantsLayer(true);
+    window.setContentView(Some(&view));
+    apply_border_layer(&window, params);
+    window.orderFront(None::<&AnyObject>);
+    window
+}
+
 // ── Overlay window factory ──────────────────────────────────────────────
 
 fn make_overlay_window(mtm: MainThreadMarker, cocoa_frame: NSRect) -> Retained<NSWindow> {
@@ -247,6 +272,11 @@ pub struct OverlayManager {
     hidden: bool,
     /// The drop-preview ghost shown during armed display drags, if any.
     drop_preview: Option<(Retained<NSWindow>, NSRect, BorderParams)>,
+    /// Per-window borders by window id: the focused window plus, when
+    /// inactive borders are enabled, every visible tiled window. Small
+    /// layer-backed windows (see `BorderOverlay`); entries not in the latest
+    /// sync are ordered out and dropped.
+    borders: HashMap<WinID, BorderOverlay>,
 }
 
 impl OverlayManager {
@@ -256,18 +286,20 @@ impl OverlayManager {
             overlays: Vec::new(),
             hidden: false,
             drop_preview: None,
+            borders: HashMap::new(),
         }
     }
 
-    /// Update the per-display overlays.
+    /// Update the per-display dim surfaces.
     /// `focused_abs_cg` is the focused window rect in absolute CG coords,
-    /// or `None` if no window is focused.
+    /// or `None` if no window is focused. The border is drawn by its own
+    /// layer-backed window (`update_focused_border`), never here.
     pub fn update(
         &mut self,
         dim_opacity: f32,
         dim_color: (f64, f64, f64),
         focused_abs_cg: Option<NSRect>,
-        border: Option<&BorderParams>,
+        cutout_radius: f64,
     ) {
         let screen_h = primary_screen_height(self.mtm);
         let screens = NSScreen::screens(self.mtm);
@@ -304,7 +336,7 @@ impl OverlayManager {
                 opacity: dim_opacity,
                 color: dim_color,
                 cutout: cutout_local,
-                border: border.cloned(),
+                cutout_radius,
             };
 
             if let Some((window, stored)) = self.overlays.get_mut(i) {
@@ -335,7 +367,17 @@ impl OverlayManager {
         for (window, _) in self.overlays.drain(..) {
             window.orderOut(None::<&AnyObject>);
         }
+        self.hide_borders();
         self.hidden = false;
+    }
+
+    /// Remove the fullscreen dim surfaces without touching the per-window
+    /// borders (used when dimming is configured off but borders are on: no
+    /// transparent fullscreen windows linger consuming backing stores).
+    pub fn remove_dim_overlays(&mut self) {
+        for (window, _) in self.overlays.drain(..) {
+            window.orderOut(None::<&AnyObject>);
+        }
     }
 
     pub fn hide_all(&mut self) {
@@ -345,7 +387,58 @@ impl OverlayManager {
         for (window, _) in &self.overlays {
             window.orderOut(None::<&AnyObject>);
         }
+        self.hide_borders();
         self.hidden = true;
+    }
+
+    /// Order out every border window but keep them cached, so the next sync
+    /// re-shows without rebuilding.
+    fn hide_borders(&mut self) {
+        for border in self.borders.values() {
+            border.window.orderOut(None::<&AnyObject>);
+        }
+    }
+
+    /// Sync per-window borders to `desired` (window id, absolute CG rect,
+    /// params): drops vanished windows, moves/reskins changed ones, orders
+    /// everything in. Moves never repaint and never rebuild views; only
+    /// genuine param changes rewrite layer properties. Cost is O(changed),
+    /// never O(all windows).
+    pub fn sync_borders(&mut self, desired: &[(WinID, NSRect, BorderParams)]) {
+        let screen_h = primary_screen_height(self.mtm);
+        self.borders.retain(|id, border| {
+            let keep = desired.iter().any(|(want, _, _)| want == id);
+            if !keep {
+                border.window.orderOut(None::<&AnyObject>);
+            }
+            keep
+        });
+        for (id, abs_cg, params) in desired {
+            let cocoa = cg_abs_to_cocoa(border_window_rect(*abs_cg, params.width), screen_h);
+            if let Some(border) = self.borders.get_mut(id) {
+                if !nsrect_eq(border.rect, cocoa) {
+                    border.window.setFrame_display(cocoa, false);
+                    border.rect = cocoa;
+                }
+                if border.params != *params {
+                    apply_border_layer(&border.window, params);
+                    border.params = params.clone();
+                }
+                border.window.orderFront(None::<&AnyObject>);
+            } else {
+                let window = make_border_window(self.mtm, cocoa, params);
+                self.borders.insert(
+                    *id,
+                    BorderOverlay {
+                        window,
+                        rect: cocoa,
+                        params: params.clone(),
+                    },
+                );
+            }
+        }
+        // An empty desired set with an empty map is steady state; anything
+        // dropped above was ordered out on the way out.
     }
 
     /// Show the drop-preview ghost: a filled, border-stroked outline of the
@@ -677,5 +770,32 @@ impl FlashMessageManager {
         if let Some(window) = self.window.take() {
             window.orderOut(None::<&AnyObject>);
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn border_window_inflates_by_half_width() {
+        // A 2px border on a 400x300 window at (10, 20): the layer stroke is
+        // centered on the layer edge with its outer half visible, so the
+        // window grows by half the width per side and the visible stroke
+        // sits exactly at [edge, edge+width] — flush, no hairline gap.
+        let rect = border_window_rect(
+            NSRect::new(NSPoint::new(10.0, 20.0), NSSize::new(400.0, 300.0)),
+            2.0,
+        );
+        assert!(nsrect_eq(
+            rect,
+            NSRect::new(NSPoint::new(9.0, 19.0), NSSize::new(402.0, 302.0))
+        ));
+    }
+
+    #[test]
+    fn zero_width_border_is_identity() {
+        let rect = NSRect::new(NSPoint::new(10.0, 20.0), NSSize::new(400.0, 300.0));
+        assert!(nsrect_eq(rect, border_window_rect(rect, 0.0)));
     }
 }
