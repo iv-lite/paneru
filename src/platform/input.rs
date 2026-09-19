@@ -17,6 +17,7 @@ use std::ffi::c_void;
 use std::marker::PhantomPinned;
 use std::pin::Pin;
 use std::ptr::null_mut;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, LazyLock};
 use std::time::{Duration, Instant};
 use stdext::function_name;
@@ -39,6 +40,20 @@ static FOCUSED_PASSTHROUGH: LazyLock<ArcSwap<Vec<(u8, Modifiers)>>> =
 /// key-down. Called from the ECS thread on focus change and config reload.
 pub fn set_focused_passthrough(keys: Vec<(u8, Modifiers)>) {
     FOCUSED_PASSTHROUGH.store(Arc::new(keys));
+}
+
+/// While true, an unmodified left-drag on a tiled window pans the workspace
+/// strip instead of moving the window, so the tap swallows the native
+/// `LeftMouseDragged` (which would otherwise move the OS window underneath).
+/// Set by the ECS mouse-down/up triggers; only read here. `Down`/`Up` always
+/// pass through so clicks, focus and buttons keep working, as do right-drags
+/// and modifier-armed display drags.
+static SCROLL_DRAG_SUPPRESS: AtomicBool = AtomicBool::new(false);
+
+/// Toggle native-drag suppression for strip-scroll drags. Called from the
+/// main thread by the ECS mouse triggers.
+pub(crate) fn set_scroll_drag_suppress(suppress: bool) {
+    SCROLL_DRAG_SUPPRESS.store(suppress, Ordering::Release);
 }
 
 /// How long to suppress scroll wheel events after a vertical swipe gesture,
@@ -349,6 +364,10 @@ impl InputHandler {
         let flags = CGEvent::flags(Some(event));
         let modifiers = get_modifiers(flags);
 
+        // Set when this event's native delivery must be swallowed after the
+        // ECS has seen it (strip-scroll drags: the ECS needs the deltas, but
+        // macOS must not move the window).
+        let mut swallow_native = false;
         let result = match event_type {
             CGEventType::LeftMouseDown | CGEventType::RightMouseDown => {
                 let point = CGEvent::location(Some(event));
@@ -360,6 +379,11 @@ impl InputHandler {
             }
             CGEventType::LeftMouseDragged | CGEventType::RightMouseDragged => {
                 let point = CGEvent::location(Some(event));
+                if matches!(event_type, CGEventType::LeftMouseDragged)
+                    && SCROLL_DRAG_SUPPRESS.load(Ordering::Acquire)
+                {
+                    swallow_native = true;
+                }
                 events.send(Event::MouseDragged { point, modifiers })
             }
             CGEventType::MouseMoved => {
@@ -387,8 +411,10 @@ impl InputHandler {
             // Trigger cleanup destructor, unregistering the handler.
             self.events = None;
         }
-        // Do not intercept this event, let it fall through.
-        false
+        // Strip-scroll drags still reach the ECS (sent above) but never reach
+        // macOS: the OS window stays in its slot while the strip follows the
+        // cursor. Everything else falls through.
+        swallow_native
     }
 
     /// Handles scroll wheel events. If configured modifier is held, it transforms the scroll into a swipe event.

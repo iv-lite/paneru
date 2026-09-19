@@ -38,8 +38,9 @@ https://github.com/user-attachments/assets/793e7eaa-7909-4086-8380-1fb7861f8780
   A filled ghost spanning the dragged column marks the landing slot
   throughout the drag, and the edge
   warp carries the cursor across when `horizontal_mouse_warp` is set.
-  Without the shortcut, dragged columns still follow the cursor but always
-  glide home on release — only armed drags reorder or transfer.
+  Without the shortcut, dragging a tiled window scrolls the workspace strip
+  instead of moving anything (disable with `left_drag_scrolls_strip = false`) —
+  only armed drags reorder or transfer.
 - **Virtual Workspaces (Experimental):** Group your windows into tasks by
   stacking multiple horizontal strips (rows) within a single space. Use native
   macOS workspaces for broad segregation (e.g., 'Work', 'Personal') and virtual

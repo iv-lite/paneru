@@ -691,6 +691,12 @@ impl Config {
         self.options().mouse_drag_display_modifier
     }
 
+    /// Whether an unmodified left-drag on a tiled window pans the workspace
+    /// strip instead of moving the window. Default: true.
+    pub fn left_drag_scrolls_strip(&self) -> bool {
+        self.options().left_drag_scrolls_strip.unwrap_or(true)
+    }
+
     pub fn restore_enabled(&self) -> bool {
         self.inner()
             .restore
@@ -1260,6 +1266,12 @@ pub struct MainOptions {
     /// dragged windows snap back to their own strip like foreign moves.
     #[serde(default, deserialize_with = "deserialize_modifier")]
     pub mouse_drag_display_modifier: Option<Modifiers>,
+    /// When enabled (default), dragging a tiled window with the left mouse
+    /// button — without the display-drag modifier held — scrolls the
+    /// workspace strip horizontally instead of moving the window, and the
+    /// native drag is swallowed so macOS can't move it either. Modifier-held
+    /// (armed) drags still move and transfer as before.
+    pub left_drag_scrolls_strip: Option<bool>,
     /// Override the system menubar height (in pixels).
     /// When set, this value is used instead of the height reported by macOS.
     pub menubar_height: Option<u16>,

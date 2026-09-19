@@ -1777,9 +1777,8 @@ fn test_armed_drag_at_edge_warps_cursor() {
         .run(commands);
 }
 
-/// An unarmed drag at the edge moves the column with the cursor (all
-/// title-bar drags drive their column) but never warps: the cursor stays
-/// where focus parked it, and the drop will glide home.
+/// An unarmed drag at the edge scrolls the strip with the cursor but never
+/// warps: the cursor stays where focus parked it, and the window never moves.
 #[test]
 fn test_unarmed_drag_at_edge_does_not_warp() {
     let grab = CGPoint::new(200.0, 500.0);
@@ -1811,11 +1810,18 @@ fn test_unarmed_drag_at_edge_does_not_warp() {
             // Focus-follow parks the cursor on the window center at menu
             // open; without the shortcut no warp moves it from there...
             assert_eq!(state.cursor_position(), Origin::new(200, 394));
-            // ...but the column still followed the drag synthetically and
-            // will glide home on release.
+            // ...the window stays in its slot while the strip follows the
+            // (822, -400) drag horizontally: slot-relative, so y is
+            // untouched and x tracks the strip 1:1.
             let entity = find_window_entity(0, world);
             let position = world.get::<Position>(entity).expect("need position").0;
-            assert_eq!(position, Origin::new(822, -380));
+            assert_eq!(position, Origin::new(822, TEST_MENUBAR_HEIGHT));
+            let mut strips = world.query::<(&LayoutStrip, &Position)>();
+            let (_, position) = strips
+                .iter(world)
+                .find(|(strip, _)| strip.contains(entity))
+                .expect("need owning strip");
+            assert_eq!(position.0.x, 822);
         })
         .run(commands);
 }
@@ -2516,10 +2522,11 @@ fn test_armed_drop_reorders_column_to_nearest_slot() {
         .run(commands);
 }
 
-/// An unarmed drag moves the whole column visually, then glides every
-/// member home on release — the shortcut stays the relocation gate.
+/// An unarmed drag pans the strip with the cursor instead of moving the
+/// column: members stay in their slots, the strip keeps the scroll offset on
+/// release (no homing, no reshuffle) — the shortcut stays the relocation gate.
 #[test]
-fn test_unarmed_drag_moves_column_then_glides_home() {
+fn test_unarmed_drag_scrolls_strip() {
     // Stacked column sits at x=400 (see transfer test); grab window 0 and
     // drag right without the shortcut.
     let grab = CGPoint::new(600.0, 100.0);
@@ -2553,6 +2560,94 @@ fn test_unarmed_drag_moves_column_then_glides_home() {
 
     TestHarness::new()
         .with_config(drag_display_config())
+        .with_windows(2)
+        .on_iteration(4, move |world, _state| {
+            // Both stacked mates tracked the (300, 0) drag 1:1 *with* their
+            // strip (slot-relative): the strip followed to 700 and the
+            // column stayed in its slot, instead of tearing off to 700 over
+            // a strip left behind at 400.
+            for id in [0, 1] {
+                let entity = find_window_entity(id, world);
+                let position = world.get::<Position>(entity).expect("need position").0;
+                assert_eq!(
+                    position.x, 700,
+                    "stacked mate {id} must scroll with its strip"
+                );
+            }
+            let first = find_window_entity(0, world);
+            let mut strips = world.query::<(&LayoutStrip, &Position)>();
+            let (_, position) = strips
+                .iter(world)
+                .find(|(strip, _)| strip.contains(first))
+                .expect("need owning strip");
+            assert_eq!(position.0.x, 700);
+        })
+        .on_iteration(6, move |world, _state| {
+            // Release keeps the scroll offset: no homing, no reshuffle.
+            let first = find_window_entity(0, world);
+            let position = world.get::<Position>(first).expect("need position").0;
+            assert_eq!(position, Origin::new(700, TEST_MENUBAR_HEIGHT));
+            let second = find_window_entity(1, world);
+            let position = world.get::<Position>(second).expect("need position").0;
+            assert_eq!(position.x, 700);
+            let mut strips = world.query::<(&LayoutStrip, &Position)>();
+            let (_, position) = strips
+                .iter(world)
+                .find(|(strip, _)| strip.contains(first))
+                .expect("need owning strip");
+            assert_eq!(position.0.x, 700);
+        })
+        .run(commands);
+}
+
+/// With `left_drag_scrolls_strip` off, the legacy behavior returns: an
+/// unarmed drag moves the whole column visually, then glides every member
+/// home on release.
+#[test]
+fn test_unarmed_drag_with_scroll_disabled_moves_column_then_glides_home() {
+    // Stacked column sits at x=400 (see transfer test); grab window 0 and
+    // drag right without the shortcut.
+    let grab = CGPoint::new(600.0, 100.0);
+    let commands = vec![
+        Event::MenuOpened { window_id: 0 },
+        Event::Command {
+            command: Command::Window(Operation::Focus(Direction::Last)),
+        },
+        Event::Command {
+            command: Command::Window(Operation::Stack(true)),
+        },
+        Event::MouseDown {
+            point: grab,
+            modifiers: Modifiers::empty(),
+        },
+        Event::MouseDragged {
+            point: CGPoint::new(900.0, 100.0),
+            modifiers: Modifiers::empty(),
+        },
+        Event::Command {
+            command: Command::PrintState,
+        },
+        Event::MouseUp {
+            point: CGPoint::new(900.0, 100.0),
+            modifiers: Modifiers::empty(),
+        },
+        Event::Command {
+            command: Command::PrintState,
+        },
+    ];
+
+    TestHarness::new()
+        .with_config(
+            (
+                MainOptions {
+                    mouse_drag_display_modifier: Some(Modifiers::ALT),
+                    left_drag_scrolls_strip: Some(false),
+                    ..Default::default()
+                },
+                vec![],
+            )
+                .into(),
+        )
         .with_windows(2)
         .on_iteration(4, move |world, _state| {
             // Both stacked mates followed the (300, 0) drag delta from
