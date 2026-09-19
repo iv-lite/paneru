@@ -39,7 +39,7 @@ use crate::manager::{
     Application, Display, Origin, Process, Window, WindowManager, WindowOS, bruteforce_windows,
 };
 use crate::overlay::{FlashMessageManager, OverlayManager};
-use crate::platform::input::TapHealth;
+use crate::platform::input::{TapHealth, left_button_held};
 use crate::platform::{PlatformCallbacks, WinID};
 
 /// Processes and applications still inside their spawn grace period, with the
@@ -952,6 +952,25 @@ pub(super) fn window_resized_update_frame(
     }
 }
 
+/// Whether a native `WindowMoved` echo must not be adopted into the layout.
+///
+/// True only for a managed window paneru tracks no gesture for (no holder,
+/// no in-flight marker) while the tap reports the left button physically
+/// held: that is a native drag session the daemon never saw (press-frame
+/// leak, stale suppress gate, tap-disabled gap) — never an app moving its
+/// own window, which arrives with the button up. Pure so the matrix is unit
+/// testable; the harness has no tap, so the button arm is covered by those
+/// tests rather than the loop below.
+#[allow(clippy::fn_params_excessive_bools)]
+fn adoption_distrusted(
+    unmanaged: bool,
+    held: bool,
+    repositioning: bool,
+    button_held: bool,
+) -> bool {
+    !unmanaged && !held && !repositioning && button_held
+}
+
 #[instrument(level = Level::TRACE, skip_all)]
 pub(crate) fn window_moved_update_frame(
     mut messages: MessageReader<Event>,
@@ -994,6 +1013,25 @@ pub(crate) fn window_moved_update_frame(
         // `Position`, so overwriting it with the echoed frame mid-animation
         // restarts each step from behind, and the two chase each other.
         if repositioning {
+            continue;
+        }
+        // A native session paneru never tracked (press-frame leak, stale
+        // suppress gate, tap-disabled gap): push the slot back instead of
+        // adopting, or the displaced echo becomes layout permanently and a
+        // later `commit` legitimizes it on the OS side. Direct push (not a
+        // marker: origin already equals the slot, so the chain would no-op).
+        if adoption_distrusted(
+            unmanaged.is_some(),
+            held.iter().any(|(_, marker, _)| marker.0 == entity),
+            repositioning,
+            left_button_held(),
+        ) {
+            let Ok(live) = window.update_frame() else {
+                continue;
+            };
+            let drift = (live.min - position.0).abs();
+            debug!("untracked native drag of window {entity}, drift {drift:?}: pushing slot back");
+            window.reposition(position.0);
             continue;
         }
         let Ok(new_frame) = window.update_frame() else {
@@ -1099,7 +1137,7 @@ pub(super) struct OverlayWindowConfigCache {
     detected_border_radius: Option<f64>,
 }
 
-#[allow(clippy::too_many_arguments)]
+#[allow(clippy::too_many_arguments, clippy::too_many_lines)]
 pub(super) fn update_overlays(
     // Gating lives in the overlay run conditions (dirty ticks plus every
     // frame of scroll/drag motion); this query just resolves the current
@@ -1110,6 +1148,7 @@ pub(super) fn update_overlays(
     displays: Query<(&Display, Has<ActiveDisplayMarker>)>,
     focus_markers: Query<(), With<FocusedMarker>>,
     drag_held: Query<(), With<MouseHeldMarker>>,
+    armed_drag: Query<(), (With<MouseHeldMarker>, With<DragDisplayArmed>)>,
     overlay_mgr: Option<NonSendMut<OverlayManager>>,
     mission_control_active: Res<MissionControlActive>,
     config: Res<Config>,
@@ -1195,7 +1234,15 @@ pub(super) fn update_overlays(
         ))
     };
 
-    let border_params = if border_enabled && {
+    // The border belongs to the focused window at rest: hide it for the
+    // duration of an armed column drag rather than tracking a window
+    // mid-relocation (which reads as detached). Plain clicks hold unarmed
+    // markers, so they never flicker this.
+    let dragging_column = !armed_drag.is_empty();
+    if dragging_column {
+        trace!("hiding border for armed column drag");
+    }
+    let border_params = if border_enabled && !dragging_column && {
         // Parked slivers physically sit inside abutting displays; drawing the
         // focus border around one paints a stripe on the neighbor. The focused
         // window belongs on screen, so a center outside the active display
@@ -1727,6 +1774,7 @@ mod tests {
 
     use bevy::prelude::*;
 
+    use super::adoption_distrusted;
     use super::gather_initial_processes;
     use crate::config::Config;
     use crate::events::Event;
@@ -1755,6 +1803,23 @@ mod tests {
         app.update();
 
         assert_eq!(tap_config.swipe_gesture_fingers(), Some(3));
+    }
+
+    #[test]
+    fn untracked_drag_session_is_distrusted() {
+        // Managed window, no holder, no marker, button physically held: a
+        // native session the daemon never saw — never adopt it.
+        assert!(adoption_distrusted(false, false, false, true));
+    }
+
+    #[test]
+    fn tracked_or_idle_echoes_still_adopt() {
+        // Held (normal drag), marked (own animation), unmanaged (floating),
+        // or button up (app moved itself): all adopt as before.
+        assert!(!adoption_distrusted(false, true, false, true));
+        assert!(!adoption_distrusted(false, false, true, true));
+        assert!(!adoption_distrusted(true, false, false, true));
+        assert!(!adoption_distrusted(false, false, false, false));
     }
 }
 

@@ -113,6 +113,21 @@ pub fn set_lua_keybinds(keys: Vec<(u8, Modifiers, u32)>) {
     LUA_KEYBINDS.store(Arc::new(keys));
 }
 
+/// Physical left-button state as the tap last saw it. Lets the ECS tell a
+/// native drag session it never tracked (press-frame leak, stale gate,
+/// tap-disabled gap) apart from an app moving its own window: an echo that
+/// arrives with no holder, no marker, *and* the button held is a session we
+/// missed, never intent. Best-effort — a missed release can leave it stale
+/// until the next press — so it only ever *suppresses* adoption, and small
+/// drifts still adopt as before.
+static LEFT_BUTTON_HELD: AtomicBool = AtomicBool::new(false);
+
+/// Whether the tap has seen a left press without its release yet. Called
+/// from the main thread by the adoption path.
+pub(crate) fn left_button_held() -> bool {
+    LEFT_BUTTON_HELD.load(Ordering::Acquire)
+}
+
 /// Gate for pre-suppressing native left-drags in the tap, before the ECS has
 /// seen the press. Mirrors the `mouse_down_trigger` scroll rule
 /// (`left_drag_scrolls_strip` on, drag shortcut not held); published from the
@@ -400,6 +415,10 @@ impl InputHandler {
             CGEventType::LeftMouseDown | CGEventType::RightMouseDown => {
                 let point = CGEvent::location(Some(event));
                 if matches!(event_type, CGEventType::LeftMouseDown) {
+                    // Physical button state for the adoption path (see
+                    // `LEFT_BUTTON_HELD`); updated before the gate below so a
+                    // suppressed press still counts as held.
+                    LEFT_BUTTON_HELD.store(true, Ordering::Release);
                     // Pre-suppress synchronously: the ECS only learns about
                     // the press (and sets the flag authoritatively) a frame
                     // later, and any drag slipping through in between starts
@@ -420,8 +439,11 @@ impl InputHandler {
                 events.send(Event::MouseDown { point, modifiers })
             }
             CGEventType::LeftMouseUp | CGEventType::RightMouseUp => {
-                // A release ends any drag: never let a lost press leave
-                // native drags swallowed.
+                // A release ends any drag: never let a lost press leave native
+                // drags swallowed, and report the button up for adoption.
+                if matches!(event_type, CGEventType::LeftMouseUp) {
+                    LEFT_BUTTON_HELD.store(false, Ordering::Release);
+                }
                 SCROLL_DRAG_SUPPRESS.store(false, Ordering::Release);
                 let point = CGEvent::location(Some(event));
                 events.send(Event::MouseUp { point, modifiers })
