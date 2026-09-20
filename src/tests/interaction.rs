@@ -1623,6 +1623,94 @@ fn test_ensure_visible_without_snap_still_animates() {
     );
 }
 
+/// `ensure_focused_visible` fires on every fresh focus (`Added<FocusedMarker>`),
+/// not just the OS-event path that already calls `ensure_visible`: focusing a
+/// window whose frame sits outside the viewport scrolls the minimum shortfall
+/// via the shared `ensure_visible` machinery. Reproduces the mechanism
+/// directly (marker move, like the `EnsureVisibleMarker` tests above) rather
+/// than through one focus operation, since the guarantee covers every focus
+/// path — keyboard, click, virtual moves, close-refocus — and only this
+/// system's scroll output is under test here.
+#[test]
+fn test_focus_outside_viewport_scrolls_strip_to_reveal() {
+    // 5 windows @ 400px = 2000px strip on a 1024px display → scrollable, so
+    // window 4 sits off the right edge at scroll position 0.
+    TestHarness::new()
+        .with_windows(5)
+        .on_iteration(0, |world, _state| {
+            let holders: Vec<Entity> = world
+                .query_filtered::<Entity, With<FocusedMarker>>()
+                .iter(world)
+                .collect();
+            for entity in holders {
+                world.entity_mut(entity).remove::<FocusedMarker>();
+            }
+            let target = find_window_entity(4, world);
+            world.entity_mut(target).insert(FocusedMarker);
+        })
+        .on_iteration(2, |world, _state| {
+            assert_focused!(world, 4);
+            let mut strips = world.query_filtered::<&Position, With<ActiveWorkspaceMarker>>();
+            let strip_x = strips.single(world).expect("exactly one active strip").0.x;
+            assert_ne!(
+                strip_x, 0,
+                "focusing an off-viewport window must scroll the strip to reveal it"
+            );
+        })
+        .run(vec![
+            Event::Command {
+                command: Command::PrintState,
+            },
+            Event::Command {
+                command: Command::PrintState,
+            },
+            Event::Command {
+                command: Command::PrintState,
+            },
+        ]);
+}
+
+/// Companion: focusing a window that is already fully visible must not touch
+/// the strip — the guarantee is a no-op, not a recenter.
+#[test]
+fn test_focus_inside_viewport_leaves_strip_alone() {
+    TestHarness::new()
+        .with_windows(5)
+        .on_iteration(0, |world, _state| {
+            // Window 0 starts visible at scroll 0; re-focus it so the
+            // `Added<FocusedMarker>` path fires on an in-viewport window.
+            let holders: Vec<Entity> = world
+                .query_filtered::<Entity, With<FocusedMarker>>()
+                .iter(world)
+                .collect();
+            for entity in holders {
+                world.entity_mut(entity).remove::<FocusedMarker>();
+            }
+            let target = find_window_entity(0, world);
+            world.entity_mut(target).insert(FocusedMarker);
+        })
+        .on_iteration(2, |world, _state| {
+            assert_focused!(world, 0);
+            let mut strips = world.query_filtered::<&Position, With<ActiveWorkspaceMarker>>();
+            let strip_x = strips.single(world).expect("exactly one active strip").0.x;
+            assert_eq!(
+                strip_x, 0,
+                "focusing an already-visible window must not move the strip"
+            );
+        })
+        .run(vec![
+            Event::Command {
+                command: Command::PrintState,
+            },
+            Event::Command {
+                command: Command::PrintState,
+            },
+            Event::Command {
+                command: Command::PrintState,
+            },
+        ]);
+}
+
 /// Regression: `position_layout_windows`'s offscreen/parking magnitude
 /// heuristic has no way to know a virtual-workspace restore is in progress.
 /// A member window whose last position differs from its recomputed target

@@ -12,7 +12,7 @@ use bevy::ecs::resource::Resource;
 use bevy::ecs::schedule::SystemCondition;
 use bevy::ecs::schedule::common_conditions::{not, resource_exists};
 use bevy::ecs::schedule::{ScheduleLabel as _, SingleThreadedExecutor};
-use bevy::ecs::system::{Commands, EntityCommands, Query, Res, SystemId};
+use bevy::ecs::system::{Commands, EntityCommands, Local, Query, Res, SystemId};
 use bevy::prelude::Event as BevyEvent;
 use bevy::tasks::Task;
 use bevy::time::Timer;
@@ -40,6 +40,7 @@ use crate::manager::{
 use crate::menubar::MenuBarManager;
 use crate::overlay::{FlashMessageManager, OverlayManager};
 use crate::platform::{Modifiers, PlatformCallbacks, WinID, WorkspaceId};
+use crate::snapshot::SnapshotStore;
 
 pub mod display;
 pub mod focus;
@@ -126,6 +127,17 @@ pub fn register_systems(app: &mut bevy::app::App) {
     // the next focus/strip/position change. Overlay-only, like above.
     let drag_ended =
         |mut released: RemovedComponents<MouseHeldMarker>| released.read().next().is_some();
+    // A fresh snapshot generation re-runs the overlay even when nothing else
+    // dirtied it: border attachment reads snapshot frames, and the worker
+    // wakes the pump on change precisely so native motion repaints promptly.
+    // `Local` (not a resource): the epoch cursor belongs to this gate alone.
+    // Overlay-only, like above.
+    let snapshot_advanced = |store: Option<Res<SnapshotStore>>, mut last: Local<u64>| {
+        let epoch = store.as_deref().map_or(0, |s| s.0.load().epoch);
+        let advanced = epoch != *last;
+        *last = epoch;
+        advanced
+    };
     // The menu bar additionally shows how many virtual workspaces exist, so it
     // has to redraw when one is created or reaped, neither of which touches the
     // active strip.
@@ -246,7 +258,8 @@ pub fn register_systems(app: &mut bevy::app::App) {
                         vw_indicator_dirty
                             .or_eager(overlay_tracking_motion)
                             .or_eager(bordered_set_changed)
-                            .or_eager(drag_ended),
+                            .or_eager(drag_ended)
+                            .or_eager(snapshot_advanced),
                     ),
                 systems::update_flash_messages,
             )
@@ -795,6 +808,7 @@ pub fn setup_bevy_app(sender: EventSender, receiver: Receiver<Event>) -> Result<
     {
         let (store, roster) = crate::snapshot::spawn_snapshot_thread(
             crate::manager::WindowManagerOS::new(sender.clone()),
+            sender.waker().clone(),
         );
         app.insert_resource(store);
         app.insert_resource(roster);

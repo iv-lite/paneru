@@ -6,12 +6,11 @@
 //! lock-free. Plain `Send` data only across the boundary — never ECS
 //! borrows, Lua values, or `MainThreadMarker` objects.
 //!
-//! Shadow mode: nothing consumes the snapshots yet. The thread runs, reads,
-//! publishes, and logs its progress; later steps migrate readers
-//! (verify/adoption/overlay/Lua) onto it one by one, each keeping a direct
-//! fallback. The thread is detached and dies with the process (same as the
-//! socket reader thread); it holds no world state, so there is nothing to
-//! join or drain on exit.
+//! Readers (verifier, overlay borders, tab grouping, saved-state titles)
+//! prefer the snapshot and fall back to direct reads when it is absent or
+//! stale; the harness takes the fallback exclusively. The thread is detached
+//! and dies with the process (same as the socket reader thread); it holds
+//! no world state, so there is nothing to join or drain on exit.
 
 use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
@@ -26,7 +25,7 @@ use tracing::{debug, warn};
 
 use crate::manager::snapshot_frame;
 use crate::manager::{Display, WindowManager, WindowManagerApi, WindowManagerOS};
-use crate::platform::{Pid, WinID, WorkspaceId};
+use crate::platform::{EventLoopWaker, Pid, WinID, WorkspaceId};
 use crate::util::{AXUIAttributes, AXUIWrapper};
 
 /// How often the snapshot thread re-reads every rostered handle.
@@ -173,6 +172,12 @@ fn read_one(win_id: WinID, pid: Option<Pid>, element: &CFRetained<AXUIWrapper>) 
 /// walk rather than deciding on stale membership.
 pub(crate) const ON_SCREEN_MAX_AGE: Duration = Duration::from_millis(500);
 
+/// Maximum age of a snapshot frame consumers trust. The worker publishes
+/// every 250ms, so this allows one missed tick plus margin; older snapshots
+/// fall back to a direct read rather than deciding on stale data. Shared by
+/// the verifier and border attachment so both agree on what "fresh" means.
+pub(crate) const SNAPSHOT_FRAME_MAX_AGE: Duration = Duration::from_millis(500);
+
 /// On-screen window ids from the snapshot worker, if the store exists and is
 /// fresh. Pure over the loaded snapshot, so the matrix is unit testable.
 pub(crate) fn snapshot_on_screen_set(
@@ -243,6 +248,12 @@ pub(crate) fn snapshot_live_frame(
 /// Snapshot worker main loop. Drains roster deltas (blocking up to one tick
 /// so an idle roster costs nothing), polls every handle, publishes.
 ///
+/// Wakes the Cocoa pump whenever frames or the on-screen set actually change
+/// (compared against the last published generation): border attachment reads
+/// snapshots, and without the wake a native move would sit borderless until
+/// the next dirty tick. Titles, spaces and displays don't wake — no border
+/// consumer reads them. The waker coalesces bursts into one posted event.
+///
 /// Two cadences: window attributes + the on-screen set every fast tick
 /// (250ms, matching the overlay memo horizon); display/space enumeration
 /// every eighth tick (2s), since it moves slower and costs one SLS iterator
@@ -252,6 +263,7 @@ fn run(
     roster: Receiver<RosterDelta>,
     window_manager: WindowManagerOS,
     published: Arc<ArcSwap<AxSnapshot>>,
+    waker: Arc<EventLoopWaker>,
 ) {
     let mut handles: RosterHandles = HashMap::new();
     let mut spaces: HashMap<WorkspaceId, Vec<WinID>> = HashMap::new();
@@ -261,6 +273,10 @@ fn run(
     let mut active_space: HashMap<u32, WorkspaceId> = HashMap::new();
     let mut epoch: u64 = 0;
     let mut ticks: u64 = 0;
+    // Last woken generation: frames (`None` = unreadable that tick) plus the
+    // on-screen set. Compared every tick; the pump wakes only on change.
+    let mut last_frames: HashMap<WinID, Option<IRect>> = HashMap::new();
+    let mut last_on_screen: HashSet<WinID> = HashSet::new();
 
     loop {
         match roster.recv_timeout(SNAPSHOT_TICK) {
@@ -321,6 +337,15 @@ fn run(
         }
 
         epoch += 1;
+        let frames: HashMap<WinID, Option<IRect>> = windows
+            .iter()
+            .map(|(win_id, snapshot)| (*win_id, snapshot.frame))
+            .collect();
+        if frames != last_frames || on_screen != last_on_screen {
+            last_frames = frames;
+            last_on_screen.clone_from(&on_screen);
+            waker.wake();
+        }
         published.store(Arc::new(AxSnapshot {
             epoch,
             at: Instant::now(),
@@ -350,16 +375,19 @@ fn run(
 ///
 /// Owns a private [`WindowManagerOS`] for SLS/CG enumeration so no main
 /// state crosses threads — only the constructor's `EventSender` is shared
-/// (already `Send + Sync` by design).
+/// (already `Send + Sync` by design). Wakes the pump (via `waker`) whenever
+/// frames or the on-screen set change, so border attachment tracks native
+/// motion without waiting for the next dirty tick.
 pub(crate) fn spawn_snapshot_thread(
     window_manager: WindowManagerOS,
+    waker: Arc<EventLoopWaker>,
 ) -> (SnapshotStore, SnapshotRoster) {
     let (tx, rx) = unbounded();
     let published = Arc::new(ArcSwap::new(Arc::new(AxSnapshot::default())));
     let thread_published = Arc::clone(&published);
     std::thread::Builder::new()
         .name("paneru-ax-snap".to_string())
-        .spawn(move || run(rx, window_manager, thread_published))
+        .spawn(move || run(rx, window_manager, thread_published, waker))
         .expect("spawning the ax snapshot thread");
     (SnapshotStore(published), SnapshotRoster(tx))
 }

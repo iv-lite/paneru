@@ -41,7 +41,9 @@ use crate::manager::{
 use crate::overlay::{FlashMessageManager, OverlayManager};
 use crate::platform::input::{TapHealth, left_button_held};
 use crate::platform::{PlatformCallbacks, WinID};
-use crate::snapshot::{ON_SCREEN_MAX_AGE, SnapshotStore, on_screen_set, snapshot_live_frame};
+use crate::snapshot::{
+    ON_SCREEN_MAX_AGE, SNAPSHOT_FRAME_MAX_AGE, SnapshotStore, on_screen_set, snapshot_live_frame,
+};
 
 /// Processes and applications still inside their spawn grace period, with the
 /// `FreshMarker` that says whether the spawn actually completed in time.
@@ -85,7 +87,11 @@ type ResizableWindows<'w, 's> = Query<
     Without<LayoutStrip>,
 >;
 
-const ANIAMTE_SNAP_THRESHOLD: f32 = 5.0;
+/// Settle band for the exponential animator: residuals inside it snap to the
+/// target and drop the marker. Must exceed one sluggish frame's travel, or a
+/// slow machine creeps toward the target for seconds, re-driving AX commits
+/// (and borders) the whole way instead of landing.
+const ANIAMTE_SNAP_THRESHOLD: f32 = 8.0;
 
 /// Cap for animation time steps. A main-thread stall (synchronous AX IPC)
 /// must shed time instead of teleporting: without the cap the next
@@ -827,8 +833,9 @@ pub(super) fn animate_entities(
             let current = position.0.as_vec2();
             let lerped = current.lerp(target, t);
 
-            // Snap once we're within a pixel of the target (or after one effectively-
-            // complete tick), so the marker is dropped promptly.
+            // Snap once the shortfall fits inside the settle band (or after
+            // one effectively-complete tick), so the marker is dropped
+            // promptly instead of creeping for seconds on a slow machine.
             let finished = (target - lerped).length() <= ANIAMTE_SNAP_THRESHOLD;
             let new_pos = if finished {
                 *origin
@@ -1180,6 +1187,10 @@ pub(crate) fn window_moved_update_frame(
     drag_modifiers: Res<DragModifierState>,
     scroll_grace: Res<DragScrollState>,
 ) {
+    // Adoption reads the echo directly, never the snapshot worker: the event
+    // announces a move that just happened, and the 250ms poll may not have
+    // seen it yet (or may still hold the pre-move frame). A snapshot read
+    // here would adopt stale frames as layout and fight the move reported.
     for event in messages.read() {
         let Event::WindowMoved { window_id } = event else {
             continue;
@@ -1356,6 +1367,69 @@ pub(super) struct OverlayWindowConfigCache {
     radii: HashMap<WinID, (Option<f64>, Option<f64>)>,
 }
 
+/// Windows as the overlay sees them for flight checks: whether paneru is
+/// currently driving or confirming each window.
+type FlightMarkers<'w, 's> = Query<
+    'w,
+    's,
+    (
+        Has<RepositionMarker>,
+        Has<ResizeMarker>,
+        Has<VerifyWindowPosition>,
+    ),
+    With<Window>,
+>;
+
+/// Snapshot frames are raw CG-decoded rects: re-apply the window's padding
+/// (the inverse of `update_frame`'s strip) so snapshot and direct reads
+/// agree. Shared by the verifier and border attachment.
+fn pad_snapshot_frame(raw: IRect, window: &Window) -> IRect {
+    let h_pad = window.horizontal_padding();
+    let v_pad = window.vertical_padding();
+    let mut frame = raw;
+    frame.min.x -= h_pad;
+    frame.min.y -= v_pad;
+    frame.max.x += h_pad;
+    frame.max.y += v_pad;
+    frame
+}
+
+/// Frame a border should hug for one window (the attach guarantee), in
+/// priority order:
+///
+/// 1. The layout target while paneru drives or confirms the window — any of
+///    `RepositionMarker`, `ResizeMarker`, `VerifyWindowPosition` present — or
+///    while the strip scrolls, a drag is held, or a release settles. The OS
+///    position trails AX commits through all of these; the cached frame
+///    would paint a detached border.
+/// 2. A fresh snapshot frame: native moves/resizes bypass ECS, and the
+///    snapshot sees them without a synchronous round trip.
+/// 3. The cached OS frame, last.
+fn border_frame_for(
+    windows: &Windows,
+    flight: &FlightMarkers<'_, '_>,
+    entity: Entity,
+    window: &Window,
+    tracking_live: bool,
+    store: Option<&SnapshotStore>,
+) -> IRect {
+    let driving = tracking_live
+        || flight
+            .get(entity)
+            .is_ok_and(|(repositioning, resizing, verifying)| {
+                repositioning || resizing || verifying
+            });
+    if driving {
+        if let Some(frame) = windows.moving_frame(entity) {
+            return frame;
+        }
+        trace!("overlay driving {entity} but no layout frame, falling back to OS frame");
+    } else if let Some(raw) = snapshot_live_frame(store, window.id(), SNAPSHOT_FRAME_MAX_AGE) {
+        return pad_snapshot_frame(raw, window);
+    }
+    window.frame()
+}
+
 /// Absolute CG rect of a layout frame, corrected for window padding.
 /// Shared by focused and inactive borders so both use identical math.
 fn abs_cg_rect(frame: IRect, window: &Window) -> NSRect {
@@ -1415,6 +1489,7 @@ pub(super) fn update_overlays(
     focus_markers: Query<(), With<FocusedMarker>>,
     drag_held: Query<(), With<MouseHeldMarker>>,
     armed_drag: Query<(), (With<MouseHeldMarker>, With<DragDisplayArmed>)>,
+    flight: FlightMarkers<'_, '_>,
     scroll_grace: Res<DragScrollState>,
     overlay_mgr: Option<NonSendMut<OverlayManager>>,
     mission_control_active: Res<MissionControlActive>,
@@ -1491,23 +1566,22 @@ pub(super) fn update_overlays(
         return;
     }
 
-    // The focused window's frame. While the strip is being scrolled, a drag
-    // is held, or a scroll release is still settling, the cached OS frame
-    // lags behind AX commits, so the border would trail the motion and
-    // settle detached: use the live ECS layout frame instead — it is what
-    // the windows are being driven to. Otherwise the OS frame is fresher
-    // (native moves/resizes bypass ECS). The grace arm matters most on the
-    // release tick itself: without it the border snaps backward to the stale
-    // cache for one tick and then freezes there until the next dirty tick.
+    // The focused window's frame: the layout target while paneru drives or
+    // confirms it, a fresh snapshot frame for native motion that bypassed
+    // ECS, the cached OS frame last (see `border_frame_for`). The grace arm
+    // matters most on the release tick itself: without it the border snaps
+    // backward to the stale cache for one tick and then freezes there until
+    // the next dirty tick.
     let tracking_live =
         overlay_tracks_live(swiping, !drag_held.is_empty(), scroll_grace.settle_active());
-    let layout_frame = tracking_live
-        .then(|| windows.moving_frame(entity))
-        .flatten();
-    let frame = layout_frame.unwrap_or_else(|| window.frame());
-    if tracking_live && layout_frame.is_none() {
-        trace!("overlay tracking live but no layout frame, falling back to OS frame");
-    }
+    let frame = border_frame_for(
+        &windows,
+        &flight,
+        entity,
+        window,
+        tracking_live,
+        store.as_deref(),
+    );
     let focused_abs_cg = abs_cg_rect(frame, window);
 
     // The border belongs to the focused window at rest: hide it for the
@@ -1588,13 +1662,14 @@ pub(super) fn update_overlays(
             if window.is_full_screen() || !on_screen.contains(&window_id) {
                 continue;
             }
-            let window_frame = if tracking_live {
-                windows
-                    .moving_frame(entity)
-                    .unwrap_or_else(|| window.frame())
-            } else {
-                window.frame()
-            };
+            let window_frame = border_frame_for(
+                &windows,
+                &flight,
+                entity,
+                window,
+                tracking_live,
+                store.as_deref(),
+            );
             // Parked-sliver guard, generalized per window across displays.
             if !displays
                 .iter()
@@ -1667,11 +1742,6 @@ pub(super) fn commit_window_position(
         .for_each(|(mut window, position)| window.reposition(position.0));
 }
 
-/// Maximum age of a snapshot frame the verifier trusts. The worker publishes
-/// every 250ms, so this allows one missed tick plus margin; older snapshots
-/// fall back to a direct read rather than deciding on stale data.
-const VERIFY_SNAPSHOT_MAX_AGE: Duration = Duration::from_millis(500);
-
 /// Confirms OS positions against layout intent. Every driven move carries
 /// verification (see `reposition_entity`), so this is the universal drift
 /// backstop between commits and the 5s audit — throttled to ~100ms per
@@ -1703,17 +1773,8 @@ pub(crate) fn verify_window_position(
         // trip. Absent in tests (identical behavior there), stale, or
         // missing this window: fall back to a direct read.
         let window_id = window.id();
-        let h_pad = window.horizontal_padding();
-        let v_pad = window.vertical_padding();
-        let live =
-            snapshot_live_frame(store.as_deref(), window_id, VERIFY_SNAPSHOT_MAX_AGE).map(|raw| {
-                let mut frame = raw;
-                frame.min.x -= h_pad;
-                frame.min.y -= v_pad;
-                frame.max.x += h_pad;
-                frame.max.y += v_pad;
-                frame
-            });
+        let live = snapshot_live_frame(store.as_deref(), window_id, SNAPSHOT_FRAME_MAX_AGE)
+            .map(|raw| pad_snapshot_frame(raw, &window));
         let live = if let Some(frame) = live {
             frame
         } else {

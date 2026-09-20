@@ -15,7 +15,9 @@ use bevy::prelude::Event as BevyEvent;
 use bevy::time::common_conditions::on_timer;
 use tracing::{Level, debug, instrument, trace, warn};
 
-use super::{FocusedMarker, MouseHeldMarker, SystemTheme, Unmanaged};
+use super::{
+    FocusedMarker, MouseHeldMarker, RepositionMarker, SystemTheme, Unmanaged, VerifyWindowPosition,
+};
 use crate::config::Config;
 use crate::ecs::layout::LayoutStrip;
 use crate::ecs::params::{ActiveDisplay, GlobalState, WindowCtx, Windows};
@@ -108,6 +110,9 @@ impl Plugin for FocusEventsPlugin {
                 // Otherwise the one-shot `Added` warp lands on the
                 // pre-recenter frame and never corrects itself.
                 mouse_follows_focus.after(autocenter_window_on_focus),
+                // After the warp target is settled: guarantees the focused
+                // window ends fully visible on every focus path.
+                ensure_focused_visible.after(mouse_follows_focus),
                 recover_lost_focus.run_if(on_timer(Duration::from_millis(
                     REFRESH_WINDOW_CHECK_FREQ_MS,
                 ))),
@@ -290,6 +295,91 @@ fn autocenter_window_on_focus(
         ctx.commands.reposition_entity(entity, origin);
     }
     ctx.commands.reshuffle_around(entity);
+}
+
+/// What [`ensure_focused_visible`] checks to decide a window is mid-flight:
+/// whether paneru is currently driving or confirming it.
+type FlightMarkers<'w, 's> = Query<
+    'w,
+    's,
+    (
+        Has<RepositionMarker>,
+        Has<ResizeMarker>,
+        Has<VerifyWindowPosition>,
+    ),
+    With<Window>,
+>;
+
+/// Guarantees a focused window at rest is fully visible: if its frame is not
+/// completely inside the viewport, scrolls the minimum shortfall via the
+/// shared `ensure_visible` machinery (animated, no-op when already visible).
+/// Runs on every focus change regardless of path — keyboard, click, virtual
+/// moves, close-refocus, Cmd-Tab — and deliberately ignores `skip_reshuffle`
+/// (which brings FFM hover into the guarantee) and `window_hidden_ratio`
+/// (which still governs unfocused windows only). Skipped while a drag holds
+/// the layout (release reshuffles instead), during setup, for background
+/// native tabs (which share the showing tab's slot), while a
+/// `RestoreFocusMarker` names the window, while anything is in flight, and
+/// on a freshly activated strip. The last two share one reason: mid-motion
+/// frames are transient, and "exposing" one fights the motion that owns it —
+/// firing during initial layout baked a half-built offset into the strip
+/// that later restores faithfully preserved. Restores expose arriving focus
+/// themselves (snapping when animations are off), so this defers to them.
+#[allow(clippy::too_many_arguments)]
+#[instrument(level = Level::DEBUG, skip_all)]
+fn ensure_focused_visible(
+    focused: Single<Entity, Added<FocusedMarker>>,
+    windows: Windows,
+    mouse_held: Query<&MouseHeldMarker>,
+    restored: Query<&RestoreFocusMarker>,
+    flight: FlightMarkers<'_, '_>,
+    strips: Query<(Entity, &LayoutStrip, Has<RepositionMarker>, Has<Scrolling>)>,
+    fresh_strips: Query<Entity, Added<ActiveWorkspaceMarker>>,
+    global_state: GlobalState,
+    active_display: ActiveDisplay,
+    config: Res<Config>,
+    mut commands: Commands,
+) {
+    use crate::ecs::layout::clamp_origin_to_viewport;
+
+    let entity = *focused;
+    if global_state.initializing() || !mouse_held.is_empty() {
+        return;
+    }
+    if restored.iter().any(|marker| marker.entity == entity) {
+        return;
+    }
+    // At rest only: a window or strip mid-animation is on its way somewhere
+    // else, and exposing its transient frame perturbs the motion's own
+    // trajectory (boot layout, swipe momentum, restores).
+    if flight
+        .get(entity)
+        .is_ok_and(|(repositioning, resizing, verifying)| repositioning || resizing || verifying)
+    {
+        return;
+    }
+    if let Some((strip_entity, _, strip_flight, strip_scrolling)) = strips
+        .iter()
+        .find(|(_, strip, _, _)| strip.contains(entity))
+    {
+        if strip_flight || strip_scrolling {
+            return;
+        }
+        if fresh_strips.contains(strip_entity) {
+            return;
+        }
+    }
+    if active_display.active_strip().tabbed(entity) {
+        return;
+    }
+    let (Some(frame), Some(size)) = (windows.moving_frame(entity), windows.size(entity)) else {
+        return;
+    };
+    let viewport = active_display.actual_bounds(&config);
+    if clamp_origin_to_viewport(frame.min, size, viewport) != frame.min {
+        debug!("focus on {entity} outside viewport, exposing");
+        commands.ensure_visible(entity);
+    }
 }
 
 #[instrument(level = Level::DEBUG, skip_all, fields(trigger))]
