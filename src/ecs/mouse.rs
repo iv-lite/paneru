@@ -11,7 +11,10 @@ use bevy::time::Time;
 use std::time::{Duration, Instant};
 use tracing::{debug, info, trace, warn};
 
-use super::{ActiveDisplayMarker, DragDisplayArmed, DragScrollArmed, MouseHeldMarker, Timeout};
+use super::{
+    ActiveDisplayMarker, DragDisplayArmed, DragScrollArmed, DragSettleMarker, MouseHeldMarker,
+    Timeout,
+};
 use crate::commands::{OffscreenStrips, attach_column_to_display, detach_column_from_strip};
 use crate::config::swipe::SwipeGestureDirection;
 use crate::config::{Config, decorations::BorderRadiusOption};
@@ -323,12 +326,15 @@ fn mouse_down_trigger(
             continue;
         };
 
-        // Stop any ongoing scroll.
+        // Stop any ongoing scroll. A fresh press supersedes any gesture in
+        // flight, including a pending drag-release settle from an earlier
+        // drag: the new press owns the strip from here.
         for (entity, scroll) in active_workspace {
-            if scroll.is_some()
-                && let Ok(mut entity_commands) = commands.get_entity(entity)
-            {
-                entity_commands.try_remove::<Scrolling>();
+            if let Ok(mut entity_commands) = commands.get_entity(entity) {
+                if scroll.is_some() {
+                    entity_commands.try_remove::<Scrolling>();
+                }
+                entity_commands.try_remove::<DragSettleMarker>();
             }
         }
 
@@ -862,8 +868,10 @@ fn sample_release_velocity(scroll_state: &mut DragScrollState, dx: f64, now: Dur
 /// strip glides after a fling instead of stopping dead. The pipeline zeroes
 /// velocity for pointer-driven `Scroll` events (native momentum doesn't
 /// apply), so without this the existing inertia chain starts from rest.
-/// Below `MIN_RELEASE_PX_S` the release stops dead (today's behavior); above
-/// `MAX_RELEASE_PX_S` it clamps. Get-or-insert: a mid-drag pause may have let
+/// Below `MIN_RELEASE_PX_S` the release stops dead (today's behavior) but
+/// still arms the drag-release settle, so the nearest window glides back
+/// into the viewport instead of stranding half-out at the kept offset.
+/// Above `MAX_RELEASE_PX_S` it clamps. Get-or-insert: a mid-drag pause may have let
 /// the lift-timeout reap `Scrolling`, in which case it is recreated at the
 /// strip's current offset.
 fn seed_release_inertia(
@@ -875,9 +883,6 @@ fn seed_release_inertia(
     now: Duration,
     commands: &mut Commands,
 ) {
-    if ema_px_s.abs() < MIN_RELEASE_PX_S {
-        return;
-    }
     let Some((strip_entity, _, position, child)) = strips
         .iter()
         .find(|(_, strip, _, _)| strip.contains(entity))
@@ -898,12 +903,17 @@ fn seed_release_inertia(
         SwipeGestureDirection::Natural => -1.0,
         SwipeGestureDirection::Reversed => 1.0,
     };
-    let velocity =
-        ema_px_s.clamp(-MAX_RELEASE_PX_S, MAX_RELEASE_PX_S) / (viewport_width * direction);
+    let velocity = if ema_px_s.abs() < MIN_RELEASE_PX_S {
+        0.0
+    } else {
+        ema_px_s.clamp(-MAX_RELEASE_PX_S, MAX_RELEASE_PX_S) / (viewport_width * direction)
+    };
     // Replace (never touch `Query<&mut Scrolling>` here: declaring mutable
     // access on the release path perturbs an unrelated pinning test, so the
     // seed goes through ordered commands instead — remove then insert lands
     // as a replace at flush, a tick later at most, which the glide absorbs.
+    // The settle marker rides along so the strip reveals the nearest window
+    // once the glide decays (see `DragSettleMarker`).
     if let Ok(mut entity_commands) = commands.get_entity(strip_entity) {
         entity_commands.try_remove::<Scrolling>();
         entity_commands.try_insert(Scrolling {
@@ -912,6 +922,7 @@ fn seed_release_inertia(
             is_user_swiping: false,
             last_event: now,
         });
+        entity_commands.try_insert(DragSettleMarker);
     }
     debug!("mouse up: strip-scroll release at {ema_px_s:.0}px/s, seeding glide");
 }

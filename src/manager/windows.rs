@@ -92,6 +92,12 @@ pub trait WindowApi: Send + Sync {
     fn reposition(&mut self, origin: Origin);
     fn resize(&mut self, size: Size);
     fn update_frame(&mut self) -> Result<IRect>;
+    /// Re-resolves the window's accessibility element from its app, matching
+    /// by window id. Sleep invalidates cached element refs (observer
+    /// registration then fails with `-25202`), so the wake path calls this
+    /// before re-subscribing. The old element is kept when the window is gone
+    /// (caller treats that as a failed refresh, not a loss).
+    fn refresh_element(&mut self) -> Result<()>;
     fn focus_without_raise(
         &self,
         psn: ProcessSerialNumber,
@@ -565,6 +571,21 @@ impl WindowApi for WindowOS {
     /// A `CFRetained<AXUIWrapper>` representing the accessibility element.
     fn element(&self) -> Option<CFRetained<AXUIWrapper>> {
         Some(self.ax_element.clone())
+    }
+
+    fn refresh_element(&mut self) -> Result<()> {
+        let Some(app_element) = self.app_reference() else {
+            return Err(Error::InvalidWindow);
+        };
+        let id = self.id;
+        let fresh = app_element
+            .windows()
+            .map_err(|err| Error::InvalidInput(format!("{err}")))?
+            .into_iter()
+            .find(|element| try_ax_window_id(element.as_ptr()) == Some(id))
+            .ok_or(Error::InvalidWindow)?;
+        self.ax_element = fresh;
+        Ok(())
     }
 
     /// Retrieves the title of the window.

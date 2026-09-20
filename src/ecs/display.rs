@@ -24,10 +24,10 @@ use crate::ecs::params::Windows;
 use crate::ecs::workspace::IgnoredMovedWindows;
 use crate::ecs::{
     ActiveDisplayMarker, MouseHeldMarker, ReadDisplayProperties, SendMessageTrigger,
-    SpawnCommandsExt, Timeout,
+    SpawnCommandsExt, StaleAxMarker, Timeout,
 };
 use crate::events::Event;
-use crate::manager::{Application, Display, WindowManager, irect_from};
+use crate::manager::{Application, Display, Window, WindowManager, irect_from};
 use crate::platform::{PlatformCallbacks, WorkspaceId};
 use crate::util::{read_screen_property, round_px};
 
@@ -45,6 +45,9 @@ impl Plugin for DisplayEventsPlugin {
         // may have broken (dead AX observers, stale drag state, poisoned
         // ignore-lists). See `wake_recovery`.
         app.add_systems(Update, wake_recovery.after(reconcile_displays));
+        // Retries stale AX elements with a re-resolved ref (see
+        // `StaleAxMarker`); ordered after the recovery that marks them.
+        app.add_systems(Update, refresh_stale_window_elements.after(wake_recovery));
     }
 }
 
@@ -99,9 +102,53 @@ fn wake_recovery(
             Ok(mut app) => {
                 if app.observe_window(window).is_err() {
                     warn!("wake recovery: re-observing window {window_id} failed");
+                    // The cached AX ref likely died across sleep (`-25202`):
+                    // mark for a refresh with a re-resolved element instead
+                    // of warning forever on the dead ref.
+                    if let Ok(mut entity_commands) = commands.get_entity(entity) {
+                        entity_commands.try_insert(StaleAxMarker);
+                    }
                 }
             }
             Err(err) => warn!("wake recovery: window {entity} has no parent app: {err}"),
+        }
+    }
+}
+
+/// Retries windows marked [`StaleAxMarker`] by [`wake_recovery`]: re-resolves
+/// the dead accessibility element from the app and re-subscribes. Runs on
+/// the wake tick only; the marker is kept for the next wake when the window
+/// is genuinely gone, so a dead app cannot spam this every frame.
+#[instrument(level = Level::DEBUG, skip_all)]
+fn refresh_stale_window_elements(
+    mut messages: MessageReader<Event>,
+    stale: Query<(Entity, &ChildOf), With<StaleAxMarker>>,
+    mut windows: Query<&mut Window>,
+    mut apps: Query<&mut Application>,
+    mut commands: Commands,
+) {
+    if !messages
+        .read()
+        .any(|event| matches!(event, Event::SystemWoke { .. }))
+    {
+        return;
+    }
+    for (entity, child_of) in &stale {
+        let Ok(mut window) = windows.get_mut(entity) else {
+            continue;
+        };
+        let window_id = window.id();
+        let refreshed = window.refresh_element().is_ok()
+            && apps
+                .get_mut(child_of.parent())
+                .is_ok_and(|mut app| app.observe_window(&window).is_ok());
+        if refreshed {
+            debug!("wake recovery: re-observing window {window_id} recovered");
+            if let Ok(mut entity_commands) = commands.get_entity(entity) {
+                entity_commands.try_remove::<StaleAxMarker>();
+            }
+        } else {
+            warn!("wake recovery: window {window_id} still unobservable after refresh");
         }
     }
 }

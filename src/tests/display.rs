@@ -9,8 +9,8 @@ use crate::ecs::layout::{LayoutStrip, PARKED_STRIP_SLIVER};
 use crate::ecs::mouse::{DragModifierState, DropPreviewState};
 use crate::ecs::workspace::IgnoredMovedWindows;
 use crate::ecs::{
-    ActiveDisplayMarker, Bounds, DockPosition, MouseHeldMarker, Position, RepositionMarker,
-    Scrolling, SpawnWindowTrigger, Timeout,
+    ActiveDisplayMarker, Bounds, DockPosition, DragSettleMarker, MouseHeldMarker, Position,
+    RepositionMarker, Scrolling, SpawnWindowTrigger, StaleAxMarker, Timeout,
 };
 use crate::events::Event;
 use crate::manager::{Application, Display, Origin, Size, Window};
@@ -2269,6 +2269,36 @@ fn test_wake_recovery_clears_transient_state() {
         .run(commands);
 }
 
+/// A window whose AX element went stale across sleep is refreshed and
+/// re-observed on wake, clearing the marker instead of warning forever on
+/// the dead ref.
+#[test]
+fn test_wake_refreshes_stale_window_observers() {
+    let mut harness = TestHarness::new().with_windows(1);
+    harness.app.update();
+
+    let world = harness.world();
+    let entity = find_window_entity(0, world);
+    world.entity_mut(entity).insert(StaleAxMarker);
+
+    harness.run(vec![
+        Event::SystemWoke { msg: String::new() },
+        Event::Command {
+            command: Command::PrintState,
+        },
+    ]);
+
+    let world = harness.world();
+    assert!(
+        world
+            .query_filtered::<Entity, With<StaleAxMarker>>()
+            .iter(world)
+            .next()
+            .is_none(),
+        "wake must refresh the stale element and clear the marker"
+    );
+}
+
 /// A managed window sitting on the wrong display for two consecutive audit
 /// ticks is re-homed to that display's strip. The displaced window must be
 /// unfocused: focusing it would (correctly) yank it back via reshuffle.
@@ -2768,15 +2798,16 @@ fn test_armed_drop_reorders_column_to_nearest_slot() {
 }
 
 /// An unarmed drag pans the strip with the cursor instead of moving the
-/// column: members stay in their slots, the strip keeps the scroll offset on
-/// release (no homing, no reshuffle) — the shortcut stays the relocation gate.
+/// column: members stay in their slots, and release glides and then settles
+/// to reveal the nearest window (no homing, no reshuffle) — the shortcut
+/// stays the relocation gate.
 #[test]
 fn test_unarmed_drag_scrolls_strip() {
     // Stacked column sits at x=400 (see transfer test); grab window 0's
     // titlebar (slot y=20, so y=25 is header) and drag right without the
     // shortcut.
     let grab = CGPoint::new(600.0, 30.0);
-    let commands = vec![
+    let mut commands = vec![
         Event::MenuOpened { window_id: 0 },
         Event::Command {
             command: Command::Window(Operation::Focus(Direction::Last)),
@@ -2803,12 +2834,14 @@ fn test_unarmed_drag_scrolls_strip() {
             command: Command::PrintState,
         },
     ];
+    commands.extend((0..12).map(|_| Event::Command {
+        command: Command::PrintState,
+    }));
 
     TestHarness::new()
         .with_config(drag_display_config())
         .with_windows(2)
         .on_iteration(4, move |world, _state| {
-            // Both stacked mates tracked the (300, 0) drag 1:1 *with* their
             // strip (slot-relative): the strip followed to 700 and the
             // column stayed in its slot, instead of tearing off to 700 over
             // a strip left behind at 400.
@@ -2829,19 +2862,41 @@ fn test_unarmed_drag_scrolls_strip() {
             assert_eq!(position.0.x, 700);
         })
         .on_iteration(6, move |world, _state| {
-            // Release keeps the scroll offset: no homing, no reshuffle.
+            // Release flung the strip: the glide is still running with the
+            // settle armed behind it.
             let first = find_window_entity(0, world);
-            let position = world.get::<Position>(first).expect("need position").0;
-            assert_eq!(position, Origin::new(700, TEST_MENUBAR_HEIGHT));
-            let second = find_window_entity(1, world);
-            let position = world.get::<Position>(second).expect("need position").0;
-            assert_eq!(position.x, 700);
+            let mut strips = world.query::<(&LayoutStrip, &Position, Has<DragSettleMarker>)>();
+            let (_, _, settled) = strips
+                .iter(world)
+                .find(|(strip, _, _)| strip.contains(first))
+                .expect("need owning strip");
+            assert!(settled, "release must arm the drag-release settle");
+            assert!(
+                world.query::<&Scrolling>().iter(world).next().is_some(),
+                "glide must still be scrolling"
+            );
+        })
+        .on_iteration(19, move |world, _state| {
+            // Glide decayed and the settle revealed the stacked column at the
+            // right edge: no homing, no reshuffle, no stranded half-visible
+            // window.
+            let first = find_window_entity(0, world);
             let mut strips = world.query::<(&LayoutStrip, &Position)>();
             let (_, position) = strips
                 .iter(world)
                 .find(|(strip, _)| strip.contains(first))
                 .expect("need owning strip");
-            assert_eq!(position.0.x, 700);
+            assert_eq!(position.0.x, 624);
+            // Stacked mates share the revealed column; the lower mate sits
+            // below the top one, so only its x is pinned here.
+            for id in [0, 1] {
+                let entity = find_window_entity(id, world);
+                let position = world.get::<Position>(entity).expect("need position").0;
+                assert_eq!(position.x, 624, "stacked mate {id} must be revealed");
+            }
+            let top = find_window_entity(0, world);
+            let position = world.get::<Position>(top).expect("need position").0;
+            assert_eq!(position, Origin::new(624, TEST_MENUBAR_HEIGHT));
         })
         .run(commands);
 }

@@ -1043,9 +1043,16 @@ pub(crate) fn pump_events(
     // while the socket and the layout engine carry on as normal. Waking is the
     // usual trigger (display reconfiguration fires even when the workspace
     // wake notification is dropped), so sweep on a slow timer too for the
-    // deaths without one.
-    if woke
-        || display_changed
+    // deaths without one. A wake always rebuilds rather than checking: a
+    // locally-valid port can still be dead server-side, which the validity
+    // and enabled flags cannot see.
+    if woke {
+        *last_tap_check = Some(Instant::now());
+        match platform.rebuild_input_tap() {
+            TapHealth::Rebuilt => {}
+            health => warn!("input tap rebuild after wake: {health:?}"),
+        }
+    } else if display_changed
         || last_tap_check.is_none_or(|last| last.elapsed() >= TAP_HEALTH_CHECK_INTERVAL)
     {
         *last_tap_check = Some(Instant::now());
@@ -1176,6 +1183,15 @@ fn adoption_distrusted(
 /// where the release-transition behavior is pinned, not in the loop.
 fn overlay_tracks_live(swiping: bool, drag_held: bool, settle_grace: bool) -> bool {
     swiping || drag_held || settle_grace
+}
+
+/// Whether the overlay hides for an active swipe. Touchpad swipes hide, but
+/// a held header-drag drives the strip scroll by hand, so the border must
+/// keep tracking the dragged window instead of vanishing until release (the
+/// reappearance jump reads as detached). Pure and unit tested like
+/// [`overlay_tracks_live`].
+fn overlay_hide_for_swipe(swiping: bool, drag_held: bool) -> bool {
+    swiping && !drag_held
 }
 
 #[instrument(level = Level::TRACE, skip_all)]
@@ -1516,12 +1532,17 @@ pub(super) fn update_overlays(
     let border_enabled = config.border_active_window();
 
     // Hide overlays during swipe, mission control, native fullscreen spaces,
-    // or briefly after a space change (macOS space-switch animation).
+    // or briefly after a space change (macOS space-switch animation). A held
+    // header-drag drives the strip scroll by hand, so the border must ride
+    // the dragged window through the tier-1 live frame below: hiding for the
+    // whole gesture and reappearing at the release point reads as detached.
+    // Touchpad swipes with no drag held keep the hide.
     let Some((swiping, active_strip)) = active_workspace.iter().next() else {
         return;
     };
 
-    if swiping || mission_control_active.0 || active_strip.is_fullscreen() {
+    let hide_for_swipe = overlay_hide_for_swipe(swiping, !drag_held.is_empty());
+    if hide_for_swipe || mission_control_active.0 || active_strip.is_fullscreen() {
         overlay_mgr.hide_all();
         return;
     }
@@ -2248,6 +2269,7 @@ mod tests {
     use super::active_timeout_limit;
     use super::adoption_distrusted;
     use super::gather_initial_processes;
+    use super::overlay_hide_for_swipe;
     use super::overlay_tracks_live;
     use super::{LOOP_MAX_TIMEOUT_FRAME_ACTIVE_MS, LOOP_MAX_TIMEOUT_PROMOTION_MS};
     use crate::config::Config;
@@ -2305,6 +2327,18 @@ mod tests {
         assert!(overlay_tracks_live(false, false, true));
         // At rest with no grace: the OS frame is fresher.
         assert!(!overlay_tracks_live(false, false, false));
+    }
+
+    #[test]
+    fn overlay_hides_for_swipe_but_tracks_held_drags() {
+        // Touchpad swipe with no drag held: hide for the gesture.
+        assert!(overlay_hide_for_swipe(true, false));
+        // A held header-drag drives the scroll by hand: the border must keep
+        // tracking instead of vanishing until release.
+        assert!(!overlay_hide_for_swipe(true, true));
+        // No swipe: nothing to hide for.
+        assert!(!overlay_hide_for_swipe(false, false));
+        assert!(!overlay_hide_for_swipe(false, true));
     }
 
     #[test]

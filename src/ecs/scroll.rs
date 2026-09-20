@@ -1,7 +1,7 @@
 use bevy::app::{App, Plugin, Update};
 use bevy::ecs::entity::Entity;
 use bevy::ecs::message::MessageReader;
-use bevy::ecs::query::{With, Without};
+use bevy::ecs::query::{Has, With, Without};
 use bevy::ecs::schedule::IntoScheduleConfigs as _;
 use bevy::ecs::system::{Commands, Local, Populated, Res, Single};
 use bevy::math::IRect;
@@ -15,8 +15,8 @@ use crate::config::swipe::SwipeGestureDirection;
 use crate::ecs::layout::{Column, LayoutStrip};
 use crate::ecs::params::{ActiveDisplay, Windows};
 use crate::ecs::{
-    ActiveWorkspaceMarker, ManualStripOffset, MissionControlActive, Position, Scrolling,
-    SendMessageTrigger,
+    ActiveWorkspaceMarker, DragSettleMarker, ManualStripOffset, MissionControlActive, Position,
+    Scrolling, SendMessageTrigger,
 };
 use crate::errors::Result;
 use bevy::ecs::schedule::common_conditions::on_message;
@@ -170,9 +170,19 @@ fn swipe_gesture(
     let (entity, position, scrolling) = &mut *active_workspace;
 
     // The user is driving the strip by hand now, so an earlier deliberate
-    // placement (center, snap) no longer describes where they want it.
+    // placement (center, snap) no longer describes where they want it — and
+    // a pending drag-release settle is superseded by the fresh drive. The
+    // settle removal must only run on gesture input (touchpad down/swipe):
+    // plain `Scroll` events include the leftovers of the very drag that
+    // armed the settle (still queued on the release tick) as well as the
+    // lift-timeout's synthetic echoes — neither is a fresh drive, and both
+    // would cancel the settle mid-glide. Fresh presses cancel via
+    // `mouse_down_trigger` instead.
     if let Ok(mut entity_commands) = commands.get_entity(*entity) {
         entity_commands.try_remove::<ManualStripOffset>();
+        if touchpad_down || has_gesture_event {
+            entity_commands.try_remove::<DragSettleMarker>();
+        }
     }
 
     if touchpad_down && let Some(scrolling) = scrolling.as_mut() {
@@ -280,13 +290,82 @@ fn apply_inertia(
     }
 }
 
+/// Strip offset that brings the nearest window fully into the viewport with
+/// the smallest move, given `(layout_x, width)` column spans. A window wider
+/// than the viewport aligns its left edge (best effort); when any window is
+/// already fully visible the current offset is returned (settle complete).
+/// Pure so the settle target is unit testable without a `Windows` query.
+fn nearest_visible_target(columns: &[(i32, i32)], current_offset: i32, viewport: &IRect) -> i32 {
+    let mut best: Option<(i32, i32)> = None;
+    for &(layout_x, width) in columns {
+        let min = current_offset + layout_x;
+        let max = min + width;
+        if min >= viewport.min.x && max <= viewport.max.x {
+            return current_offset;
+        }
+        let left_align = viewport.min.x - layout_x;
+        let right_align = viewport.max.x - (layout_x + width);
+        // Oversize windows left-align (best effort); otherwise take whichever
+        // side moves less, ties going left.
+        let target = if width < viewport.width()
+            && (right_align - current_offset).abs() < (left_align - current_offset).abs()
+        {
+            right_align
+        } else {
+            left_align
+        };
+        let movement = (target - current_offset).abs();
+        if best.is_none_or(|(best_move, _)| movement < best_move) {
+            best = Some((movement, target));
+        }
+    }
+    best.map_or(current_offset, |(_, target)| target)
+}
+
+/// Strip offset that brings the nearest window fully into `viewport` with the
+/// smallest move. `None` only for a strip with no windows.
+fn nearest_visible_offset(
+    layout_strip: &LayoutStrip,
+    current_offset: i32,
+    windows: &Windows,
+    viewport: &IRect,
+) -> Option<i32> {
+    let columns: Vec<(i32, i32)> = layout_strip
+        .all_columns()
+        .into_iter()
+        .filter_map(|entity| {
+            windows
+                .layout_position(entity)
+                .map(|position| position.0.x)
+                .zip(windows.moving_frame(entity).map(|frame| frame.width()))
+        })
+        .collect();
+    if columns.is_empty() {
+        return None;
+    }
+    Some(nearest_visible_target(&columns, current_offset, viewport))
+}
+
+/// Release-glide rate (px/s) below which the drag-release settle engages.
+/// The shared snap gate below reads pipeline velocity (viewport fractions),
+/// which a seeded fling never exceeds for long; the settle must wait out the
+/// actual glide instead, so it compares in px/s like the release sampler.
+const SETTLE_MAX_GLIDE_PX_S: f64 = 100.0;
+
 #[instrument(level = Level::TRACE, skip_all)]
 fn apply_snap_force(
-    mut strip: Single<(&LayoutStrip, &Position, &mut Scrolling)>,
+    mut strip: Single<(
+        Entity,
+        &LayoutStrip,
+        &Position,
+        &mut Scrolling,
+        Has<DragSettleMarker>,
+    )>,
     active_display: ActiveDisplay,
     windows: Windows,
     config: Res<Config>,
     time: Res<Time>,
+    mut commands: Commands,
 ) {
     const CENTER_MAGNETIC_FORCE: f64 = 10.0;
     const SNAP_DISPLAY_RATIO: f64 = 0.45;
@@ -298,7 +377,8 @@ fn apply_snap_force(
     // extends it to lone columns only (the nearest-column math below then
     // reduces to centering the single column, so a swipe can't leave it
     // off-center).
-    if !(config.auto_center() || (config.center_single_column() && strip.0.len() == 1)) {
+    let magnetic = config.auto_center() || (config.center_single_column() && strip.1.len() == 1);
+    if !magnetic && !strip.4 {
         return;
     }
 
@@ -306,12 +386,71 @@ fn apply_snap_force(
     let viewport_center = viewport.center().x;
     let snap_threshold = SNAP_DISPLAY_RATIO * f64::from(viewport.width());
 
-    let (strip, position, ref mut scroll) = *strip;
+    let (strip_entity, layout_strip, position, ref mut scroll, settle) = *strip;
+
+    // Drag-release settle: reveal the nearest window instead of centering.
+    // Runs independent of the magnetic options above (see `DragSettleMarker`).
+    // Unlike the magnetic pull it must wait out the release glide, whose
+    // pipeline velocity sits below the fraction-based gate almost immediately.
+    if settle && !magnetic {
+        // Keep the `Scrolling` alive while waiting and settling: the
+        // lift-timeout would otherwise reap a slow glide mid-flight (its
+        // threshold reads pipeline fractions, blind to px rates) or reap
+        // mid-settle and strand the strip half-way. The marker owns the
+        // lifecycle now; completion below reaps both.
+        scroll.last_event = time.elapsed();
+        if scroll.is_user_swiping
+            || scroll.velocity.abs() * f64::from(viewport.width()) > SETTLE_MAX_GLIDE_PX_S
+        {
+            return;
+        }
+        let get_window_frame = |entity| windows.moving_frame(entity);
+        let Some(target) = nearest_visible_offset(layout_strip, position.0.x, &windows, &viewport)
+            .and_then(|target| {
+                clamp_viewport_offset(
+                    target,
+                    layout_strip,
+                    &windows,
+                    &get_window_frame,
+                    &viewport,
+                    &config,
+                )
+            })
+        else {
+            commands
+                .entity(strip_entity)
+                .try_remove::<DragSettleMarker>();
+            commands.entity(strip_entity).try_remove::<Scrolling>();
+            return;
+        };
+        let dist_to_snap = f64::from(position.0.x - target);
+        if dist_to_snap.abs() < 1.0 {
+            scroll.position = f64::from(target);
+            commands
+                .entity(strip_entity)
+                .try_remove::<DragSettleMarker>();
+            commands.entity(strip_entity).try_remove::<Scrolling>();
+            return;
+        }
+        // Guarantee at least a pixel of progress: the constraints round the
+        // offset back to int pixels, which would quantize a sub-half-pixel
+        // exponential step away forever just outside the completion band.
+        // (The aliveness refresh above already ran, so the timeout cannot
+        // reap mid-settle.)
+        let approach = (time.delta_secs_f64() * CENTER_MAGNETIC_FORCE).min(1.0);
+        let step = (dist_to_snap * approach)
+            .abs()
+            .max(1.0)
+            .copysign(dist_to_snap);
+        scroll.position -= step;
+        return;
+    }
+
     if scroll.is_user_swiping || scroll.velocity.abs() > 0.5 {
         return;
     }
 
-    let target_offset = strip
+    let target_offset = layout_strip
         .all_columns()
         .into_iter()
         .filter_map(|entity| {
@@ -509,4 +648,49 @@ fn switch_virtual_workspace(delta: f64, config: &Config, commands: &mut Commands
     commands.trigger(SendMessageTrigger(Event::Command {
         command: Command::Window(Operation::Virtual(direction)),
     }));
+}
+
+#[cfg(test)]
+mod tests {
+    use bevy::math::IRect;
+
+    use super::nearest_visible_target;
+
+    fn viewport() -> IRect {
+        IRect::new(0, 0, 1024, 768)
+    }
+
+    #[test]
+    fn settle_keeps_offset_when_a_window_is_visible() {
+        // Middle window fully inside: already settled, no move.
+        let columns = vec![(0, 400), (400, 400), (800, 400)];
+        assert_eq!(nearest_visible_target(&columns, -176, &viewport()), -176);
+    }
+
+    #[test]
+    fn settle_pulls_stranded_window_in_by_the_shorter_side() {
+        // Neither window fully visible: window 0 is off-screen left at
+        // [-700, -300], window 1 hangs off the left edge at [-300, 100].
+        // Window 1 left-aligns with a 300px move (offset -400); every other
+        // candidate moves further, so the strip settles there.
+        let columns = vec![(0, 400), (400, 400)];
+        assert_eq!(nearest_visible_target(&columns, -700, &viewport()), -400);
+    }
+
+    #[test]
+    fn settle_reveals_from_the_right_edge() {
+        // Single wide window hanging off the right: right-align it.
+        let columns = vec![(900, 400)];
+        assert_eq!(
+            nearest_visible_target(&columns, 0, &viewport()),
+            1024 - 1300
+        );
+    }
+
+    #[test]
+    fn settle_left_aligns_oversize_windows() {
+        // Wider than the viewport: best effort is the left edge.
+        let columns = vec![(200, 1200)];
+        assert_eq!(nearest_visible_target(&columns, -200, &viewport()), -200);
+    }
 }

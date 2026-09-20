@@ -282,6 +282,10 @@ impl InputHandler {
         CFRunLoop::add_source(&main_loop, Some(&run_loop_source), unsafe {
             kCFRunLoopCommonModes
         });
+        // Belt and braces: taps are supposed to start enabled, but a tap
+        // that never fires its first event is indistinguishable from a
+        // creation-time miss downstream — assert the state we require.
+        CGEvent::tap_enable(&port, true);
 
         self.tap_port = Some(port);
         self.run_loop_source = Some(run_loop_source);
@@ -341,6 +345,15 @@ impl InputHandler {
                 TapHealth::Failed
             }
         }
+    }
+
+    /// Unconditionally tears the tap down and rebuilds it. Sleep is the
+    /// hostile event for event taps (macOS can invalidate the mach port
+    /// without ever delivering `TapDisabled`, and a locally-valid port can
+    /// still be dead server-side), so the wake path rebuilds instead of
+    /// trusting the validity/enabled flags that `ensure_tap_alive` reads.
+    pub(super) fn force_rebuild_tap(&mut self) -> TapHealth {
+        self.rebuild_tap()
     }
 
     /// The C-callback function for the `CGEventTap`. It dispatches to the `input_handler` method.

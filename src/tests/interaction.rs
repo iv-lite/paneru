@@ -8,8 +8,8 @@ use crate::commands::{Command, Direction, MoveFocus, Operation};
 use crate::config::{Config, MainOptions, WindowParams, parse_command};
 use crate::ecs::display::FloatingLayer;
 use crate::ecs::{
-    ActiveWorkspaceMarker, FocusedMarker, ManualStripOffset, NativeFullscreenMarker, Position,
-    Unmanaged, layout::LayoutStrip,
+    ActiveWorkspaceMarker, Bounds, DragSettleMarker, FocusedMarker, ManualStripOffset,
+    NativeFullscreenMarker, Position, Scrolling, Unmanaged, layout::LayoutStrip,
 };
 use crate::ecs::{RepositionMarker, SpawnWindowTrigger};
 use crate::events::Event;
@@ -395,6 +395,176 @@ fn test_scrolling_stop() {
             assert!(scroll.is_user_swiping);
         })
         .run(commands);
+}
+
+/// Active strip offset plus drag-settle transient state for the
+/// strip-scroll release test below.
+fn strip_scroll_state(world: &mut World) -> (i32, bool, bool) {
+    let (entity, x) = {
+        let mut strips = world.query_filtered::<(Entity, &Position), (With<LayoutStrip>, With<ActiveWorkspaceMarker>)>();
+        let (entity, position) = strips.single(world).expect("active strip");
+        (entity, position.0.x)
+    };
+    let settled = world.get::<DragSettleMarker>(entity).is_some();
+    let scrolling = world.query::<&Scrolling>().iter(world).next().is_some();
+    (x, settled, scrolling)
+}
+
+/// A strip-scroll header-drag release arms the drag-release settle, which
+/// then converges (nearest window revealed) and cleans itself up instead of
+/// stranding the strip at the kept offset with state left behind.
+#[test]
+fn test_strip_scroll_release_settles_and_cleans_up() {
+    // Window 0 sits at (0, 20); grab its header and drag left 254px to the
+    // clamp edge, ending slow so no fling-glide follows the release.
+    let grab = CGPoint::new(200.0, 30.0);
+    let commands = vec![
+        Event::MenuOpened { window_id: 0 },
+        Event::MouseDown {
+            point: grab,
+            modifiers: Modifiers::empty(),
+        },
+        Event::MouseDragged {
+            point: CGPoint::new(150.0, 30.0),
+            modifiers: Modifiers::empty(),
+        },
+        Event::MouseDragged {
+            point: CGPoint::new(100.0, 30.0),
+            modifiers: Modifiers::empty(),
+        },
+        Event::MouseDragged {
+            point: CGPoint::new(50.0, 30.0),
+            modifiers: Modifiers::empty(),
+        },
+        Event::MouseDragged {
+            point: CGPoint::new(0.0, 30.0),
+            modifiers: Modifiers::empty(),
+        },
+        Event::MouseDragged {
+            point: CGPoint::new(-50.0, 30.0),
+            modifiers: Modifiers::empty(),
+        },
+        Event::MouseDragged {
+            point: CGPoint::new(-54.0, 30.0),
+            modifiers: Modifiers::empty(),
+        },
+        Event::MouseUp {
+            point: CGPoint::new(-54.0, 30.0),
+            modifiers: Modifiers::empty(),
+        },
+        Event::Command {
+            command: Command::PrintState,
+        },
+        Event::Command {
+            command: Command::PrintState,
+        },
+        Event::Command {
+            command: Command::PrintState,
+        },
+    ];
+
+    TestHarness::new()
+        .with_windows(3)
+        .on_iteration(1, move |world, _state| {
+            assert_window_at!(world, 0, 0, TEST_MENUBAR_HEIGHT);
+            assert_window_at!(world, 1, 400, TEST_MENUBAR_HEIGHT);
+            assert_window_at!(world, 2, 800, TEST_MENUBAR_HEIGHT);
+        })
+        // The settle converges instantly here (window 1 already revealed),
+        // so only the converged end state is asserted; the fling test below
+        // observes the marker mid-flight. The continuous range keeps the
+        // -254 offset instead of clamping.
+        .on_iteration(11, move |world, _state| {
+            let (offset, settled, scrolling) = strip_scroll_state(world);
+            assert_eq!(offset, -254);
+            assert!(!settled, "settle marker must be reaped");
+            assert!(!scrolling, "scrolling must be reaped");
+            assert_window_at!(world, 0, -254, TEST_MENUBAR_HEIGHT);
+            assert_window_at!(world, 1, 146, TEST_MENUBAR_HEIGHT);
+            assert_window_at!(world, 2, 546, TEST_MENUBAR_HEIGHT);
+        })
+        .run(commands);
+}
+
+/// A flung strip-scroll release glides first with the settle marker held,
+/// then reveals the nearest window and cleans up once the glide decays.
+#[test]
+fn test_flung_strip_scroll_release_glides_then_settles() {
+    // Five windows give the glide room without a wall: drag left 600px,
+    // ending with a fast -300px step so the release flings further left.
+    let grab = CGPoint::new(200.0, 30.0);
+    let mut commands = vec![
+        Event::MenuOpened { window_id: 0 },
+        Event::MouseDown {
+            point: grab,
+            modifiers: Modifiers::empty(),
+        },
+        Event::MouseDragged {
+            point: CGPoint::new(100.0, 30.0),
+            modifiers: Modifiers::empty(),
+        },
+        Event::MouseDragged {
+            point: CGPoint::new(0.0, 30.0),
+            modifiers: Modifiers::empty(),
+        },
+        Event::MouseDragged {
+            point: CGPoint::new(-100.0, 30.0),
+            modifiers: Modifiers::empty(),
+        },
+        Event::MouseDragged {
+            point: CGPoint::new(-400.0, 30.0),
+            modifiers: Modifiers::empty(),
+        },
+        Event::MouseUp {
+            point: CGPoint::new(-400.0, 30.0),
+            modifiers: Modifiers::empty(),
+        },
+    ];
+    commands.extend((0..10).map(|_| Event::Command {
+        command: Command::PrintState,
+    }));
+
+    TestHarness::new()
+        .with_windows(5)
+        // In the release window the glide is running with the settle armed
+        // behind it (the glide needs ~380ms to decay past the settle gate,
+        // so both are still present here).
+        .on_iteration(6, move |world, _state| {
+            let (_, settled, scrolling) = strip_scroll_state(world);
+            assert!(settled, "settle must stay armed through the glide");
+            assert!(scrolling, "glide must still be scrolling");
+        })
+        .on_iteration(7, move |world, _state| {
+            dump_fling(world, 7);
+        })
+        .on_iteration(8, move |world, _state| {
+            dump_fling(world, 8);
+        })
+        // Glided left and settled with a window revealed; all transient
+        // scroll state reaped.
+        .on_iteration(16, move |world, _state| {
+            let (offset, settled, scrolling) = strip_scroll_state(world);
+            assert!(
+                (-745..=-675).contains(&offset),
+                "glide must carry past the release offset, got {offset}"
+            );
+            assert!(!settled, "settle marker must be reaped");
+            assert!(!scrolling, "scrolling must be reaped");
+            let mut windows = world.query::<(&Window, &Position, &Bounds)>();
+            assert!(
+                windows.iter(world).any(|(_, position, bounds)| {
+                    position.0.x >= 0 && position.0.x + bounds.0.x <= TEST_DISPLAY_WIDTH
+                }),
+                "some window must be fully revealed after settle"
+            );
+        })
+        .run(commands);
+
+    #[allow(clippy::items_after_statements)]
+    fn dump_fling(world: &mut World, iter: usize) {
+        let (offset, settled, scrolling) = strip_scroll_state(world);
+        eprintln!("TMP fling{iter}: offset={offset} settled={settled} scrolling={scrolling}");
+    }
 }
 
 #[test]

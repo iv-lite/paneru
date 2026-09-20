@@ -408,6 +408,21 @@ pub struct Scrolling {
     pub last_event: Duration,
 }
 
+/// Settle request for a strip-scroll drag release: once the release glide
+/// decays, pull the strip just enough to bring the nearest window fully into
+/// the viewport instead of stranding it half-out at the kept offset. Runs
+/// independent of `auto_center`/`center_single_column` (which center instead
+/// of revealing); a fresh user drive cancels it via `swipe_gesture`.
+#[derive(Component, Debug)]
+pub struct DragSettleMarker;
+
+/// Marks a window whose accessibility element went stale (observer
+/// registration failing with `-25202`, typically across sleep): the next
+/// wake retries with a re-resolved element instead of warning forever on
+/// the dead ref. Removed once re-observing succeeds.
+#[derive(Component, Debug)]
+pub struct StaleAxMarker;
+
 #[derive(Component, Clone, Debug, Default, Deref, DerefMut)]
 pub struct LayoutPosition(pub Origin);
 

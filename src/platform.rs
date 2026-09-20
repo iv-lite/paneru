@@ -352,6 +352,16 @@ impl PlatformCallbacks {
         unsafe { handler.as_mut().get_unchecked_mut() }.ensure_tap_alive()
     }
 
+    /// Unconditionally rebuilds the input tap. See
+    /// `InputHandler::force_rebuild_tap`.
+    pub fn rebuild_input_tap(&mut self) -> TapHealth {
+        let Some(handler) = self.event_handler.as_mut() else {
+            return TapHealth::Failed;
+        };
+        // Safety: as above.
+        unsafe { handler.as_mut().get_unchecked_mut() }.force_rebuild_tap()
+    }
+
     /// Returns `true` when at least one event was dispatched this pass.
     pub fn pump_cocoa_event_loop(&mut self, timeout: f64) -> bool {
         // Re-armed before the wait, not after it — see [`EventLoopWaker::rearm`].

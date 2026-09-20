@@ -599,6 +599,9 @@ impl MockState {
                 s.set_focused_window(id);
             });
         mw.expect_set_padding().return_const(());
+        // Re-resolution is a no-op against the shared mock state (frames are
+        // read live already); per-test overrides can still expect calls.
+        mw.expect_refresh_element().returning(|| Ok(()));
 
         Window::new(Box::new(mw))
     }
