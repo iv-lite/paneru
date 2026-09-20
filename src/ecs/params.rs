@@ -11,7 +11,7 @@ use bevy::{
 use objc2_core_graphics::CGDirectDisplayID;
 use tracing::warn;
 
-use super::{ActiveDisplayMarker, FocusFollowsMouse, SkipReshuffle};
+use super::{ActiveDisplayMarker, FocusFollowsMouse, MouseHeldMarker, SkipReshuffle};
 use crate::{
     config::Config,
     ecs::{
@@ -320,16 +320,22 @@ pub struct FrameActivity<'w, 's> {
     resizing: Query<'w, 's, (), With<ResizeMarker>>,
     scrolling: Query<'w, 's, (), With<Scrolling>>,
     flash_messages: Query<'w, 's, (), With<FlashMessage>>,
+    held: Query<'w, 's, (), With<MouseHeldMarker>>,
 }
 
 impl FrameActivity<'_, '_> {
-    /// Returns `true` while any window is being moved, resized or scrolled, or
-    /// a flash message is on screen — i.e. while frames still need drawing.
+    /// Returns `true` while any window is being moved, resized or scrolled, a
+    /// drag is held, or a flash message is on screen — i.e. while frames
+    /// still need drawing. Held drags count even with no `RepositionMarker`:
+    /// a native-owned content drag moves the OS window every tick while the
+    /// layout slot stays pinned, and backing off to the idle cadence would
+    /// starve the border repaint.
     pub fn mid_frame(&self) -> bool {
         !self.repositioning.is_empty()
             || !self.resizing.is_empty()
             || !self.scrolling.is_empty()
             || !self.flash_messages.is_empty()
+            || !self.held.is_empty()
     }
 }
 

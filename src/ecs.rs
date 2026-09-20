@@ -122,6 +122,15 @@ pub fn register_systems(app: &mut bevy::app::App) {
         |spawned: Query<(), Added<Window>>, mut removed: RemovedComponents<Window>| {
             !spawned.is_empty() || removed.read().next().is_some()
         };
+    // Any window sliding or resizing — including unfocused ones (swap
+    // partners, reorder mates, audit re-homes) whose `Position` writes touch
+    // neither the active strip nor the focused frame. Without this the
+    // inactive borders freeze mid-slide until the next snapshot epoch.
+    // Overlay-only, like above.
+    let any_window_animating =
+        |moved: Query<(), AnyWindowMoved>, flight: Query<(), AnyWindowInFlight>| {
+            !moved.is_empty() || !flight.is_empty()
+        };
     // A drag ending must re-run the overlay even when nothing else dirtied
     // it: hides imposed mid-drag (armed column) would otherwise stick until
     // the next focus/strip/position change. Overlay-only, like above.
@@ -258,6 +267,7 @@ pub fn register_systems(app: &mut bevy::app::App) {
                         vw_indicator_dirty
                             .or_eager(overlay_tracking_motion)
                             .or_eager(bordered_set_changed)
+                            .or_eager(any_window_animating)
                             .or_eager(drag_ended)
                             .or_eager(snapshot_advanced),
                     ),
@@ -306,6 +316,22 @@ pub struct FocusedMarker;
 pub type FocusedFrameChanged = (
     With<FocusedMarker>,
     Or<(Changed<Position>, Changed<Bounds>)>,
+);
+
+/// Filter matching any window whose frame moved or resized this tick —
+/// including unfocused ones (swap partners, reorder mates, audit re-homes).
+/// Overlay-only gate term; the menu bar keeps the cheaper focused gate.
+pub type AnyWindowMoved = (With<Window>, Or<(Changed<Position>, Changed<Bounds>)>);
+
+/// Filter matching any window paneru is currently driving or confirming.
+/// Overlay-only gate term, paired with [`AnyWindowMoved`].
+pub type AnyWindowInFlight = (
+    With<Window>,
+    Or<(
+        With<RepositionMarker>,
+        With<ResizeMarker>,
+        With<VerifyWindowPosition>,
+    )>,
 );
 
 #[derive(Component)]

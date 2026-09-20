@@ -4,13 +4,13 @@ use bevy::prelude::*;
 use bevy::time::TimeUpdateStrategy;
 
 use crate::commands::{Command, Direction, MouseMove, MoveFocus, Operation};
-use crate::config::{Config, MainOptions};
+use crate::config::{Config, MainOptions, WindowParams};
 use crate::ecs::layout::{LayoutStrip, PARKED_STRIP_SLIVER};
 use crate::ecs::mouse::{DragModifierState, DropPreviewState};
 use crate::ecs::workspace::IgnoredMovedWindows;
 use crate::ecs::{
     ActiveDisplayMarker, Bounds, DockPosition, DragSettleMarker, MouseHeldMarker, Position,
-    RepositionMarker, Scrolling, SpawnWindowTrigger, StaleAxMarker, Timeout,
+    RepositionMarker, Scrolling, SpawnWindowTrigger, StaleAxMarker, Timeout, Unmanaged,
 };
 use crate::events::Event;
 use crate::manager::{Application, Display, Origin, Size, Window};
@@ -1399,6 +1399,113 @@ fn test_init_keeps_windows_on_their_real_displays() {
         .run(commands);
 }
 
+/// Startup sync phase: strip columns snap to the current display placement.
+/// Mock discovery returns id-sorted order, so spawning window 0 on the right
+/// and window 1 on the left distinguishes "discovery order" from "live-x
+/// order": the strip must hold `[1, 0]` and focus the leftmost.
+#[test]
+fn test_init_sorts_strip_columns_by_live_x() {
+    let harness = TestHarness::new();
+
+    let size = Size::new(TEST_WINDOW_WIDTH, TEST_WINDOW_HEIGHT);
+    let left_origin = Origin::new(0, TEST_MENUBAR_HEIGHT);
+    let right_origin = Origin::new(600, TEST_MENUBAR_HEIGHT);
+    harness.mock_state.spawn_window(
+        TEST_PROCESS_ID,
+        TEST_WORKSPACE_ID,
+        0,
+        IRect::from_corners(right_origin, right_origin + size),
+    );
+    harness.mock_state.spawn_window(
+        TEST_PROCESS_ID,
+        TEST_WORKSPACE_ID,
+        1,
+        IRect::from_corners(left_origin, left_origin + size),
+    );
+
+    let commands = vec![
+        Event::Command {
+            command: Command::PrintState,
+        },
+        Event::Command {
+            command: Command::PrintState,
+        },
+    ];
+
+    harness
+        .on_iteration(0, |world, _state| {
+            let left = find_window_entity(1, world);
+            let right = find_window_entity(0, world);
+            let (left_idx, right_idx) = {
+                let mut strips = world.query::<&LayoutStrip>();
+                let strip = strips
+                    .iter(world)
+                    .find(|strip| strip.id() == TEST_WORKSPACE_ID)
+                    .expect("test workspace strip");
+                (
+                    strip.index_of(left).expect("left window in strip"),
+                    strip.index_of(right).expect("right window in strip"),
+                )
+            };
+            assert!(
+                left_idx < right_idx,
+                "init sorts columns by live x (left {left_idx} vs right {right_idx})"
+            );
+            assert_focused!(world, 1);
+        })
+        .run(commands);
+}
+
+/// A config-floating window is excluded from the initial strip assignment
+/// inside `finish_setup` — not a tick later by `apply_window_positions` —
+/// so it is never sorted as if tiled and never steals the initial focus.
+/// Window 0 (left) floats, window 1 (right) tiles: the strip holds only
+/// window 1 and focus lands there.
+#[test]
+fn test_init_floating_window_skipped_before_sort_and_focus() {
+    let mut params = WindowParams::new("Window 0", None);
+    params.floating = Some(true);
+    let config: Config = (MainOptions::default(), vec![params]).into();
+
+    let harness = TestHarness::new().with_config(config);
+
+    let size = Size::new(TEST_WINDOW_WIDTH, TEST_WINDOW_HEIGHT);
+    let left_origin = Origin::new(0, TEST_MENUBAR_HEIGHT);
+    let right_origin = Origin::new(600, TEST_MENUBAR_HEIGHT);
+    harness.mock_state.spawn_window(
+        TEST_PROCESS_ID,
+        TEST_WORKSPACE_ID,
+        0,
+        IRect::from_corners(left_origin, left_origin + size),
+    );
+    harness.mock_state.spawn_window(
+        TEST_PROCESS_ID,
+        TEST_WORKSPACE_ID,
+        1,
+        IRect::from_corners(right_origin, right_origin + size),
+    );
+
+    harness
+        .on_iteration(0, |world, _state| {
+            let floating = find_window_entity(0, world);
+            assert!(
+                world.entity(floating).contains::<Unmanaged>(),
+                "floating window marked unmanaged at init"
+            );
+            assert_not_on_workspace!(world, 0, TEST_WORKSPACE_ID);
+            assert_on_workspace!(world, 1, TEST_WORKSPACE_ID);
+            assert_focused!(world, 1);
+        })
+        .run(vec![
+            Event::Command {
+                command: Command::PrintState,
+            },
+            Event::Command {
+                command: Command::PrintState,
+            },
+        ]);
+}
+
 /// Windows the space-membership pass leaves unassigned (stale spaces,
 /// discovery races) are placed onto their live display's strip at startup —
 /// never piled onto the active strip. Drives the extracted placement
@@ -1431,6 +1538,7 @@ fn test_startup_places_unassigned_windows_on_live_display() {
             &mut workspaces,
             &displays,
             &window_manager,
+            &std::collections::HashSet::new(),
         );
     }
 

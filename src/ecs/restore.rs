@@ -517,6 +517,18 @@ pub(super) fn restore_window_state(
                 })
         {
             strip.append_strip(&mut existing);
+            // Interleave the kept startup windows by live placement: the
+            // appended run was sorted at init, but it always lands after the
+            // restored columns regardless of on-screen order. Whole columns
+            // move, `Stack`/`Tabs` groups stay intact, and saved order wins
+            // ties and unknown frames (stable `None`-last sort).
+            strip.sort_columns_by_x(|entity| {
+                let (_, _, unmanaged) = ctx.windows.get_managed(entity)?;
+                if unmanaged.is_some() {
+                    return None;
+                }
+                ctx.windows.frame(entity).map(|frame| frame.center().x)
+            });
             emptied_existing_strips.insert(entity);
             if let Ok(mut entity_commands) = ctx.commands.get_entity(entity) {
                 entity_commands.try_despawn();

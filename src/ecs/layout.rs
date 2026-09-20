@@ -693,6 +693,51 @@ impl LayoutStrip {
         self.columns.insert(index, column);
     }
 
+    /// Stable left-to-right reorder of whole columns by `x_of`, the live
+    /// frame center-x of each column's representative window (its top, or
+    /// any member as fallback). Whole columns move — `Stack`/`Tabs` groups
+    /// are never split — and the sort never crosses strips. Columns with no
+    /// known frame sink stably to the end. Returns `true` when the order
+    /// changed. Pure column math: the caller decides what "live-x" means
+    /// (ECS frame, fresh OS read) and which members count (e.g. skipping
+    /// unmanaged windows by returning `None` for them).
+    pub fn sort_columns_by_x(&mut self, x_of: impl Fn(Entity) -> Option<i32>) -> bool {
+        let n = self.len();
+        if n < 2 {
+            return false;
+        }
+        let cols: Vec<Column> = (0..n).filter_map(|i| self.get(i).ok()).collect();
+        if cols.len() < 2 {
+            return false;
+        }
+        let keys: Vec<Option<i32>> = cols
+            .iter()
+            .map(|col| {
+                col.top()
+                    .and_then(&x_of)
+                    .or_else(|| col.window_iter().find_map(&x_of))
+            })
+            .collect();
+        let mut order: Vec<usize> = (0..cols.len()).collect();
+        order.sort_by(|&a, &b| match (keys[a], keys[b]) {
+            (Some(xa), Some(xb)) => xa.cmp(&xb).then_with(|| a.cmp(&b)),
+            (Some(_), None) => std::cmp::Ordering::Less,
+            (None, Some(_)) => std::cmp::Ordering::Greater,
+            (None, None) => a.cmp(&b),
+        });
+        if order.iter().enumerate().all(|(i, &o)| i == o) {
+            return false;
+        }
+        let sorted: Vec<Column> = order.into_iter().map(|i| cols[i].clone()).collect();
+        for _ in 0..n {
+            self.remove_column_at(0);
+        }
+        for col in sorted {
+            self.insert_column_at(usize::MAX, col);
+        }
+        true
+    }
+
     /// Returns the number of panels in the pane.
     ///
     /// # Returns
@@ -1983,6 +2028,62 @@ mod tests {
         other.insert_column_at(99, Column::Single(c));
         assert_eq!(other.all_windows(), vec![a, b, c]);
         assert!(other.remove_column_at(7).is_none());
+    }
+
+    #[test]
+    fn sort_columns_by_x_orders_left_to_right_stably() {
+        let mut world = World::new();
+        let right = world.spawn_empty().id();
+        let left = world.spawn_empty().id();
+        let unknown = world.spawn_empty().id();
+
+        let mut strip = LayoutStrip::new(2, 0);
+        strip.append(right);
+        strip.append(left);
+        strip.append(unknown);
+
+        let x_of = |entity: Entity| {
+            if entity == left {
+                Some(0)
+            } else if entity == right {
+                Some(600)
+            } else {
+                None
+            }
+        };
+        assert!(strip.sort_columns_by_x(x_of));
+        assert_eq!(strip.all_windows(), vec![left, right, unknown]);
+        // Already sorted and unknown sinks stably: no-op.
+        assert!(!strip.sort_columns_by_x(|entity| {
+            if entity == left {
+                Some(0)
+            } else if entity == right {
+                Some(600)
+            } else {
+                None
+            }
+        }));
+    }
+
+    #[test]
+    fn sort_columns_by_x_moves_whole_columns() {
+        let mut world = World::new();
+        let a = world.spawn_empty().id();
+        let b = world.spawn_empty().id();
+        let c = world.spawn_empty().id();
+
+        let mut strip = LayoutStrip::new(2, 0);
+        strip.append(a);
+        strip.append(b);
+        strip.append(c);
+        strip.stack(b).expect("stack b onto a");
+        // Columns are [Stack(a, b), Single(c)]; the stack leads at x=500.
+        let x_of = |entity: Entity| {
+            if entity == a { Some(500) } else { Some(0) }
+        };
+        assert!(strip.sort_columns_by_x(x_of));
+        // The stack moves as one column; members never split.
+        assert_eq!(strip.all_windows(), vec![c, a, b]);
     }
 
     #[test]

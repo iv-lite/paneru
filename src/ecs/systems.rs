@@ -322,6 +322,7 @@ pub(crate) fn place_startup_windows_on_live_displays(
     )>,
     displays: &Query<(&Display, Entity)>,
     window_manager: &WindowManager,
+    excluded: &HashSet<Entity>,
 ) {
     if displays.is_empty() {
         // Displays not gathered yet (transient empty enumeration at launch):
@@ -361,8 +362,11 @@ pub(crate) fn place_startup_windows_on_live_displays(
         // Assigned windows stay put even when their frame disagrees:
         // space membership is authoritative (see
         // `test_init_keeps_windows_on_their_real_displays`). Only the
-        // unassigned get placed here.
-        if strip_of.contains_key(&entity) {
+        // unassigned get placed here. `excluded` covers windows the caller
+        // just marked `Unmanaged` via deferred commands: the marker is not
+        // yet visible to this read, so without the set they would be placed
+        // (and then sorted/focused) as if tiled for one tick.
+        if strip_of.contains_key(&entity) || excluded.contains(&entity) {
             continue;
         }
         let center = frame.center();
@@ -413,49 +417,55 @@ pub(crate) fn sort_startup_strips_by_live_x(
     )>,
 ) {
     for (_, mut strip, _, _) in workspaces {
-        let n = strip.len();
-        if n < 2 {
-            continue;
-        }
-        let cols: Vec<Column> = (0..n).filter_map(|i| strip.get(i).ok()).collect();
-        if cols.len() < 2 {
-            continue;
-        }
-        let keys: Vec<Option<i32>> = cols
-            .iter()
-            .map(|col| {
-                col.top()
-                    .and_then(|entity| windows.frame(entity))
-                    .map(|frame| frame.center().x)
-                    .or_else(|| {
-                        col.window_iter()
-                            .find_map(|entity| windows.frame(entity).map(|frame| frame.center().x))
-                    })
-            })
-            .collect();
-        let mut order: Vec<usize> = (0..cols.len()).collect();
-        order.sort_by(|&a, &b| match (keys[a], keys[b]) {
-            (Some(xa), Some(xb)) => xa.cmp(&xb).then_with(|| a.cmp(&b)),
-            (Some(_), None) => std::cmp::Ordering::Less,
-            (None, Some(_)) => std::cmp::Ordering::Greater,
-            (None, None) => a.cmp(&b),
+        // Unmanaged windows (floating/minimized) never hold a tiled slot:
+        // sink them stably instead of ordering them as if tiled.
+        let reordered = strip.sort_columns_by_x(|entity| {
+            let (_, _, unmanaged) = windows.get_managed(entity)?;
+            if unmanaged.is_some() {
+                return None;
+            }
+            windows.frame(entity).map(|frame| frame.center().x)
         });
-        if order.iter().enumerate().all(|(i, &o)| i == o) {
-            continue;
+        if reordered {
+            debug!("startup: sorted strip columns by live x");
         }
-        let sorted: Vec<Column> = order.into_iter().map(|i| cols[i].clone()).collect();
-        for _ in 0..n {
-            strip.remove_column_at(0);
-        }
-        for col in sorted {
-            strip.insert_column_at(usize::MAX, col);
-        }
-        debug!("startup: sorted strip columns by live x");
     }
 }
 
+/// Whether a startup window is config-floating and must be excluded from the
+/// initial strip assignment in `finish_setup` (marked `Unmanaged::Floating`
+/// instead, mirroring the minimized path). `apply_window_positions` runs
+/// after `finish_setup`, so without this the floating window is appended,
+/// sorted as if tiled, and can even steal the initial focus before being
+/// ejected a tick later. Restore-matched windows are exempt (mirroring
+/// `apply_window_positions`): session restore owns them and clears the
+/// marker when rebuilding.
+fn is_startup_floating(
+    windows: &Windows,
+    applications: &Query<&Application>,
+    config: Option<&Config>,
+    session: Option<&crate::ecs::restore::SessionRestore>,
+    restoration: Option<&crate::ecs::state::PaneruState>,
+    window: &Window,
+) -> bool {
+    let Some(config) = config else {
+        return false;
+    };
+    let Some((_, _, parent)) = windows.find_parent(window.id()) else {
+        return false;
+    };
+    let Ok(app) = applications.get(parent) else {
+        return false;
+    };
+    if crate::ecs::restore::matches_startup_restore_state(window, app, session, restoration, config)
+    {
+        return false;
+    }
+    WindowProperties::new(app, window, config).floating()
+}
+
 #[instrument(level = Level::DEBUG, skip_all)]
-#[allow(clippy::too_many_arguments)]
+#[allow(clippy::too_many_arguments, clippy::too_many_lines)]
 pub(crate) fn finish_setup(
     process_query: Query<Entity, With<ExistingMarker>>,
     windows: Windows,
@@ -469,6 +479,9 @@ pub(crate) fn finish_setup(
     )>,
     displays: Query<(&Display, Entity)>,
     window_manager: Res<WindowManager>,
+    config: Option<Res<Config>>,
+    session: Option<Res<crate::ecs::restore::SessionRestore>>,
+    restoration: Option<Res<crate::ecs::state::PaneruState>>,
     mut commands: Commands,
 ) {
     if !process_query.is_empty() {
@@ -503,6 +516,12 @@ pub(crate) fn finish_setup(
     );
 
     let mut focused_managed_window = false;
+    // Entities marked `Minimized`/`Floating` in the membership pass below:
+    // `try_insert` is deferred, so the marker is still stale for the later
+    // passes in THIS system (placement, sort, focus) — track them explicitly
+    // so a just-excluded window is never placed, sorted, or focused as if
+    // tiled for one tick.
+    let mut excluded: HashSet<Entity> = HashSet::new();
     for (_strip_entity, mut strip, _active_strip, _) in &mut workspaces {
         debug!("space {}: before refresh {strip:?}", strip.id());
         let workspace_windows = window_manager
@@ -520,6 +539,20 @@ pub(crate) fn finish_setup(
                             if let Ok(mut entity_commands) = commands.get_entity(*entity) {
                                 entity_commands.try_insert(Unmanaged::Minimized);
                             }
+                            excluded.insert(*entity);
+                            false
+                        } else if is_startup_floating(
+                            &windows,
+                            &applications,
+                            config.as_deref(),
+                            session.as_deref(),
+                            restoration.as_deref(),
+                            window,
+                        ) {
+                            if let Ok(mut entity_commands) = commands.get_entity(*entity) {
+                                entity_commands.try_insert(Unmanaged::Floating);
+                            }
+                            excluded.insert(*entity);
                             false
                         } else {
                             true
@@ -549,7 +582,13 @@ pub(crate) fn finish_setup(
     // `place_startup_windows_on_live_displays`): the space-membership pass
     // above is authoritative, but geometry fixes what it missed before the
     // first layout tick.
-    place_startup_windows_on_live_displays(&windows, &mut workspaces, &displays, &window_manager);
+    place_startup_windows_on_live_displays(
+        &windows,
+        &mut workspaces,
+        &displays,
+        &window_manager,
+        &excluded,
+    );
 
     // Sync phase: snap windows to columns with respect to current display
     // placement. Sorts each strip's columns left-to-right by live frame
@@ -1310,6 +1349,14 @@ pub(crate) fn window_moved_update_frame(
                 .is_some_and(|required| required.matches(drag_modifiers.current));
         if unmanaged.is_none() && held.iter().any(|(_, marker, _)| marker.0 == entity) && !draggable
         {
+            // Native-owned held drag (content grab with strip scrolling):
+            // keep the synthetic slot pinned, but refresh the cached OS
+            // frame so the border's live-OS branch paints the cursor, not
+            // the grab point. Paint-only: `Position` stays untouched and
+            // release homing still owns the glide home.
+            if let Err(err) = window.update_frame() {
+                debug!("refreshing held window {entity} frame: {err}");
+            }
             continue;
         }
         // Our own move, echoed back: `animate_entities` lerps from the current
