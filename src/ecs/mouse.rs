@@ -23,7 +23,7 @@ use crate::ecs::params::{ActiveDisplayMut, GlobalState, Windows};
 use crate::ecs::scroll::px_to_scroll_delta;
 use crate::ecs::workspace::mid_strip_slot;
 use crate::ecs::{
-    ActiveWorkspaceMarker, DockPosition, MissionControlActive, Position, Scrolling,
+    ActiveWorkspaceMarker, ColdStart, DockPosition, MissionControlActive, Position, Scrolling,
     SelectedVirtualMarker, SpawnCommandsExt, Unmanaged,
 };
 use crate::manager::{Display, Origin, Size, Window, WindowManager, origin_from};
@@ -31,7 +31,7 @@ use crate::overlay::{BorderParams, OverlayManager};
 use crate::platform::input::set_scroll_drag_suppress;
 use crate::platform::{Modifiers, WinID, WorkspaceId};
 use crate::util::round_px;
-use bevy::ecs::schedule::common_conditions::on_message;
+use bevy::ecs::schedule::common_conditions::{not, on_message, resource_exists};
 use objc2_core_foundation::CGPoint;
 use objc2_core_graphics::CGDirectDisplayID;
 
@@ -131,11 +131,13 @@ impl Plugin for MouseEventsPlugin {
         app.init_resource::<DragPaintState>();
         app.init_resource::<DragScrollState>();
         app.init_resource::<DropPreviewState>();
+        // Never during warmup: relocation needs converged strips.
         app.add_systems(
             Update,
             drag_window_across_display
                 .after(super::systems::window_moved_update_frame)
-                .after(drag_move_held_column),
+                .after(drag_move_held_column)
+                .run_if(not(resource_exists::<ColdStart>)),
         );
     }
 }
@@ -524,6 +526,7 @@ fn mouse_up_trigger(
     time: Res<Time>,
     mut scroll_state: ResMut<DragScrollState>,
     mut paint: ResMut<DragPaintState>,
+    cold: Option<Res<ColdStart>>,
     mut commands: Commands,
 ) {
     for InputEvent(event) in messages.read() {
@@ -544,6 +547,15 @@ fn mouse_up_trigger(
 
         for (held_entity, marker, armed, scroll_armed) in &mouse_held {
             let entity = marker.0;
+            if cold.is_some() {
+                // Warmup: release bookkeeping only (despawn below); no
+                // reorder, homing, reshuffle, or inertia until the world
+                // converges.
+                if let Ok(mut entity_commands) = commands.get_entity(held_entity) {
+                    entity_commands.try_despawn();
+                }
+                continue;
+            }
             // A strip-scroll drag (header grab that actually moved through
             // the shared scroll pipeline): the new scroll offset is the
             // intended result — no reorder, no homing, no click-reshuffle.
@@ -1031,6 +1043,7 @@ fn drag_move_held_column(
     time: Res<Time>,
     mut scroll_state: ResMut<DragScrollState>,
     mut paint: ResMut<DragPaintState>,
+    cold: Option<Res<ColdStart>>,
     mut state: Local<DragMoveState>,
 ) {
     for InputEvent(event) in messages.read() {
@@ -1079,6 +1092,12 @@ fn drag_move_held_column(
                 // target regardless of branch — scroll/column paths ignore
                 // it, the native path paints it.
                 paint.advance(target, delta);
+                if cold.is_some() {
+                    // Warmup: track the cursor for paint only; the slot,
+                    // strip, and scroll pipeline must not move before the
+                    // world converges.
+                    continue;
+                }
                 // Header scroll-drag (grab-time armed): feed the pointer delta
                 // into the shared modifier+scroll pipeline (see above).
                 // Armed modifier drags and legacy (scroll-disabled) drags

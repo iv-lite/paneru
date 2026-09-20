@@ -5,6 +5,8 @@ use bevy::ecs::entity::{Entity, EntityHashSet};
 use bevy::ecs::hierarchy::ChildOf;
 use bevy::ecs::message::MessageReader;
 use bevy::ecs::query::{Has, With, Without};
+use bevy::ecs::schedule::IntoScheduleConfigs as _;
+use bevy::ecs::schedule::common_conditions::{not, resource_exists};
 use bevy::ecs::system::{Commands, Query, Res, ResMut, Single};
 use bevy::math::IRect;
 use objc2_core_graphics::CGDirectDisplayID;
@@ -23,7 +25,7 @@ use crate::ecs::layout::{
 use crate::ecs::mouse::{DragModifierState, DropPreviewState};
 use crate::ecs::params::{ActiveDisplay, ActiveDisplayMut, Windows, ring_neighbour_of_cursor};
 use crate::ecs::{
-    ActiveDisplayMarker, ActiveWorkspaceMarker, Bounds, DockPosition, DragDisplayArmed,
+    ActiveDisplayMarker, ActiveWorkspaceMarker, Bounds, ColdStart, DockPosition, DragDisplayArmed,
     FocusedMarker, FullWidthMarker, ManualStripOffset, MissionControlActive, MouseHeldMarker,
     NativeFullscreenMarker, RaiseWindow, SelectedVirtualMarker, SpawnCommandsExt, Timeout,
     Unmanaged,
@@ -67,19 +69,30 @@ pub fn register_commands(app: &mut bevy::app::App) {
     // Registered here (not with the Lua systems) so it's exercised by the mock
     // harness without a running interpreter.
     #[cfg(feature = "lua")]
-    app.add_systems(PreUpdate, crate::ecs::layout_ops::apply_layout_ops);
+    app.add_systems(
+        PreUpdate,
+        crate::ecs::layout_ops::apply_layout_ops.run_if(not(resource_exists::<ColdStart>)),
+    );
 
     query::register_query_commands(app);
     // Empty store so the mock harness and saveless runs still have one to
     // answer from; the real app overwrites it from disk.
     app.init_resource::<crate::ecs::script_state::ScriptStateStore>();
     app.add_systems(PreUpdate, crate::ecs::script_state::script_state_handler);
+    // Quit/restart/state reads stay live during warmup; everything that
+    // mutates strips, focus, or window state parks behind `ColdStart` (see
+    // `park_cold_commands`) instead of applying to the half-built world.
     app.add_systems(
         PreUpdate,
         (
             command_quit_handler,
             command_restart_handler,
             print_internal_state_handler,
+        ),
+    );
+    app.add_systems(
+        PreUpdate,
+        (
             mouse_to_adjacent_display,
             resize_window,
             resize_window_vertical,
@@ -97,7 +110,8 @@ pub fn register_commands(app: &mut bevy::app::App) {
             command_toggle_floating_layer,
             command_swap_focus,
             snap_window,
-        ),
+        )
+            .run_if(not(resource_exists::<ColdStart>)),
     );
     // A separate registration because the tuple above is already at Bevy's
     // 20-system limit.

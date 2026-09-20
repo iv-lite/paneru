@@ -4,6 +4,7 @@ use bevy::ecs::entity::Entity;
 use bevy::ecs::hierarchy::{ChildOf, Children};
 use bevy::ecs::message::{MessageReader, MessageWriter};
 use bevy::ecs::query::{Added, Changed, Has, Or, With, Without};
+use bevy::ecs::resource::Resource;
 use bevy::ecs::system::{
     Commands, Local, NonSend, NonSendMut, Populated, Query, Res, ResMut, Single,
 };
@@ -12,7 +13,7 @@ use bevy::tasks::AsyncComputeTaskPool;
 use bevy::tasks::futures_lite::future;
 use bevy::time::Time;
 use objc2_foundation::{NSPoint, NSRect, NSSize};
-use std::collections::{HashMap, HashSet};
+use std::collections::{HashMap, HashSet, VecDeque};
 use std::pin::Pin;
 use std::sync::mpsc::{Receiver, RecvTimeoutError, TryRecvError};
 use std::time::{Duration, Instant};
@@ -29,10 +30,12 @@ use crate::ecs::display::FloatingLayer;
 use crate::ecs::layout::{Column, LayoutStrip};
 use crate::ecs::mouse::{DragModifierState, DragPaintState, DragScrollState};
 use crate::ecs::params::{ActiveDisplay, FrameActivity, Windows};
+use crate::ecs::workspace::SnapStripMarker;
 use crate::ecs::{
-    ActiveWorkspaceMarker, Bounds, BruteforceWindows, FlashMessage, FocusedMarker, Initializing,
-    LowPowerMode, MissionControlActive, Position, ReadDisplayProperties, RestoreWindowState,
-    Scrolling, SendMessageTrigger, SpawnCommandsExt, Unmanaged, WidthRatio, WindowProperties,
+    ActiveWorkspaceMarker, AnyWindowInFlight, Bounds, BruteforceWindows, ColdStart, FlashMessage,
+    FocusedMarker, Initializing, LowPowerMode, MissionControlActive, Position,
+    ReadDisplayProperties, RestoreWindowState, Scrolling, SendMessageTrigger, SpawnCommandsExt,
+    Unmanaged, WidthRatio, WindowProperties,
 };
 use crate::events::{Event, InputEvent};
 use crate::manager::{
@@ -42,7 +45,8 @@ use crate::overlay::{FlashMessageManager, OverlayManager};
 use crate::platform::input::{TapHealth, left_button_held};
 use crate::platform::{PlatformCallbacks, WinID};
 use crate::snapshot::{
-    ON_SCREEN_MAX_AGE, SNAPSHOT_FRAME_MAX_AGE, SnapshotStore, on_screen_set, snapshot_live_frame,
+    ON_SCREEN_MAX_AGE, SNAPSHOT_FRAME_MAX_AGE, SnapshotRoster, SnapshotStore, on_screen_set,
+    snapshot_live_frame,
 };
 
 /// Processes and applications still inside their spawn grace period, with the
@@ -462,6 +466,161 @@ fn is_startup_floating(
         return false;
     }
     WindowProperties::new(app, window, config).floating()
+}
+
+/// Mutating `Event::Command`s parked while [`ColdStart`] is present, drained
+/// in order when warmup ends. The `Event` message stream only lives two
+/// frames, so commands gated off by the warmup would otherwise vanish;
+/// the parked copy survives in this resource and is re-written onto the
+/// stream at drain. Bounded: excess drops oldest with a warning, never grows
+/// without limit under a stuck warmup plus a chatty client.
+#[derive(Resource, Default)]
+pub(crate) struct ParkedCommands {
+    queue: VecDeque<Event>,
+}
+
+/// Cap for [`ParkedCommands`]: human-rate input across an 8s watchdog
+/// deadline cannot approach it; only a script loop could.
+const PARKED_COMMAND_CAP: usize = 256;
+
+/// Watchdog: warmup never parks input longer than this, no matter what is
+/// still unready (dead AX source, missing snapshot). Loud on expiry so the
+/// unmet item gets fixed instead of silently tolerated.
+const COLD_START_DEADLINE: Duration = Duration::from_secs(8);
+
+impl ParkedCommands {
+    fn park(&mut self, event: Event) {
+        if self.queue.len() >= PARKED_COMMAND_CAP {
+            self.queue.pop_front();
+            warn!("warmup: parked command buffer full, dropping oldest command");
+        }
+        self.queue.push_back(event);
+    }
+
+    fn drain(&mut self) -> Vec<Event> {
+        std::mem::take(&mut self.queue).into()
+    }
+}
+
+/// Warmup readiness as pure data, so the predicate below is unit testable
+/// without a world. Four independent gates by design (init, snapshot,
+/// settle, restore), hence the bool struct.
+#[allow(clippy::struct_excessive_bools)]
+#[derive(Debug, Default)]
+struct WarmupStatus {
+    init_done: bool,
+    snapshot_primed: bool,
+    settled: bool,
+    restore_done: bool,
+}
+
+fn warmup_ready(status: &WarmupStatus) -> bool {
+    status.init_done && status.snapshot_primed && status.settled && status.restore_done
+}
+
+/// Parks mutating commands while the world warms up. Runs in `PreUpdate`
+/// ahead of the (gated) command handlers; reader cursors are independent,
+/// so no ordering with them is needed — the gated handlers skip these
+/// messages and the parked copy outlives the two-frame stream.
+pub(super) fn park_cold_commands(
+    cold: Option<Res<ColdStart>>,
+    mut parked: ResMut<ParkedCommands>,
+    mut messages: MessageReader<Event>,
+) {
+    if cold.is_none() {
+        return;
+    }
+    for event in messages.read() {
+        if matches!(event, Event::Command { .. }) {
+            parked.park(event.clone());
+        }
+    }
+}
+
+/// Ends the [`ColdStart`] warmup once the world is loaded and settled (or
+/// the watchdog deadline hits), then replays parked commands in order.
+/// Ungated: early-returns on costless checks when no warmup is active.
+#[allow(clippy::too_many_arguments)]
+pub(super) fn tick_cold_start(
+    cold: Option<Res<ColdStart>>,
+    initializing: Option<Res<Initializing>>,
+    session: Option<Res<crate::ecs::restore::SessionRestore>>,
+    restoration: Option<Res<crate::ecs::state::PaneruState>>,
+    store: Option<Res<SnapshotStore>>,
+    windows: Windows,
+    flight: Query<(), AnyWindowInFlight>,
+    scrolling: Query<(), With<Scrolling>>,
+    snap_guards: Query<(), With<SnapStripMarker>>,
+    mut parked: ResMut<ParkedCommands>,
+    mut messages: MessageWriter<Event>,
+    mut commands: Commands,
+) {
+    let Some(cold) = cold.as_deref() else {
+        return;
+    };
+    // Primed when every managed window has a fresh rostered frame. Absent
+    // store (mock harness) counts as primed: direct reads are the only path
+    // there and need no worker.
+    let snapshot_primed = match store.as_deref() {
+        None => true,
+        Some(store) => {
+            store.0.load().epoch >= 1
+                && windows.managed_iter().all(|(window, _, _)| {
+                    snapshot_live_frame(Some(store), window.id(), SNAPSHOT_FRAME_MAX_AGE).is_some()
+                })
+        }
+    };
+    let status = WarmupStatus {
+        init_done: initializing.is_none(),
+        snapshot_primed,
+        // Settled when nothing is in flight and the snap guards (500ms
+        // first-layout guards from `finish_setup`/restore) have expired:
+        // observing the guards directly instead of a clock proxy keeps
+        // this deterministic under virtual time.
+        settled: flight.is_empty() && scrolling.is_empty() && snap_guards.is_empty(),
+        // Grace fully over (both resources are removed together): late
+        // windows may still be arriving, so mutations wait for them.
+        restore_done: session.is_none() && restoration.is_none(),
+    };
+    if !warmup_ready(&status) && cold.elapsed() < COLD_START_DEADLINE {
+        return;
+    }
+    if cold.elapsed() >= COLD_START_DEADLINE {
+        warn!("warmup: deadline hit with {status:?}, proceeding anyway");
+    } else {
+        info!("warmup: cold start complete after {:?}", cold.elapsed());
+    }
+    commands.remove_resource::<ColdStart>();
+    let queued = parked.drain();
+    if !queued.is_empty() {
+        info!(
+            "warmup: replaying {} parked command(s) in order",
+            queued.len()
+        );
+        messages.write_batch(queued);
+    }
+}
+
+/// Publishes the snapshot worker's poll cadence: fast while warming up or
+/// holding a drag (paint and prime converge in ~1 tick), slow idle. Sends
+/// on change only — the channel is unbounded but there is no reason to spam
+/// it 60 times a second with a constant.
+pub(super) fn publish_snapshot_cadence(
+    cold: Option<Res<ColdStart>>,
+    held: Query<(), With<MouseHeldMarker>>,
+    roster: Option<Res<SnapshotRoster>>,
+    mut last: Local<bool>,
+) {
+    let Some(roster) = roster.as_deref() else {
+        return;
+    };
+    let fast = cold.is_some() || !held.is_empty();
+    if fast != *last {
+        *last = fast;
+        let _ = roster
+            .0
+            .try_send(crate::snapshot::RosterDelta::SetFastPoll(fast));
+    }
 }
 
 #[instrument(level = Level::DEBUG, skip_all)]
@@ -2556,6 +2715,7 @@ mod tests {
 mod seam_tests {
     use super::CoalescedPointer;
     use super::seam_snap_target;
+    use super::{PARKED_COMMAND_CAP, ParkedCommands, WarmupStatus, warmup_ready};
     use crate::events::Event;
     use crate::manager::Origin;
     use bevy::math::IRect;
@@ -2610,6 +2770,54 @@ mod seam_tests {
         assert_eq!(
             seam_snap_target(at(-500, 100), at(-400, 100), &[a(), b()]),
             None
+        );
+    }
+
+    #[test]
+    fn warmup_ready_needs_every_gate() {
+        let ready = WarmupStatus {
+            init_done: true,
+            snapshot_primed: true,
+            settled: true,
+            restore_done: true,
+        };
+        assert!(warmup_ready(&ready));
+        assert!(!warmup_ready(&WarmupStatus::default()));
+        // Each gate blocks alone.
+        let mut partial = WarmupStatus {
+            init_done: true,
+            snapshot_primed: true,
+            settled: true,
+            restore_done: true,
+        };
+        partial.init_done = false;
+        assert!(!warmup_ready(&partial));
+        partial.init_done = true;
+        partial.snapshot_primed = false;
+        assert!(!warmup_ready(&partial));
+        partial.snapshot_primed = true;
+        partial.settled = false;
+        assert!(!warmup_ready(&partial));
+        partial.settled = true;
+        partial.restore_done = false;
+        assert!(!warmup_ready(&partial));
+    }
+
+    #[test]
+    fn parked_commands_preserve_order_and_cap() {
+        let mut parked = ParkedCommands::default();
+        for _ in 0..(PARKED_COMMAND_CAP + 5) {
+            parked.park(Event::SpaceChanged);
+        }
+        let drained = parked.drain();
+        assert_eq!(
+            drained.len(),
+            PARKED_COMMAND_CAP,
+            "bounded: oldest overflow drops, never grows"
+        );
+        assert!(
+            parked.drain().is_empty(),
+            "drain empties the buffer for the next warmup"
         );
     }
 

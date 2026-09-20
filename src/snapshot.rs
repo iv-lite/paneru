@@ -31,6 +31,12 @@ use crate::util::{AXUIAttributes, AXUIWrapper};
 /// How often the snapshot thread re-reads every rostered handle.
 const SNAPSHOT_TICK: Duration = Duration::from_millis(250);
 
+/// Fast-loop cadence while warming up or holding a drag (see
+/// `RosterDelta::SetFastPoll`): paint and prime converge in ~1 tick instead
+/// of stepping at 4Hz. Bounded — only while hinted — and the pump still
+/// wakes on change alone, so idle frames stay cheap.
+const SNAPSHOT_FAST_TICK: Duration = Duration::from_millis(30);
+
 /// Slow-loop cadence: every Nth tick re-enumerates displays, spaces and
 /// membership. SLS enumeration moves slower than window attributes and costs
 /// one iterator walk per space.
@@ -107,8 +113,9 @@ impl Default for SnapshotStore {
 }
 
 /// Roster deltas main → snapshot worker. Spawn carries a cloned element
-/// handle (an atomic retain); Remove drops it. Unbounded: bursts at launch
-/// must never block the main thread.
+/// handle (an atomic retain); Remove drops it. `SetFastPoll` switches the
+/// poll cadence (fast while warming up or holding a drag, slow idle).
+/// Unbounded: bursts at launch must never block the main thread.
 #[derive(Debug)]
 pub(crate) enum RosterDelta {
     Spawn {
@@ -117,6 +124,7 @@ pub(crate) enum RosterDelta {
         element: CFRetained<AXUIWrapper>,
     },
     Remove(WinID),
+    SetFastPoll(bool),
 }
 
 /// Outbound roster channel endpoint, held as a resource. `Sender` is
@@ -138,7 +146,8 @@ type RosterHandles = HashMap<WinID, (Option<Pid>, CFRetained<AXUIWrapper>)>;
 /// Applies one roster delta. Pure (no AX, no threads) so the bookkeeping is
 /// unit testable; the polling loop below only ever calls this. Removal of an
 /// unknown id is a no-op by contract: destroy events can precede (or outlive)
-/// the corresponding spawn feed.
+/// the corresponding spawn feed. Cadence hints are not roster state — the
+/// loop consumes them via [`ingest_delta`] instead.
 fn apply_roster(handles: &mut RosterHandles, delta: RosterDelta) {
     match delta {
         RosterDelta::Spawn {
@@ -151,6 +160,23 @@ fn apply_roster(handles: &mut RosterHandles, delta: RosterDelta) {
         RosterDelta::Remove(win_id) => {
             handles.remove(&win_id);
         }
+        RosterDelta::SetFastPoll(_) => {}
+    }
+}
+
+/// Routes one roster-channel delta: cadence hints flip the poll rate,
+/// everything else mutates the handle roster. Pure so the routing is unit
+/// testable; the loop calls this for the blocking receive and the
+/// burst-drain alike so a hint can never strand behind a launch storm.
+fn ingest_delta(handles: &mut RosterHandles, fast_poll: &mut bool, delta: RosterDelta) {
+    match delta {
+        RosterDelta::SetFastPoll(fast) => {
+            if fast != *fast_poll {
+                debug!("ax snapshot: fast poll {fast}");
+            }
+            *fast_poll = fast;
+        }
+        other => apply_roster(handles, other),
     }
 }
 
@@ -255,10 +281,12 @@ pub(crate) fn snapshot_live_frame(
 /// consumer reads them. The waker coalesces bursts into one posted event.
 ///
 /// Two cadences: window attributes + the on-screen set every fast tick
-/// (250ms, matching the overlay memo horizon); display/space enumeration
-/// every eighth tick (2s), since it moves slower and costs one SLS iterator
-/// walk per space. SLS failures keep the previous generation's data (never
-/// clear on a transient error); the next slow tick retries.
+/// (250ms idle, 30ms while warming up or holding a drag per
+/// `RosterDelta::SetFastPoll`, matching the overlay memo horizon); display/space
+/// enumeration every eighth tick (2s idle, faster while boosted), since it
+/// moves slower and costs one SLS iterator walk per space. SLS failures keep
+/// the previous generation's data (never clear on a transient error); the
+/// next slow tick retries.
 fn run(
     roster: Receiver<RosterDelta>,
     window_manager: WindowManagerOS,
@@ -273,18 +301,27 @@ fn run(
     let mut active_space: HashMap<u32, WorkspaceId> = HashMap::new();
     let mut epoch: u64 = 0;
     let mut ticks: u64 = 0;
+    // Poll cadence hint from the main thread (fast while warming up or
+    // holding a drag). Slow enumeration below stays tick-counted, so in
+    // fast mode it simply runs more often — still on this thread, never
+    // the main one.
+    let mut fast_poll = false;
     // Last woken generation: frames (`None` = unreadable that tick) plus the
     // on-screen set. Compared every tick; the pump wakes only on change.
     let mut last_frames: HashMap<WinID, Option<IRect>> = HashMap::new();
     let mut last_on_screen: HashSet<WinID> = HashSet::new();
 
     loop {
-        match roster.recv_timeout(SNAPSHOT_TICK) {
+        match roster.recv_timeout(if fast_poll {
+            SNAPSHOT_FAST_TICK
+        } else {
+            SNAPSHOT_TICK
+        }) {
             Ok(delta) => {
-                apply_roster(&mut handles, delta);
+                ingest_delta(&mut handles, &mut fast_poll, delta);
                 // Drain bursts (launch storms) without waiting a tick each.
                 while let Ok(delta) = roster.try_recv() {
-                    apply_roster(&mut handles, delta);
+                    ingest_delta(&mut handles, &mut fast_poll, delta);
                 }
             }
             Err(RecvTimeoutError::Timeout) => {}
@@ -425,6 +462,19 @@ mod tests {
         let mut handles: RosterHandles = HashMap::new();
         apply_roster(&mut handles, RosterDelta::Remove(7));
         assert!(handles.is_empty());
+    }
+
+    #[test]
+    fn ingest_delta_routes_cadence_and_roster() {
+        let mut handles: RosterHandles = HashMap::new();
+        let mut fast = false;
+        ingest_delta(&mut handles, &mut fast, RosterDelta::SetFastPoll(true));
+        assert!(fast, "hint flips the poll rate");
+        ingest_delta(&mut handles, &mut fast, RosterDelta::Remove(7));
+        assert!(fast, "roster traffic leaves cadence alone");
+        assert!(handles.is_empty());
+        ingest_delta(&mut handles, &mut fast, RosterDelta::SetFastPoll(false));
+        assert!(!fast, "idle hint restores the slow tick");
     }
 
     #[test]

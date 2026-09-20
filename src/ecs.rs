@@ -1,5 +1,5 @@
 use std::sync::mpsc::Receiver;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use bevy::MinimalPlugins;
 use bevy::app::App as BevyApp;
@@ -183,12 +183,14 @@ pub fn register_systems(app: &mut bevy::app::App) {
     // Registered with `add_message`, not `init_resource`, so the buffer is
     // double-buffered and dropped after a frame like any other message stream.
     app.add_message::<InputEvent>();
+    app.init_resource::<systems::ParkedCommands>();
     app.add_systems(
         PreUpdate,
         (
             systems::window_creation_event,
             systems::pump_events,
             systems::demux_input_events.after(systems::pump_events),
+            systems::park_cold_commands,
         ),
     );
     app.add_systems(
@@ -224,6 +226,8 @@ pub fn register_systems(app: &mut bevy::app::App) {
             // Throttled: each attempt is AX round trips, and the 2s Timeout
             // bounds the total storm.
             systems::retry_front_switch.run_if(on_timer(Duration::from_millis(100))),
+            systems::tick_cold_start,
+            systems::publish_snapshot_cadence,
             systems::update_low_power_state
                 .run_if(resource_exists::<LowPowerMode>)
                 .run_if(on_timer(LOW_POWER_MODE_CHECK)),
@@ -627,6 +631,33 @@ pub struct FocusFollowsMouse(pub Option<WinID>);
 #[derive(Resource)]
 pub struct Initializing;
 
+/// Warmup gate present from app build until the world is fully loaded and
+/// settled (snapshot primed, layout converged, restore grace over — see
+/// `tick_cold_start`). While present, mutating `Event::Command`s park in
+/// `ParkedCommands` instead of applying to the half-built world, and the
+/// pump stays at the active cadence via `FrameActivity`. Reads are always
+/// served; paint is never gated. Removed with a watchdog deadline so a dead
+/// AX source can never stall startup forever. The mock harness never
+/// inserts it — tests opt in explicitly.
+#[derive(Resource)]
+pub struct ColdStart {
+    started: Instant,
+}
+
+impl ColdStart {
+    pub fn new() -> Self {
+        Self {
+            started: Instant::now(),
+        }
+    }
+
+    /// Wall-clock time since startup. Wall, not virtual: backoff must not
+    /// stretch while the pump sleeps, and tests run virtual time flat-out.
+    pub fn elapsed(&self) -> Duration {
+        self.started.elapsed()
+    }
+}
+
 /// Bevy event trigger for spawning new windows.
 #[derive(BevyEvent)]
 pub struct SpawnWindowTrigger(pub Vec<Window>);
@@ -846,6 +877,7 @@ pub fn setup_bevy_app(sender: EventSender, receiver: Receiver<Event>) -> Result<
         .insert_resource(MissionControlActive(false))
         .insert_resource(FocusFollowsMouse(None))
         .insert_resource(Initializing)
+        .insert_resource(ColdStart::new())
         .insert_non_send(watcher)
         .add_plugins(mouse::MouseEventsPlugin)
         .add_plugins(scroll::ScrollEventsPlugin)

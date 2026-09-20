@@ -3,8 +3,10 @@ use std::time::Duration;
 use bevy::ecs::query::Has;
 use bevy::prelude::*;
 
-use crate::commands::Command;
+use crate::assert_focused;
+use crate::commands::{Command, Direction, Operation};
 use crate::config::{Config, MainOptions, WindowParams};
+use crate::ecs::ColdStart;
 use crate::ecs::layout::{Column, LayoutStrip};
 use crate::ecs::state::{
     PaneruState, SavedColumn, SavedDisplay, SavedRect, SavedStrip, SavedWindow, SavedWorkspace,
@@ -536,6 +538,51 @@ fn test_startup_restore_overrides_floating_config_for_matched_window() {
         world.entity(restored_window).get::<Unmanaged>().is_none(),
         "matched restore windows should not inherit floating config"
     );
+}
+
+#[test]
+fn test_cold_start_parks_commands_until_restore_grace_ends() {
+    // Window 0 hard-matches the saved strip, so a 2s virtual restore grace
+    // starts. A focus-East command issued mid-grace must park (focus stays
+    // put, warmup stays present) and replay in order once the grace ends.
+    let mut harness = TestHarness::new().with_windows(2);
+    harness
+        .world()
+        .insert_resource(state_with_strips(vec![SavedStrip {
+            virtual_index: 0,
+            columns: vec![SavedColumn::Single(saved_window(0))],
+        }]));
+    harness.app.world_mut().insert_resource(ColdStart::new());
+
+    let mut commands = vec![
+        Event::MenuOpened { window_id: 0 },
+        Event::Command {
+            command: Command::Window(Operation::Focus(Direction::East)),
+        },
+    ];
+    // 2s virtual grace at 200ms per command window: pad past it.
+    for _ in 0..11 {
+        commands.push(Event::Command {
+            command: Command::PrintState,
+        });
+    }
+
+    harness
+        .on_iteration(5, |world, _state| {
+            assert!(
+                world.contains_resource::<ColdStart>(),
+                "warmup waits out the restore grace"
+            );
+            assert_focused!(world, 0);
+        })
+        .on_iteration(12, |world, _state| {
+            assert!(
+                !world.contains_resource::<ColdStart>(),
+                "warmup ends with the grace"
+            );
+            assert_focused!(world, 1);
+        })
+        .run(commands);
 }
 
 #[test]
