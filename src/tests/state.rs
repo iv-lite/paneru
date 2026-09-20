@@ -64,6 +64,8 @@ fn extract_query_state(world: &mut World) -> crate::errors::Result<PaneruQuerySt
         &apps,
         &window_manager,
         &config,
+        None,
+        None,
     )
 }
 

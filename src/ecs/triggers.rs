@@ -34,6 +34,7 @@ use crate::manager::{
     Application, Display, Origin, Process, Size, Window, WindowManager, WindowPadding,
 };
 use crate::platform::WinID;
+use crate::snapshot::{SnapshotRoster, SnapshotStore, TitleInvalidations};
 use crate::util::{round_px, symlink_target};
 
 /// The display currently in front, paired with the Dock's edge — together they
@@ -875,6 +876,7 @@ pub(super) fn window_managed_trigger(
 /// * `windows` - A query for all windows with their parent.
 /// * `commands` - Bevy commands to despawn entities and trigger events.
 #[instrument(level = Level::DEBUG, skip_all)]
+#[allow(clippy::too_many_arguments)]
 pub(super) fn window_destroyed_trigger(
     mut messages: MessageReader<Event>,
     active_display: ActiveDisplay,
@@ -882,6 +884,7 @@ pub(super) fn window_destroyed_trigger(
     mut global_state: GlobalState,
     mut focus_history: ResMut<FocusHistory>,
     windows: Windows,
+    roster: Option<Res<SnapshotRoster>>,
     mut commands: Commands,
 ) {
     for event in messages.read() {
@@ -931,6 +934,15 @@ pub(super) fn window_destroyed_trigger(
             entity_commands.try_despawn();
         }
 
+        // Confirmed teardown (both sources reach here only after the checks
+        // above): drop the window from the AX snapshot roster. Absent in
+        // tests, where the `None` below skips silently.
+        if let Some(roster) = roster.as_deref() {
+            let _ = roster
+                .0
+                .try_send(crate::snapshot::RosterDelta::Remove(*window_id));
+        }
+
         // The window entity will be removed from the layout strip in the On<Remove> trigger.
     }
 }
@@ -939,13 +951,24 @@ pub(super) fn window_destroyed_trigger(
 ///
 /// Must run before the broadcast handler reads titles in `PostUpdate`, so a
 /// subscriber sees the new title in the same frame it changed.
-pub(super) fn invalidate_window_title(mut messages: MessageReader<Event>, windows: Windows) {
+pub(super) fn invalidate_window_title(
+    mut messages: MessageReader<Event>,
+    windows: Windows,
+    store: Option<Res<SnapshotStore>>,
+    mut invalidations: Option<ResMut<TitleInvalidations>>,
+) {
     for event in messages.read() {
         let Event::WindowTitleChanged { window_id } = event else {
             continue;
         };
         if let Some((window, _)) = windows.find(*window_id) {
             window.invalidate_title();
+        }
+        // Record the snapshot epoch at invalidation so later extracts only
+        // serve snapshot titles strictly newer than this change.
+        if let (Some(store), Some(invalidations)) = (store.as_deref(), invalidations.as_deref_mut())
+        {
+            invalidations.0.insert(*window_id, store.0.load().epoch);
         }
     }
 }
@@ -1011,6 +1034,7 @@ fn give_away_focus(
 /// * `main_cid` - The main connection ID resource.
 /// * `commands` - Bevy commands to manage components and trigger events.
 #[instrument(level = Level::DEBUG, skip_all)]
+#[allow(clippy::too_many_arguments)]
 pub(super) fn spawn_window_trigger(
     mut trigger: On<SpawnWindowTrigger>,
     windows: Query<&Window>,
@@ -1018,6 +1042,7 @@ pub(super) fn spawn_window_trigger(
     active_display: ActiveDisplay,
     initializing: Option<Res<Initializing>>,
     restore: Option<Res<crate::ecs::restore::SessionRestore>>,
+    roster: Option<Res<SnapshotRoster>>,
     mut commands: Commands,
 ) {
     let new_windows = &mut trigger.event_mut().0;
@@ -1078,6 +1103,17 @@ pub(super) fn spawn_window_trigger(
 
         // Insert the window into the internal Bevy state.
         // This insertion triggers window attributes observer.
+        //
+        // Feed the AX snapshot roster before `window` moves into the bundle:
+        // absent in tests (no `SnapshotRoster` resource there), where the
+        // `None` below skips silently.
+        if let (Some(roster), Some(element)) = (roster.as_deref(), window.element()) {
+            let _ = roster.0.try_send(crate::snapshot::RosterDelta::Spawn {
+                win_id: window_id,
+                pid: window.pid().ok(),
+                element,
+            });
+        }
         commands.spawn((
             position,
             bounds,
@@ -1086,7 +1122,6 @@ pub(super) fn spawn_window_trigger(
             layout_position,
             ChildOf(app_entity),
         ));
-
         commands.trigger(SendMessageTrigger(Event::WindowSpawned {
             window_id,
             pid,

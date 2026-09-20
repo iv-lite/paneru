@@ -25,6 +25,7 @@ use crate::ecs::{
 use crate::events::Event;
 use crate::manager::{Application, Display, Window, WindowManager};
 use crate::platform::{Pid, ProcessSerialNumber, WinID, WorkspaceId};
+use crate::snapshot::{SnapshotStore, TitleInvalidations, snapshot_title};
 use paneru_shared_types::windowset::WindowSet;
 
 pub const STATE_FILE_NAME: &str = "state.json";
@@ -431,6 +432,8 @@ pub struct QueryStateParams<'w, 's> {
     apps: Query<'w, 's, &'static Application>,
     window_manager: Res<'w, WindowManager>,
     config: Res<'w, Config>,
+    store: Option<Res<'w, SnapshotStore>>,
+    invalidations: Option<Res<'w, TitleInvalidations>>,
 }
 
 impl QueryStateParams<'_, '_> {
@@ -453,6 +456,8 @@ impl QueryStateParams<'_, '_> {
             &self.apps,
             &self.window_manager,
             &self.config,
+            self.store.as_deref(),
+            self.invalidations.as_deref(),
         )
     }
 }
@@ -599,7 +604,12 @@ impl QueryStateParams<'_, '_> {
             id: window.id(),
             app_name: app.name().to_string(),
             bundle_id: app.bundle_id().unwrap_or_default().clone(),
-            title: window.title().unwrap_or_default(),
+            title: snapshot_title(
+                self.store.as_deref(),
+                self.invalidations.as_deref(),
+                window.id(),
+                window,
+            ),
             frame: frame.map(|frame| Frame {
                 x: frame.min.x,
                 y: frame.min.y,
@@ -626,6 +636,7 @@ fn column_kind(column: &Column) -> paneru_shared_types::windowset::ColumnKind {
 }
 
 pub trait QueryState: std::marker::Sized {
+    #[allow(clippy::too_many_arguments)]
     fn extract(
         workspaces: &Query<(
             &ChildOf,
@@ -638,6 +649,8 @@ pub trait QueryState: std::marker::Sized {
         apps: &Query<&Application>,
         window_manager: &WindowManager,
         config: &Config,
+        store: Option<&SnapshotStore>,
+        invalidations: Option<&TitleInvalidations>,
     ) -> crate::errors::Result<Self>;
 }
 
@@ -646,7 +659,7 @@ pub trait QueryState: std::marker::Sized {
 /// A free function rather than an inherent method because [`PaneruQueryState`]
 /// belongs to the shared protocol crate, which knows nothing about the ECS.
 impl QueryState for PaneruQueryState {
-    #[allow(clippy::too_many_lines)]
+    #[allow(clippy::too_many_lines, clippy::too_many_arguments)]
     fn extract(
         workspaces: &Query<(
             &ChildOf,
@@ -659,6 +672,8 @@ impl QueryState for PaneruQueryState {
         apps: &Query<&Application>,
         window_manager: &WindowManager,
         config: &Config,
+        store: Option<&SnapshotStore>,
+        invalidations: Option<&TitleInvalidations>,
     ) -> crate::errors::Result<Self> {
         let focused_entity = windows.focused().map(|(_, entity)| entity);
         let sliver_width = config.sliver_width();
@@ -702,7 +717,7 @@ impl QueryState for PaneruQueryState {
                     let app = apps.get(app_entity).ok()?;
                     let bundle_id = app.bundle_id().unwrap_or_default().clone();
                     let app_name = app.name().to_string();
-                    let title = window.title().unwrap_or_default();
+                    let title = snapshot_title(store, invalidations, window.id(), window);
                     let frame = windows.frame(entity);
                     // Minimized and hidden windows are never on screen, whatever
                     // their last known frame says.

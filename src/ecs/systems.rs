@@ -41,6 +41,7 @@ use crate::manager::{
 use crate::overlay::{FlashMessageManager, OverlayManager};
 use crate::platform::input::{TapHealth, left_button_held};
 use crate::platform::{PlatformCallbacks, WinID};
+use crate::snapshot::{ON_SCREEN_MAX_AGE, SnapshotStore, on_screen_set, snapshot_live_frame};
 
 /// Processes and applications still inside their spawn grace period, with the
 /// `FreshMarker` that says whether the spawn actually completed in time.
@@ -92,6 +93,22 @@ const ANIAMTE_SNAP_THRESHOLD: f32 = 5.0;
 /// scroll integrator's step cap.
 const MAX_ANIMATION_DT_SECS: f64 = 1.0 / 30.0;
 const LOOP_MAX_TIMEOUT_FRAME_ACTIVE_MS: u32 = 16;
+/// Active-frame sleep while a `ProMotion` (120Hz) display is present.
+/// Committing animation at 16ms judders against a 120Hz panel; halving the
+/// sleep smooths it at the cost of ~2x AX traffic during motion (idle and
+/// low-power cadences are untouched).
+const LOOP_MAX_TIMEOUT_PROMOTION_MS: u32 = 8;
+
+/// Active-frame pump sleep for the current display mix. Pure so the matrix
+/// is unit testable; the `NSScreen` query feeding it lives in `pump_events`
+/// (main thread only, absent in tests).
+fn active_timeout_limit(promotion_present: bool) -> u32 {
+    if promotion_present {
+        LOOP_MAX_TIMEOUT_PROMOTION_MS
+    } else {
+        LOOP_MAX_TIMEOUT_FRAME_ACTIVE_MS
+    }
+}
 const LOOP_MAX_TIMEOUT_LOWPOWER_MS: u32 = 2000;
 // Real events (input, IPC, workspace changes, ...) wake the pump immediately
 // via `EventLoopWaker`, so this only bounds how late the free-running 1s
@@ -903,6 +920,10 @@ pub(crate) fn pump_events(
     activity: FrameActivity,
     mut timeout: Local<u32>,
     mut last_tap_check: Local<Option<Instant>>,
+    // Cached ProMotion presence + last refresh. `NSScreen::screens` per frame
+    // would cost more than the cadence it tunes; displays barely change, so
+    // refresh on wake/display events and every 60s.
+    mut promotion: Local<(bool, Option<Instant>)>,
 ) {
     let Some((ref mut platform, incoming_events)) = platform.zip(incoming_events) else {
         // No platform interface or incoming event pipe - probably executing in a unit test.
@@ -986,8 +1007,19 @@ pub(crate) fn pump_events(
         let low_power = low_power_mode
             .as_deref()
             .is_some_and(|low_power| low_power.0);
+        if woke
+            || display_changed
+            || promotion
+                .1
+                .is_none_or(|last| last.elapsed() >= Duration::from_secs(60))
+        {
+            promotion.0 = objc2_app_kit::NSScreen::screens(platform.main_thread_marker)
+                .iter()
+                .any(|screen| screen.maximumFramesPerSecond() >= 110);
+            promotion.1 = Some(Instant::now());
+        }
         let timeout_limit = if frame_active {
-            LOOP_MAX_TIMEOUT_FRAME_ACTIVE_MS
+            active_timeout_limit(promotion.0)
         } else if low_power {
             LOOP_MAX_TIMEOUT_LOWPOWER_MS
         } else {
@@ -1388,6 +1420,7 @@ pub(super) fn update_overlays(
     mission_control_active: Res<MissionControlActive>,
     config: Res<Config>,
     mut window_config_cache: Local<OverlayWindowConfigCache>,
+    store: Option<Res<SnapshotStore>>,
     window_manager: Res<WindowManager>,
 ) {
     use crate::overlay::BorderParams;
@@ -1537,13 +1570,9 @@ pub(super) fn update_overlays(
     }
     // Inactive borders (opt-in) need the on-screen set; without it only the
     // focused entry above applies — dim below still updates either way.
+    // Snapshot first (250ms cadence, shared), direct walk as fallback.
     let on_screen: Option<HashSet<WinID>> = if config.inactive_border_enabled() {
-        if let Some(ids) = window_manager.windows_on_screen() {
-            Some(ids.into_iter().collect())
-        } else {
-            trace!("inactive borders: on-screen set unavailable, focused only");
-            None
-        }
+        on_screen_set(store.as_deref(), &window_manager, ON_SCREEN_MAX_AGE)
     } else {
         None
     };
@@ -1638,6 +1667,11 @@ pub(super) fn commit_window_position(
         .for_each(|(mut window, position)| window.reposition(position.0));
 }
 
+/// Maximum age of a snapshot frame the verifier trusts. The worker publishes
+/// every 250ms, so this allows one missed tick plus margin; older snapshots
+/// fall back to a direct read rather than deciding on stale data.
+const VERIFY_SNAPSHOT_MAX_AGE: Duration = Duration::from_millis(500);
+
 /// Confirms OS positions against layout intent. Every driven move carries
 /// verification (see `reposition_entity`), so this is the universal drift
 /// backstop between commits and the 5s audit — throttled to ~100ms per
@@ -1651,6 +1685,7 @@ pub(crate) fn verify_window_position(
         &mut VerifyWindowPosition,
         Option<&RepositionMarker>,
     )>,
+    store: Option<Res<SnapshotStore>>,
     mut commands: Commands,
 ) {
     for (entity, mut window, position, mut verification, repositioning) in &mut windows {
@@ -1664,10 +1699,30 @@ pub(crate) fn verify_window_position(
         if repositioning.is_some() {
             continue;
         }
-        let Ok(live) = window.update_frame() else {
-            // Unreadable window (beachballed app): retry next throttled pass
-            // instead of burning lifetime on failures.
-            continue;
+        // Prefer the snapshot worker's last read over a synchronous round
+        // trip. Absent in tests (identical behavior there), stale, or
+        // missing this window: fall back to a direct read.
+        let window_id = window.id();
+        let h_pad = window.horizontal_padding();
+        let v_pad = window.vertical_padding();
+        let live =
+            snapshot_live_frame(store.as_deref(), window_id, VERIFY_SNAPSHOT_MAX_AGE).map(|raw| {
+                let mut frame = raw;
+                frame.min.x -= h_pad;
+                frame.min.y -= v_pad;
+                frame.max.x += h_pad;
+                frame.max.y += v_pad;
+                frame
+            });
+        let live = if let Some(frame) = live {
+            frame
+        } else {
+            let Ok(frame) = window.update_frame() else {
+                // Unreadable window (beachballed app): retry next
+                // throttled pass instead of burning lifetime on failures.
+                continue;
+            };
+            frame
         };
         // 1px tolerance like the audit: OS rounding must converge, not spin.
         let drift = (live.min - position.0).abs();
@@ -1889,6 +1944,7 @@ pub(crate) fn regroup_stray_native_tabs(
     mut workspaces: Query<(&mut LayoutStrip, Has<ActiveWorkspaceMarker>)>,
     window_manager: Res<WindowManager>,
     mission_control: Res<MissionControlActive>,
+    store: Option<Res<SnapshotStore>>,
     mut commands: Commands,
 ) {
     if mission_control.0 {
@@ -1900,7 +1956,8 @@ pub(crate) fn regroup_stray_native_tabs(
     else {
         return;
     };
-    let Some(on_screen) = window_manager.windows_on_screen() else {
+    let Some(on_screen) = on_screen_set(store.as_deref(), &window_manager, ON_SCREEN_MAX_AGE)
+    else {
         return;
     };
 
@@ -1970,6 +2027,7 @@ pub(crate) fn regroup_stray_native_tabs(
     }
 }
 
+#[allow(clippy::too_many_arguments)]
 pub(crate) fn detect_tabbed_windows(
     created: Populated<(Entity, &Position, &Bounds, &ChildOf), Added<Window>>,
     windows: Query<(Entity, &Window, &Position, &Bounds, &ChildOf), With<Window>>,
@@ -1977,6 +2035,7 @@ pub(crate) fn detect_tabbed_windows(
     mut workspaces: Query<(&mut LayoutStrip, Has<ActiveWorkspaceMarker>)>,
     window_manager: Res<WindowManager>,
     active_display: Single<&Display, With<ActiveDisplayMarker>>,
+    store: Option<Res<SnapshotStore>>,
     mut commands: Commands,
 ) {
     let display_bounds = active_display.bounds();
@@ -2029,8 +2088,7 @@ pub(crate) fn detect_tabbed_windows(
             });
 
         if let Some((leader, leader_id)) = tabbed
-            && window_manager
-                .windows_on_screen()
+            && on_screen_set(store.as_deref(), &window_manager, ON_SCREEN_MAX_AGE)
                 .is_some_and(|ids| !ids.contains(&leader_id))
             && let Some((mut strip, _)) =
                 workspaces.iter_mut().find(|strip| strip.0.contains(leader))
@@ -2113,9 +2171,11 @@ mod tests {
 
     use bevy::prelude::*;
 
+    use super::active_timeout_limit;
     use super::adoption_distrusted;
     use super::gather_initial_processes;
     use super::overlay_tracks_live;
+    use super::{LOOP_MAX_TIMEOUT_FRAME_ACTIVE_MS, LOOP_MAX_TIMEOUT_PROMOTION_MS};
     use crate::config::Config;
     use crate::events::Event;
 
@@ -2171,6 +2231,18 @@ mod tests {
         assert!(overlay_tracks_live(false, false, true));
         // At rest with no grace: the OS frame is fresher.
         assert!(!overlay_tracks_live(false, false, false));
+    }
+
+    #[test]
+    fn promotion_halves_the_active_pump_sleep() {
+        assert_eq!(active_timeout_limit(true), LOOP_MAX_TIMEOUT_PROMOTION_MS);
+        assert_eq!(
+            active_timeout_limit(false),
+            LOOP_MAX_TIMEOUT_FRAME_ACTIVE_MS
+        );
+        const {
+            assert!(LOOP_MAX_TIMEOUT_PROMOTION_MS < LOOP_MAX_TIMEOUT_FRAME_ACTIVE_MS);
+        }
     }
 }
 

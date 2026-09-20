@@ -276,6 +276,11 @@ fn setup_world() -> App {
         .insert_resource(FocusFollowsMouse(None))
         .insert_resource(Config::default())
         .insert_resource(Initializing)
+        // Title-invalidation epochs for snapshot titles. The snapshot worker
+        // itself never runs here (no `SnapshotStore`, so all reads stay
+        // direct), but the resource must exist for the systems that record
+        // and consult it.
+        .insert_resource(crate::snapshot::TitleInvalidations::default())
         .add_plugins(MouseEventsPlugin)
         .add_plugins(ScrollEventsPlugin)
         .add_plugins(WorkspaceEventsPlugin)

@@ -24,6 +24,7 @@ mod overlay;
 mod pasteboard;
 mod platform;
 mod reader;
+mod snapshot;
 mod util;
 
 #[cfg(test)]

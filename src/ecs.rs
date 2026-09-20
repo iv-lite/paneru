@@ -724,6 +724,7 @@ pub(crate) fn rewatch_configs(
     Some(watcher)
 }
 
+#[allow(clippy::too_many_lines)]
 pub fn setup_bevy_app(sender: EventSender, receiver: Receiver<Event>) -> Result<BevyApp> {
     let window_manager: Box<dyn WindowManagerApi> = Box::new(WindowManagerOS::new(sender.clone()));
 
@@ -785,6 +786,20 @@ pub fn setup_bevy_app(sender: EventSender, receiver: Receiver<Event>) -> Result<
         .add_plugins(focus::FocusEventsPlugin)
         .add_plugins(display::DisplayEventsPlugin)
         .add_plugins((register_triggers, register_systems, register_commands));
+
+    // Start the AX snapshot worker (kept out of the mock harness: it has no
+    // real AX handles, and a thread per harness would leak parked threads by
+    // the hundreds). The worker owns a private `WindowManagerOS` for SLS/CG
+    // enumeration so no main state crosses threads (only the constructor's
+    // sender is shared).
+    {
+        let (store, roster) = crate::snapshot::spawn_snapshot_thread(
+            crate::manager::WindowManagerOS::new(sender.clone()),
+        );
+        app.insert_resource(store);
+        app.insert_resource(roster);
+        app.insert_resource(crate::snapshot::TitleInvalidations::default());
+    }
 
     // Run every schedule inline rather than fanning systems out across the task
     // pool: the task-pool handoff measured ~45% of main-thread time against

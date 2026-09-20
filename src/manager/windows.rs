@@ -495,6 +495,50 @@ impl WindowOS {
     }
 }
 
+/// Reads an AX element's position+size into a raw (unpadded) frame.
+/// Same decode as [`WindowApi::update_frame`], but free of `&mut` and of any
+/// cache write, so the snapshot thread can call it on its own cloned
+/// handles. Consumers apply padding themselves from the live `Window`.
+pub(crate) fn snapshot_frame(element: &AXUIWrapper) -> Result<IRect> {
+    let window_ref = element.as_ptr();
+
+    let position = unsafe {
+        let mut position_ref: *mut CFType = null_mut();
+        AXUIElementCopyAttributeValue(
+            window_ref,
+            CFString::from_static_str(kAXPositionAttribute).as_ref(),
+            &mut position_ref,
+        )
+        .to_result(function_name!())?;
+        AXUIWrapper::retain(position_ref)?
+    };
+    let size = unsafe {
+        let mut size_ref: *mut CFType = null_mut();
+        AXUIElementCopyAttributeValue(
+            window_ref,
+            CFString::from_static_str(kAXSizeAttribute).as_ref(),
+            &mut size_ref,
+        )
+        .to_result(function_name!())?;
+        AXUIWrapper::retain(size_ref)?
+    };
+
+    let mut frame = CGRect::default();
+    unsafe {
+        AXValueGetValue(
+            position.as_ptr(),
+            kAXValueTypeCGPoint,
+            NonNull::from(&mut frame.origin).as_ptr().cast(),
+        );
+        AXValueGetValue(
+            size.as_ptr(),
+            kAXValueTypeCGSize,
+            NonNull::from(&mut frame.size).as_ptr().cast(),
+        );
+    }
+    Ok(irect_from(frame))
+}
+
 impl WindowApi for WindowOS {
     /// Returns the ID of the window.
     ///
