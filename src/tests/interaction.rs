@@ -1711,6 +1711,111 @@ fn test_focus_inside_viewport_leaves_strip_alone() {
         ]);
 }
 
+/// A focus arrival on a freshly activated strip (the cross-display hover
+/// case: `virtual_strip_activated` moves the strip marker with no restore
+/// state) must not fire `ensure_visible` immediately — the shared machinery
+/// skips newly active strips, so that would be consumed as a no-op and the
+/// window would sit off-viewport forever. Instead the focus defers one
+/// activation tick and the followup exposes it once the strip settles.
+/// Manual pump: the deferral only exists for a single tick.
+#[test]
+fn test_focus_arrival_on_fresh_strip_defers_then_exposes() {
+    use crate::ecs::DeferredExposeMarker;
+
+    let config: Config = (
+        MainOptions {
+            swipe_gesture_fingers: Some(3),
+            ..Default::default()
+        },
+        vec![],
+    )
+        .into();
+
+    // 5 windows @ 400px = 2000px strip on a 1024px display → scrollable.
+    let mut h = TestHarness::new().with_config(config).with_windows(5);
+    let pump = |h: &mut TestHarness, times: usize| {
+        for _ in 0..times {
+            h.app.update();
+            for e in h.mock_state.drain_events() {
+                h.app.world_mut().write_message::<Event>(e);
+            }
+        }
+    };
+    h.app.world_mut().write_message::<Event>(Event::Command {
+        command: Command::PrintState,
+    });
+    pump(&mut h, 8);
+    // Scroll window 0 off the left edge; focus stays put. The swipe's own
+    // glide must settle first — a real arrival lands on a strip at rest.
+    h.app.world_mut().write_message::<Event>(Event::Swipe {
+        delta: 0.3,
+        fingers: 3,
+    });
+    pump(&mut h, 8);
+    h.advance(Duration::from_millis(1500));
+
+    let strip_x_before = {
+        let world = h.app.world_mut();
+        let mut strips = world.query_filtered::<&Position, With<ActiveWorkspaceMarker>>();
+        strips.single(world).expect("exactly one active strip").0.x
+    };
+    assert_ne!(strip_x_before, 0, "setup: swipe must scroll the strip");
+
+    // Simulate the arrival: focus re-added while the owner strip is freshly
+    // (re-)activated with no restore state — the end state
+    // `virtual_strip_activated` produces on hover, applied synchronously so
+    // both `Added` flags are visible to the next tick.
+    let target = find_window_entity(0, h.app.world_mut());
+    let world = h.app.world_mut();
+    let strip_entity = world
+        .query_filtered::<Entity, (With<LayoutStrip>, With<ActiveWorkspaceMarker>)>()
+        .single(world)
+        .expect("exactly one active strip");
+    world
+        .entity_mut(strip_entity)
+        .remove::<ActiveWorkspaceMarker>();
+    let holders: Vec<Entity> = world
+        .query_filtered::<Entity, With<FocusedMarker>>()
+        .iter(world)
+        .collect();
+    for entity in holders {
+        world.entity_mut(entity).remove::<FocusedMarker>();
+    }
+    world.entity_mut(strip_entity).insert(ActiveWorkspaceMarker);
+    world.entity_mut(target).insert(FocusedMarker);
+
+    pump(&mut h, 1);
+    // Deferred, not immediate: the marker is parked and the strip unmoved.
+    assert_focused!(h.app.world_mut(), 0);
+    let world = h.app.world_mut();
+    assert!(
+        world.get::<DeferredExposeMarker>(target).is_some(),
+        "fresh-strip arrival must defer, not fire immediately"
+    );
+    let mut strips = world.query_filtered::<&Position, With<ActiveWorkspaceMarker>>();
+    assert_eq!(
+        strips.single(world).expect("exactly one active strip").0.x,
+        strip_x_before,
+        "deferred arrival must not move the strip on the activation tick"
+    );
+
+    h.advance(Duration::from_millis(300));
+    // Converted: the marker is consumed and the strip scrolled to expose
+    // window 0.
+    let world = h.app.world_mut();
+    assert_focused!(world, 0);
+    assert!(
+        world.get::<DeferredExposeMarker>(target).is_none(),
+        "followup must consume the deferred marker"
+    );
+    let mut strips = world.query_filtered::<&Position, With<ActiveWorkspaceMarker>>();
+    let strip_x_after = strips.single(world).expect("exactly one active strip").0.x;
+    assert!(
+        strip_x_after > strip_x_before,
+        "followup must scroll the strip to expose the window, went {strip_x_before} -> {strip_x_after}"
+    );
+}
+
 /// Regression: `position_layout_windows`'s offscreen/parking magnitude
 /// heuristic has no way to know a virtual-workspace restore is in progress.
 /// A member window whose last position differs from its recomputed target

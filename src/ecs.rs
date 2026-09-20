@@ -368,6 +368,20 @@ pub struct EnsureVisibleMarker {
     pub snap: bool,
 }
 
+/// Deferred scroll-to-reveal for a focus arrival on a freshly activated
+/// strip. Inserted by `ensure_focused_visible` when the owner's strip was
+/// just activated by the focus itself arriving (a cross-display hover, not a
+/// restore — see the skip battery there): the shared `ensure_visible`
+/// machinery skips newly active strips, so firing immediately would be
+/// consumed as a no-op. A followup converts this to `ensure_visible` once
+/// the strip settles.
+#[derive(Component)]
+pub struct DeferredExposeMarker {
+    /// Virtual-time expiry: transient states (flight, fresh strip, held
+    /// drag) retry until this passes; then the marker is dropped.
+    pub deadline: Duration,
+}
+
 /// Marks a [`LayoutStrip`](crate::ecs::layout::LayoutStrip) whose offset was
 /// placed deliberately by the user (`Operation::Center`, `Operation::Snap`)
 /// rather than derived from a window frame. While it is present and still

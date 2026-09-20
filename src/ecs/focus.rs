@@ -12,16 +12,18 @@ use bevy::ecs::schedule::IntoScheduleConfigs as _;
 use bevy::ecs::system::{Commands, Populated, Query, Res, ResMut, Single};
 use bevy::math::IRect;
 use bevy::prelude::Event as BevyEvent;
+use bevy::time::Time;
 use bevy::time::common_conditions::on_timer;
 use tracing::{Level, debug, instrument, trace, warn};
 
 use super::{
-    FocusedMarker, MouseHeldMarker, RepositionMarker, SystemTheme, Unmanaged, VerifyWindowPosition,
+    DeferredExposeMarker, FocusedMarker, MouseHeldMarker, RepositionMarker, SystemTheme, Unmanaged,
+    VerifyWindowPosition,
 };
 use crate::config::Config;
 use crate::ecs::layout::LayoutStrip;
 use crate::ecs::params::{ActiveDisplay, GlobalState, WindowCtx, Windows};
-use crate::ecs::workspace::RestoreFocusMarker;
+use crate::ecs::workspace::{PreviousStripPosition, RestoreFocusMarker, SnapStripMarker};
 use crate::ecs::{
     ActiveWorkspaceMarker, Bounds, DockPosition, Position, RaiseWindow, ResizeMarker, Scrolling,
     SendMessageTrigger, SpawnCommandsExt, StrayFocusEvent,
@@ -111,8 +113,10 @@ impl Plugin for FocusEventsPlugin {
                 // pre-recenter frame and never corrects itself.
                 mouse_follows_focus.after(autocenter_window_on_focus),
                 // After the warp target is settled: guarantees the focused
-                // window ends fully visible on every focus path.
+                // window ends fully visible on every focus path, deferring
+                // across fresh strip activations (see above).
                 ensure_focused_visible.after(mouse_follows_focus),
+                deferred_expose_followup.after(ensure_focused_visible),
                 recover_lost_focus.run_if(on_timer(Duration::from_millis(
                     REFRESH_WINDOW_CHECK_FREQ_MS,
                 ))),
@@ -310,21 +314,46 @@ type FlightMarkers<'w, 's> = Query<
     With<Window>,
 >;
 
+/// What the focus-visibility systems check on the focused window's strip:
+///
+/// * driving/confirming markers (at-rest scope),
+/// * restore ownership (`PreviousStripPosition`, `SnapStripMarker` — a focus
+///   arrival never carries these),
+/// * freshness (a fresh strip defers instead of firing).
+type OwnerStrips<'w, 's> = Query<
+    'w,
+    's,
+    (
+        Entity,
+        &'static LayoutStrip,
+        Has<RepositionMarker>,
+        Has<Scrolling>,
+        Has<PreviousStripPosition>,
+        Has<SnapStripMarker>,
+    ),
+>;
+
+/// How long a deferred expose keeps retrying transient states before it is
+/// dropped. Restores settle far inside this; a strip in perpetual motion
+/// must not accumulate a marker that outlives its focus.
+const DEFER_EXPOSE_TIMEOUT: Duration = Duration::from_secs(2);
+
 /// Guarantees a focused window at rest is fully visible: if its frame is not
-/// completely inside the viewport, scrolls the minimum shortfall via the
-/// shared `ensure_visible` machinery (animated, no-op when already visible).
-/// Runs on every focus change regardless of path — keyboard, click, virtual
-/// moves, close-refocus, Cmd-Tab — and deliberately ignores `skip_reshuffle`
-/// (which brings FFM hover into the guarantee) and `window_hidden_ratio`
-/// (which still governs unfocused windows only). Skipped while a drag holds
-/// the layout (release reshuffles instead), during setup, for background
-/// native tabs (which share the showing tab's slot), while a
-/// `RestoreFocusMarker` names the window, while anything is in flight, and
-/// on a freshly activated strip. The last two share one reason: mid-motion
-/// frames are transient, and "exposing" one fights the motion that owns it —
-/// firing during initial layout baked a half-built offset into the strip
-/// that later restores faithfully preserved. Restores expose arriving focus
-/// themselves (snapping when animations are off), so this defers to them.
+/// completely inside its owner's viewport, scrolls the minimum shortfall via
+/// the shared `ensure_visible` machinery (animated, no-op when already
+/// visible). Runs on every focus change regardless of path — keyboard,
+/// click, virtual moves, close-refocus, Cmd-Tab, cross-display hover — and
+/// deliberately ignores `skip_reshuffle` (which brings FFM hover into the
+/// guarantee) and `window_hidden_ratio` (which still governs unfocused
+/// windows only). Skipped while a drag holds the layout (release reshuffles
+/// instead), during setup, for background native tabs (which share the
+/// showing tab's slot), and while a restore owns the strip: a pre-show tick
+/// still parks `PreviousStripPosition`, snap restores guard, refocuses guard,
+/// animated restores fly. None of these ever marks a focus arrival — a
+/// cross-display hover activates a strip with no restore state at all — so
+/// that case defers instead of dropping (see `DeferredExposeMarker`): the
+/// shared machinery skips newly active strips, and firing immediately would
+/// be consumed as a no-op.
 #[allow(clippy::too_many_arguments)]
 #[instrument(level = Level::DEBUG, skip_all)]
 fn ensure_focused_visible(
@@ -333,11 +362,14 @@ fn ensure_focused_visible(
     mouse_held: Query<&MouseHeldMarker>,
     restored: Query<&RestoreFocusMarker>,
     flight: FlightMarkers<'_, '_>,
-    strips: Query<(Entity, &LayoutStrip, Has<RepositionMarker>, Has<Scrolling>)>,
+    strips: OwnerStrips<'_, '_>,
     fresh_strips: Query<Entity, Added<ActiveWorkspaceMarker>>,
+    strip_parents: Query<&ChildOf, With<LayoutStrip>>,
+    display_viewports: Query<(&Display, Option<&DockPosition>)>,
     global_state: GlobalState,
     active_display: ActiveDisplay,
     config: Res<Config>,
+    time: Res<Time>,
     mut commands: Commands,
 ) {
     use crate::ecs::layout::clamp_origin_to_viewport;
@@ -349,6 +381,18 @@ fn ensure_focused_visible(
     if restored.iter().any(|marker| marker.entity == entity) {
         return;
     }
+    let owner = strips
+        .iter()
+        .find(|(_, strip, _, _, _, _)| strip.contains(entity));
+    if let Some((_, _, _, _, previous_position, snap_settling)) = owner {
+        // A restore owns this strip: the pre-show tick still parks the
+        // previous position, snap restores guard, refocuses guard. A focus
+        // arrival never carries any of these, so reaching past here means
+        // nobody else will expose the window.
+        if previous_position || snap_settling {
+            return;
+        }
+    }
     // At rest only: a window or strip mid-animation is on its way somewhere
     // else, and exposing its transient frame perturbs the motion's own
     // trajectory (boot layout, swipe momentum, restores).
@@ -358,27 +402,160 @@ fn ensure_focused_visible(
     {
         return;
     }
-    if let Some((strip_entity, _, strip_flight, strip_scrolling)) = strips
-        .iter()
-        .find(|(_, strip, _, _)| strip.contains(entity))
+    if owner
+        .is_some_and(|(_, _, strip_flight, strip_scrolling, _, _)| strip_flight || strip_scrolling)
     {
-        if strip_flight || strip_scrolling {
-            return;
-        }
-        if fresh_strips.contains(strip_entity) {
-            return;
-        }
+        return;
     }
-    if active_display.active_strip().tabbed(entity) {
+    let tabbed = owner.map_or_else(
+        || active_display.active_strip().tabbed(entity),
+        |(_, strip, _, _, _, _)| strip.tabbed(entity),
+    );
+    if tabbed {
         return;
     }
     let (Some(frame), Some(size)) = (windows.moving_frame(entity), windows.size(entity)) else {
         return;
     };
-    let viewport = active_display.actual_bounds(&config);
-    if clamp_origin_to_viewport(frame.min, size, viewport) != frame.min {
-        debug!("focus on {entity} outside viewport, exposing");
+    let viewport = owner_viewport(
+        owner.map(|(entity, _, _, _, _, _)| entity),
+        &strip_parents,
+        &display_viewports,
+        &active_display,
+        &config,
+    );
+    if clamp_origin_to_viewport(frame.min, size, viewport) == frame.min {
+        return;
+    }
+    debug!("focus on {entity} outside viewport, exposing");
+    let fresh =
+        owner.is_some_and(|(strip_entity, _, _, _, _, _)| fresh_strips.contains(strip_entity));
+    if fresh {
+        // Fresh strip: the shared machinery skips newly active strips, so
+        // firing now would be consumed as a no-op. Defer one activation
+        // tick; the followup converts once the strip settles.
+        if let Ok(mut entity_commands) = commands.get_entity(entity) {
+            entity_commands.try_insert(DeferredExposeMarker {
+                deadline: time.elapsed() + DEFER_EXPOSE_TIMEOUT,
+            });
+        }
+    } else {
         commands.ensure_visible(entity);
+    }
+}
+
+/// Viewport owning the focused window: its strip's display, falling back to
+/// the active display when the window is strip-less (floating). The active
+/// display marker can lag a cross-display focus arrival, so measuring
+/// against it would clamp one display's sizes against another's bounds.
+fn owner_viewport(
+    owner: Option<Entity>,
+    strip_parents: &Query<&ChildOf, With<LayoutStrip>>,
+    display_viewports: &Query<(&Display, Option<&DockPosition>)>,
+    active_display: &ActiveDisplay,
+    config: &Config,
+) -> IRect {
+    owner
+        .and_then(|strip| strip_parents.get(strip).ok())
+        .and_then(|child| display_viewports.get(child.parent()).ok())
+        .map_or_else(
+            || active_display.actual_bounds(config),
+            |(display, dock)| display.actual_display_bounds(dock, config),
+        )
+}
+
+/// Converts deferred focus exposures once their strip settles. Retries
+/// transient states (flight, fresh strip, held drag); drops restore-owned,
+/// permanent, stale and expired markers — a restore that arrived after the
+/// deferral owns the exposure, and a marker must never outlive its focus.
+#[allow(clippy::too_many_arguments)]
+#[instrument(level = Level::DEBUG, skip_all)]
+fn deferred_expose_followup(
+    deferred: Query<(Entity, &DeferredExposeMarker)>,
+    focused: Query<(), With<FocusedMarker>>,
+    windows: Windows,
+    mouse_held: Query<&MouseHeldMarker>,
+    restored: Query<&RestoreFocusMarker>,
+    flight: FlightMarkers<'_, '_>,
+    strips: OwnerStrips<'_, '_>,
+    fresh_strips: Query<Entity, Added<ActiveWorkspaceMarker>>,
+    strip_parents: Query<&ChildOf, With<LayoutStrip>>,
+    display_viewports: Query<(&Display, Option<&DockPosition>)>,
+    global_state: GlobalState,
+    active_display: ActiveDisplay,
+    config: Res<Config>,
+    time: Res<Time>,
+    mut commands: Commands,
+) {
+    use crate::ecs::layout::clamp_origin_to_viewport;
+
+    for (entity, marker) in &deferred {
+        let drop_marker = |commands: &mut Commands| {
+            if let Ok(mut entity_commands) = commands.get_entity(entity) {
+                entity_commands.try_remove::<DeferredExposeMarker>();
+            }
+        };
+        // Stale (focus moved on) or expired: never outlive the focus.
+        if focused.get(entity).is_err() || time.elapsed() > marker.deadline {
+            drop_marker(&mut commands);
+            continue;
+        }
+        if global_state.initializing() || !mouse_held.is_empty() {
+            continue;
+        }
+        if restored.iter().any(|marker| marker.entity == entity) {
+            drop_marker(&mut commands);
+            continue;
+        }
+        let owner = strips
+            .iter()
+            .find(|(_, strip, _, _, _, _)| strip.contains(entity));
+        // A restore arrived after the deferral: it owns the exposure now.
+        if let Some((_, _, _, _, previous_position, snap_settling)) = owner
+            && (previous_position || snap_settling)
+        {
+            drop_marker(&mut commands);
+            continue;
+        }
+        if flight
+            .get(entity)
+            .is_ok_and(|(repositioning, resizing, verifying)| {
+                repositioning || resizing || verifying
+            })
+        {
+            continue;
+        }
+        if owner.is_some_and(|(strip_entity, _, strip_flight, strip_scrolling, _, _)| {
+            strip_flight || strip_scrolling || fresh_strips.contains(strip_entity)
+        }) {
+            continue;
+        }
+        let tabbed = owner.map_or_else(
+            || active_display.active_strip().tabbed(entity),
+            |(_, strip, _, _, _, _)| strip.tabbed(entity),
+        );
+        if tabbed {
+            drop_marker(&mut commands);
+            continue;
+        }
+        let (Some(frame), Some(size)) = (windows.moving_frame(entity), windows.size(entity)) else {
+            drop_marker(&mut commands);
+            continue;
+        };
+        let viewport = owner_viewport(
+            owner.map(|(entity, _, _, _, _, _)| entity),
+            &strip_parents,
+            &display_viewports,
+            &active_display,
+            &config,
+        );
+        if clamp_origin_to_viewport(frame.min, size, viewport) == frame.min {
+            drop_marker(&mut commands);
+            continue;
+        }
+        debug!("deferred expose for {entity} outside viewport, exposing");
+        commands.ensure_visible(entity);
+        drop_marker(&mut commands);
     }
 }
 

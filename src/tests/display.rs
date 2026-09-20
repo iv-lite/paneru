@@ -10,7 +10,7 @@ use crate::ecs::mouse::{DragModifierState, DropPreviewState};
 use crate::ecs::workspace::IgnoredMovedWindows;
 use crate::ecs::{
     ActiveDisplayMarker, Bounds, DockPosition, MouseHeldMarker, Position, RepositionMarker,
-    SpawnWindowTrigger, Timeout,
+    Scrolling, SpawnWindowTrigger, Timeout,
 };
 use crate::events::Event;
 use crate::manager::{Application, Display, Origin, Size, Window};
@@ -2962,6 +2962,189 @@ fn test_toolbar_grab_scrolls_strip() {
                 .find(|(strip, _)| strip.contains(entity))
                 .expect("need owning strip");
             assert_eq!(position.0.x, 300);
+        })
+        .run(commands);
+}
+
+/// X of the strip owning window 0, for drag-scroll assertions.
+fn strip_x_of_window_0(world: &mut World) -> i32 {
+    let first = find_window_entity(0, world);
+    let mut strips = world.query::<(&LayoutStrip, &Position)>();
+    let (_, position) = strips
+        .iter(world)
+        .find(|(strip, _)| strip.contains(first))
+        .expect("need owning strip");
+    position.0.x
+}
+
+/// A flung header drag keeps gliding after release: the drag tracks its own
+/// release velocity (the shared pipeline zeroes it for pointer-driven
+/// Scrolls) and seeds `Scrolling` with it, so the existing inertia chain
+/// carries the strip past the finger's travel, then decays and cleans up —
+/// no homing, no reshuffle.
+#[test]
+fn test_scroll_drag_release_glides_with_inertia() {
+    // 5 tiled windows: 2000px strip on a 1024px display, clamp [-976, 0].
+    // Grab window 0's header and drag left in staged segments (200ms virtual
+    // time apart): -300, -200, then lift still moving -200.
+    let commands = vec![
+        Event::MenuOpened { window_id: 0 },
+        Event::MouseDown {
+            point: CGPoint::new(300.0, 30.0),
+            modifiers: Modifiers::empty(),
+        },
+        Event::MouseDragged {
+            point: CGPoint::new(-100.0, 30.0),
+            modifiers: Modifiers::empty(),
+        },
+        Event::MouseDragged {
+            point: CGPoint::new(-500.0, 30.0),
+            modifiers: Modifiers::empty(),
+        },
+        Event::MouseUp {
+            point: CGPoint::new(-900.0, 30.0),
+            modifiers: Modifiers::empty(),
+        },
+        Event::Command {
+            command: Command::PrintState,
+        },
+        Event::Command {
+            command: Command::PrintState,
+        },
+    ];
+
+    TestHarness::new()
+        .with_windows(5)
+        .with_focused_window(0)
+        .on_iteration(3, move |world, _state| {
+            // Finger travel so far: -800 through the shared pipeline.
+            assert!(
+                strip_x_of_window_0(world) <= -785,
+                "drag segments must have scrolled the strip, got {}",
+                strip_x_of_window_0(world)
+            );
+        })
+        .on_iteration(4, move |world, _state| {
+            // Release at -800 of finger travel, but the seeded glide carries
+            // the strip further left inside the same command window.
+            assert!(
+                strip_x_of_window_0(world) <= -810,
+                "release must glide past the finger travel, got {}",
+                strip_x_of_window_0(world)
+            );
+        })
+        .on_iteration(6, move |world, _state| {
+            // Settled: inertia decayed, `Scrolling` reaped, offset kept (no
+            // homing back toward 0).
+            let mut scrolling = world.query_filtered::<&Scrolling, With<LayoutStrip>>();
+            assert!(
+                scrolling.iter(world).next().is_none(),
+                "inertia must converge and reap Scrolling"
+            );
+            assert!(
+                strip_x_of_window_0(world) <= -810,
+                "settled offset must keep the glide, got {}",
+                strip_x_of_window_0(world)
+            );
+        })
+        .run(commands);
+}
+
+/// A press-hold-release with no final travel stops dead: the gap resets the
+/// release average, the lift folds ~zero, and nothing seeds a fling.
+#[test]
+fn test_scroll_drag_release_without_travel_stops_dead() {
+    let commands = vec![
+        Event::MenuOpened { window_id: 0 },
+        Event::MouseDown {
+            point: CGPoint::new(300.0, 30.0),
+            modifiers: Modifiers::empty(),
+        },
+        Event::MouseUp {
+            point: CGPoint::new(300.0, 30.0),
+            modifiers: Modifiers::empty(),
+        },
+        Event::Command {
+            command: Command::PrintState,
+        },
+        Event::Command {
+            command: Command::PrintState,
+        },
+    ];
+
+    TestHarness::new()
+        .with_windows(5)
+        .with_focused_window(0)
+        .on_iteration(4, move |world, _state| {
+            let mut scrolling = world.query_filtered::<&Scrolling, With<LayoutStrip>>();
+            assert!(
+                scrolling.iter(world).next().is_none(),
+                "a click release must seed no inertia"
+            );
+            let first = find_window_entity(0, world);
+            let mut strips = world.query::<(&LayoutStrip, &Position)>();
+            let (_, position) = strips
+                .iter(world)
+                .find(|(strip, _)| strip.contains(first))
+                .expect("need owning strip");
+            assert_eq!(position.0.x, 0);
+        })
+        .run(commands);
+}
+
+/// A drag that pauses before release keeps its scroll offset but gains no
+/// fling: the lift folds ~zero travel over a stale gap, so the average stays
+/// ~zero and the strip sits where the finger left it.
+#[test]
+fn test_scroll_drag_stale_release_keeps_offset_without_glide() {
+    let commands = vec![
+        Event::MenuOpened { window_id: 0 },
+        Event::MouseDown {
+            point: CGPoint::new(300.0, 30.0),
+            modifiers: Modifiers::empty(),
+        },
+        Event::MouseDragged {
+            point: CGPoint::new(0.0, 30.0),
+            modifiers: Modifiers::empty(),
+        },
+        Event::Command {
+            command: Command::PrintState,
+        },
+        Event::MouseUp {
+            point: CGPoint::new(0.0, 30.0),
+            modifiers: Modifiers::empty(),
+        },
+        Event::Command {
+            command: Command::PrintState,
+        },
+        Event::Command {
+            command: Command::PrintState,
+        },
+    ];
+
+    TestHarness::new()
+        .with_windows(5)
+        .with_focused_window(0)
+        .on_iteration(4, move |world, _state| {
+            // The -300 finger travel scrolled and stuck: offset kept.
+            assert!(
+                (-315..=-285).contains(&strip_x_of_window_0(world)),
+                "stale release must keep the scroll offset, got {}",
+                strip_x_of_window_0(world)
+            );
+        })
+        .on_iteration(6, move |world, _state| {
+            // ...and nothing glided afterwards.
+            assert!(
+                (-315..=-285).contains(&strip_x_of_window_0(world)),
+                "stale release must not glide, got {}",
+                strip_x_of_window_0(world)
+            );
+            let mut scrolling = world.query_filtered::<&Scrolling, With<LayoutStrip>>();
+            assert!(
+                scrolling.iter(world).next().is_none(),
+                "a stale release must seed no inertia"
+            );
         })
         .run(commands);
 }

@@ -1421,6 +1421,11 @@ fn border_frame_for(
             });
     if driving {
         if let Some(frame) = windows.moving_frame(entity) {
+            // Trace-only pin for drag-detach diagnosis: during motion each
+            // overlay tick must log a live frame that advances; a frozen
+            // rect here with a scrolling strip means the layout stopped
+            // rewriting window positions (not an overlay gating miss).
+            trace!("overlay live frame for {entity}: {frame:?}");
             return frame;
         }
         trace!("overlay driving {entity} but no layout frame, falling back to OS frame");
@@ -1574,6 +1579,14 @@ pub(super) fn update_overlays(
     // the next dirty tick.
     let tracking_live =
         overlay_tracks_live(swiping, !drag_held.is_empty(), scroll_grace.settle_active());
+    if !drag_held.is_empty() {
+        // Trace-only pin for drag-detach diagnosis (see `border_frame_for`):
+        // proves the overlay ran during the drag and which truth it read.
+        trace!(
+            "overlay drag tick: swiping={swiping} tracking_live={tracking_live} settle={}",
+            scroll_grace.settle_active(),
+        );
+    }
     let frame = border_frame_for(
         &windows,
         &flight,

@@ -13,6 +13,7 @@ use tracing::{debug, info, trace, warn};
 
 use super::{ActiveDisplayMarker, DragDisplayArmed, DragScrollArmed, MouseHeldMarker, Timeout};
 use crate::commands::{OffscreenStrips, attach_column_to_display, detach_column_from_strip};
+use crate::config::swipe::SwipeGestureDirection;
 use crate::config::{Config, decorations::BorderRadiusOption};
 use crate::ecs::layout::{Column, LayoutStrip, desired_window_frame};
 use crate::ecs::params::{ActiveDisplayMut, GlobalState, Windows};
@@ -508,6 +509,7 @@ fn mouse_up_trigger(
     scrolling: Query<Entity, With<Scrolling>>,
     config: Res<Config>,
     drag_modifiers: Res<DragModifierState>,
+    time: Res<Time>,
     mut scroll_state: ResMut<DragScrollState>,
     mut commands: Commands,
 ) {
@@ -519,6 +521,10 @@ fn mouse_up_trigger(
         // drags swallowed.
         set_scroll_drag_suppress(false);
         let scroll_distance = std::mem::take(&mut scroll_state.distance_px);
+        // Release velocity is per-gesture too: a stale EMA must never leak
+        // into the next press (its MouseDown resets the sampler anyway).
+        let release_ema_px_s = std::mem::take(&mut scroll_state.release_ema_px_s);
+        scroll_state.last_sample_at = None;
 
         for (held_entity, marker, armed, scroll_armed) in &mouse_held {
             let entity = marker.0;
@@ -548,6 +554,15 @@ fn mouse_up_trigger(
                 scroll_state.settle_deadline = Some(Instant::now() + SCROLL_SETTLE_GRACE);
                 let system_id = commands.register_system(scroll_settle_check);
                 Timeout::callback(SCROLL_SETTLE_DELAY, system_id, &mut commands);
+                seed_release_inertia(
+                    entity,
+                    release_ema_px_s,
+                    &strips,
+                    &displays,
+                    &config,
+                    time.elapsed(),
+                    &mut commands,
+                );
                 if let Ok(mut entity_commands) = commands.get_entity(held_entity) {
                     entity_commands.try_despawn();
                 }
@@ -640,6 +655,13 @@ pub(crate) struct DragScrollState {
     pub(crate) distance_px: f64,
     pub(crate) members: Vec<Entity>,
     pub(crate) settle_deadline: Option<Instant>,
+    /// EMA of the horizontal drag rate (strip px/s) and the virtual time of
+    /// the last sample. The shared scroll pipeline zeroes velocity for
+    /// pointer-driven `Scroll` events, so the drag tracks its own release
+    /// velocity here and seeds `Scrolling` with it on mouse-up; the existing
+    /// inertia chain then glides, clamps and cleans up like a trackpad fling.
+    pub(crate) release_ema_px_s: f64,
+    pub(crate) last_sample_at: Option<Duration>,
 }
 
 impl DragScrollState {
@@ -662,6 +684,24 @@ const SCROLL_SETTLE_STEP: Duration = Duration::from_millis(300);
 /// Wall-clock budget for post-release settling. Retries must not depend on
 /// frame counts: idle pump sleeps stretch frames to 500ms.
 const SCROLL_SETTLE_GRACE: Duration = Duration::from_secs(1);
+
+/// Floor for release-velocity sample timesteps: a catch-up frame can drive
+/// `dt` arbitrarily close to zero and `dx / dt` would diverge (same hazard
+/// as `MIN_STEP_SECS` in the swipe pipeline).
+const RELEASE_VELOCITY_MIN_STEP_SECS: f64 = 1.0 / 1000.0;
+/// EMA weight for release-velocity samples, mirroring `swipe_gesture`'s
+/// gesture smoothing (0.3 new, 0.7 history).
+const RELEASE_VELOCITY_EMA_NEW: f64 = 0.3;
+/// A sample gap past this resets the EMA: a pause mid-drag means "holding
+/// still", and only post-pause motion may seed a fling — a press-hold-release
+/// with no final travel must stop dead, never fling from stale motion.
+const RELEASE_VELOCITY_GAP_RESET: Duration = Duration::from_millis(150);
+/// Floor below which a release stops dead: residue the swipe pipeline's own
+/// lift-timeout would reap on its first pass.
+const MIN_RELEASE_PX_S: f64 = 100.0;
+/// Cap so a teleporting pointer (warp, multi-monitor jump) can't fling the
+/// strip at unbounded speed.
+const MAX_RELEASE_PX_S: f64 = 12_000.0;
 
 /// Re-reads OS truth for scroll-released column members once they have had a
 /// moment to land, pushing any displaced window back into its slot.
@@ -796,6 +836,86 @@ struct DragMoveState {
     last: Option<Origin>,
 }
 
+/// Folds one horizontal drag segment into the release-velocity EMA. The
+/// first sample after a press only stores its time (no `dt` to divide by).
+/// A gap past `RELEASE_VELOCITY_GAP_RESET` zeroes the average first — a
+/// pause reads as holding still — then folds the segment over the whole
+/// gap, so only post-pause motion at a post-pause rate can fling: a
+/// press-hold-release folds ~zero travel and stops dead.
+fn sample_release_velocity(scroll_state: &mut DragScrollState, dx: f64, now: Duration) {
+    let Some(last) = scroll_state.last_sample_at else {
+        scroll_state.last_sample_at = Some(now);
+        return;
+    };
+    let gap = now.saturating_sub(last);
+    if gap > RELEASE_VELOCITY_GAP_RESET {
+        scroll_state.release_ema_px_s = 0.0;
+    }
+    let dt = gap.as_secs_f64().max(RELEASE_VELOCITY_MIN_STEP_SECS);
+    let instant = dx / dt;
+    scroll_state.release_ema_px_s = RELEASE_VELOCITY_EMA_NEW * instant
+        + (1.0 - RELEASE_VELOCITY_EMA_NEW) * scroll_state.release_ema_px_s;
+    scroll_state.last_sample_at = Some(now);
+}
+
+/// Seeds the shared scroll pipeline with the drag's release velocity so the
+/// strip glides after a fling instead of stopping dead. The pipeline zeroes
+/// velocity for pointer-driven `Scroll` events (native momentum doesn't
+/// apply), so without this the existing inertia chain starts from rest.
+/// Below `MIN_RELEASE_PX_S` the release stops dead (today's behavior); above
+/// `MAX_RELEASE_PX_S` it clamps. Get-or-insert: a mid-drag pause may have let
+/// the lift-timeout reap `Scrolling`, in which case it is recreated at the
+/// strip's current offset.
+fn seed_release_inertia(
+    entity: Entity,
+    ema_px_s: f64,
+    strips: &ReleaseStrips<'_, '_>,
+    displays: &PreviewDisplays<'_, '_>,
+    config: &Config,
+    now: Duration,
+    commands: &mut Commands,
+) {
+    if ema_px_s.abs() < MIN_RELEASE_PX_S {
+        return;
+    }
+    let Some((strip_entity, _, position, child)) = strips
+        .iter()
+        .find(|(_, strip, _, _)| strip.contains(entity))
+    else {
+        return;
+    };
+    let Ok((_, display, _, _)) = displays.get(child.parent()) else {
+        return;
+    };
+    let viewport_width = f64::from(display.bounds().width());
+    if viewport_width <= f64::EPSILON {
+        return;
+    }
+    // Strip px/s into the pipeline's velocity units: the integrator advances
+    // `velocity * dt * viewport_width * direction`, so dividing the measured
+    // rate back through the gain continues at exactly the release pace.
+    let direction = match config.swipe_gesture_direction() {
+        SwipeGestureDirection::Natural => -1.0,
+        SwipeGestureDirection::Reversed => 1.0,
+    };
+    let velocity =
+        ema_px_s.clamp(-MAX_RELEASE_PX_S, MAX_RELEASE_PX_S) / (viewport_width * direction);
+    // Replace (never touch `Query<&mut Scrolling>` here: declaring mutable
+    // access on the release path perturbs an unrelated pinning test, so the
+    // seed goes through ordered commands instead — remove then insert lands
+    // as a replace at flush, a tick later at most, which the glide absorbs.
+    if let Ok(mut entity_commands) = commands.get_entity(strip_entity) {
+        entity_commands.try_remove::<Scrolling>();
+        entity_commands.try_insert(Scrolling {
+            velocity,
+            position: f64::from(position.0.x),
+            is_user_swiping: false,
+            last_event: now,
+        });
+    }
+    debug!("mouse up: strip-scroll release at {ema_px_s:.0}px/s, seeding glide");
+}
+
 /// Moves a held column synthetically from `MouseDragged` deltas, 1:1 with
 /// the cursor.
 ///
@@ -831,6 +951,7 @@ fn drag_move_held_column(
     mut positions: Query<&mut Position, With<Window>>,
     displays: Query<(&Display, Has<ActiveDisplayMarker>)>,
     config: Res<Config>,
+    time: Res<Time>,
     mut scroll_state: ResMut<DragScrollState>,
     mut state: Local<DragMoveState>,
 ) {
@@ -840,6 +961,8 @@ fn drag_move_held_column(
                 state.last = Some(origin_from(*point));
                 // Travel is per-gesture.
                 scroll_state.distance_px = 0.0;
+                scroll_state.release_ema_px_s = 0.0;
+                scroll_state.last_sample_at = None;
             }
             Event::MouseUp { .. } => {
                 state.last = None;
@@ -886,6 +1009,11 @@ fn drag_move_held_column(
                             .iter()
                             .find_map(|(display, active)| active.then(|| display.bounds().width()))
                     {
+                        sample_release_velocity(
+                            &mut scroll_state,
+                            f64::from(delta.x),
+                            time.elapsed(),
+                        );
                         moved.write(Event::Scroll {
                             delta: px_to_scroll_delta(
                                 f64::from(delta.x),
@@ -1678,9 +1806,49 @@ mod tests {
     }
 
     #[test]
-    fn slot_preview_pins_oversized_ghost_to_viewport_origin() {
+    fn slot_preview_pins_oversized_ghost_to_viewport() {
         let rect = slot_preview_rect(100, test_viewport(), Size::new(2000, 300));
         assert_eq!(rect, IRect::new(0, 20, 2000, 768));
+    }
+
+    #[test]
+    fn release_velocity_first_sample_only_stores_time() {
+        let mut state = DragScrollState::default();
+        sample_release_velocity(&mut state, 300.0, Duration::from_millis(100));
+        assert!(
+            state.release_ema_px_s.abs() < f64::EPSILON,
+            "no dt on the first sample: nothing to divide by"
+        );
+        assert_eq!(state.last_sample_at, Some(Duration::from_millis(100)));
+    }
+
+    #[test]
+    fn release_velocity_folds_segments_with_ema_smoothing() {
+        let mut state = DragScrollState::default();
+        sample_release_velocity(&mut state, 300.0, Duration::from_millis(100));
+        // 200px over 200ms past the first sample: the gap resets, then folds
+        // 1000px/s instantaneous at 0.3 weight like the swipe pipeline's
+        // gesture smoothing.
+        sample_release_velocity(&mut state, 200.0, Duration::from_millis(300));
+        assert!((state.release_ema_px_s - 300.0).abs() < 1e-9);
+        // Back-to-back segments inside the gap keep blending, not replacing:
+        // 200px over 100ms is 2000px/s instantaneous.
+        sample_release_velocity(&mut state, 200.0, Duration::from_millis(400));
+        assert!((state.release_ema_px_s - (0.3 * 2000.0 + 0.7 * 300.0)).abs() < 1e-9);
+    }
+
+    #[test]
+    fn release_velocity_gap_resets_stale_motion() {
+        let mut state = DragScrollState::default();
+        sample_release_velocity(&mut state, 300.0, Duration::from_millis(100));
+        sample_release_velocity(&mut state, 200.0, Duration::from_millis(300));
+        assert!(state.release_ema_px_s > 0.0);
+        // A pause past the gap zeroes the average, then folds the new
+        // segment over the whole gap: post-pause motion at a post-pause rate.
+        sample_release_velocity(&mut state, 0.0, Duration::from_millis(1000));
+        assert!(state.release_ema_px_s.abs() < f64::EPSILON);
+        sample_release_velocity(&mut state, 100.0, Duration::from_millis(1200));
+        assert!((state.release_ema_px_s - 0.3 * 500.0).abs() < 1e-9);
     }
 
     fn make_display() -> Display {
