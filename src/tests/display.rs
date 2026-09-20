@@ -6,7 +6,7 @@ use bevy::time::TimeUpdateStrategy;
 use crate::commands::{Command, Direction, MouseMove, MoveFocus, Operation};
 use crate::config::{Config, MainOptions, WindowParams};
 use crate::ecs::layout::{LayoutStrip, PARKED_STRIP_SLIVER};
-use crate::ecs::mouse::{DragModifierState, DropPreviewState};
+use crate::ecs::mouse::{DragModifierState, DragPaintState, DropPreviewState};
 use crate::ecs::workspace::IgnoredMovedWindows;
 use crate::ecs::{
     ActiveDisplayMarker, Bounds, DockPosition, DragSettleMarker, MouseHeldMarker, Position,
@@ -673,6 +673,62 @@ fn test_drag_window_across_display_transfers_strip() {
         .on_iteration(6, move |world, _state| {
             assert_on_workspace!(world, 0, EXT_WORKSPACE_ID);
             assert_not_on_workspace!(world, 0, TEST_WORKSPACE_ID);
+        })
+        .run(commands);
+}
+
+/// A native content drag keeps the layout slot pinned while the OS window
+/// follows the cursor: the paint-only drag offset must accumulate the full
+/// pointer travel (one entry per drag tick here), so the border rides the
+/// cursor at input rate instead of stepping at snapshot epochs. The slot
+/// itself never moves, and release clears the gesture.
+#[test]
+fn test_native_drag_accumulates_paint_offset_with_slot_pinned() {
+    // Window 0 tiles at (0, 20); grab its content (below the titlebar) with
+    // no shortcut so native owns the drag.
+    let grab = CGPoint::new(200.0, 500.0);
+    let commands = vec![
+        Event::MenuOpened { window_id: 0 },
+        Event::MouseDown {
+            point: grab,
+            modifiers: Modifiers::empty(),
+        },
+        Event::MouseDragged {
+            point: CGPoint::new(250.0, 500.0),
+            modifiers: Modifiers::empty(),
+        },
+        Event::MouseDragged {
+            point: CGPoint::new(250.0, 550.0),
+            modifiers: Modifiers::empty(),
+        },
+        Event::MouseUp {
+            point: CGPoint::new(250.0, 550.0),
+            modifiers: Modifiers::empty(),
+        },
+    ];
+
+    TestHarness::new()
+        .with_windows(1)
+        .on_iteration(3, |world, _state| {
+            let entity = find_window_entity(0, world);
+            let paint = world.resource::<DragPaintState>();
+            assert_eq!(paint.target, Some(entity));
+            assert_eq!(paint.offset, Origin::new(50, 50));
+            assert_eq!(
+                paint.frame_for(entity),
+                Some(IRect::from_corners(
+                    Origin::new(50, 70),
+                    Origin::new(450, 818),
+                )),
+                "grab frame plus pointer offset, every tick"
+            );
+            // The slot never moved: layout truth is still the tiled origin.
+            let position = world.entity(entity).get::<Position>().expect("position");
+            assert_eq!(position.0, Origin::new(0, TEST_MENUBAR_HEIGHT));
+        })
+        .on_iteration(4, |world, _state| {
+            let paint = world.resource::<DragPaintState>();
+            assert_eq!(paint.target, None, "release ends the paint gesture");
         })
         .run(commands);
 }

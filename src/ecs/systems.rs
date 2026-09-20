@@ -27,7 +27,7 @@ use super::{
 use crate::config::{Config, decorations::BorderRadiusOption};
 use crate::ecs::display::FloatingLayer;
 use crate::ecs::layout::{Column, LayoutStrip};
-use crate::ecs::mouse::{DragModifierState, DragScrollState};
+use crate::ecs::mouse::{DragModifierState, DragPaintState, DragScrollState};
 use crate::ecs::params::{ActiveDisplay, FrameActivity, Windows};
 use crate::ecs::{
     ActiveWorkspaceMarker, Bounds, BruteforceWindows, FlashMessage, FocusedMarker, Initializing,
@@ -1031,6 +1031,40 @@ pub(crate) fn demux_input_events(
     }
 }
 
+/// Pending absolute-pointer motion held back one drain step so HID bursts
+/// fold to the newest event: moves and drags carry absolute points, so only
+/// the latest per batch matters for displacement. Without this a burst past
+/// the pump budget queues stale deltas across frames, which the drag paints
+/// late as overshoot. Anything else flushes pending motion first, so press /
+/// release gesture boundaries stay ordered around the motion they bound.
+#[derive(Default)]
+struct CoalescedPointer {
+    moved: Option<Event>,
+    dragged: Option<Event>,
+}
+
+impl CoalescedPointer {
+    fn push(&mut self, events: &mut Vec<Event>, event: Event) {
+        match event {
+            Event::MouseMoved { .. } => {
+                self.moved = Some(event);
+            }
+            Event::MouseDragged { .. } => {
+                self.dragged = Some(event);
+            }
+            _ => {
+                self.flush(events);
+                events.push(event);
+            }
+        }
+    }
+
+    fn flush(&mut self, events: &mut Vec<Event>) {
+        events.extend(self.moved.take());
+        events.extend(self.dragged.take());
+    }
+}
+
 #[allow(clippy::too_many_arguments)]
 pub(crate) fn pump_events(
     mut exit: MessageWriter<AppExit>,
@@ -1059,7 +1093,7 @@ pub(crate) fn pump_events(
 
     let deadline = Instant::now() + PUMP_BUDGET;
     let mut received_events = Vec::new();
-    let mut pending_mouse = None;
+    let mut coalesced = CoalescedPointer::default();
     let mut woke = false;
     let mut display_changed = false;
 
@@ -1098,19 +1132,14 @@ pub(crate) fn pump_events(
                         | Event::DisplayResized { .. }
                         | Event::DisplayConfigured { .. }
                 );
-                if matches!(event, Event::MouseMoved { .. }) {
-                    pending_mouse = Some(event);
-                } else {
-                    received_events.extend(pending_mouse.take());
-                    received_events.push(event);
-                }
+                coalesced.push(&mut received_events, event);
                 *timeout = LOOP_TIMEOUT_STEP;
             }
             Err(RecvTimeoutError::Timeout) => break true,
         }
     };
 
-    received_events.extend(pending_mouse.take());
+    coalesced.flush(&mut received_events);
     messages.write_batch(received_events);
 
     // Wake is handled before the backoff below: a stale `LowPowerMode` (polled
@@ -1535,10 +1564,11 @@ fn pad_snapshot_frame(raw: IRect, window: &Window) -> IRect {
 /// Frame a border should hug for one window (the attach guarantee), in
 /// priority order:
 ///
-/// 1. The live OS frame for a native-owned held drag (content grab with
-///    strip scrolling enabled): the layout slot is pinned stale by design
-///    (adoption skipped), so the slot would paint detached from the cursor.
-///    Snapshot first, cached OS frame as fallback — never the slot.
+/// 1. The paint-only drag offset for a native-owned held drag (content grab
+///    with strip scrolling enabled): the layout slot is pinned stale by
+///    design (adoption skipped), so the slot would paint detached from the
+///    cursor. Grab frame plus pointer deltas at input rate first, then the
+///    snapshot, then the cached OS frame — never the slot.
 /// 2. The current layout frame while paneru drives or confirms the window —
 ///    any of `RepositionMarker`, `ResizeMarker`, `VerifyWindowPosition`
 ///    present — or while the strip scrolls, a drag is held, or a release
@@ -1550,6 +1580,7 @@ fn pad_snapshot_frame(raw: IRect, window: &Window) -> IRect {
 /// 3. A fresh snapshot frame: native moves/resizes bypass ECS, and the
 ///    snapshot sees them without a synchronous round trip.
 /// 4. The cached OS frame, last.
+#[allow(clippy::too_many_arguments)]
 fn border_frame_for(
     windows: &Windows,
     flight: &FlightMarkers<'_, '_>,
@@ -1557,11 +1588,19 @@ fn border_frame_for(
     window: &Window,
     tracking_live: bool,
     native_held: bool,
+    paint_frame: Option<IRect>,
     store: Option<&SnapshotStore>,
 ) -> IRect {
     // Native-owned drag: layout never moved, so neither the slot nor the
-    // flight target means anything — track the OS truth instead.
+    // flight target means anything. Prefer the paint-only drag offset
+    // (grab frame plus pointer deltas at input rate) over the 250ms
+    // snapshot, so the border follows the cursor every tick instead of
+    // stepping at snapshot epochs; snapshot and cached OS frames cover a
+    // missed press with no gesture state.
     if native_held {
+        if let Some(frame) = paint_frame {
+            return frame;
+        }
         if let Some(raw) = snapshot_live_frame(store, window.id(), SNAPSHOT_FRAME_MAX_AGE) {
             return pad_snapshot_frame(raw, window);
         }
@@ -1654,9 +1693,9 @@ pub(super) fn update_overlays(
         Has<DragDisplayArmed>,
         Has<DragScrollArmed>,
     )>,
-    armed_drag: Query<(), (With<MouseHeldMarker>, With<DragDisplayArmed>)>,
     flight: FlightMarkers<'_, '_>,
     scroll_grace: Res<DragScrollState>,
+    paint: Res<DragPaintState>,
     overlay_mgr: Option<NonSendMut<OverlayManager>>,
     mission_control_active: Res<MissionControlActive>,
     config: Res<Config>,
@@ -1739,11 +1778,11 @@ pub(super) fn update_overlays(
 
     // The focused window's frame (see `border_frame_for`): the current
     // layout frame while paneru drives it (riding the animation, not the
-    // target), the live OS frame for native-owned held drags, a fresh
-    // snapshot frame for other native motion that bypassed ECS, the cached
-    // OS frame last. The grace arm matters most on the release tick itself:
-    // without it the border snaps backward to the stale cache for one tick
-    // and then freezes there until the next dirty tick.
+    // target), the paint-only drag offset for native-owned held drags, a
+    // fresh snapshot frame for other native motion that bypassed ECS, the
+    // cached OS frame last. The grace arm matters most on the release tick
+    // itself: without it the border snaps backward to the stale cache for
+    // one tick and then freezes there until the next dirty tick.
     let tracking_live =
         overlay_tracks_live(swiping, !drag_held.is_empty(), scroll_grace.settle_active());
     if !drag_held.is_empty() {
@@ -1757,9 +1796,10 @@ pub(super) fn update_overlays(
     // A native-owned held drag (content grab with strip scrolling enabled:
     // unarmed, not scroll-armed, so neither the column drive nor the strip
     // scroll moved the slot) keeps its synthetic slot while the OS window
-    // follows the cursor — track the OS truth so the border rides the
-    // cursor. Legacy scroll-disabled drags drive the column directly and
-    // header scroll-drags drive the strip, so both keep the layout frame.
+    // follows the cursor — paint the grab frame plus pointer deltas so the
+    // border rides the cursor at input rate. Legacy scroll-disabled drags
+    // drive the column directly and header scroll-drags drive the strip, so
+    // both keep the layout frame.
     let is_native_held = |entity: Entity| {
         config.left_drag_scrolls_strip()
             && drag_held
@@ -1773,19 +1813,16 @@ pub(super) fn update_overlays(
         window,
         tracking_live,
         is_native_held(entity),
+        paint.frame_for(entity),
         store.as_deref(),
     );
     let focused_abs_cg = abs_cg_rect(frame, window);
 
-    // The border belongs to the focused window at rest: hide it for the
-    // duration of an armed column drag rather than tracking a window
-    // mid-relocation (which reads as detached). Plain clicks hold unarmed
-    // markers, so they never flicker this.
-    let dragging_column = !armed_drag.is_empty();
-    if dragging_column {
-        trace!("hiding border for armed column drag");
-    }
-    let want_border = border_enabled && !dragging_column && {
+    // The border tracks the focused window through every drag — including
+    // armed column drags, whose lockstep layout frame doubles as the paint
+    // source while the drop ghost marks the landing slot. Plain clicks hold
+    // unarmed markers, so they never flicker.
+    let want_border = border_enabled && {
         // Parked slivers physically sit inside abutting displays; drawing the
         // focus border around one paints a stripe on the neighbor. The focused
         // window belongs on screen, so a center outside its owner display
@@ -1862,6 +1899,7 @@ pub(super) fn update_overlays(
                 window,
                 tracking_live,
                 is_native_held(entity),
+                paint.frame_for(entity),
                 store.as_deref(),
             );
             // Parked-sliver guard, generalized per window across displays.
@@ -2516,7 +2554,9 @@ mod tests {
 
 #[cfg(test)]
 mod seam_tests {
+    use super::CoalescedPointer;
     use super::seam_snap_target;
+    use crate::events::Event;
     use crate::manager::Origin;
     use bevy::math::IRect;
 
@@ -2571,5 +2611,62 @@ mod seam_tests {
             seam_snap_target(at(-500, 100), at(-400, 100), &[a(), b()]),
             None
         );
+    }
+
+    fn drag_point(event: &Event) -> Option<f64> {
+        match event {
+            Event::MouseDragged { point, .. } => Some(point.x),
+            _ => None,
+        }
+    }
+
+    fn dragged(x: f64) -> Event {
+        use objc2_core_foundation::CGPoint;
+
+        use crate::platform::Modifiers;
+        Event::MouseDragged {
+            point: CGPoint::new(x, 30.0),
+            modifiers: Modifiers::empty(),
+        }
+    }
+
+    #[test]
+    fn pointer_coalescing_folds_drag_bursts_to_newest() {
+        let mut coalesced = CoalescedPointer::default();
+        let mut events = Vec::new();
+        coalesced.push(&mut events, dragged(0.0));
+        coalesced.push(&mut events, dragged(10.0));
+        coalesced.push(&mut events, dragged(20.0));
+        assert!(events.is_empty(), "motion waits a step for supersession");
+        coalesced.flush(&mut events);
+        assert_eq!(events.len(), 1);
+        assert_eq!(drag_point(&events[0]), Some(20.0));
+    }
+
+    #[test]
+    fn pointer_coalescing_keeps_gesture_boundaries_ordered() {
+        use objc2_core_foundation::CGPoint;
+
+        use crate::platform::Modifiers;
+        let down = Event::MouseDown {
+            point: CGPoint::new(0.0, 30.0),
+            modifiers: Modifiers::empty(),
+        };
+        let up = Event::MouseUp {
+            point: CGPoint::new(20.0, 30.0),
+            modifiers: Modifiers::empty(),
+        };
+        let mut coalesced = CoalescedPointer::default();
+        let mut events = Vec::new();
+        coalesced.push(&mut events, down);
+        coalesced.push(&mut events, dragged(5.0));
+        coalesced.push(&mut events, dragged(15.0));
+        // Press flushes nothing pending; the two drags fold to one.
+        assert_eq!(events.len(), 1);
+        coalesced.push(&mut events, up);
+        // Release flushes the newest drag first, then itself.
+        assert_eq!(events.len(), 3);
+        assert_eq!(drag_point(&events[1]), Some(15.0));
+        assert!(matches!(events[2], Event::MouseUp { .. }));
     }
 }

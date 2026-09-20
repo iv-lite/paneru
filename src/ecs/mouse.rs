@@ -128,6 +128,7 @@ impl Plugin for MouseEventsPlugin {
         // dragging. Ordered after adoption so the hit-test reads fresh frames,
         // and after the synthetic move so transfer sees this tick's motion.
         app.init_resource::<DragModifierState>();
+        app.init_resource::<DragPaintState>();
         app.init_resource::<DragScrollState>();
         app.init_resource::<DropPreviewState>();
         app.add_systems(
@@ -295,6 +296,7 @@ fn mouse_down_trigger(
     config: Res<Config>,
     mouse_held: Query<Entity, With<MouseHeldMarker>>,
     mut scroll_state: ResMut<DragScrollState>,
+    mut paint: ResMut<DragPaintState>,
     mut logged_config: Local<bool>,
     mut commands: Commands,
 ) {
@@ -358,6 +360,10 @@ fn mouse_down_trigger(
         // mid-click. The Timeout auto-despawns if mouse-up is lost.
         let timeout = Timeout::new(Duration::from_secs(5), None, &mut commands);
         let mut holder = commands.spawn((MouseHeldMarker(entity), timeout));
+        // Seed the paint-only drag tracker: a native-owned drag keeps its
+        // layout slot pinned, so the border needs the grab frame plus the
+        // pointer deltas below to follow the cursor at input rate.
+        paint.begin(entity, window.frame());
         // A fresh press takes over from any previous release: the holder
         // (and the adoption lock on it) owns echo handling from here, so a
         // stale settle grace must not shadow it — notably an armed re-grab
@@ -517,6 +523,7 @@ fn mouse_up_trigger(
     drag_modifiers: Res<DragModifierState>,
     time: Res<Time>,
     mut scroll_state: ResMut<DragScrollState>,
+    mut paint: ResMut<DragPaintState>,
     mut commands: Commands,
 ) {
     for InputEvent(event) in messages.read() {
@@ -526,6 +533,9 @@ fn mouse_up_trigger(
         // The grab is over either way: never let a lost press leave native
         // drags swallowed.
         set_scroll_drag_suppress(false);
+        // The gesture is over: drop the paint-only drag offset so a later
+        // drag starts from its own grab frame.
+        paint.clear();
         let scroll_distance = std::mem::take(&mut scroll_state.distance_px);
         // Release velocity is per-gesture too: a stale EMA must never leak
         // into the next press (its MouseDown resets the sampler anyway).
@@ -680,6 +690,62 @@ impl DragScrollState {
         self.settle_deadline
             .is_some_and(|deadline| Instant::now() < deadline)
             && !self.members.is_empty()
+    }
+}
+
+/// Paint-only drag tracker: grab frame plus accumulated pointer offset for
+/// the current held gesture, so the border can follow a native-owned drag
+/// at input rate while the layout slot stays pinned (adoption skips held
+/// windows by design) and the 250ms snapshot would otherwise step.
+///
+/// Written from the `MouseDragged` stream, read by the overlay's
+/// `native_held` branch. Never written back to `Position`: release homing
+/// still owns the glide home. Seeded at press time (when the OS frame is
+/// at-rest accurate); a missed press simply leaves no gesture and the
+/// border falls back to snapshot/cached frames as before.
+#[derive(Debug, Resource, Default)]
+pub(crate) struct DragPaintState {
+    pub(crate) target: Option<Entity>,
+    pub(crate) grab_frame: Option<IRect>,
+    pub(crate) offset: Origin,
+}
+
+impl DragPaintState {
+    /// Seed a new gesture. Overwrites any stale state (e.g. a lost
+    /// mouse-up whose holder timed out).
+    pub(crate) fn begin(&mut self, target: Entity, grab_frame: IRect) {
+        self.target = Some(target);
+        self.grab_frame = Some(grab_frame);
+        self.offset = Origin::ZERO;
+    }
+
+    /// Accumulate one drag delta. Ignores deltas for a different target so
+    /// a stale press can never steer another window's border.
+    pub(crate) fn advance(&mut self, target: Entity, delta: Origin) {
+        if self.target == Some(target) {
+            self.offset += delta;
+        }
+    }
+
+    /// Current painted frame for `entity`, or `None` when no gesture tracks
+    /// it (missed press, already released).
+    pub(crate) fn frame_for(&self, entity: Entity) -> Option<IRect> {
+        if self.target != Some(entity) {
+            return None;
+        }
+        let grab = self.grab_frame?;
+        Some(IRect::from_corners(
+            grab.min + self.offset,
+            grab.max + self.offset,
+        ))
+    }
+
+    /// End the gesture. Called on mouse-up; the holder despawn covers the
+    /// timeout path (a lingering offset is unread without a live holder).
+    pub(crate) fn clear(&mut self) {
+        self.target = None;
+        self.grab_frame = None;
+        self.offset = Origin::ZERO;
     }
 }
 
@@ -964,6 +1030,7 @@ fn drag_move_held_column(
     config: Res<Config>,
     time: Res<Time>,
     mut scroll_state: ResMut<DragScrollState>,
+    mut paint: ResMut<DragPaintState>,
     mut state: Local<DragMoveState>,
 ) {
     for InputEvent(event) in messages.read() {
@@ -1006,6 +1073,12 @@ fn drag_move_held_column(
                     trace!("synthetic drag: held target is unmanaged, skipping");
                     continue;
                 }
+                // Paint-only tracking for native-owned drags: the layout
+                // slot stays pinned, but the border needs every pointer
+                // delta at input rate. Advanced for every managed held
+                // target regardless of branch — scroll/column paths ignore
+                // it, the native path paints it.
+                paint.advance(target, delta);
                 // Header scroll-drag (grab-time armed): feed the pointer delta
                 // into the shared modifier+scroll pipeline (see above).
                 // Armed modifier drags and legacy (scroll-disabled) drags
@@ -1820,6 +1893,42 @@ mod tests {
     fn slot_preview_pins_oversized_ghost_to_viewport() {
         let rect = slot_preview_rect(100, test_viewport(), Size::new(2000, 300));
         assert_eq!(rect, IRect::new(0, 20, 2000, 768));
+    }
+
+    #[test]
+    fn drag_paint_tracks_grab_frame_plus_pointer_offset() {
+        use bevy::ecs::entity::Entity;
+
+        let mut paint = DragPaintState::default();
+        let target = Entity::PLACEHOLDER;
+        assert_eq!(paint.frame_for(target), None, "no gesture, no frame");
+
+        let grab = IRect::new(0, 20, 400, 1020);
+        paint.begin(target, grab);
+        assert_eq!(
+            paint.frame_for(target),
+            Some(grab),
+            "zero offset paints grab"
+        );
+        paint.advance(target, Origin::new(50, 0));
+        paint.advance(target, Origin::new(0, 30));
+        assert_eq!(
+            paint.frame_for(target),
+            Some(IRect::new(50, 50, 450, 1050)),
+            "deltas accumulate 1:1 with the pointer"
+        );
+
+        let other = Entity::from_raw_u32(9999).expect("test entity");
+        assert_eq!(paint.frame_for(other), None, "foreign entity reads nothing");
+        paint.advance(other, Origin::new(500, 500));
+        assert_eq!(
+            paint.frame_for(target),
+            Some(IRect::new(50, 50, 450, 1050)),
+            "foreign deltas never steer the gesture"
+        );
+
+        paint.clear();
+        assert_eq!(paint.frame_for(target), None, "release ends the gesture");
     }
 
     #[test]
