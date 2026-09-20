@@ -19,8 +19,8 @@ use std::time::{Duration, Instant};
 use tracing::{Level, debug, error, info, instrument, trace, warn};
 
 use super::{
-    ActiveDisplayMarker, BProcess, DragDisplayArmed, ExistingMarker, FreshMarker, MouseHeldMarker,
-    RepositionMarker, ResizeMarker, RetryFrontSwitch, SpawnWindowTrigger, Timeout,
+    ActiveDisplayMarker, BProcess, DragDisplayArmed, DragScrollArmed, ExistingMarker, FreshMarker,
+    MouseHeldMarker, RepositionMarker, ResizeMarker, RetryFrontSwitch, SpawnWindowTrigger, Timeout,
     VerifyWindowPosition,
 };
 
@@ -389,6 +389,71 @@ pub(crate) fn place_startup_windows_on_live_displays(
     }
 }
 
+/// Sync phase at initialization: snap windows to columns with respect to
+/// current display placement.
+///
+/// Reorders each strip's columns left-to-right by live OS frame center `x`,
+/// preserving `Stack`/`Tabs` grouping (whole columns move, members never
+/// split) and never moving windows across strips/displays. Space membership
+/// stays authoritative; only intra-strip order changes. Windows without a
+/// known frame keep discovery order at the end (stable).
+///
+/// Runs inside `finish_setup` after space membership and live-display
+/// placement, before snap guards and before `Initializing` is removed, so
+/// the first layout pass snaps into already-correct slots. Unit-testable in
+/// isolation via `run_system_once`: pure query logic over strips and window
+/// frames.
+pub(crate) fn sort_startup_strips_by_live_x(
+    windows: &Windows,
+    workspaces: &mut Query<(
+        Entity,
+        &mut LayoutStrip,
+        Has<ActiveWorkspaceMarker>,
+        &ChildOf,
+    )>,
+) {
+    for (_, mut strip, _, _) in workspaces {
+        let n = strip.len();
+        if n < 2 {
+            continue;
+        }
+        let cols: Vec<Column> = (0..n).filter_map(|i| strip.get(i).ok()).collect();
+        if cols.len() < 2 {
+            continue;
+        }
+        let keys: Vec<Option<i32>> = cols
+            .iter()
+            .map(|col| {
+                col.top()
+                    .and_then(|entity| windows.frame(entity))
+                    .map(|frame| frame.center().x)
+                    .or_else(|| {
+                        col.window_iter()
+                            .find_map(|entity| windows.frame(entity).map(|frame| frame.center().x))
+                    })
+            })
+            .collect();
+        let mut order: Vec<usize> = (0..cols.len()).collect();
+        order.sort_by(|&a, &b| match (keys[a], keys[b]) {
+            (Some(xa), Some(xb)) => xa.cmp(&xb).then_with(|| a.cmp(&b)),
+            (Some(_), None) => std::cmp::Ordering::Less,
+            (None, Some(_)) => std::cmp::Ordering::Greater,
+            (None, None) => a.cmp(&b),
+        });
+        if order.iter().enumerate().all(|(i, &o)| i == o) {
+            continue;
+        }
+        let sorted: Vec<Column> = order.into_iter().map(|i| cols[i].clone()).collect();
+        for _ in 0..n {
+            strip.remove_column_at(0);
+        }
+        for col in sorted {
+            strip.insert_column_at(usize::MAX, col);
+        }
+        debug!("startup: sorted strip columns by live x");
+    }
+}
+
 #[instrument(level = Level::DEBUG, skip_all)]
 #[allow(clippy::too_many_arguments)]
 pub(crate) fn finish_setup(
@@ -438,7 +503,7 @@ pub(crate) fn finish_setup(
     );
 
     let mut focused_managed_window = false;
-    for (_strip_entity, mut strip, active_strip, _) in &mut workspaces {
+    for (_strip_entity, mut strip, _active_strip, _) in &mut workspaces {
         debug!("space {}: before refresh {strip:?}", strip.id());
         let workspace_windows = window_manager
             .windows_in_workspace(strip.id())
@@ -478,7 +543,23 @@ pub(crate) fn finish_setup(
             }
         }
         debug!("space {}: after refresh {strip:?}", strip.id());
+    }
 
+    // Startup placement by live OS display (see
+    // `place_startup_windows_on_live_displays`): the space-membership pass
+    // above is authoritative, but geometry fixes what it missed before the
+    // first layout tick.
+    place_startup_windows_on_live_displays(&windows, &mut workspaces, &displays, &window_manager);
+
+    // Sync phase: snap windows to columns with respect to current display
+    // placement. Sorts each strip's columns left-to-right by live frame
+    // center `x` (whole columns move, `Stack`/`Tabs` groups stay intact,
+    // never across strips). Must run before focus selection and snap guards
+    // so the first layout pass snaps into already-correct slots.
+    sort_startup_strips_by_live_x(&windows, &mut workspaces);
+
+    // Focus the leftmost column top of the active strip after the sync sort.
+    for (_, strip, active_strip, _) in &workspaces {
         if active_strip && let Some(entity) = strip.first().ok().and_then(|column| column.top()) {
             commands.focus_entity(entity, true);
             focused_managed_window = true;
@@ -505,12 +586,6 @@ pub(crate) fn finish_setup(
     {
         entity_commands.try_insert(FocusedMarker);
     }
-
-    // Startup placement by live OS display (see
-    // `place_startup_windows_on_live_displays`): the space-membership pass
-    // above is authoritative, but geometry fixes what it missed before the
-    // first layout tick.
-    place_startup_windows_on_live_displays(&windows, &mut workspaces, &displays, &window_manager);
 
     commands.remove_resource::<Initializing>();
     commands.trigger(RestoreWindowState);
@@ -1413,22 +1488,38 @@ fn pad_snapshot_frame(raw: IRect, window: &Window) -> IRect {
 /// Frame a border should hug for one window (the attach guarantee), in
 /// priority order:
 ///
-/// 1. The layout target while paneru drives or confirms the window — any of
-///    `RepositionMarker`, `ResizeMarker`, `VerifyWindowPosition` present — or
-///    while the strip scrolls, a drag is held, or a release settles. The OS
+/// 1. The live OS frame for a native-owned held drag (content grab with
+///    strip scrolling enabled): the layout slot is pinned stale by design
+///    (adoption skipped), so the slot would paint detached from the cursor.
+///    Snapshot first, cached OS frame as fallback — never the slot.
+/// 2. The current layout frame while paneru drives or confirms the window —
+///    any of `RepositionMarker`, `ResizeMarker`, `VerifyWindowPosition`
+///    present — or while the strip scrolls, a drag is held, or a release
+///    settles. This rides the lerped `Position` each frame instead of
+///    jumping to the `RepositionMarker` target, so focus moves, reshuffles
+///    and release homing stay attached through the animation. The OS
 ///    position trails AX commits through all of these; the cached frame
 ///    would paint a detached border.
-/// 2. A fresh snapshot frame: native moves/resizes bypass ECS, and the
+/// 3. A fresh snapshot frame: native moves/resizes bypass ECS, and the
 ///    snapshot sees them without a synchronous round trip.
-/// 3. The cached OS frame, last.
+/// 4. The cached OS frame, last.
 fn border_frame_for(
     windows: &Windows,
     flight: &FlightMarkers<'_, '_>,
     entity: Entity,
     window: &Window,
     tracking_live: bool,
+    native_held: bool,
     store: Option<&SnapshotStore>,
 ) -> IRect {
+    // Native-owned drag: layout never moved, so neither the slot nor the
+    // flight target means anything — track the OS truth instead.
+    if native_held {
+        if let Some(raw) = snapshot_live_frame(store, window.id(), SNAPSHOT_FRAME_MAX_AGE) {
+            return pad_snapshot_frame(raw, window);
+        }
+        return window.frame();
+    }
     let driving = tracking_live
         || flight
             .get(entity)
@@ -1436,7 +1527,10 @@ fn border_frame_for(
                 repositioning || resizing || verifying
             });
     if driving {
-        if let Some(frame) = windows.moving_frame(entity) {
+        // Ride the animation: `frame()` is the current lerped `Position`,
+        // while `moving_frame()` would substitute the final `Reposition` /
+        // `Resize` target and jump ahead of the window.
+        if let Some(frame) = windows.frame(entity) {
             // Trace-only pin for drag-detach diagnosis: during motion each
             // overlay tick must log a live frame that advances; a frozen
             // rect here with a scrolling strip means the layout stopped
@@ -1508,7 +1602,11 @@ pub(super) fn update_overlays(
     displays: Query<(Entity, &Display, Has<ActiveDisplayMarker>)>,
     strips: Query<(&LayoutStrip, &ChildOf)>,
     focus_markers: Query<(), With<FocusedMarker>>,
-    drag_held: Query<(), With<MouseHeldMarker>>,
+    drag_held: Query<(
+        &MouseHeldMarker,
+        Has<DragDisplayArmed>,
+        Has<DragScrollArmed>,
+    )>,
     armed_drag: Query<(), (With<MouseHeldMarker>, With<DragDisplayArmed>)>,
     flight: FlightMarkers<'_, '_>,
     scroll_grace: Res<DragScrollState>,
@@ -1592,12 +1690,13 @@ pub(super) fn update_overlays(
         return;
     }
 
-    // The focused window's frame: the layout target while paneru drives or
-    // confirms it, a fresh snapshot frame for native motion that bypassed
-    // ECS, the cached OS frame last (see `border_frame_for`). The grace arm
-    // matters most on the release tick itself: without it the border snaps
-    // backward to the stale cache for one tick and then freezes there until
-    // the next dirty tick.
+    // The focused window's frame (see `border_frame_for`): the current
+    // layout frame while paneru drives it (riding the animation, not the
+    // target), the live OS frame for native-owned held drags, a fresh
+    // snapshot frame for other native motion that bypassed ECS, the cached
+    // OS frame last. The grace arm matters most on the release tick itself:
+    // without it the border snaps backward to the stale cache for one tick
+    // and then freezes there until the next dirty tick.
     let tracking_live =
         overlay_tracks_live(swiping, !drag_held.is_empty(), scroll_grace.settle_active());
     if !drag_held.is_empty() {
@@ -1608,12 +1707,25 @@ pub(super) fn update_overlays(
             scroll_grace.settle_active(),
         );
     }
+    // A native-owned held drag (content grab with strip scrolling enabled:
+    // unarmed, not scroll-armed, so neither the column drive nor the strip
+    // scroll moved the slot) keeps its synthetic slot while the OS window
+    // follows the cursor — track the OS truth so the border rides the
+    // cursor. Legacy scroll-disabled drags drive the column directly and
+    // header scroll-drags drive the strip, so both keep the layout frame.
+    let is_native_held = |entity: Entity| {
+        config.left_drag_scrolls_strip()
+            && drag_held
+                .iter()
+                .any(|(marker, armed, scroll_armed)| marker.0 == entity && !armed && !scroll_armed)
+    };
     let frame = border_frame_for(
         &windows,
         &flight,
         entity,
         window,
         tracking_live,
+        is_native_held(entity),
         store.as_deref(),
     );
     let focused_abs_cg = abs_cg_rect(frame, window);
@@ -1702,6 +1814,7 @@ pub(super) fn update_overlays(
                 entity,
                 window,
                 tracking_live,
+                is_native_held(entity),
                 store.as_deref(),
             );
             // Parked-sliver guard, generalized per window across displays.
