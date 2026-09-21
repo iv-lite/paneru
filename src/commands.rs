@@ -71,17 +71,26 @@ type StripsWithVisibility<'w, 's> = Query<
 pub fn register_commands(app: &mut bevy::app::App) {
     // Registered here (not with the Lua systems) so it's exercised by the mock
     // harness without a running interpreter.
+    // All command readers run after the pump publishes this frame's events:
+    // otherwise a command can sit a full frame behind input nondeterministically.
+    use crate::ecs::systems::pump_events;
+
     #[cfg(feature = "lua")]
     app.add_systems(
         PreUpdate,
-        crate::ecs::layout_ops::apply_layout_ops.run_if(not(resource_exists::<ColdStart>)),
+        crate::ecs::layout_ops::apply_layout_ops
+            .run_if(not(resource_exists::<ColdStart>))
+            .after(pump_events),
     );
 
     query::register_query_commands(app);
     // Empty store so the mock harness and saveless runs still have one to
     // answer from; the real app overwrites it from disk.
     app.init_resource::<crate::ecs::script_state::ScriptStateStore>();
-    app.add_systems(PreUpdate, crate::ecs::script_state::script_state_handler);
+    app.add_systems(
+        PreUpdate,
+        crate::ecs::script_state::script_state_handler.after(pump_events),
+    );
     // Quit/restart/state reads stay live during warmup; everything that
     // mutates strips, focus, or window state parks behind `ColdStart` (see
     // `park_cold_commands`) instead of applying to the half-built world.
@@ -91,7 +100,8 @@ pub fn register_commands(app: &mut bevy::app::App) {
             command_quit_handler,
             command_restart_handler,
             print_internal_state_handler,
-        ),
+        )
+            .after(pump_events),
     );
     app.add_systems(
         PreUpdate,
@@ -114,7 +124,8 @@ pub fn register_commands(app: &mut bevy::app::App) {
             command_swap_focus,
             snap_window,
         )
-            .run_if(not(resource_exists::<ColdStart>)),
+            .run_if(not(resource_exists::<ColdStart>))
+            .after(pump_events),
     );
     // A separate registration because the tuple above is already at Bevy's
     // 20-system limit.
@@ -301,7 +312,8 @@ fn focus_arrival_center(
 }
 
 /// Handles West on a fullscreen space: swaps to the last column of the
-/// owning workspace. Returns true when it consumed the command.
+/// owning workspace. Returns the focused entity when it consumed the
+/// command, `None` when handling should fall through to normal routing.
 #[allow(clippy::too_many_arguments)]
 fn focus_fullscreen_west(
     direction: &Direction,
@@ -314,31 +326,29 @@ fn focus_fullscreen_west(
     )>,
     focus_history: &mut ResMut<FocusHistory>,
     commands: &mut Commands,
-) -> bool {
-    if let Some(NativeFullscreenMarker {
+) -> Option<Entity> {
+    if !matches!(direction, Direction::West) {
+        return None;
+    }
+    let NativeFullscreenMarker {
         layout_strip,
         workspace_id,
-        index: _,
-    }) = active_display.fullscreen()
-        && matches!(direction, Direction::West)
-    {
-        let mut strip = workspaces
+        ..
+    } = active_display.fullscreen()?;
+    let mut strip = workspaces
+        .into_iter()
+        .find_map(|(strip, entity, _, _)| (entity == *layout_strip).then_some(strip));
+    if strip.is_none() {
+        strip = workspaces
             .into_iter()
-            .find_map(|(strip, entity, _, _)| (entity == *layout_strip).then_some(strip));
-        if strip.is_none() {
-            strip = workspaces
-                .into_iter()
-                .find_map(|(strip, _, _, _)| (strip.id() == *workspace_id).then_some(strip));
-        }
-
-        if let Some(entity) = strip.and_then(|strip| strip.last().ok().and_then(|col| col.top())) {
-            debug!("fullscreen: swap raising {entity}");
-            focus_history.pending_focus = Some(entity);
-            commands.focus_entity(entity, true);
-        }
-        return true;
+            .find_map(|(strip, _, _, _)| (strip.id() == *workspace_id).then_some(strip));
     }
-    false
+
+    let entity = strip.and_then(|strip| strip.last().ok().and_then(|col| col.top()))?;
+    debug!("fullscreen: swap raising {entity}");
+    focus_history.pending_focus = Some(entity);
+    commands.focus_entity(entity, true);
+    Some(entity)
 }
 
 /// Handles the "focus" command, moving focus to a window in a specified direction.
@@ -373,28 +383,94 @@ fn command_move_focus(
     mut focus_history: ResMut<FocusHistory>,
     mut commands: Commands,
 ) {
-    let Some(Operation::Focus(direction)) =
-        filter_window_operations(&mut messages, |op| matches!(op, Operation::Focus(_))).next()
-    else {
-        return;
-    };
+    // Drain every queued press: N rapid repeats in one pump batch become
+    // N focus steps, not one. Deferred focus markers are invisible until
+    // flush, so repeats chain through the local `arrival` instead of
+    // re-reading live focus (which would repeat the first step).
+    let mut arrival: Option<Entity> = None;
+    for op in filter_window_operations(&mut messages, |op| matches!(op, Operation::Focus(_))) {
+        let Operation::Focus(direction) = op else {
+            continue;
+        };
+        let anchor = arrival.or_else(|| windows.focused().map(|(_, entity)| entity));
+        let Some(anchor) = anchor else {
+            continue;
+        };
 
+        if let Some(entity) = focus_move_step(
+            direction,
+            anchor,
+            &windows,
+            &workspaces,
+            &active_display,
+            &window_manager,
+            &config,
+            &mouse_held,
+            &restored,
+            &global_state,
+            &mut focus_history,
+            &mut commands,
+        ) {
+            arrival = Some(entity);
+            continue;
+        }
+        // North/South fall-through past the strip is handled inline below
+        // (it needs the same locals); other directions simply had no target.
+        if !matches!(direction, Direction::North | Direction::South) {
+            continue;
+        }
+        let north = matches!(direction, Direction::North);
+        let Some((target_id, target_bounds)) = active_display.above_or_below(north) else {
+            continue;
+        };
+        debug!("moving focus to display {target_id}");
+        warp_mouse_to_display(
+            target_id,
+            target_bounds,
+            &windows,
+            &layout_strips,
+            &window_manager,
+            &mut commands,
+        );
+    }
+}
+
+/// One same-strip focus step from `focused_entity`. Returns the entity
+/// holding focus afterwards when the press is fully handled (focus moved,
+/// or an edge case consumed it without moving); `None` when North/South
+/// should fall through to the display warp handled by the caller.
+#[allow(clippy::too_many_arguments)]
+fn focus_move_step(
+    direction: &Direction,
+    focused_entity: Entity,
+    windows: &Windows,
+    workspaces: &Query<(
+        &LayoutStrip,
+        Entity,
+        Option<&NativeFullscreenMarker>,
+        &ChildOf,
+    )>,
+    active_display: &ActiveDisplay,
+    window_manager: &WindowManager,
+    config: &Config,
+    mouse_held: &Query<Entity, With<MouseHeldMarker>>,
+    restored: &Query<&RestoreFocusMarker>,
+    global_state: &GlobalState,
+    focus_history: &mut ResMut<FocusHistory>,
+    commands: &mut Commands,
+) -> Option<Entity> {
     let active_strip = active_display.active_strip();
 
     // On a fullscreen space, swap to the last column in the workspace.
-    if focus_fullscreen_west(
+    if let Some(entity) = focus_fullscreen_west(
         direction,
-        &active_display,
-        &workspaces,
-        &mut focus_history,
-        &mut commands,
+        active_display,
+        workspaces,
+        focus_history,
+        commands,
     ) {
-        return;
+        return Some(entity);
     }
-
-    let Some((_, focused_entity)) = windows.focused() else {
-        return;
-    };
 
     if let Some((_, _, Some(Unmanaged::Floating))) = windows.get_managed(focused_entity)
         && !matches!(direction, Direction::Nth(_))
@@ -402,15 +478,16 @@ fn command_move_focus(
         if let Some(entity) = nearest_float_in_direction(
             direction,
             focused_entity,
-            &windows,
-            &window_manager,
+            windows,
+            window_manager,
             active_strip.id(),
             active_display.bounds(),
         ) {
             focus_history.pending_focus = Some(entity);
             commands.focus_entity(entity, true);
+            return Some(entity);
         }
-        return;
+        return Some(focused_entity);
     }
 
     // If focus is on a window that no longer lives in the active strip
@@ -457,41 +534,23 @@ fn command_move_focus(
         focus_history.pending_focus = Some(entity);
         focus_arrival_center(
             entity,
-            &windows,
-            &active_display,
-            &config,
-            &mouse_held,
-            &restored,
-            &global_state,
-            &mut commands,
+            windows,
+            active_display,
+            config,
+            mouse_held,
+            restored,
+            global_state,
+            commands,
         );
         commands.focus_entity(entity, true);
         // Explicitly reshuffle so the target window is brought into view.
         // This avoids a race where focus-follows-mouse leaves skip_reshuffle
         // set, causing the WindowFocused handler to skip the reshuffle.
         commands.reshuffle_around(entity);
-        return;
+        return Some(entity);
     }
 
-    // Check if the movement can switch to another display: North moves
-    // focus to the nearest display above, South to the nearest below.
-    let north = match direction {
-        Direction::North => true,
-        Direction::South => false,
-        _ => return,
-    };
-    let Some((target_id, target_bounds)) = active_display.above_or_below(north) else {
-        return;
-    };
-    debug!("moving focus to display {target_id}");
-    warp_mouse_to_display(
-        target_id,
-        target_bounds,
-        &windows,
-        &layout_strips,
-        &window_manager,
-        &mut commands,
-    );
+    None
 }
 
 fn command_focus_unmanaged(

@@ -1904,6 +1904,11 @@ fn pad_snapshot_frame(raw: IRect, window: &Window) -> IRect {
 /// 3. A fresh snapshot frame: native moves/resizes bypass ECS, and the
 ///    snapshot sees them without a synchronous round trip.
 /// 4. The cached OS frame, last.
+///
+/// `chase` is the fraction of the remaining distance to the layout target
+/// painted ahead (one animator step at the current rate over the frame
+/// lead), so the border lands where the window will be at present time
+/// instead of where it was at commit time. Zero disables the chase.
 #[allow(clippy::too_many_arguments)]
 fn border_frame_for(
     windows: &Windows,
@@ -1913,6 +1918,7 @@ fn border_frame_for(
     tracking_live: bool,
     native_held: bool,
     paint_frame: Option<IRect>,
+    chase: f32,
     store: Option<&SnapshotStore>,
 ) -> IRect {
     // Native-owned drag: layout never moved, so neither the slot nor the
@@ -1939,13 +1945,20 @@ fn border_frame_for(
     if driving {
         // Ride the animation: `frame()` is the current lerped `Position`,
         // while `moving_frame()` would substitute the final `Reposition` /
-        // `Resize` target and jump ahead of the window.
+        // `Resize` target and jump ahead of the window. The chase advances
+        // one lead-step toward that target, so at display rate the border
+        // meets the window instead of trailing a frame behind it.
         if let Some(frame) = windows.frame(entity) {
             // Trace-only pin for drag-detach diagnosis: during motion each
             // overlay tick must log a live frame that advances; a frozen
             // rect here with a scrolling strip means the layout stopped
             // rewriting window positions (not an overlay gating miss).
             trace!("overlay live frame for {entity}: {frame:?}");
+            if chase > 0.0
+                && let Some(target) = windows.moving_frame(entity)
+            {
+                return chase_frame_toward(frame, target, chase);
+            }
             return frame;
         }
         trace!("overlay driving {entity} but no layout frame, falling back to OS frame");
@@ -1953,6 +1966,27 @@ fn border_frame_for(
         return pad_snapshot_frame(raw, window);
     }
     window.frame()
+}
+
+/// Advances `frame` toward `target` by one animator step (`chase`
+/// fraction of the remaining distance), so at display rate the border
+/// meets the window instead of trailing a frame behind it. Pure math —
+/// unit tested; no-op when already there or the chase is off.
+fn chase_frame_toward(frame: IRect, target: IRect, chase: f32) -> IRect {
+    if chase <= 0.0 {
+        return frame;
+    }
+    #[allow(
+        clippy::cast_possible_truncation,
+        reason = "one lead-step of a screen rect; sub-pixel precision is lost"
+    )]
+    let step = |remaining: i32| (f64::from(remaining) * f64::from(chase)).round() as i32;
+    let mut moved = frame;
+    moved.min.x += step(target.min.x - frame.min.x);
+    moved.min.y += step(target.min.y - frame.min.y);
+    moved.max.x += step(target.max.x - frame.max.x);
+    moved.max.y += step(target.max.y - frame.max.y);
+    moved
 }
 
 /// Absolute CG rect of a layout frame, corrected for window padding.
@@ -2139,9 +2173,12 @@ pub(super) fn update_overlays(
     // grab frame plus pointer EMA keeps the border on the cursor at display
     // rate instead of a frame behind the last event. Stale samples decay
     // to the plain offset inside the paint state, so holding still can
-    // never drift the rect.
+    // never drift the rect. The same lead drives the animation chase in
+    // `border_frame_for` (one animator step ahead at the current rate),
+    // which under vsync pacing equals one retrace period.
     let paint_now = time.elapsed();
     let paint_lead = time.delta_secs_f64().clamp(0.0, 0.05);
+    let chase = ease_out_factor(config.animation_speed(), paint_lead);
     let frame = border_frame_for(
         &windows,
         &flight,
@@ -2150,6 +2187,7 @@ pub(super) fn update_overlays(
         tracking_live,
         is_native_held(entity),
         paint.predicted_frame_for(entity, paint_now, paint_lead),
+        chase,
         store.as_deref(),
     );
     let focused_abs_cg = abs_cg_rect(frame, window);
@@ -2237,6 +2275,7 @@ pub(super) fn update_overlays(
                 tracking_live,
                 is_native_held(entity),
                 paint.predicted_frame_for(entity, paint_now, paint_lead),
+                chase,
                 store.as_deref(),
             );
             // Parked-sliver guard, generalized per window across displays.
@@ -2947,6 +2986,7 @@ mod tests {
 #[cfg(test)]
 mod seam_tests {
     use super::CoalescedPointer;
+    use super::chase_frame_toward;
     use super::seam_snap_target;
     use super::{PARKED_COMMAND_CAP, ParkedCommands, WarmupStatus, warmup_ready};
     use crate::events::Event;
@@ -3161,5 +3201,27 @@ mod seam_tests {
             }
             _ => panic!("expected the four-finger run"),
         }
+    }
+
+    #[test]
+    fn chase_frame_advances_one_step_toward_target() {
+        let frame = IRect::new(0, 20, 400, 768);
+        let target = IRect::new(100, 20, 500, 768);
+        // Zero chase disables: current frame paints as-is.
+        assert_eq!(chase_frame_toward(frame, target, 0.0), frame);
+        // Full chase lands on the target (instant-speed behavior).
+        assert_eq!(chase_frame_toward(frame, target, 1.0), target);
+        // Half chase advances half the remaining distance on every edge.
+        assert_eq!(
+            chase_frame_toward(frame, target, 0.5),
+            IRect::new(50, 20, 450, 768)
+        );
+        // Already there never drifts, even at full chase.
+        assert_eq!(chase_frame_toward(target, target, 1.0), target);
+        // Works backing up too (negative remaining).
+        assert_eq!(
+            chase_frame_toward(target, frame, 0.5),
+            IRect::new(50, 20, 450, 768)
+        );
     }
 }

@@ -857,3 +857,21 @@ fn test_center_single_column_detach_lands_centered() {
         })
         .run(commands);
 }
+
+/// Rapid repeats in one pump batch become one focus step each: two East
+/// presses written before a single update move focus 0 -> 1 -> 2, instead
+/// of collapsing to one step per tick.
+#[test]
+fn test_rapid_focus_repeats_drain_in_one_tick() {
+    let mut h = TestHarness::new().with_windows(3);
+    h.run(vec![Event::MenuOpened { window_id: 0 }]);
+    assert_focused!(h.app.world_mut(), 0);
+    h.app.world_mut().write_message::<Event>(Event::Command {
+        command: Command::Window(Operation::Focus(Direction::East)),
+    });
+    h.app.world_mut().write_message::<Event>(Event::Command {
+        command: Command::Window(Operation::Focus(Direction::East)),
+    });
+    h.app.update();
+    assert_focused!(h.app.world_mut(), 2);
+}

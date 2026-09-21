@@ -139,10 +139,13 @@ pub fn register_systems(app: &mut bevy::app::App) {
     // A fresh snapshot generation re-runs the overlay even when nothing else
     // dirtied it: border attachment reads snapshot frames, and the worker
     // wakes the pump on change precisely so native motion repaints promptly.
+    // Compares `changed_epoch` (real frame/on-screen differences only), not
+    // the always-advancing `epoch`, so no-op generations at fast cadence
+    // don't force repaints.
     // `Local` (not a resource): the epoch cursor belongs to this gate alone.
     // Overlay-only, like above.
     let snapshot_advanced = |store: Option<Res<SnapshotStore>>, mut last: Local<u64>| {
-        let epoch = store.as_deref().map_or(0, |s| s.0.load().epoch);
+        let epoch = store.as_deref().map_or(0, |s| s.0.load().changed_epoch);
         let advanced = epoch != *last;
         *last = epoch;
         advanced

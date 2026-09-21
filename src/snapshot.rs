@@ -68,13 +68,16 @@ pub(crate) struct WindowSnapshot {
 
 /// One published AX generation. Monotonic `epoch` is the ordering key later
 /// steps use to correlate reads against write-behind commits; `at` bounds
-/// staleness fallbacks.
+/// staleness fallbacks. `changed_epoch` only advances when frames or the
+/// on-screen set actually differ (the same condition that wakes the pump),
+/// so overlay gating can skip no-op generations without loading frames.
 ///
 /// Staging allow like [`WindowSnapshot`]: published now, consumed next step.
 #[allow(dead_code)]
 #[derive(Clone, Debug)]
 pub(crate) struct AxSnapshot {
     pub epoch: u64,
+    pub changed_epoch: u64,
     pub at: Instant,
     pub windows: HashMap<WinID, WindowSnapshot>,
     /// Per-space window membership (all spaces of all present displays).
@@ -92,6 +95,7 @@ impl Default for AxSnapshot {
     fn default() -> Self {
         Self {
             epoch: 0,
+            changed_epoch: 0,
             at: Instant::now(),
             windows: HashMap::new(),
             spaces: HashMap::new(),
@@ -223,6 +227,54 @@ fn snapshot_windows(
         windows.insert(*win_id, snapshot);
     }
     windows
+}
+
+/// Slow-cadence enumeration (displays, spaces, radii) extracted from
+/// [`run`] so the loop stays under the line budget. SLS failures keep the
+/// previous generation's data (never clear on a transient error); the next
+/// slow tick retries.
+#[allow(clippy::too_many_arguments)]
+fn refresh_slow_state(
+    radii: &mut HashMap<WinID, Option<f64>>,
+    handles: &RosterHandles,
+    displays: &mut Vec<(Display, Vec<WorkspaceId>)>,
+    spaces: &mut HashMap<WorkspaceId, Vec<WinID>>,
+    active_space: &mut HashMap<u32, WorkspaceId>,
+    active_display: &mut Option<u32>,
+    window_manager: &WindowManagerOS,
+) {
+    refresh_radii(radii, handles);
+    let fresh_displays = window_manager.present_displays();
+    if fresh_displays.is_empty() {
+        debug!("ax snapshot: empty display list, keeping previous set");
+        return;
+    }
+    let mut fresh_spaces = HashMap::new();
+    let mut fresh_active_space = HashMap::new();
+    for (display, workspaces) in &fresh_displays {
+        if let Ok(space) = window_manager.active_display_space(display.id()) {
+            fresh_active_space.insert(display.id(), space);
+        }
+        for space in workspaces {
+            match window_manager.windows_in_workspace(*space) {
+                Ok(ids) => {
+                    fresh_spaces.insert(*space, ids);
+                }
+                Err(err) => {
+                    debug!("ax snapshot: space {space} enumeration failed: {err}");
+                }
+            }
+        }
+    }
+    *displays = fresh_displays;
+    *spaces = fresh_spaces;
+    *active_space = fresh_active_space;
+    match window_manager.active_display_id() {
+        Ok(id) => *active_display = Some(id),
+        Err(err) => {
+            debug!("ax snapshot: active display query failed: {err}");
+        }
+    }
 }
 
 /// Maximum age of a snapshot on-screen set consumers trust. The worker
@@ -362,6 +414,7 @@ fn run(
     // on-screen set. Compared every tick; the pump wakes only on change.
     let mut last_frames: HashMap<WinID, Option<IRect>> = HashMap::new();
     let mut last_on_screen: HashSet<WinID> = HashSet::new();
+    let mut last_changed_epoch: u64 = 0;
 
     loop {
         match roster.recv_timeout(if fast_poll {
@@ -389,38 +442,15 @@ fn run(
         }
 
         if ticks.is_multiple_of(SLOW_EVERY_TICKS) {
-            refresh_radii(&mut radii, &handles);
-            let fresh_displays = window_manager.present_displays();
-            if fresh_displays.is_empty() {
-                debug!("ax snapshot: empty display list, keeping previous set");
-            } else {
-                let mut fresh_spaces = HashMap::new();
-                let mut fresh_active_space = HashMap::new();
-                for (display, workspaces) in &fresh_displays {
-                    if let Ok(space) = window_manager.active_display_space(display.id()) {
-                        fresh_active_space.insert(display.id(), space);
-                    }
-                    for space in workspaces {
-                        match window_manager.windows_in_workspace(*space) {
-                            Ok(ids) => {
-                                fresh_spaces.insert(*space, ids);
-                            }
-                            Err(err) => {
-                                debug!("ax snapshot: space {space} enumeration failed: {err}");
-                            }
-                        }
-                    }
-                }
-                displays = fresh_displays;
-                spaces = fresh_spaces;
-                active_space = fresh_active_space;
-                match window_manager.active_display_id() {
-                    Ok(id) => active_display = Some(id),
-                    Err(err) => {
-                        debug!("ax snapshot: active display query failed: {err}");
-                    }
-                }
-            }
+            refresh_slow_state(
+                &mut radii,
+                &handles,
+                &mut displays,
+                &mut spaces,
+                &mut active_space,
+                &mut active_display,
+                &window_manager,
+            );
         }
 
         epoch += 1;
@@ -428,13 +458,20 @@ fn run(
             .iter()
             .map(|(win_id, snapshot)| (*win_id, snapshot.frame))
             .collect();
+        // `changed_epoch` only advances with real differences (same
+        // condition as the wake): overlay gating compares against it so
+        // no-op generations at fast cadence don't force repaints.
+        let mut changed_epoch = last_changed_epoch;
         if frames != last_frames || on_screen != last_on_screen {
             last_frames = frames;
             last_on_screen.clone_from(&on_screen);
+            changed_epoch = epoch;
             waker.wake();
         }
+        last_changed_epoch = changed_epoch;
         published.store(Arc::new(AxSnapshot {
             epoch,
+            changed_epoch,
             at: Instant::now(),
             windows,
             spaces: spaces.clone(),
