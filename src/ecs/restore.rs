@@ -7,6 +7,7 @@ use bevy::ecs::observer::On;
 use bevy::ecs::query::Has;
 use bevy::ecs::resource::Resource;
 use bevy::ecs::system::{Commands, Query, Res, ResMut};
+use bevy::math::IRect;
 use bevy::time::{Time, Timer, TimerMode, Virtual};
 use objc2_core_graphics::CGDirectDisplayID;
 use tracing::{Level, info, instrument, warn};
@@ -15,7 +16,7 @@ use crate::config::{Config, MissingWindowBehavior};
 use crate::ecs::layout::{LayoutStrip, PARKED_STRIP_SLIVER};
 use crate::ecs::params::{WindowCtx, Windows};
 use crate::ecs::state::{
-    PaneruState, SavedColumn, SavedStackItem, SavedStrip, SavedWindow, SavedWorkspace,
+    PaneruState, SavedColumn, SavedRect, SavedStackItem, SavedStrip, SavedWindow, SavedWorkspace,
 };
 use crate::ecs::workspace::PreviousStripPosition;
 use crate::ecs::{
@@ -45,6 +46,8 @@ impl SessionRestore {
 pub(super) fn tick_restore_grace(
     time: Res<Time<Virtual>>,
     mut session: Option<ResMut<SessionRestore>>,
+    apps: Query<&Application>,
+    config: Res<Config>,
     mut commands: Commands,
 ) {
     let Some(session) = session.as_mut() else {
@@ -54,6 +57,23 @@ pub(super) fn tick_restore_grace(
     session.timer.tick(time.delta());
     if session.timer.is_finished() {
         info!("Session restore grace period ended");
+        if config.restore_missing_windows() == MissingWindowBehavior::Drop {
+            // Drop saved windows whose app never opened: without this the
+            // stale entries (with their cached displays) sit in the file
+            // until the next save and can resurrect across a crash before
+            // it. Late launches inside the grace already matched above.
+            let launched: HashSet<String> = apps.iter().filter_map(|app| app.bundle_id()).collect();
+            let removed = session.state.prune_unlaunched(&launched);
+            if removed > 0 {
+                info!("Session restore dropping {removed} window(s) from unlaunched apps");
+                if let Err(err) = session
+                    .state
+                    .save_to_file(&PaneruState::default_state_file_path())
+                {
+                    warn!("Session restore failed to rewrite state file: {err}");
+                }
+            }
+        }
         commands.remove_resource::<SessionRestore>();
         commands.remove_resource::<PaneruState>();
     }
@@ -128,6 +148,9 @@ pub(crate) struct PlannedStrip {
     pub display_id: Option<CGDirectDisplayID>,
     pub virtual_index: u32,
     pub columns: Vec<PlannedColumn>,
+    /// First saved frame among the strip's windows, for geometric display
+    /// fallback when the saved display id is gone (undock/reorder).
+    pub fallback_frame: Option<SavedRect>,
 }
 
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
@@ -195,6 +218,7 @@ impl<'a> RestorePlanner<'a> {
             display_id: workspace.display_id,
             virtual_index: strip.virtual_index,
             columns,
+            fallback_frame: first_saved_frame(strip),
         })
     }
 
@@ -423,7 +447,9 @@ pub(super) fn restore_window_state(
             return;
         }
         match ctx.config.restore_missing_windows() {
-            MissingWindowBehavior::Ignore => {}
+            // Drop is enforced at grace expiry (see `tick_restore_grace`),
+            // not here: late launches inside the window must still match.
+            MissingWindowBehavior::Ignore | MissingWindowBehavior::Drop => {}
         }
         ctx.commands.insert_resource(SessionRestore::new(
             restoration.clone(),
@@ -490,6 +516,7 @@ pub(super) fn restore_window_state(
         let Some((display_entity, display)) = select_display(
             planned.workspace_id,
             planned.display_id,
+            planned.fallback_frame,
             &existing_workspace_parents,
             &displays,
         ) else {
@@ -653,6 +680,7 @@ fn hydrate_fallback_identities(
 fn select_display<'a>(
     workspace_id: WorkspaceId,
     planned_display_id: Option<CGDirectDisplayID>,
+    fallback_frame: Option<SavedRect>,
     existing_workspace_parents: &HashMap<WorkspaceId, Entity>,
     displays: &'a Query<(Entity, &Display, Has<ActiveDisplayMarker>)>,
 ) -> Option<(Entity, &'a Display)> {
@@ -680,6 +708,30 @@ fn select_display<'a>(
             "Session restore remapping workspace {} from missing display {}",
             workspace_id, display_id
         );
+        // Geometric fallback: the saved id is gone (undock/reorder), so
+        // place by largest overlap with the saved frame instead of piling
+        // onto the active display below.
+        if let Some(frame) = fallback_frame {
+            let frame = IRect::new(frame.min_x, frame.min_y, frame.max_x, frame.max_y);
+            if let Some(((target_entity, target_display, _), _)) = displays
+                .iter()
+                .map(|(entity, candidate, active)| {
+                    let overlap = frame.intersect(candidate.bounds());
+                    let area =
+                        i64::from(overlap.width().max(0)) * i64::from(overlap.height().max(0));
+                    ((entity, candidate, active), area)
+                })
+                .filter(|(_, area)| *area > 0)
+                .max_by_key(|(_, area)| *area)
+            {
+                info!(
+                    "Session restore placing workspace {} by saved-frame overlap on display {}",
+                    workspace_id,
+                    target_display.id()
+                );
+                return Some((target_entity, target_display));
+            }
+        }
     }
 
     if let Some(display_entity) = existing_workspace_parents.get(&workspace_id)
@@ -742,6 +794,23 @@ fn append_stack_item(strip: &mut LayoutStrip, item: &PlannedStackItem) -> Option
         }
         PlannedStackItem::Tabs(entities) => append_tabs(strip, entities),
     }
+}
+
+/// First saved frame among a strip's windows, for geometric display
+/// fallback at restore. Best-effort: windows of one workspace normally
+/// share a display, so any saved frame anchors the overlap search.
+fn first_saved_frame(strip: &SavedStrip) -> Option<SavedRect> {
+    fn column_frame(column: &SavedColumn) -> Option<SavedRect> {
+        match column {
+            SavedColumn::Single(saved) | SavedColumn::Fullscreen(saved) => saved.frame,
+            SavedColumn::Tabs(tabs) => tabs.iter().find_map(|saved| saved.frame),
+            SavedColumn::Stack(items) => items.iter().find_map(|item| match item {
+                SavedStackItem::Single(saved) => saved.frame,
+                SavedStackItem::Tabs(tabs) => tabs.iter().find_map(|saved| saved.frame),
+            }),
+        }
+    }
+    strip.columns.iter().find_map(column_frame)
 }
 
 fn compact_entities(entities: Vec<Entity>) -> Option<PlannedColumn> {

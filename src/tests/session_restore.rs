@@ -541,10 +541,12 @@ fn test_startup_restore_overrides_floating_config_for_matched_window() {
 }
 
 #[test]
-fn test_cold_start_parks_commands_until_restore_grace_ends() {
+fn test_focus_bypasses_cold_park_after_init() {
     // Window 0 hard-matches the saved strip, so a 2s virtual restore grace
-    // starts. A focus-East command issued mid-grace must park (focus stays
-    // put, warmup stays present) and replay in order once the grace ends.
+    // starts and warmup stays present. A focus-East command issued mid-grace
+    // must NOT park: init already laid the layout down, so directional
+    // focus applies immediately (same condition as the consumer gate, so
+    // the bypass never strands a command). Other commands keep parking.
     let mut harness = TestHarness::new().with_windows(2);
     harness
         .world()
@@ -568,12 +570,12 @@ fn test_cold_start_parks_commands_until_restore_grace_ends() {
     }
 
     harness
-        .on_iteration(5, |world, _state| {
+        .on_iteration(1, |world, _state| {
+            assert_focused!(world, 1);
             assert!(
                 world.contains_resource::<ColdStart>(),
-                "warmup waits out the restore grace"
+                "warmup still waits out the restore grace"
             );
-            assert_focused!(world, 0);
         })
         .on_iteration(12, |world, _state| {
             assert!(
@@ -808,5 +810,7 @@ fn saved_window(window_id: i32) -> SavedWindow {
         identifier: String::new(),
         role: "AXWindow".to_string(),
         subrole: "AXStandardWindow".to_string(),
+        display_id: None,
+        frame: None,
     }
 }

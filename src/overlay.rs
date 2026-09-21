@@ -392,8 +392,9 @@ impl OverlayManager {
     }
 
     /// Order out every border window but keep them cached, so the next sync
-    /// re-shows without rebuilding.
-    fn hide_borders(&mut self) {
+    /// re-shows without rebuilding. Used for the drag blackout: borders
+    /// hide for the gesture while dim and the drop ghost keep painting.
+    pub(crate) fn hide_borders(&mut self) {
         for border in self.borders.values() {
             border.window.orderOut(None::<&AnyObject>);
         }

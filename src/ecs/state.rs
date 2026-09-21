@@ -29,7 +29,10 @@ use crate::snapshot::{SnapshotStore, TitleInvalidations, snapshot_title};
 use paneru_shared_types::windowset::WindowSet;
 
 pub const STATE_FILE_NAME: &str = "state.json";
-const SUPPORTED_STATE_VERSION: u32 = 2;
+const SUPPORTED_STATE_VERSION: u32 = 3;
+/// Older files we still read: v2 lacks per-window display/frame (filled as
+/// `None`, restoring old behavior). Anything else is dropped.
+const BACKFILL_STATE_VERSION: u32 = 2;
 
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Resource)]
 pub struct PaneruState {
@@ -98,6 +101,13 @@ pub struct SavedWindow {
     pub identifier: String,
     pub role: String,
     pub subrole: String,
+
+    // Display memory: which display (and frame) the window had when saved,
+    // so restore can put it back after undock/reorder. `None` on v2 files.
+    #[serde(default)]
+    pub display_id: Option<CGDirectDisplayID>,
+    #[serde(default)]
+    pub frame: Option<SavedRect>,
 }
 
 // These wire-format types live in the shared `paneru_shared_types` crate;
@@ -144,6 +154,7 @@ impl SavedWindow {
         entity: Entity,
         windows: &Windows,
         apps: &Query<&Application>,
+        display_id: Option<CGDirectDisplayID>,
     ) -> Option<Self> {
         let window = windows.get(entity)?;
         let (_, _, app_entity) = windows.find_parent(window.id())?;
@@ -158,6 +169,8 @@ impl SavedWindow {
             identifier: window.identifier().unwrap_or_default(),
             role: window.role().unwrap_or_default(),
             subrole: window.subrole().unwrap_or_default(),
+            display_id,
+            frame: windows.frame(entity).map(SavedRect::from),
         })
     }
 
@@ -203,20 +216,23 @@ impl PaneruState {
             for col in strip.columns() {
                 let saved_col = match col {
                     Column::Single(entity) => {
-                        SavedWindow::from_entity(*entity, windows, apps).map(SavedColumn::Single)
+                        SavedWindow::from_entity(*entity, windows, apps, display_id)
+                            .map(SavedColumn::Single)
                     }
                     Column::Stack(items) => {
                         let saved_items = items
                             .iter()
                             .filter_map(|item| match item {
                                 StackItem::Single(entity) => {
-                                    SavedWindow::from_entity(*entity, windows, apps)
+                                    SavedWindow::from_entity(*entity, windows, apps, display_id)
                                         .map(SavedStackItem::Single)
                                 }
                                 StackItem::Tabs(tabs) => {
                                     let saved_tabs: Vec<_> = tabs
                                         .iter()
-                                        .filter_map(|&e| SavedWindow::from_entity(e, windows, apps))
+                                        .filter_map(|&e| {
+                                            SavedWindow::from_entity(e, windows, apps, display_id)
+                                        })
                                         .collect();
                                     if saved_tabs.is_empty() {
                                         None
@@ -235,7 +251,7 @@ impl PaneruState {
                     Column::Tabs(tabs) => {
                         let saved_tabs: Vec<_> = tabs
                             .iter()
-                            .filter_map(|&e| SavedWindow::from_entity(e, windows, apps))
+                            .filter_map(|&e| SavedWindow::from_entity(e, windows, apps, display_id))
                             .collect();
                         if saved_tabs.is_empty() {
                             None
@@ -243,8 +259,10 @@ impl PaneruState {
                             Some(SavedColumn::Tabs(saved_tabs))
                         }
                     }
-                    Column::Fullscren(entity) => SavedWindow::from_entity(*entity, windows, apps)
-                        .map(SavedColumn::Fullscreen),
+                    Column::Fullscren(entity) => {
+                        SavedWindow::from_entity(*entity, windows, apps, display_id)
+                            .map(SavedColumn::Fullscreen)
+                    }
                 };
 
                 if let Some(sc) = saved_col {
@@ -320,7 +338,84 @@ impl PaneruState {
     pub fn load_from_file(path: &Path) -> Option<Self> {
         let data = fs::read_to_string(path).ok()?;
         let state: Self = serde_json::from_str(&data).ok()?;
-        (state.version == SUPPORTED_STATE_VERSION).then_some(state)
+        (state.version == SUPPORTED_STATE_VERSION || state.version == BACKFILL_STATE_VERSION)
+            .then_some(state)
+    }
+
+    /// Drops saved windows whose application was never observed (bundle id
+    /// absent from `launched_bundles`), compacting emptied columns. Called
+    /// at restore-grace expiry under `MissingWindowBehavior::Drop` so a
+    /// stale cached display can't resurrect an unlaunched app's windows on
+    /// a later restart. Returns the number removed. Pure over data —
+    /// unit testable without a world.
+    pub fn prune_unlaunched(&mut self, launched_bundles: &HashSet<String>) -> usize {
+        fn keep(
+            saved: &SavedWindow,
+            launched_bundles: &HashSet<String>,
+            removed: &std::cell::Cell<usize>,
+        ) -> bool {
+            if launched_bundles.contains(&saved.bundle_id) {
+                true
+            } else {
+                removed.set(removed.get() + 1);
+                false
+            }
+        }
+        fn prune_stack_item(
+            item: SavedStackItem,
+            launched_bundles: &HashSet<String>,
+            removed: &std::cell::Cell<usize>,
+        ) -> Option<SavedStackItem> {
+            match item {
+                SavedStackItem::Single(saved) => {
+                    keep(&saved, launched_bundles, removed).then_some(SavedStackItem::Single(saved))
+                }
+                SavedStackItem::Tabs(tabs) => {
+                    let kept: Vec<SavedWindow> = tabs
+                        .into_iter()
+                        .filter(|saved| keep(saved, launched_bundles, removed))
+                        .collect();
+                    (!kept.is_empty()).then_some(SavedStackItem::Tabs(kept))
+                }
+            }
+        }
+        fn prune_column(
+            column: SavedColumn,
+            launched_bundles: &HashSet<String>,
+            removed: &std::cell::Cell<usize>,
+        ) -> Option<SavedColumn> {
+            match column {
+                SavedColumn::Single(saved) => {
+                    keep(&saved, launched_bundles, removed).then_some(SavedColumn::Single(saved))
+                }
+                SavedColumn::Fullscreen(saved) => keep(&saved, launched_bundles, removed)
+                    .then_some(SavedColumn::Fullscreen(saved)),
+                SavedColumn::Tabs(tabs) => {
+                    let kept: Vec<SavedWindow> = tabs
+                        .into_iter()
+                        .filter(|saved| keep(saved, launched_bundles, removed))
+                        .collect();
+                    (!kept.is_empty()).then_some(SavedColumn::Tabs(kept))
+                }
+                SavedColumn::Stack(items) => {
+                    let kept: Vec<SavedStackItem> = items
+                        .into_iter()
+                        .filter_map(|item| prune_stack_item(item, launched_bundles, removed))
+                        .collect();
+                    (!kept.is_empty()).then_some(SavedColumn::Stack(kept))
+                }
+            }
+        }
+        let removed = std::cell::Cell::new(0usize);
+        for workspace in &mut self.workspaces {
+            for strip in &mut workspace.strips {
+                strip.columns = std::mem::take(&mut strip.columns)
+                    .into_iter()
+                    .filter_map(|column| prune_column(column, launched_bundles, &removed))
+                    .collect();
+            }
+        }
+        removed.get()
     }
 
     pub fn default_state_file_path() -> PathBuf {

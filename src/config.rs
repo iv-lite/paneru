@@ -1286,6 +1286,11 @@ impl InnerConfig {
 #[serde(rename_all = "snake_case")]
 pub enum MissingWindowBehavior {
     Ignore,
+    /// At grace expiry, drop saved windows whose application never opened
+    /// (bundle never observed) from the in-memory state and rewrite the
+    /// state file, so a stale cached display can't resurrect them later.
+    /// Late launches inside the grace window still restore normally.
+    Drop,
 }
 
 #[derive(Clone, Debug, Deserialize, Default)]

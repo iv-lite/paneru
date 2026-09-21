@@ -80,6 +80,8 @@ fn test_state_serialization() {
         identifier: "finder-main".to_string(),
         role: "AXWindow".to_string(),
         subrole: "AXStandardWindow".to_string(),
+        display_id: None,
+        frame: None,
     };
 
     let state = PaneruState {
@@ -125,6 +127,8 @@ fn test_state_restoration() {
         identifier: "finder-main".to_string(),
         role: "AXWindow".to_string(),
         subrole: "AXStandardWindow".to_string(),
+        display_id: None,
+        frame: None,
     };
 
     let state = PaneruState {
@@ -213,7 +217,7 @@ fn test_state_serializes_display_and_active_virtual_workspace() {
 
     let state = PaneruState::extract(&workspaces, &displays, &windows, &apps);
 
-    assert_eq!(state.version, 2);
+    assert_eq!(state.version, 3);
     assert_eq!(state.active_display_id, Some(TEST_DISPLAY_ID));
     assert_eq!(
         state.displays,
@@ -519,6 +523,8 @@ fn saved_window(window_id: WinID, pid: Pid, bundle_id: &str, title: &str) -> Sav
         identifier: "main".to_string(),
         role: "AXWindow".to_string(),
         subrole: "AXStandardWindow".to_string(),
+        display_id: None,
+        frame: None,
     }
 }
 

@@ -26,6 +26,7 @@ use super::{
 };
 
 use crate::ax_writer::{AxWriteInbox, AxWriteState, AxWriterQueue, push_position};
+use crate::commands::{Command, Operation};
 use crate::config::{Config, decorations::BorderRadiusOption};
 use crate::ecs::display::FloatingLayer;
 use crate::ecs::layout::{Column, LayoutStrip};
@@ -553,6 +554,7 @@ fn warmup_ready(status: &WarmupStatus) -> bool {
 /// messages and the parked copy outlives the two-frame stream.
 pub(super) fn park_cold_commands(
     cold: Option<Res<ColdStart>>,
+    initializing: Option<Res<Initializing>>,
     mut parked: ResMut<ParkedCommands>,
     mut messages: MessageReader<Event>,
 ) {
@@ -560,7 +562,19 @@ pub(super) fn park_cold_commands(
         return;
     }
     for event in messages.read() {
-        if matches!(event, Event::Command { .. }) {
+        let Event::Command { command } = event else {
+            continue;
+        };
+        // Directional focus bypasses the park once init laid the layout
+        // down: it moves focus plus a reshuffle (no membership changes),
+        // and parking it strands keyboard focus through restore grace.
+        // Everything earlier (mid-init half-built world) keeps parking.
+        let focus_bypass = initializing.is_none()
+            && matches!(
+                command,
+                Command::Window(Operation::Focus(_) | Operation::FocusOrVirtual(_))
+            );
+        if !focus_bypass {
             parked.park(event.clone());
         }
     }
@@ -630,24 +644,27 @@ pub(super) fn tick_cold_start(
     }
 }
 
-/// Publishes the snapshot worker's poll cadence: fast while warming up or
-/// holding a drag (paint and prime converge in ~1 tick), slow idle. Sends
-/// on change only — the channel is unbounded but there is no reason to spam
-/// it 60 times a second with a constant.
+/// Publishes the snapshot worker's poll cadence: fast while warming up,
+/// holding a drag, confirming landings, or pressing the mouse (paint,
+/// prime, and verify converge in ~1 tick), slow idle. Sends on change
+/// only — the channel is unbounded but there is no reason to spam it 60
+/// times a second with a constant.
 pub(super) fn publish_snapshot_cadence(
     cold: Option<Res<ColdStart>>,
     held: Query<(), With<MouseHeldMarker>>,
+    verifying: Query<(), With<VerifyWindowPosition>>,
     roster: Option<Res<SnapshotRoster>>,
     mut last: Local<bool>,
 ) {
     let Some(roster) = roster.as_deref() else {
         return;
     };
-    // Fast while warming up, while a drag is held, or while any mouse
-    // button is down: the last covers missed-press native drags with no
-    // holder (no paint state), whose border would otherwise step at the
-    // 250ms idle cadence. Press-gated, so idle cost is untouched.
-    let fast = cold.is_some() || !held.is_empty() || left_button_held();
+    // Fast while warming up, while a drag is held, while any landing
+    // awaits confirmation, or while any mouse button is down: the last
+    // covers missed-press native drags with no holder (no paint state),
+    // whose border would otherwise step at the 250ms idle cadence.
+    // Press-gated, so idle cost is untouched.
+    let fast = cold.is_some() || !held.is_empty() || !verifying.is_empty() || left_button_held();
     if fast != *last {
         *last = fast;
         let _ = roster
@@ -2096,6 +2113,27 @@ pub(super) fn update_overlays(
 
     if dim_opacity == 0.0 && !border_enabled {
         overlay_mgr.remove_all();
+        return;
+    }
+
+    // No borders while a left-drag is held: a live outline tracking the
+    // gesture reads as detached next to the moving window, so the border
+    // hides for the gesture and reappears at the release point (the
+    // `drag_ended` gate guarantees the repaint). Holder covers every
+    // tracked grab; the button-state arm covers missed-press native drags
+    // with no holder, where the slot stays pinned while the OS moves.
+    // Dim surfaces stay frozen (never hidden — no flash) and the
+    // drop-preview ghost keeps painting on its own window.
+    let holder_held = !drag_held.is_empty();
+    let pressed_without_holder = !holder_held
+        && left_button_held()
+        && window_manager
+            .cursor_position()
+            .and_then(|point| window_manager.find_window_at_point(&point).ok())
+            .and_then(|id| windows.find(id))
+            .is_some();
+    if holder_held || pressed_without_holder {
+        overlay_mgr.hide_borders();
         return;
     }
 

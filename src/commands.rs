@@ -6,6 +6,7 @@ use bevy::ecs::hierarchy::ChildOf;
 use bevy::ecs::message::MessageReader;
 use bevy::ecs::query::{Has, With, Without};
 use bevy::ecs::schedule::IntoScheduleConfigs as _;
+use bevy::ecs::schedule::SystemCondition as _;
 use bevy::ecs::schedule::common_conditions::{not, resource_exists};
 use bevy::ecs::system::{Commands, Query, Res, ResMut, Single};
 use bevy::math::IRect;
@@ -29,9 +30,9 @@ use crate::ecs::params::{
 use crate::ecs::workspace::RestoreFocusMarker;
 use crate::ecs::{
     ActiveDisplayMarker, ActiveWorkspaceMarker, Bounds, ColdStart, DockPosition, DragDisplayArmed,
-    FocusedMarker, FullWidthMarker, ManualStripOffset, MissionControlActive, MouseHeldMarker,
-    NativeFullscreenMarker, RaiseWindow, SelectedVirtualMarker, SpawnCommandsExt, Timeout,
-    Unmanaged,
+    FocusedMarker, FullWidthMarker, Initializing, ManualStripOffset, MissionControlActive,
+    MouseHeldMarker, NativeFullscreenMarker, RaiseWindow, SelectedVirtualMarker, SpawnCommandsExt,
+    Timeout, Unmanaged,
 };
 use crate::events::Event;
 use crate::manager::{Application, Display, Origin, Size, Window, WindowManager, origin_from};
@@ -116,7 +117,6 @@ pub fn register_commands(app: &mut bevy::app::App) {
             balance_strip,
             manage_window,
             stack_windows_handler,
-            command_move_focus,
             command_focus_unmanaged,
             command_focus_managed,
             command_raise_floating,
@@ -127,6 +127,16 @@ pub fn register_commands(app: &mut bevy::app::App) {
             .run_if(not(resource_exists::<ColdStart>))
             .after(pump_events),
     );
+    // Directional focus additionally runs during warmup once init laid the
+    // layout down (same condition as the park bypass in
+    // `park_cold_commands`, so the two stay in sync): it moves focus plus
+    // a reshuffle, no membership changes.
+    app.add_systems(
+        PreUpdate,
+        command_move_focus
+            .run_if(not(resource_exists::<ColdStart>).or_eager(focus_warmup_bypass))
+            .after(pump_events),
+    );
     // A separate registration because the tuple above is already at Bevy's
     // 20-system limit.
     //
@@ -134,6 +144,14 @@ pub fn register_commands(app: &mut bevy::app::App) {
     // once it knows whether a Lua script took over the configuration.
     app.init_resource::<SnippetDialect>();
     app.add_systems(PreUpdate, copy_window_rule);
+}
+
+/// Run condition letting directional focus through during warmup once
+/// init laid the layout down. Mirrors the park bypass in
+/// `park_cold_commands` exactly (same two resources, same polarity), so a
+/// bypassed command always finds a running consumer and vice versa.
+fn focus_warmup_bypass(cold: Option<Res<ColdStart>>, init: Option<Res<Initializing>>) -> bool {
+    cold.is_some() && init.is_none()
 }
 
 pub fn filter_window_operations<'a, F: Fn(&Operation) -> bool>(

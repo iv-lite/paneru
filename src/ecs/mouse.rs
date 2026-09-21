@@ -169,8 +169,12 @@ impl Plugin for MouseEventsPlugin {
                 mouse_up_trigger,
                 horizontal_warp_mouse_trigger,
                 // Outside the mission-control gate like `mouse_up_trigger`:
-                // it must still run to hide a stale ghost.
-                drag_drop_preview,
+                // it must still run to hide a stale ghost. Ordered after
+                // the move and the transfer so the ghost never trails the
+                // gesture a tick behind.
+                drag_drop_preview
+                    .after(drag_move_held_column)
+                    .after(drag_window_across_display),
             )
                 .run_if(on_message::<InputEvent>),
         );
