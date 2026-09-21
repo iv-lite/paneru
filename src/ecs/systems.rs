@@ -29,7 +29,7 @@ use crate::ax_writer::{AxWriteInbox, AxWriteState, AxWriterQueue, push_position}
 use crate::config::{Config, decorations::BorderRadiusOption};
 use crate::ecs::display::FloatingLayer;
 use crate::ecs::layout::{Column, LayoutStrip};
-use crate::ecs::mouse::{DragModifierState, DragPaintState, DragScrollState};
+use crate::ecs::mouse::{DragModifierState, DragPaintState, DragScrollState, arm_release_grace};
 use crate::ecs::params::{ActiveDisplay, FrameActivity, Windows};
 use crate::ecs::workspace::SnapStripMarker;
 use crate::ecs::{
@@ -615,7 +615,11 @@ pub(super) fn publish_snapshot_cadence(
     let Some(roster) = roster.as_deref() else {
         return;
     };
-    let fast = cold.is_some() || !held.is_empty();
+    // Fast while warming up, while a drag is held, or while any mouse
+    // button is down: the last covers missed-press native drags with no
+    // holder (no paint state), whose border would otherwise step at the
+    // 250ms idle cadence. Press-gated, so idle cost is untouched.
+    let fast = cold.is_some() || !held.is_empty() || left_button_held();
     if fast != *last {
         *last = fast;
         let _ = roster
@@ -977,7 +981,9 @@ pub(super) fn fresh_marker_cleanup(cleanup: TimedOutSpawns, mut commands: Comman
 /// * `commands` - Bevy commands to despawn entities.
 pub(super) fn timeout_ticker(
     timers: Populated<(Entity, &mut Timeout)>,
+    holders: Query<&MouseHeldMarker>,
     clock: Res<Time>,
+    mut scroll_state: ResMut<DragScrollState>,
     mut commands: Commands,
 ) {
     for (entity, mut timeout) in timers {
@@ -986,6 +992,13 @@ pub(super) fn timeout_ticker(
             if let Some(system_id) = timeout.system_id.take() {
                 commands.run_system(system_id);
                 commands.unregister_system(system_id);
+            }
+            // Lost release (mouse-up never arrived): the OS window may have
+            // moved natively while the slot stayed pinned, and no release
+            // path armed the echo shield — do it here so the lagging echo
+            // pushes the slot back instead of adopting the displaced frame.
+            if let Ok(marker) = holders.get(entity) {
+                arm_release_grace(vec![marker.0], &mut scroll_state, &mut commands);
             }
             trace!("Removing timer {entity}");
             if let Ok(mut entity_commands) = commands.get_entity(entity) {
@@ -1193,7 +1206,9 @@ pub(crate) fn demux_input_events(
 
 /// Pending absolute-pointer motion held back one drain step so HID bursts
 /// fold to the newest event: moves and drags carry absolute points, so only
-/// the latest per batch matters for displacement. Without this a burst past
+/// the latest per batch matters for displacement. Relative gesture deltas
+/// (`Scroll`/`Swipe` runs) fold by summing instead — the total travel is
+/// exact, only the per-event slicing is lost. Without this a burst past
 /// the pump budget queues stale deltas across frames, which the drag paints
 /// late as overshoot. Anything else flushes pending motion first, so press /
 /// release gesture boundaries stay ordered around the motion they bound.
@@ -1201,6 +1216,10 @@ pub(crate) fn demux_input_events(
 struct CoalescedPointer {
     moved: Option<Event>,
     dragged: Option<Event>,
+    scroll: f64,
+    swipe: Option<(f64, usize)>,
+    vertical_swipe: Option<(f64, usize)>,
+    vertical_tick: f64,
 }
 
 impl CoalescedPointer {
@@ -1212,6 +1231,26 @@ impl CoalescedPointer {
             Event::MouseDragged { .. } => {
                 self.dragged = Some(event);
             }
+            Event::Scroll { delta } => {
+                self.scroll += delta;
+            }
+            Event::Swipe { delta, fingers } => {
+                Self::fold_swipe(&mut self.swipe, events, delta, fingers, |delta, fingers| {
+                    Event::Swipe { delta, fingers }
+                });
+            }
+            Event::VerticalSwipe { delta, fingers } => {
+                Self::fold_swipe(
+                    &mut self.vertical_swipe,
+                    events,
+                    delta,
+                    fingers,
+                    |delta, fingers| Event::VerticalSwipe { delta, fingers },
+                );
+            }
+            Event::VerticalScrollTick { delta } => {
+                self.vertical_tick += delta;
+            }
             _ => {
                 self.flush(events);
                 events.push(event);
@@ -1219,9 +1258,57 @@ impl CoalescedPointer {
         }
     }
 
+    /// Folds one swipe segment into the pending run. A finger-count change
+    /// starts a new gesture, so it flushes first rather than mixing runs.
+    fn fold_swipe(
+        pending: &mut Option<(f64, usize)>,
+        events: &mut Vec<Event>,
+        delta: f64,
+        fingers: usize,
+        mk: impl Fn(f64, usize) -> Event,
+    ) {
+        match pending {
+            Some((total, f)) if *f == fingers => *total += delta,
+            _ => {
+                if let Some((total, f)) = pending.take()
+                    && total != 0.0
+                {
+                    events.push(mk(total, f));
+                }
+                *pending = Some((delta, fingers));
+            }
+        }
+    }
+
     fn flush(&mut self, events: &mut Vec<Event>) {
         events.extend(self.moved.take());
         events.extend(self.dragged.take());
+        if self.scroll != 0.0 {
+            events.push(Event::Scroll {
+                delta: std::mem::take(&mut self.scroll),
+            });
+        }
+        if let Some((total, fingers)) = self.swipe.take()
+            && total != 0.0
+        {
+            events.push(Event::Swipe {
+                delta: total,
+                fingers,
+            });
+        }
+        if let Some((total, fingers)) = self.vertical_swipe.take()
+            && total != 0.0
+        {
+            events.push(Event::VerticalSwipe {
+                delta: total,
+                fingers,
+            });
+        }
+        if self.vertical_tick != 0.0 {
+            events.push(Event::VerticalScrollTick {
+                delta: std::mem::take(&mut self.vertical_tick),
+            });
+        }
     }
 }
 
@@ -2959,5 +3046,57 @@ mod seam_tests {
         assert_eq!(events.len(), 3);
         assert_eq!(drag_point(&events[1]), Some(15.0));
         assert!(matches!(events[2], Event::MouseUp { .. }));
+    }
+
+    fn scroll_delta(event: &Event) -> Option<f64> {
+        match event {
+            Event::Scroll { delta } => Some(*delta),
+            _ => None,
+        }
+    }
+
+    #[test]
+    fn pointer_coalescing_sums_relative_gesture_runs() {
+        let mut coalesced = CoalescedPointer::default();
+        let mut events = Vec::new();
+        coalesced.push(&mut events, Event::Scroll { delta: 0.1 });
+        coalesced.push(&mut events, Event::Scroll { delta: 0.2 });
+        coalesced.push(&mut events, Event::Scroll { delta: -0.05 });
+        assert!(events.is_empty(), "relative runs fold like absolute ones");
+        coalesced.flush(&mut events);
+        assert_eq!(events.len(), 1);
+        let total = scroll_delta(&events[0]).expect("folded scroll");
+        assert!(
+            (total - 0.25).abs() < 1e-9,
+            "total travel is exact, only slicing is lost"
+        );
+    }
+
+    #[test]
+    fn pointer_coalescing_splits_swipe_finger_counts() {
+        let swipe = |delta: f64, fingers: usize| Event::Swipe { delta, fingers };
+        let mut coalesced = CoalescedPointer::default();
+        let mut events = Vec::new();
+        coalesced.push(&mut events, swipe(0.1, 3));
+        coalesced.push(&mut events, swipe(0.2, 3));
+        // Finger-count change starts a new gesture: flush, don't mix.
+        coalesced.push(&mut events, swipe(0.5, 4));
+        assert_eq!(events.len(), 1);
+        match events[0] {
+            Event::Swipe { delta, fingers } => {
+                assert_eq!(fingers, 3);
+                assert!((delta - 0.3).abs() < 1e-9);
+            }
+            _ => panic!("expected the flushed three-finger run"),
+        }
+        coalesced.flush(&mut events);
+        assert_eq!(events.len(), 2);
+        match events[1] {
+            Event::Swipe { delta, fingers } => {
+                assert_eq!(fingers, 4);
+                assert!((delta - 0.5).abs() < 1e-9);
+            }
+            _ => panic!("expected the four-finger run"),
+        }
     }
 }

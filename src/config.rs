@@ -387,13 +387,13 @@ impl Config {
     // Exponential ease-out decay rate (per second) consumed by the animation
     // systems as `t = 1 - e^(-rate*dt)`. Higher values feel snappier; very large
     // values collapse to an instant snap.
-    // Suggested range: 8..20 for a fluid feel. Unset = instant (no animation),
+    // Suggested range: 8..20 for a fluid feel. Unset = fluid default.
     pub fn animation_speed(&self) -> f64 {
         self.options()
             .animation_speed
-            // If unset, set it to something high, so the move happens immediately,
-            // effectively disabling animation.
-            .unwrap_or(1_000_000.0)
+            // Fluid default: visible glide that still lands quickly. Set
+            // explicitly (or very high) for an instant snap.
+            .unwrap_or(12.0)
             .max(0.0)
     }
 
@@ -919,14 +919,14 @@ impl Config {
 
     /// Moves AX position commits onto a dedicated writer thread (per-window
     /// latest coalescing) instead of blocking the main thread per animation
-    /// frame. Experimental and default-off: enable only after the soak
-    /// criteria in `ax_writer` pass on your app mix. Apps needing the
-    /// enhanced-UI workaround always stay synchronous.
+    /// frame. Experimental but default-on: the synchronous path remains for
+    /// dance apps, resizes, shutdown, and whenever the flag is unset.
+    /// Disable only if soak-testing shows regressions on your app mix.
     pub fn experimental_ax_writer(&self) -> bool {
-        // Default is disabled.
+        // Default is enabled.
         self.options()
             .experimental_ax_writer
-            .is_some_and(|enabled| enabled)
+            .is_none_or(|enabled| enabled)
     }
 
     /// Number of virtual workspaces to pre-create on each physical space at
@@ -1410,7 +1410,7 @@ pub struct MainOptions {
 
     /// Move AX position commits onto a dedicated writer thread instead of
     /// blocking the main thread per animation frame. Experimental,
-    /// default-off; see `Config::experimental_ax_writer`.
+    /// default-on; see `Config::experimental_ax_writer`.
     pub experimental_ax_writer: Option<bool>,
 }
 

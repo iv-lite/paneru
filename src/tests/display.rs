@@ -733,6 +733,75 @@ fn test_native_drag_accumulates_paint_offset_with_slot_pinned() {
         .run(commands);
 }
 
+/// A lost release (mouse-up never arrives, holder times out) still arms
+/// the echo shield: the OS window may have moved natively while the slot
+/// stayed pinned, and its later echo must push the slot back instead of
+/// adopting the displaced frame.
+#[test]
+fn test_lost_release_still_arms_echo_shield() {
+    use crate::ecs::mouse::DragScrollState;
+
+    let grab = CGPoint::new(200.0, 500.0);
+    let mut h = TestHarness::new().with_windows(1);
+    // Let init settle first so the press finds a real window.
+    h.run(vec![
+        Event::MenuOpened { window_id: 0 },
+        Event::Command {
+            command: Command::PrintState,
+        },
+    ]);
+    h.app.world_mut().write_message::<Event>(Event::MouseDown {
+        point: grab,
+        modifiers: Modifiers::empty(),
+    });
+    for _ in 0..5 {
+        h.app.update();
+        for event in h.mock_state.drain_events() {
+            h.app.world_mut().write_message::<Event>(event);
+        }
+    }
+    let target = find_window_entity(0, h.app.world_mut());
+    {
+        let world = h.app.world_mut();
+        assert!(
+            world
+                .query_filtered::<Entity, With<MouseHeldMarker>>()
+                .iter(world)
+                .next()
+                .is_some(),
+            "setup: press holds the window"
+        );
+    }
+    // Just past the 5s holder timeout with no mouse-up ever arriving: the
+    // ticker despawns the holder and must arm the shield for its target.
+    // (Checked before the +200ms settle check, which clears a clean shield.)
+    h.advance(Duration::from_millis(5100));
+    {
+        let world = h.app.world_mut();
+        assert!(
+            world
+                .query_filtered::<Entity, With<MouseHeldMarker>>()
+                .iter(world)
+                .next()
+                .is_none(),
+            "timed-out holder is gone"
+        );
+        let shield = world.resource::<DragScrollState>();
+        assert!(
+            shield.members.contains(&target),
+            "timeout arms the echo shield for the held target"
+        );
+    }
+    // The lagging echo of the native drag now arrives, still inside the
+    // shield window: slot must hold.
+    h.mock_state
+        .os_move_window(0, Origin::new(100, TEST_MENUBAR_HEIGHT));
+    h.advance(Duration::from_millis(100));
+    let world = h.app.world_mut();
+    let position = world.entity(target).get::<Position>().expect("position");
+    assert_eq!(position.0, Origin::new(0, TEST_MENUBAR_HEIGHT));
+}
+
 /// A plain left-click drag must not detach the window: the OS really moves
 /// under a native content drag while the slot stays pinned, and the lagging
 /// echo after release must push the slot back instead of adopting the
@@ -3718,6 +3787,7 @@ fn test_unarmed_drag_with_scroll_disabled_moves_column_then_glides_home() {
                 MainOptions {
                     mouse_drag_display_modifier: Some(Modifiers::ALT),
                     left_drag_scrolls_strip: Some(false),
+                    animation_speed: Some(1_000_000.0),
                     ..Default::default()
                 },
                 vec![],

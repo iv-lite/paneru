@@ -4,7 +4,7 @@ use crate::commands::{Command, Direction, Operation, ResizeDirection};
 use crate::config::{Config, MainOptions, WindowParams};
 use crate::ecs::layout::LayoutStrip;
 use crate::events::Event;
-use crate::{assert_window_at, assert_window_size};
+use crate::{assert_focused, assert_window_at, assert_window_size};
 use bevy::prelude::*;
 
 use super::*;
@@ -71,6 +71,7 @@ fn test_window_shuffle() {
             padding_right: Some(PADDING_RIGHT),
             padding_top: Some(PADDING_TOP),
             padding_bottom: Some(PADDING_BOTTOM),
+            animation_speed: Some(1_000_000.0),
             ..Default::default()
         },
         vec![params],
@@ -187,6 +188,7 @@ fn test_window_resize_grow_and_shrink_cycle() {
     let config: Config = (
         MainOptions {
             preset_column_widths: vec![0.25, 0.5, 0.75],
+            animation_speed: Some(1_000_000.0),
             ..Default::default()
         },
         vec![],
@@ -246,6 +248,7 @@ fn test_window_vertical_resize_grow_and_shrink_cycle() {
     let config: Config = (
         MainOptions {
             preset_stack_heights: vec![0.3, 0.5, 0.7],
+            animation_speed: Some(1_000_000.0),
             ..Default::default()
         },
         vec![],
@@ -304,6 +307,7 @@ fn test_window_vertical_resize_leaves_the_neighbour_its_minimum() {
         MainOptions {
             // 0.9 of the viewport would leave the neighbour 75px.
             preset_stack_heights: vec![0.5, 0.9],
+            animation_speed: Some(1_000_000.0),
             ..Default::default()
         },
         vec![],
@@ -341,6 +345,7 @@ fn test_window_vertical_resize_is_a_noop_outside_a_stack() {
     let config: Config = (
         MainOptions {
             preset_stack_heights: vec![0.3, 0.5, 0.7],
+            animation_speed: Some(1_000_000.0),
             ..Default::default()
         },
         vec![],
@@ -479,6 +484,42 @@ fn test_floating_window_does_not_hold_a_slot_in_the_strip() {
                 "the tiled windows must close the gap the floating one left"
             );
             assert_eq!(window_x(world, 2), TEST_WINDOW_WIDTH);
+        })
+        .run(commands);
+}
+
+/// The prod fluid default (no `animation_speed` set → 12): an auto-center
+/// focus glide must still land on the exact slot given a long enough
+/// window. The suite otherwise pins instant speed (see `setup_world`), so
+/// this is the one test exercising the shipped default.
+#[test]
+fn test_fluid_default_animation_converges_to_exact_slots() {
+    let config: Config = (
+        MainOptions {
+            auto_center: Some(true),
+            ..Default::default()
+        },
+        vec![],
+    )
+        .into();
+    let commands = vec![
+        Event::MenuOpened { window_id: 0 },
+        Event::Command {
+            command: Command::Window(Operation::Focus(Direction::East)),
+        },
+        Event::Command {
+            command: Command::PrintState,
+        },
+    ];
+
+    TestHarness::new()
+        .with_config(config)
+        .with_windows(2)
+        .with_command_window(Duration::from_millis(1000))
+        .on_iteration(1, |world, _state| {
+            assert_focused!(world, 1);
+            // 400px window centered in 1024px: x = (1024 - 400) / 2.
+            assert_window_at!(world, 1, 312, TEST_MENUBAR_HEIGHT);
         })
         .run(commands);
 }

@@ -821,7 +821,7 @@ fn release_column_members(entity: Entity, strips: &ReleaseStrips) -> Vec<Entity>
 /// and the settle check repairs residue with no echo at all. Previously
 /// scroll-drags only; now every release, since plain content drags detach
 /// the same way.
-fn arm_release_grace(
+pub(crate) fn arm_release_grace(
     members: Vec<Entity>,
     scroll_state: &mut DragScrollState,
     commands: &mut Commands,

@@ -738,7 +738,10 @@ impl WindowApi for WindowOS {
 
     #[instrument(level = Level::TRACE)]
     fn resize(&mut self, size: Size) {
-        if self.frame.size() == size {
+        // 1px tolerance like `reposition` and the verifier: OS rounding must
+        // converge, not dither AX traffic across an integer boundary.
+        let drift = (self.frame.size() - size).abs();
+        if drift.x <= 1 && drift.y <= 1 {
             trace!("already correct size.");
             return;
         }

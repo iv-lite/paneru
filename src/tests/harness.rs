@@ -8,7 +8,7 @@ use bevy::time::TimeUpdateStrategy;
 use tracing_subscriber::{EnvFilter, fmt, prelude::*};
 
 use crate::commands::register_commands;
-use crate::config::Config;
+use crate::config::{Config, MainOptions};
 use crate::ecs::display::DisplayEventsPlugin;
 use crate::ecs::focus::FocusEventsPlugin;
 use crate::ecs::layout::LayoutEventsPlugin;
@@ -268,13 +268,22 @@ fn setup_world() -> App {
         assert!(AsyncComputeTaskPool::try_get().is_some());
     });
     let mut bevy_app = App::new();
+    // Instant animation speed: prod defaults to fluid motion, but the
+    // suite's 200ms command windows assert exact rest positions, which a
+    // glide would still be traveling toward. Tests covering animation set
+    // their own speed explicitly.
+    let harness_options = MainOptions {
+        animation_speed: Some(1_000_000.0),
+        ..Default::default()
+    };
+    let harness_config: Config = (harness_options, Vec::new()).into();
     bevy_app
         .add_plugins(MinimalPlugins)
         .add_message::<Event>()
         .insert_resource(SkipReshuffle(false))
         .insert_resource(MissionControlActive(false))
         .insert_resource(FocusFollowsMouse(None))
-        .insert_resource(Config::default())
+        .insert_resource(harness_config)
         .insert_resource(Initializing)
         // Title-invalidation epochs for snapshot titles. The snapshot worker
         // itself never runs here (no `SnapshotStore`, so all reads stay

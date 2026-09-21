@@ -277,6 +277,7 @@ fn test_sliver_smaller_than_edge_padding() {
     let config: Config = (
         MainOptions {
             sliver_width: Some(SLIVER),
+            animation_speed: Some(1_000_000.0),
             padding_top: Some(PADDING),
             padding_bottom: Some(PADDING),
             padding_left: Some(PADDING),
@@ -1895,6 +1896,7 @@ fn test_focus_arrival_on_fresh_strip_defers_then_exposes() {
     let config: Config = (
         MainOptions {
             swipe_gesture_fingers: Some(3),
+            animation_speed: Some(1_000_000.0),
             ..Default::default()
         },
         vec![],

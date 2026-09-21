@@ -28,7 +28,7 @@ General behavior settings for the window manager.
 | `horizontal_mouse_warp_offset` | Integer (px) | `0` | Vertical pixel offset applied to the `horizontal_mouse_warp` landing position, signed by warp direction. Positive values shift the cursor lower when warping to a display *below* (in macOS arrangement) and higher when warping to one *above*. Use to compensate for physical desk arrangement differing from the macOS arrangement (e.g. portrait monitor sitting physically higher or lower than the laptop). |
 | `preset_column_widths` | Array (Float) | `[0.25, 0.33, 0.5, 0.66, 0.75, 1.0, 1.5, 2.0]` | Ratios of the screen width used by the `window_resize` command and the menu bar width picker. Values above `1.0` create a horizontally scrollable oversized window. |
 | `preset_stack_heights` | Array (Float) | `[0.25, 0.33, 0.5, 0.66, 0.75]` | Ratios of the viewport height used by the `window_vertical_resize` command. Only applies to windows inside a stack; every window in the column is kept at least 200px tall, so a ratio that would starve a neighbour is clamped. |
-| `animation_speed` | Float | *None* | Speed of window animations. Comfortable range is from 8 to 20. Unset or set to a very high value to effectively disable animations. |
+| `animation_speed` | Float | `12.0` | Speed of window animations. Comfortable range is from 8 to 20. Unset means the `12.0` fluid default; set to a very high value to effectively disable animations. |
 | `auto_center` | Boolean | `false` | Automatically center the focused window on the screen when switching focus. |
 | `center_single_column` | Boolean | `false` | When a strip holds exactly one column narrower than the viewport, center it instead of pinning it to the left edge. Multi-column strips are unaffected. |
 | `default_ratio` | Float (0.0–1.0) | *None* | Default width ratio (fraction of the viewport width) for newly managed windows, e.g. `0.5` starts windows at half the viewport width. An explicit per-window rule `width` still wins; unset means new windows keep their OS-given size. Applies on first spawn and when a window is re-managed. |
@@ -45,7 +45,7 @@ General behavior settings for the window manager.
 | `virtual_workspace_animations` | Boolean | `false` | If enabled, Paneru will animate virtual workspace swaps. Off by default, because people use virtual workspaces due to the slow animation of the native macOS workspaces. |
 | `insert_windows_mid_strip` | Boolean | `false` | When moving a window to another virtual workspace, insert it at the column matching its current on-screen position (keeping it where you see it and shifting the rest) instead of appending it to the end of the destination strip. |
 | `create_virtual_workspace_automatically` | Boolean | `false` | Automatically creates a new virtual workspace when using `window_virtual_south `or Southward gesture controls. |
-| `experimental_ax_writer` | Boolean | `false` | Moves AX position commits onto a dedicated writer thread (per-window latest coalescing) instead of blocking the main thread per animation frame. Experimental: enable only after soak-testing your app mix. Apps needing the enhanced-UI workaround always stay synchronous. |
+| `experimental_ax_writer` | Boolean | `true` | Moves AX position commits onto a dedicated writer thread (per-window latest coalescing) instead of blocking the main thread per animation frame. Experimental: disable only if soak-testing shows regressions on your app mix. Apps needing the enhanced-UI workaround always stay synchronous. |
 
 ---
 
