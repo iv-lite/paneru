@@ -209,11 +209,22 @@ pub(crate) const PERF_SAMPLE_WINDOW: usize = 120;
 #[derive(Debug, Default, Resource)]
 pub(crate) struct PerfStats {
     frame_start: Option<Instant>,
+    pre_end: Option<Instant>,
+    update_end: Option<Instant>,
     samples: VecDeque<Duration>,
+    pre_samples: VecDeque<Duration>,
+    update_samples: VecDeque<Duration>,
+    post_samples: VecDeque<Duration>,
     /// Sync re-pushes fired by the verify backstop since the last summary.
     /// Non-zero during drags means the unacked/animation skips have a hole
     /// worth investigating; at rest it should sit at zero.
     pub verify_repushes: u64,
+    /// Pump drain depths since the last summary: total events, frames, and
+    /// max burst. A high mean means an event storm (churning app firing AX
+    /// notifications) is keeping the pump off its sleep ladder.
+    pub drain_events: u64,
+    pub drain_frames: u64,
+    pub drain_max: usize,
 }
 
 /// Nearest-rank percentile over a sorted sample slice. Pure so the summary
@@ -233,16 +244,43 @@ fn percentile(sorted_ms: &[f64], pct: f64) -> f64 {
     sorted_ms[rank.clamp(1, sorted_ms.len()) - 1]
 }
 
+/// Marks the end of `PreUpdate` (pump + demux + classify). Registered last
+/// in that schedule so the `pre` stage covers event ingress end to end.
+pub(crate) fn mark_preupdate_end(mut perf: ResMut<PerfStats>) {
+    perf.pre_end = Some(Instant::now());
+}
+
+/// Marks the end of `Update` (drive + layout + focus). Registered after the
+/// main tuple so the `update` stage covers the work schedules end to end
+/// (systems registered later by other plugins fall into `post`, which only
+/// widens that bucket slightly).
+pub(crate) fn mark_update_end(mut perf: ResMut<PerfStats>) {
+    perf.update_end = Some(Instant::now());
+}
+
 /// Closes the frame clock opened by [`classify_frame_priority`] and logs a
 /// p50/p95/max summary every [`PERF_SAMPLE_WINDOW`] frames. Runs in `Last`
-/// so the sample covers pump → layout → commit → overlay end to end.
+/// so the sample covers pump → layout → commit → overlay end to end, split
+/// into `pre` (ingress) / `update` (drive+layout) / `post` (animate+commit+
+/// overlay) p50s so a slow frame can be attributed to a stage.
 /// `debug!` with an explicit target: the suite runs at `warn`, so tests
 /// never pay for formatting.
 pub(crate) fn log_frame_stats(mut perf: ResMut<PerfStats>, orchestrator: Res<FrameOrchestrator>) {
-    let Some(start) = perf.frame_start.take() else {
+    let (Some(start), Some(pre), Some(upd)) = (
+        perf.frame_start.take(),
+        perf.pre_end.take(),
+        perf.update_end.take(),
+    ) else {
         return;
     };
+    let end = Instant::now();
     perf.samples.push_back(start.elapsed());
+    perf.pre_samples
+        .push_back(pre.saturating_duration_since(start));
+    perf.update_samples
+        .push_back(upd.saturating_duration_since(pre));
+    perf.post_samples
+        .push_back(end.saturating_duration_since(upd));
     if perf.samples.len() < PERF_SAMPLE_WINDOW {
         return;
     }
@@ -252,15 +290,40 @@ pub(crate) fn log_frame_stats(mut perf: ResMut<PerfStats>, orchestrator: Res<Fra
         .map(|d| d.as_secs_f64() * 1000.0)
         .collect();
     sorted.sort_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
+    let (drain_events, drain_frames, drain_max) = (
+        std::mem::take(&mut perf.drain_events),
+        std::mem::take(&mut perf.drain_frames),
+        std::mem::take(&mut perf.drain_max),
+    );
     debug!(
         target: "paneru::perf",
-        "frame ms over {PERF_SAMPLE_WINDOW}: p50={:.2} p95={:.2} max={:.2} priority={:?} verify_repushes={}",
+        "frame ms over {PERF_SAMPLE_WINDOW}: p50={:.2} p95={:.2} max={:.2} pre={:.2} upd={:.2} post={:.2} priority={:?} verify_repushes={} drain_ev={} drain_fr={} drain_max={}",
         percentile(&sorted, 50.0),
         percentile(&sorted, 95.0),
         sorted.last().copied().unwrap_or(0.0),
+        stage_median(&mut perf.pre_samples),
+        stage_median(&mut perf.update_samples),
+        stage_median(&mut perf.post_samples),
         orchestrator.priority,
         std::mem::take(&mut perf.verify_repushes),
+        drain_events,
+        drain_frames,
+        drain_max,
     );
+}
+
+/// Median of a stage window in ms, draining it (called once per summary,
+/// alongside the main drain above).
+fn stage_median(samples: &mut VecDeque<Duration>) -> f64 {
+    let mut sorted: Vec<f64> = samples
+        .drain(..)
+        .map(|d| d.as_secs_f64() * 1000.0)
+        .collect();
+    if sorted.is_empty() {
+        return 0.0;
+    }
+    sorted.sort_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
+    sorted[sorted.len() / 2]
 }
 
 /// Owns the worker-thread join handles so a dead thread is noticed.

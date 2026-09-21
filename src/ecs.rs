@@ -201,6 +201,17 @@ pub fn register_systems(app: &mut bevy::app::App) {
             systems::demux_input_events.after(systems::pump_events),
             systems::park_cold_commands,
             systems::drain_ax_acks,
+            // Stage mark must run after every member above: the tuple is
+            // otherwise unordered, and an early mark attributes the pump
+            // sleep to the wrong stage (measured: pre=0.00 with the sleep
+            // landing in `upd`).
+            orchestrator::mark_preupdate_end
+                .after(systems::window_creation_event)
+                .after(orchestrator::classify_frame_priority)
+                .after(systems::pump_events)
+                .after(systems::demux_input_events)
+                .after(systems::park_cold_commands)
+                .after(systems::drain_ax_acks),
         ),
     );
     app.add_systems(
@@ -299,6 +310,16 @@ pub fn register_systems(app: &mut bevy::app::App) {
         orchestrator::supervise_threads.run_if(on_timer(Duration::from_secs(
             orchestrator::SUPERVISION_INTERVAL_SECS,
         ))),
+    );
+    // Stage mark for the perf log: first in `PostUpdate`, explicitly
+    // before the animate chain, so it runs after every `Update` system
+    // (schedules are ordered; the `Update` tuple itself is unordered and
+    // at the arity limit, so the mark cannot live inside it). Systems
+    // registered later by other plugins land in `post` instead —
+    // documented on `log_frame_stats`.
+    app.add_systems(
+        PostUpdate,
+        orchestrator::mark_update_end.before(systems::animate_entities),
     );
     // Frame clock close: covers pump → layout → commit → overlay end to end.
     app.add_systems(Last, orchestrator::log_frame_stats);

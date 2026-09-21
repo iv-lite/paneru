@@ -114,12 +114,6 @@ pub trait WindowApi: Send + Sync {
     fn horizontal_padding(&self) -> i32;
     fn vertical_padding(&self) -> i32;
     fn border_radius(&self) -> Option<f64>;
-    /// Frame of the window's `AXToolbar` child in CG coords, if the app
-    /// exposes one. Used to recognise header grabs on unified toolbars that
-    /// are taller than the geometric fallback strip. `None` means no toolbar
-    /// (plain titlebar: use the fallback) or an unreadable one — never an
-    /// error the caller must handle.
-    fn toolbar_frame(&self) -> Option<IRect>;
 }
 
 #[derive(Component, Deref, DerefMut)]
@@ -947,53 +941,6 @@ impl WindowApi for WindowOS {
         *self
             .border_radius
             .get_or_init(|| sls_window_corner_radius(self.id))
-    }
-
-    fn toolbar_frame(&self) -> Option<IRect> {
-        // One press-time lookup (never per-frame): most windows expose no
-        // toolbar and fail fast here, falling back to geometry.
-        let toolbar = self
-            .ax_element
-            .get_attribute::<AXUIWrapper>(&CFString::from_str("AXToolbar"))
-            .ok()?;
-        let window_ref = toolbar.as_ptr();
-        let mut position_ref: *mut CFType = null_mut();
-        unsafe {
-            AXUIElementCopyAttributeValue(
-                window_ref,
-                CFString::from_static_str(kAXPositionAttribute).as_ref(),
-                &mut position_ref,
-            )
-        }
-        .to_result(function_name!())
-        .ok()?;
-        let position = AXUIWrapper::retain(position_ref).ok()?;
-        let mut size_ref: *mut CFType = null_mut();
-        unsafe {
-            AXUIElementCopyAttributeValue(
-                window_ref,
-                CFString::from_static_str(kAXSizeAttribute).as_ref(),
-                &mut size_ref,
-            )
-        }
-        .to_result(function_name!())
-        .ok()?;
-        let size = AXUIWrapper::retain(size_ref).ok()?;
-
-        let mut frame = CGRect::default();
-        unsafe {
-            AXValueGetValue(
-                position.as_ptr(),
-                kAXValueTypeCGPoint,
-                NonNull::from(&mut frame.origin).as_ptr().cast(),
-            );
-            AXValueGetValue(
-                size.as_ptr(),
-                kAXValueTypeCGSize,
-                NonNull::from(&mut frame.size).as_ptr().cast(),
-            );
-        }
-        Some(irect_from(frame))
     }
 }
 

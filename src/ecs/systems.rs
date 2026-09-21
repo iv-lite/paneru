@@ -64,7 +64,8 @@ type TimedOutSpawns<'w, 's> = Populated<
 >;
 
 /// Windows as [`window_moved_update_frame`] sees them: the element to re-read,
-/// the origin to update, and the marker saying we are the ones moving it.
+/// the origin to update, the marker saying we are the ones moving it, and
+/// whether that move is still awaiting confirmation.
 type MovableWindows<'w, 's> = Query<
     'w,
     's,
@@ -75,6 +76,7 @@ type MovableWindows<'w, 's> = Query<
         &'static Bounds,
         Option<&'static Unmanaged>,
         Has<RepositionMarker>,
+        Has<VerifyWindowPosition>,
     ),
     Without<LayoutStrip>,
 >;
@@ -1307,7 +1309,7 @@ impl CoalescedPointer {
     }
 }
 
-#[allow(clippy::too_many_arguments)]
+#[allow(clippy::too_many_arguments, clippy::too_many_lines)]
 pub(crate) fn pump_events(
     mut exit: MessageWriter<AppExit>,
     mut messages: MessageWriter<Event>,
@@ -1321,6 +1323,7 @@ pub(crate) fn pump_events(
     // `Local`s) so pacing is observable and testable. `classify_frame`
     // runs just before this system and leaves the priority fresh.
     mut orchestrator: ResMut<FrameOrchestrator>,
+    mut perf_stats: Option<ResMut<crate::ecs::orchestrator::PerfStats>>,
 ) {
     let Some((ref mut platform, incoming_events)) = platform.zip(incoming_events) else {
         // No platform interface or incoming event pipe - probably executing in a unit test.
@@ -1382,6 +1385,14 @@ pub(crate) fn pump_events(
     };
 
     coalesced.flush(&mut received_events);
+    // Storm detector for the perf log: depth per drain tells whether an
+    // event source (churning app notifications, not user input) is
+    // keeping the pump off its sleep ladder.
+    if let Some(perf) = perf_stats.as_deref_mut() {
+        perf.drain_events += received_events.len() as u64;
+        perf.drain_frames += 1;
+        perf.drain_max = perf.drain_max.max(received_events.len());
+    }
     messages.write_batch(received_events);
 
     // Wake is handled before the backoff below: a stale `LowPowerMode` (polled
@@ -1653,6 +1664,12 @@ fn press_hit_cached(
     cache.hit
 }
 
+/// Minimum gap between paint-only frame refreshes for a held native drag.
+/// Each refresh is two synchronous AX reads against the app being dragged;
+/// at drag-event rates that contends the app's own thread and the selection
+/// stutters. 20Hz keeps the border glued while cutting the read storm ~6x.
+const HELD_PAINT_REFRESH: Duration = Duration::from_millis(50);
+
 #[instrument(level = Level::TRACE, skip_all)]
 #[allow(clippy::too_many_arguments)]
 pub(crate) fn window_moved_update_frame(
@@ -1664,19 +1681,26 @@ pub(crate) fn window_moved_update_frame(
     scroll_grace: Res<DragScrollState>,
     writer: Option<Res<AxWriterQueue>>,
     mut write_state: ResMut<AxWriteState>,
+    mut paint_refresh: Local<HashMap<WinID, Instant>>,
 ) {
     // Adoption reads the echo directly, never the snapshot worker: the event
     // announces a move that just happened, and the 250ms poll may not have
     // seen it yet (or may still hold the pre-move frame). A snapshot read
     // here would adopt stale frames as layout and fight the move reported.
+    // Nobody held means no throttle entries can be live: drop them so the
+    // map stays bounded by one gesture's windows, not the session's.
+    if held.is_empty() {
+        paint_refresh.clear();
+    }
     for event in messages.read() {
         let Event::WindowMoved { window_id } = event else {
             continue;
         };
 
-        let Some((entity, mut window, mut position, bounds, unmanaged, repositioning)) = windows
-            .iter_mut()
-            .find(|window| window.1.id() == *window_id)
+        let Some((entity, mut window, mut position, bounds, unmanaged, repositioning, verifying)) =
+            windows
+                .iter_mut()
+                .find(|window| window.1.id() == *window_id)
         else {
             continue;
         };
@@ -1701,9 +1725,18 @@ pub(crate) fn window_moved_update_frame(
             // keep the synthetic slot pinned, but refresh the cached OS
             // frame so the border's live-OS branch paints the cursor, not
             // the grab point. Paint-only: `Position` stays untouched and
-            // release homing still owns the glide home.
-            if let Err(err) = window.update_frame() {
-                debug!("refreshing held window {entity} frame: {err}");
+            // release homing still owns the glide home. Throttled: each
+            // refresh is synchronous AX against the app being dragged, and
+            // at drag-event rates the read storm contends that app's own
+            // thread until text selection stutters.
+            let fresh = paint_refresh
+                .get(&window.id())
+                .is_none_or(|at| at.elapsed() >= HELD_PAINT_REFRESH);
+            if fresh {
+                paint_refresh.insert(window.id(), Instant::now());
+                if let Err(err) = window.update_frame() {
+                    debug!("refreshing held window {entity} frame: {err}");
+                }
             }
             continue;
         }
@@ -1717,6 +1750,19 @@ pub(crate) fn window_moved_update_frame(
         // so adopting it would regress `Position` and restart the lerp
         // chase. The ack, not the echo, owns the truth until it lands.
         if write_state.unacked(window.id()) {
+            continue;
+        }
+        // Driven move awaiting confirmation: the animator may have converged
+        // and the ack may be in, but a slow-applying app (or WindowServer)
+        // can still echo the pre-move frame — adopting it regresses
+        // `Position` and the audit re-homes every few seconds forever
+        // (observed as a window breathing around its slot). Paint-only
+        // refresh like the held path; verification owns the confirmation.
+        // Bounded: verify drops the marker after its retries regardless.
+        if verifying {
+            if let Err(err) = window.update_frame() {
+                debug!("refreshing unconfirmed window {entity} frame: {err}");
+            }
             continue;
         }
         // A native session paneru never tracked (press-frame leak, stale

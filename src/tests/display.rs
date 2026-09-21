@@ -670,13 +670,14 @@ fn test_vertical_drag_wiggle_moves_nothing() {
         .run(commands);
 }
 
-/// A sustained scroll-drag damps with distance: the first step off the grab
-/// anchor applies 1:1, then each step counts `exp(-travelled/tau)` with the
-/// fractional remainder carried, so long drags ease out instead of running
-/// 1:1 forever. Idle settle is stretched out here so only the distance term
-/// is under test; the tau is tightened so damping shows within the few
-/// hundred pixels the lift-timeout settle leaves alone (window 1 stays
-/// fully visible throughout, so no reveal corrects the offset).
+/// A sustained scroll-drag damps with recent travel: the first step applies
+/// 1:1, then each step counts `exp(-recent_debt/tau)` with the fractional
+/// remainder carried, so sustained fast motion eases out instead of running
+/// 1:1 forever — while slow motion tracks exactly. Idle settle is stretched
+/// out here so only the damping term is under test; the tau is tightened so
+/// damping shows within the few hundred pixels the lift-timeout settle
+/// leaves alone (window 1 stays fully visible throughout, so no reveal
+/// corrects the offset).
 #[test]
 fn test_sustained_scroll_drag_damps_travel() {
     let config: Config = (
@@ -691,8 +692,9 @@ fn test_sustained_scroll_drag_damps_travel() {
     )
         .into();
     // Five windows give the strip room without a clamp wall: four -100px
-    // steps would travel -400 raw, but damping lands the strip at -241
-    // (-100, -60, -45, -36 with carry creep).
+    // steps would travel -400 raw, but recent-travel damping lands the
+    // strip at -319 (-100, -77, -72, -70 with carry creep across the
+    // 200ms command windows).
     let grab = CGPoint::new(200.0, 30.0);
     let commands = vec![
         Event::MenuOpened { window_id: 0 },
@@ -731,7 +733,7 @@ fn test_sustained_scroll_drag_damps_travel() {
             assert_window_at!(world, 0, -100, TEST_MENUBAR_HEIGHT);
         })
         .on_iteration(5, |world, _state| {
-            assert_window_at!(world, 0, -241, TEST_MENUBAR_HEIGHT);
+            assert_window_at!(world, 0, -319, TEST_MENUBAR_HEIGHT);
         })
         .run(commands);
 }
@@ -782,7 +784,7 @@ fn test_idle_hold_releases_strip_to_settle() {
                 .iter(world)
                 .count();
             assert_eq!(held, 1, "button still held, no release sent");
-            // The two damped drives land the strip at -686; the idle handoff
+            // The two damped drives land the strip at -737; the idle handoff
             // plus glide must have carried it further left since.
             let mut strips = world.query_filtered::<
                 (&Position, Option<&Scrolling>, Has<DragSettleMarker>),
@@ -2722,6 +2724,44 @@ fn test_unarmed_drag_at_edge_does_not_warp() {
         .run(commands);
 }
 
+/// A plain (button-free) mouse move at the display edge never warps, even
+/// with warp configured: edge warp is an armed-drag traversal feature, and
+/// an ungated move arm traps the cursor at shared display corners —
+/// each warp lands near the opposite edge, the user pulls back, and the
+/// next edge touch warps again, ping-ponging between displays.
+#[test]
+fn test_plain_move_at_edge_does_not_warp() {
+    // Right edge of the test display (bounds max.x 1024, threshold 3px);
+    // no buttons held, no modifier — just a move.
+    let edge = CGPoint::new(1022.0, 100.0);
+    let commands = vec![
+        Event::MouseMoved {
+            point: edge,
+            modifiers: Modifiers::empty(),
+        },
+        Event::Command {
+            command: Command::PrintState,
+        },
+    ];
+
+    TestHarness::new()
+        .with_config(warp_drag_config())
+        .with_windows(1)
+        .with_display(
+            EXT_DISPLAY_ID,
+            IRect::new(0, -EXT_DISPLAY_HEIGHT, EXT_DISPLAY_WIDTH, 0),
+            vec![EXT_WORKSPACE_ID],
+        )
+        .on_iteration(1, move |_world, state| {
+            // Focus parking leaves the cursor on window 0's center, and
+            // the mock cursor only moves via warp — so an armed drag
+            // would have landed at (6, -1100), while no warp leaves it
+            // parked.
+            assert_eq!(state.cursor_position(), Origin::new(200, 394));
+        })
+        .run(commands);
+}
+
 /// `mouse_follows_focus` warps to the newly focused window's visible center
 /// on keyboard focus moves — but only when the cursor is outside it.
 #[test]
@@ -3711,12 +3751,13 @@ fn test_content_drag_keeps_native_and_scrolls_nothing() {
         .run(commands);
 }
 
-/// A grab inside a tall AX toolbar (below the 28px fallback strip) still
-/// scroll-arms: the toolbar rect, not the fallback, defines the header.
+/// A grab below the 28px titlebar strip does NOT scroll-arm — even where
+/// the app exposes a tall AX toolbar: only the titlebar band drives,
+/// everything else stays native.
 #[test]
-fn test_toolbar_grab_scrolls_strip() {
-    // Window 0 tiles at (0, 20); the mocked toolbar spans y=20..72, so
-    // y=60 is content for geometry but header for the toolbar rect.
+fn test_toolbar_grab_stays_native() {
+    // Window 0 tiles at (0, 20); y=60 sits below the titlebar band, in
+    // what would be toolbar territory.
     let grab = CGPoint::new(200.0, 60.0);
     let commands = vec![
         Event::MenuOpened { window_id: 0 },
@@ -3742,23 +3783,21 @@ fn test_toolbar_grab_scrolls_strip() {
 
     TestHarness::new()
         .with_windows(1)
-        .on_iteration(0, move |_world, state| {
-            state.update_window(0, |window| {
-                window.toolbar_frame = Some(IRect::new(0, 20, 400, 72));
-            });
-        })
         .on_iteration(3, move |world, _state| {
-            // The (300, 0) drag scrolled through the shared pipeline: a lone
-            // 400px column on a 1024px display caps at x=624.
+            // No scroll drive: the window never left its slot and the
+            // strip never moved, and no scroll state was armed.
+            assert_window_at!(world, 0, 0, TEST_MENUBAR_HEIGHT);
             let entity = find_window_entity(0, world);
-            let position = world.get::<Position>(entity).expect("need position").0;
-            assert_eq!(position, Origin::new(300, TEST_MENUBAR_HEIGHT));
             let mut strips = world.query::<(&LayoutStrip, &Position)>();
             let (_, position) = strips
                 .iter(world)
                 .find(|(strip, _)| strip.contains(entity))
                 .expect("need owning strip");
-            assert_eq!(position.0.x, 300);
+            assert_eq!(position.0.x, 0);
+            assert!(
+                world.query::<&Scrolling>().iter(world).next().is_none(),
+                "a toolbar grab must not arm the scroll pipeline"
+            );
         })
         .run(commands);
 }

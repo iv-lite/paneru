@@ -191,15 +191,22 @@ fn ingest_delta(handles: &mut RosterHandles, fast_poll: &mut bool, delta: Roster
 /// Reads one rostered window. Every AX call is fallible by design (dead apps,
 /// revoked consent): failures yield `None`/defaults, never panics, and the
 /// epoch still advances so a wedged window cannot stall the roster.
-fn read_one(win_id: WinID, pid: Option<Pid>, element: &CFRetained<AXUIWrapper>) -> WindowSnapshot {
-    WindowSnapshot {
-        win_id,
-        pid,
-        title: element.title().ok(),
-        frame: snapshot_frame(element).ok(),
-        minimized: element.minimized().is_ok_and(|minimized| minimized),
-        corner_radius: None,
-    }
+/// Hot per-tick read: frame only. Titles and minimized ride the slow tick
+/// — no per-frame consumer reads them (titles serve event-driven queries
+/// with a direct-read fallback; minimized is currently unread), so polling
+/// them at 30Hz while held just contends the apps' main threads: a video
+/// page served 33 title reads/s is what made held-drags feel sluggish
+/// inside windows.
+fn read_frame(element: &CFRetained<AXUIWrapper>) -> Option<IRect> {
+    snapshot_frame(element).ok()
+}
+
+/// Cold per-window read, slow ticks only (see [`run`]).
+fn read_meta(element: &CFRetained<AXUIWrapper>) -> (Option<String>, bool) {
+    (
+        element.title().ok(),
+        element.minimized().is_ok_and(|minimized| minimized),
+    )
 }
 
 /// Refreshes slow-cadence per-window data (currently corner radii) and
@@ -213,20 +220,33 @@ fn refresh_radii(radii: &mut HashMap<WinID, Option<f64>>, handles: &RosterHandle
     }
 }
 
-/// Reads every rostered handle for one publish tick, attaching the
-/// slow-cached corner radii. Pure over its inputs apart from the AX reads
-/// inside [`read_one`].
+/// Refreshes one publish tick in place: frames every tick, titles and
+/// minimized on slow ticks only (see [`read_frame`]). Entries for removed
+/// handles are pruned so the map stays bounded by the live roster; the
+/// corner radii ride along from the slow cache. Pure over its inputs apart
+/// from the AX reads inside.
 fn snapshot_windows(
+    windows: &mut HashMap<WinID, WindowSnapshot>,
     handles: &RosterHandles,
     radii: &HashMap<WinID, Option<f64>>,
-) -> HashMap<WinID, WindowSnapshot> {
-    let mut windows = HashMap::with_capacity(handles.len());
+    read_meta_tick: bool,
+) {
+    windows.retain(|win_id, _| handles.contains_key(win_id));
     for (win_id, (pid, element)) in handles {
-        let mut snapshot = read_one(*win_id, *pid, element);
-        snapshot.corner_radius = radii.get(win_id).copied().flatten();
-        windows.insert(*win_id, snapshot);
+        let snapshot = windows.entry(*win_id).or_insert_with(|| WindowSnapshot {
+            win_id: *win_id,
+            pid: *pid,
+            ..Default::default()
+        });
+        snapshot.pid = *pid;
+        snapshot.frame = read_frame(element);
+        if read_meta_tick {
+            let (title, minimized) = read_meta(element);
+            snapshot.title = title;
+            snapshot.minimized = minimized;
+            snapshot.corner_radius = radii.get(win_id).copied().flatten();
+        }
     }
-    windows
 }
 
 /// Slow-cadence enumeration (displays, spaces, radii) extracted from
@@ -380,13 +400,14 @@ pub(crate) fn snapshot_corner_radius(
 /// the next dirty tick. Titles, spaces and displays don't wake — no border
 /// consumer reads them. The waker coalesces bursts into one posted event.
 ///
-/// Two cadences: window attributes + the on-screen set every fast tick
+/// Two cadences: window frames + the on-screen set every fast tick
 /// (250ms idle, 30ms while warming up or holding a drag per
-/// `RosterDelta::SetFastPoll`, matching the overlay memo horizon); display/space
-/// enumeration every eighth tick (2s idle, faster while boosted), since it
-/// moves slower and costs one SLS iterator walk per space. SLS failures keep
-/// the previous generation's data (never clear on a transient error); the
-/// next slow tick retries.
+/// `RosterDelta::SetFastPoll`, matching the overlay memo horizon); titles,
+/// minimized, and display/space enumeration every eighth tick (2s idle,
+/// ~240ms while boosted), since nothing per-frame reads them and each is a
+/// cross-process AX round trip per window. SLS failures keep the previous
+/// generation's data (never clear on a transient error); the next slow
+/// tick retries.
 fn run(
     roster: Receiver<RosterDelta>,
     window_manager: WindowManagerOS,
@@ -410,6 +431,11 @@ fn run(
     // fast mode it simply runs more often — still on this thread, never
     // the main one.
     let mut fast_poll = false;
+    // Published window generations, merged in place across ticks so slow
+    // reads (titles, minimized) survive the frame-only fast ticks between
+    // slow ones. Bounded by the live roster via the retain in
+    // `snapshot_windows`.
+    let mut windows: HashMap<WinID, WindowSnapshot> = HashMap::new();
     // Last woken generation: frames (`None` = unreadable that tick) plus the
     // on-screen set. Compared every tick; the pump wakes only on change.
     let mut last_frames: HashMap<WinID, Option<IRect>> = HashMap::new();
@@ -434,11 +460,24 @@ fn run(
         }
         ticks += 1;
 
-        let windows = snapshot_windows(&handles, &radii);
-        if let Some(ids) = window_manager.windows_on_screen() {
-            on_screen = ids.into_iter().collect();
-        } else {
-            debug!("ax snapshot: on-screen enumeration failed, keeping previous set");
+        // Slow ticks carry the cold per-window reads (titles, minimized)
+        // alongside the display/space enumeration below; fast ticks read
+        // frames only, so a held drag polls one cheap attribute per
+        // window instead of three.
+        let slow_tick = ticks.is_multiple_of(SLOW_EVERY_TICKS);
+        snapshot_windows(&mut windows, &handles, &radii, slow_tick);
+        // The on-screen walk (`CGWindowList` + dict parse) is the heaviest
+        // call in this loop — far heavier than one frame read per window —
+        // so fast ticks sample it every fourth tick (~120ms) instead of
+        // every 30ms. Membership changes slower than frames, and every
+        // consumer (`on_screen_set`) carries a direct-walk fallback for
+        // the gap. Skipped ticks keep the previous set.
+        if slow_tick || !fast_poll || ticks.is_multiple_of(4) {
+            if let Some(ids) = window_manager.windows_on_screen() {
+                on_screen = ids.into_iter().collect();
+            } else {
+                debug!("ax snapshot: on-screen enumeration failed, keeping previous set");
+            }
         }
 
         if ticks.is_multiple_of(SLOW_EVERY_TICKS) {
@@ -473,7 +512,10 @@ fn run(
             epoch,
             changed_epoch,
             at: Instant::now(),
-            windows,
+            // Cloned per generation: maps are small (one entry per
+            // rostered window) and the merge map must survive for the
+            // next tick's frame-only refresh.
+            windows: windows.clone(),
             spaces: spaces.clone(),
             on_screen: on_screen.clone(),
             displays: displays.clone(),

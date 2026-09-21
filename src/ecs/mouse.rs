@@ -51,16 +51,19 @@ const TITLEBAR_HEIGHT_PX: i32 = 28;
 /// strip and native edge resize must keep working.
 const RESIZE_MARGIN_PX: i32 = 6;
 
-/// Whether a press landed on the window's header (titlebar/toolbar) as
-/// opposed to its content. Only header grabs scroll the columns and swallow
-/// the native drag; content keeps fully native behavior (text selection,
-/// sliders, tab drags, ...).
+/// Whether a press landed on the window's titlebar as opposed to its
+/// content. Only titlebar grabs scroll the columns and swallow the native
+/// drag; everything else keeps fully native behavior (text selection,
+/// sliders, tab drags, toolbar interaction, ...).
 ///
-/// Prefers the app's `AXToolbar` rect when exposed (unified toolbars taller
-/// than the fallback strip), else the top `TITLEBAR_HEIGHT_PX` of the
-/// window. Fullscreen windows and sheets/drawers never count — they have no
-/// draggable header. Best-effort: any AX failure falls back to geometry and
-/// a press outside the window can never classify, so this never blocks input.
+/// Pure geometry: the top `TITLEBAR_HEIGHT_PX` of the window, minus the
+/// resize margins. Deliberately not the app's `AXToolbar` rect — unified
+/// toolbars span regions users read as window content (tabs, toolbars),
+/// and arming there made left-drag scroll fire from inside the window.
+/// Fullscreen windows and sheets/drawers never count — they have no
+/// draggable header. Best-effort: any AX failure falls back to geometry
+/// and a press outside the window can never classify, so this never
+/// blocks input.
 fn press_is_on_titlebar(point: &CGPoint, window: &Window) -> bool {
     if window.is_full_screen() || window.child_role().unwrap_or(false) {
         return false;
@@ -77,19 +80,15 @@ fn press_is_on_titlebar(point: &CGPoint, window: &Window) -> bool {
     {
         return false;
     }
-    if let Some(toolbar) = window.toolbar_frame() {
-        return toolbar.contains(cursor);
-    }
     cursor.y - os_min_y < TITLEBAR_HEIGHT_PX
 }
 
 /// Direct-drives one header scroll-drag delta into the owner strip's
-/// scroll offset, 1:1 with the pointer and same-tick as the column drive.
-/// Keeps the integrator's `Scrolling` state glued to the write (zero
-/// velocity, refreshed lift timestamp) so it no-ops plus clamps regardless
-/// of plugin execution order, and clears a deliberate manual placement now
-/// that the user owns the strip. The release path (offset keep, inertia,
-/// settle) is untouched.
+/// scroll offset, same-tick as the column drive. Keeps the integrator's
+/// `Scrolling` state glued to the write (zero velocity, refreshed lift
+/// timestamp) so it no-ops plus clamps regardless of plugin execution
+/// order, and clears a deliberate manual placement now that the user owns
+/// the strip. The release path (offset keep, inertia, settle) is untouched.
 #[allow(clippy::too_many_arguments)]
 fn drive_scroll_strip(
     target: Entity,
@@ -100,22 +99,25 @@ fn drive_scroll_strip(
     commands: &mut Commands,
     scroll_state: &mut DragScrollState,
     config: &Config,
-) {
+) -> i32 {
     let Some(owner) = strips
         .iter()
         .find_map(|(entity, strip)| strip.contains(target).then_some(entity))
     else {
         trace!("synthetic drag: held target {target} has no strip, skipping");
-        return;
+        return 0;
     };
     let Ok((strip_entity, mut strip_position, scrolling)) = scroll.get_mut(owner) else {
-        return;
+        return 0;
     };
-    // Sustained-motion friction: the further the strip has travelled from
-    // the grab anchor, the less each new pixel counts. Idle-while-held is
-    // handled by `expire_idle_held_scroll` (no events arrive when the
-    // pointer is still, so it cannot live in this event-driven path).
-    let delta_x = friction_damped_dx(delta_x, strip_position.0.x, scroll_state, config);
+    // Sustained-motion friction: the faster the recent motion, the less
+    // each new pixel counts (see `friction_damped_dx`). Slow motion stays
+    // 1:1 so the strip never punishes the hand; idle-while-held is handled
+    // by `expire_idle_held_scroll` (no events arrive when the pointer is
+    // still, so it cannot live in this event-driven path). Returns the
+    // applied delta so samplers seed velocity from strip truth, not the
+    // raw pointer.
+    let delta_x = friction_damped_dx(delta_x, time.elapsed(), scroll_state, config);
     strip_position.0.x += delta_x;
     if let Some(mut scrolling) = scrolling {
         // Keep the integrator's state glued to the direct write: with zero
@@ -136,6 +138,7 @@ fn drive_scroll_strip(
     if let Ok(mut entity_commands) = commands.get_entity(strip_entity) {
         entity_commands.try_remove::<ManualStripOffset>();
     }
+    delta_x
 }
 
 /// Accumulated left-drag travel (px) in the current press, for telling a
@@ -464,11 +467,11 @@ fn mouse_down_trigger(
                 window.id()
             );
         }
-        // Scroll-drag arming: same grab-time philosophy, but for the header
-        // only. A tiled, unmodified header grab scrolls the columns and
-        // swallows the native drag; content grabs (and anything armed,
-        // floating or fullscreen) keep fully native behavior. The tap
-        // pre-suppresses broadly and this corrects it a frame later.
+        // Scroll-drag arming: same grab-time philosophy, but for the
+        // titlebar only. A tiled, unmodified titlebar grab scrolls the
+        // columns and swallows the native drag; content grabs (and anything
+        // armed, floating or fullscreen) keep fully native behavior. The
+        // tap pre-suppresses broadly and this corrects it a frame later.
         let tiled = windows
             .get_managed(entity)
             .is_some_and(|(_, _, unmanaged)| unmanaged.is_none());
@@ -477,7 +480,10 @@ fn mouse_down_trigger(
             && !armed
             && press_is_on_titlebar(point, window);
         if scroll_armed {
-            debug!("mouse drag scroll-armed on window {} header", window.id());
+            debug!(
+                "mouse drag scroll-armed on window {} header at {point:?}",
+                window.id()
+            );
             holder.try_insert(DragScrollArmed);
         }
         set_scroll_drag_suppress(scroll_armed);
@@ -669,10 +675,11 @@ fn mouse_up_trigger(
         // into the next press (its MouseDown resets the sampler anyway).
         let release_ema_px_s = std::mem::take(&mut scroll_state.release_ema_px_s);
         scroll_state.last_sample_at = None;
-        // Friction gesture state is per-gesture too: a stale grab anchor or
+        // Friction gesture state is per-gesture too: stale travel debt or
         // carry must never leak into the next press (its MouseDown resets
         // the trackers anyway).
-        scroll_state.friction_grab_x = None;
+        scroll_state.friction_travel_px = 0.0;
+        scroll_state.friction_at = None;
         scroll_state.friction_carry_px = 0.0;
         scroll_state.held_ema_px_s = 0.0;
         scroll_state.last_drag_move_at = None;
@@ -830,10 +837,13 @@ pub(crate) struct DragScrollState {
     /// inertia chain then glides, clamps and cleans up like a trackpad fling.
     pub(crate) release_ema_px_s: f64,
     pub(crate) last_sample_at: Option<Duration>,
-    /// Strip x at the first driven motion of the gesture: the anchor for
-    /// distance damping. Set lazily (the press-time strip is unknown until
-    /// the first drive resolves the owner), cleared on every press.
-    pub(crate) friction_grab_x: Option<i32>,
+    /// Recent driven travel (px, decayed by `FRICTION_TRAVEL_TAU_SECS`):
+    /// the debt damping draws on. Grows with applied motion, washes out
+    /// over pauses, cleared on every press.
+    pub(crate) friction_travel_px: f64,
+    /// Virtual time of the last damped drive: the decay gap covers whole
+    /// pauses, since no events arrive while still. Cleared on press.
+    pub(crate) friction_at: Option<Duration>,
     /// Fractional damped pixels carried across events so a heavily damped
     /// drag still creeps instead of quantizing to a standstill.
     pub(crate) friction_carry_px: f64,
@@ -1209,26 +1219,23 @@ struct DragMoveState {
 fn damped_column_drive(
     target: Entity,
     raw_dx: i32,
+    now: Duration,
     strips: &Query<(Entity, &LayoutStrip)>,
-    scroll_strips: &ScrollDriveStrips,
     scroll_state: &mut DragScrollState,
     config: &Config,
 ) -> Option<(Origin, Vec<Entity>)> {
-    let (owner, members): (Option<Entity>, Vec<Entity>) = strips
+    let members: Vec<Entity> = strips
         .iter()
-        .find_map(|(entity, strip)| {
+        .find_map(|(_, strip)| {
             strip.index_of(target).ok().and_then(|index| {
                 strip
                     .get(index)
                     .ok()
-                    .map(|column| (Some(entity), column.window_iter().collect()))
+                    .map(|column| column.window_iter().collect())
             })
         })
-        .unwrap_or((None, vec![target]));
-    let strip_x = owner
-        .and_then(|entity| scroll_strips.get(entity).ok())
-        .map_or(0, |(_, position, _)| position.0.x);
-    let dx = friction_damped_dx(raw_dx, strip_x, scroll_state, config);
+        .unwrap_or(vec![target]);
+    let dx = friction_damped_dx(raw_dx, now, scroll_state, config);
     if dx == 0 {
         return None;
     }
@@ -1368,30 +1375,45 @@ fn held_drag_target(
     Some((target, window.id(), armed, scroll_armed))
 }
 
+/// Decay constant for recent drag travel: after this long without motion
+/// the friction debt has mostly washed out and tracking is 1:1 again.
+const FRICTION_TRAVEL_TAU_SECS: f64 = 0.3;
+
 /// Damps one raw drag delta by the friction factor: exponential falloff
-/// with distance travelled from the gesture's grab anchor, floored at
-/// `drag_friction_min_rate` so a moving pointer never fully glues. The
-/// fractional remainder rides `friction_carry_px` so slow creeps survive
-/// integer truncation. Returns the raw delta untouched when friction is
-/// disabled (factor exactly 1.0, zero carry drift).
+/// with *recent* travel, floored at `drag_friction_min_rate` so a moving
+/// pointer never fully glues. Slow motion stays 1:1 — only sustained fast
+/// motion eases out, and a pause washes the debt away (the gap `dt` covers
+/// the whole silence, since no events arrive while still). The fractional
+/// remainder rides `friction_carry_px` so slow creeps survive integer
+/// truncation. Returns the raw delta untouched when friction is disabled
+/// (factor exactly 1.0, zero carry drift).
+///
+/// The cursor path never calls this: press anchor, paint offset, click
+/// threshold and warp velocity all stay raw. Only held-surface motion
+/// (strip/column drives) and the velocity samplers seeded from it are
+/// damped — friction shapes stripes and windows, never the pointer.
 #[allow(clippy::cast_possible_truncation)]
 fn friction_damped_dx(
     raw_dx: i32,
-    strip_x: i32,
+    now: Duration,
     scroll_state: &mut DragScrollState,
     config: &Config,
 ) -> i32 {
     if !config.drag_friction_enabled() || raw_dx == 0 {
         return raw_dx;
     }
-    let grab_x = *scroll_state.friction_grab_x.get_or_insert(strip_x);
-    let travelled = f64::from((strip_x - grab_x).abs());
-    let factor = (-travelled / config.drag_friction_distance_tau_px())
+    if let Some(last) = scroll_state.friction_at {
+        let dt = now.saturating_sub(last).as_secs_f64();
+        scroll_state.friction_travel_px *= (-dt / FRICTION_TRAVEL_TAU_SECS).exp();
+    }
+    scroll_state.friction_at = Some(now);
+    let factor = (-scroll_state.friction_travel_px / config.drag_friction_distance_tau_px())
         .exp()
         .clamp(config.drag_friction_min_rate(), 1.0);
     let effective = f64::from(raw_dx).mul_add(factor, scroll_state.friction_carry_px);
     let applied = effective.trunc();
     scroll_state.friction_carry_px = effective - applied;
+    scroll_state.friction_travel_px += applied.abs();
     applied as i32
 }
 
@@ -1530,7 +1552,8 @@ fn drag_move_held_column(
                 scroll_state.distance_px = 0.0;
                 scroll_state.release_ema_px_s = 0.0;
                 scroll_state.last_sample_at = None;
-                scroll_state.friction_grab_x = None;
+                scroll_state.friction_travel_px = 0.0;
+                scroll_state.friction_at = None;
                 scroll_state.friction_carry_px = 0.0;
                 scroll_state.held_ema_px_s = 0.0;
                 scroll_state.last_drag_move_at = None;
@@ -1587,17 +1610,17 @@ fn drag_move_held_column(
                 // take the move path below; content grabs with scrolling
                 // enabled are ignored entirely — native owns them.
                 if scroll_armed {
+                    // Threshold and velocity track the hand (raw); only the
+                    // strip displacement is damped. Friction shapes stripes
+                    // and windows, never the velocity the drag works with.
                     scroll_state.distance_px += f64::from(delta.x.abs());
                     // Horizontal columns only: `delta.y` is always zero after
                     // the horizontal projection above; the `dx != 0` gate just
                     // skips no-op events.
                     if delta.x != 0 {
-                        sample_release_velocity(
-                            &mut scroll_state,
-                            f64::from(delta.x),
-                            time.elapsed(),
-                        );
-                        sample_held_velocity(&mut scroll_state, f64::from(delta.x), time.elapsed());
+                        let now = time.elapsed();
+                        sample_release_velocity(&mut scroll_state, f64::from(delta.x), now);
+                        sample_held_velocity(&mut scroll_state, f64::from(delta.x), now);
                         drive_scroll_strip(
                             target,
                             delta.x,
@@ -1618,15 +1641,16 @@ fn drag_move_held_column(
                 if !armed && config.left_drag_scrolls_strip() {
                     continue;
                 }
-                // Held-motion tracking for the idle-settle clock, plus the
-                // same distance damping as the scroll path so a sustained
-                // armed drag eases out instead of running forever.
+                // Same recent-motion damping as the scroll path so a
+                // sustained armed drag eases out instead of running forever.
+                // The held sampler folds the raw hand delta: velocity stays
+                // hand truth, damping applies to displacement only.
                 sample_held_velocity(&mut scroll_state, f64::from(delta.x), time.elapsed());
                 let Some((delta, members)) = damped_column_drive(
                     target,
                     delta.x,
+                    time.elapsed(),
                     &strips,
-                    &scroll_strips,
                     &mut scroll_state,
                     &config,
                 ) else {
@@ -2290,20 +2314,23 @@ fn horizontal_warp_mouse_trigger(
     const VELOCITY_FRESHNESS: Duration = Duration::from_millis(80);
 
     for InputEvent(event) in messages.read() {
-        // Edge-warp also fires mid-drag, but only for a shortcut-armed
-        // display drag in progress: other drags (text selection, resize
-        // handles) keep native edge behavior. The grab-time arming is what
-        // distinguishes them — see `DragDisplayArmed`.
+        // Edge-warp fires only for a shortcut-armed display drag in
+        // progress: anything else (plain moves, text selection, resize
+        // handles, unarmed strip drags) keeps native edge behavior. The
+        // grab-time arming is what distinguishes them — see
+        // `DragDisplayArmed`. An ungated move arm traps the cursor at
+        // shared display corners: each warp lands near the opposite
+        // edge, the user pulls back, and the next edge touch warps
+        // again, ping-ponging between displays.
+        let armed_drag = |modifiers: &Modifiers| {
+            held.iter().any(|(_, _, armed)| armed)
+                && config
+                    .mouse_drag_display_modifier()
+                    .is_some_and(|required| required.matches(*modifiers))
+        };
         let point = match event {
-            Event::MouseMoved { point, .. } => point,
-            Event::MouseDragged { point, modifiers }
-                if held.iter().any(|(_, _, armed)| armed)
-                    && config
-                        .mouse_drag_display_modifier()
-                        .is_some_and(|required| required.matches(*modifiers)) =>
-            {
-                point
-            }
+            Event::MouseMoved { point, modifiers } if armed_drag(modifiers) => point,
+            Event::MouseDragged { point, modifiers } if armed_drag(modifiers) => point,
             _ => continue,
         };
 
@@ -2484,45 +2511,61 @@ mod tests {
         )
             .into();
         let mut state = DragScrollState {
-            friction_grab_x: Some(0),
+            friction_travel_px: 9999.0,
             ..Default::default()
         };
-        // Even far from the grab anchor the raw delta survives, and no
-        // anchor is even recorded.
-        assert_eq!(friction_damped_dx(-800, 5000, &mut state, &config), -800);
-        assert_eq!(state.friction_grab_x, Some(0));
+        // Even deep in debt the raw delta survives, and no debt is even
+        // recorded.
+        let now = Duration::from_millis(1000);
+        assert_eq!(friction_damped_dx(-800, now, &mut state, &config), -800);
+        assert!((state.friction_travel_px - 9999.0).abs() < f64::EPSILON);
         assert!(state.friction_carry_px.abs() < f64::EPSILON);
-        assert_eq!(friction_damped_dx(0, 5000, &mut state, &config), 0);
+        assert!(state.friction_at.is_none());
+        assert_eq!(friction_damped_dx(0, now, &mut state, &config), 0);
     }
 
     #[test]
-    fn friction_starts_at_unity_then_damps_with_distance() {
+    fn friction_starts_at_unity_then_damps_with_recent_travel() {
         let config = Config::default();
         assert!(config.drag_friction_enabled());
         let mut state = DragScrollState::default();
-        // At the grab anchor the factor is exactly 1.0: full motion.
-        assert_eq!(friction_damped_dx(-200, 0, &mut state, &config), -200);
-        assert_eq!(state.friction_grab_x, Some(0));
-        // One time-constant out the factor is 1/e: -100px damps to -36
-        // with the -0.79px remainder carried for the next event.
-        let damped = friction_damped_dx(-100, 1200, &mut state, &config);
-        assert_eq!(damped, -36);
-        assert!((state.friction_carry_px - (-0.787_5)).abs() < 0.01);
-        // The carry creeps: the same raw delta applies one more pixel.
-        let crept = friction_damped_dx(-100, 1200, &mut state, &config);
-        assert_eq!(crept, -37);
+        let t0 = Duration::from_millis(1000);
+        // No debt yet: full motion, debt grows by what moved.
+        assert_eq!(friction_damped_dx(-200, t0, &mut state, &config), -200);
+        assert!((state.friction_travel_px - 200.0).abs() < f64::EPSILON);
+        assert_eq!(state.friction_at, Some(t0));
+        // Same tick (no decay): 200px of debt damps -100px by
+        // exp(-200/1200) = 0.846 -> -84.64, remainder carried.
+        let damped = friction_damped_dx(-100, t0, &mut state, &config);
+        assert_eq!(damped, -84);
+        assert!((state.friction_carry_px - (-0.648)).abs() < 0.01);
+        assert!((state.friction_travel_px - 284.0).abs() < 1e-9);
     }
 
     #[test]
-    fn friction_floors_at_min_rate_far_from_grab() {
+    fn friction_debt_washes_out_over_a_pause() {
         let config = Config::default();
+        let mut state = DragScrollState::default();
+        let t0 = Duration::from_millis(1000);
+        assert_eq!(friction_damped_dx(-200, t0, &mut state, &config), -200);
+        // A 900ms pause (three time constants) decays the 200px debt to
+        // ~10px: tracking is back to ~1:1 instead of punishing the resume.
+        let resumed =
+            friction_damped_dx(-100, t0 + Duration::from_millis(900), &mut state, &config);
+        assert_eq!(resumed, -99);
+    }
+
+    #[test]
+    fn friction_floors_at_min_rate_under_sustained_motion() {
+        let config = Config::default();
+        // Saturate the debt first: the 0.05 floor turns -100px into -5.
         let mut state = DragScrollState {
-            friction_grab_x: Some(0),
+            friction_travel_px: 1e9,
+            friction_at: Some(Duration::from_millis(1000)),
             ..Default::default()
         };
-        // Effectively infinitely far: the 0.05 floor turns -100px into -5.
         assert_eq!(
-            friction_damped_dx(-100, i32::MAX / 2, &mut state, &config),
+            friction_damped_dx(-100, Duration::from_millis(1000), &mut state, &config),
             -5
         );
     }

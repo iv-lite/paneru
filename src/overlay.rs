@@ -275,7 +275,7 @@ pub struct OverlayManager {
     /// window span multiple displays (with "Displays have separate Spaces" it
     /// renders on only one), so each screen gets its own overlay drawn in that
     /// screen's local coordinates. Indexed in lockstep with `NSScreen::screens`.
-    overlays: Vec<(Retained<NSWindow>, DimParams)>,
+    overlays: Vec<(Retained<NSWindow>, DimParams, NSRect)>,
     hidden: bool,
     /// The drop-preview ghost shown during armed display drags, if any.
     drop_preview: Option<(Retained<NSWindow>, NSRect, BorderParams)>,
@@ -337,7 +337,7 @@ impl OverlayManager {
 
         // A display was added/removed — tear down and rebuild from scratch.
         if self.overlays.len() != screens.len() {
-            for (window, _) in self.overlays.drain(..) {
+            for (window, ..) in self.overlays.drain(..) {
                 window.orderOut(None::<&AnyObject>);
             }
         }
@@ -367,15 +367,21 @@ impl OverlayManager {
                 cutout_radius,
             };
 
-            if let Some((window, stored)) = self.overlays.get_mut(i) {
+            if let Some((window, stored, placed)) = self.overlays.get_mut(i) {
                 if *stored == params {
-                    // Keep geometry in sync cheaply (no forced redraw).
-                    window.setFrame_display(frame, false);
+                    // A `setFrame` is a WindowServer round trip even with
+                    // `display: false`: skip it when neither geometry nor
+                    // params moved since the last tick.
+                    if !nsrect_eq(*placed, frame) {
+                        window.setFrame_display(frame, false);
+                        *placed = frame;
+                    }
                 } else {
                     let view = DimView::new(self.mtm, frame, &params);
                     window.setContentView(Some(&view));
                     window.setFrame_display(frame, true);
                     *stored = params;
+                    *placed = frame;
                 }
                 if self.hidden {
                     window.orderFront(None::<&AnyObject>);
@@ -385,14 +391,14 @@ impl OverlayManager {
                 let view = DimView::new(self.mtm, frame, &params);
                 window.setContentView(Some(&view));
                 window.orderFront(None::<&AnyObject>);
-                self.overlays.push((window, params));
+                self.overlays.push((window, params, frame));
             }
         }
         self.hidden = false;
     }
 
     pub fn remove_all(&mut self) {
-        for (window, _) in self.overlays.drain(..) {
+        for (window, ..) in self.overlays.drain(..) {
             window.orderOut(None::<&AnyObject>);
         }
         self.hide_borders();
@@ -403,7 +409,7 @@ impl OverlayManager {
     /// borders (used when dimming is configured off but borders are on: no
     /// transparent fullscreen windows linger consuming backing stores).
     pub fn remove_dim_overlays(&mut self) {
-        for (window, _) in self.overlays.drain(..) {
+        for (window, ..) in self.overlays.drain(..) {
             window.orderOut(None::<&AnyObject>);
         }
     }
@@ -412,7 +418,7 @@ impl OverlayManager {
         if self.hidden {
             return;
         }
-        for (window, _) in &self.overlays {
+        for (window, ..) in &self.overlays {
             window.orderOut(None::<&AnyObject>);
         }
         self.hide_borders();
@@ -435,8 +441,12 @@ impl OverlayManager {
     /// never O(all windows).
     pub fn sync_borders(&mut self, desired: &[(WinID, NSRect, BorderParams)]) {
         let screen_h = self.screen_height(false);
+        // Set lookup: the retain scan below runs per border per tick, and
+        // with inactive borders on both sides grow with the window count.
+        let wanted: std::collections::HashSet<WinID> =
+            desired.iter().map(|(id, _, _)| *id).collect();
         self.borders.retain(|id, border| {
-            let keep = desired.iter().any(|(want, _, _)| want == id);
+            let keep = wanted.contains(id);
             if !keep {
                 border.window.orderOut(None::<&AnyObject>);
             }
