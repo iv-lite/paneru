@@ -602,7 +602,7 @@ pub(super) fn tick_cold_start(
 /// times a second with a constant.
 pub(super) fn publish_snapshot_cadence(
     cold: Option<Res<ColdStart>>,
-    held: Query<(), With<MouseHeldMarker>>,
+    held: Query<(), crate::ecs::DrivenDragHeld>,
     verifying: Query<(), With<VerifyWindowPosition>>,
     roster: Option<Res<SnapshotRoster>>,
     mut orchestrator: ResMut<FrameOrchestrator>,
@@ -610,13 +610,15 @@ pub(super) fn publish_snapshot_cadence(
     let Some(roster) = roster.as_deref() else {
         return;
     };
-    // Fast while warming up, while a drag is held, while any landing
-    // awaits confirmation, or while any mouse button is down: the last
-    // covers missed-press native drags with no holder (no paint state),
-    // whose border would otherwise step at the 250ms idle cadence.
-    // Press-gated, so idle cost is untouched. Last-published state lives
-    // in the orchestrator so cadence is observable, not a `Local`.
-    let fast = cold.is_some() || !held.is_empty() || !verifying.is_empty() || left_button_held();
+    // Fast while warming up, while an armed or scroll-driven drag is held,
+    // or while any landing awaits confirmation. Deliberately NOT while any
+    // mouse button is down, and not for plain content holders: content
+    // presses engage no tracking by design, so a text selection must not
+    // buy the 30ms AX storm. A genuinely missed press (no holder at all)
+    // degrades to 250ms borders — the overlay paints those from throttled
+    // direct reads, not the snapshot. Last-published state lives in the
+    // orchestrator so cadence is observable, not a `Local`.
+    let fast = cold.is_some() || !held.is_empty() || !verifying.is_empty();
     if fast != orchestrator.snapshot_fast {
         orchestrator.snapshot_fast = fast;
         let _ = roster
@@ -2176,6 +2178,15 @@ pub(super) fn update_overlays(
     // Dim surfaces stay frozen (never hidden — no flash) and the
     // drop-preview ghost keeps painting on its own window.
     let holder_held = !drag_held.is_empty();
+    if !holder_held && paint.target.is_none() && left_button_held() {
+        // Button held with no drag tracking (a content press by design):
+        // nothing to hide for and no hit-test worth its IPC — borders
+        // stay glued and native behavior is fully untouched.
+        // `paint.begin` runs for every tracked grab, so an empty target
+        // exactly marks the untracked ones. Without a held button this
+        // must not fire: ordinary dirty ticks still need their repaint.
+        return;
+    }
     // Two SLS round trips per tick while any button is held with no holder
     // (missed-press native drags). Throttled like the FFM hover hit-test:
     // the answer only gates border hiding, so 50ms staleness is invisible.

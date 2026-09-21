@@ -284,6 +284,11 @@ pub struct OverlayManager {
     /// layer-backed windows (see `BorderOverlay`); entries not in the latest
     /// sync are ordered out and dropped.
     borders: HashMap<WinID, BorderOverlay>,
+    /// Whether the border set is currently ordered out. `hide_borders`
+    /// runs every frame of a tracked hold; without this each tick pays an
+    /// `orderOut` round trip per border for windows that are already
+    /// hidden. Cleared whenever `sync_borders` (re)shows anything.
+    borders_hidden: bool,
     /// Cached [`primary_screen_height`]: up to three overlay entry points
     /// need it per tick (`update`, `sync_borders`, `show_drop_preview`),
     /// and each probe walks `NSScreen::screens` on the main thread.
@@ -298,6 +303,7 @@ impl OverlayManager {
             hidden: false,
             drop_preview: None,
             borders: HashMap::new(),
+            borders_hidden: false,
             screen_h: None,
         }
     }
@@ -403,6 +409,8 @@ impl OverlayManager {
         }
         self.hide_borders();
         self.hidden = false;
+        // Map is empty either way; reset so the next hide pays honestly.
+        self.borders_hidden = false;
     }
 
     /// Remove the fullscreen dim surfaces without touching the per-window
@@ -429,9 +437,13 @@ impl OverlayManager {
     /// re-shows without rebuilding. Used for the drag blackout: borders
     /// hide for the gesture while dim and the drop ghost keep painting.
     pub(crate) fn hide_borders(&mut self) {
+        if self.borders_hidden {
+            return;
+        }
         for border in self.borders.values() {
             border.window.orderOut(None::<&AnyObject>);
         }
+        self.borders_hidden = true;
     }
 
     /// Sync per-window borders to `desired` (window id, absolute CG rect,
@@ -469,6 +481,7 @@ impl OverlayManager {
                 // windows order front on creation below.
                 if !border.window.isVisible() {
                     border.window.orderFront(None::<&AnyObject>);
+                    self.borders_hidden = false;
                 }
             } else {
                 let window = make_border_window(self.mtm, cocoa, params);
@@ -480,6 +493,7 @@ impl OverlayManager {
                         params: params.clone(),
                     },
                 );
+                self.borders_hidden = false;
             }
         }
         // An empty desired set with an empty map is steady state; anything

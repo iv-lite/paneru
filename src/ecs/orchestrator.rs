@@ -21,7 +21,7 @@ use bevy::ecs::system::{Commands, NonSendMut, Query, Res, ResMut};
 use tracing::{debug, error};
 
 use crate::ax_writer::AxWriteState;
-use crate::ecs::{ColdStart, DragSettleMarker, FlashMessage, MouseHeldMarker, RepositionMarker};
+use crate::ecs::{ColdStart, DragSettleMarker, DrivenDragHeld, FlashMessage, RepositionMarker};
 use crate::ecs::{ResizeMarker, Scrolling};
 use crate::events::EventSender;
 use crate::manager::WindowManagerOS;
@@ -168,9 +168,10 @@ impl Default for FrameOrchestrator {
 /// Derives [`FramePriority`] from O(1) archetype-emptiness probes before the
 /// pump sleeps on it. No component data is touched. Any live [`Scrolling`]
 /// counts as motion even with no markers: a coasting inertia glide writes
-/// every frame, and sleeping through it would judder the landing. Stamps
-/// the frame clock for [`log_frame_stats`] at the other end of the
-/// schedules.
+/// every frame, and sleeping through it would judder the landing. Only
+/// armed or scroll-driven holders count as held: plain content holders
+/// stay fully native and must not pin the active cadence. Stamps the frame
+/// clock for [`log_frame_stats`] at the other end of the schedules.
 type MotionMarkers = Or<(
     With<DragSettleMarker>,
     With<RepositionMarker>,
@@ -180,7 +181,7 @@ type MotionMarkers = Or<(
 /// output resources. Splitting would fork the priority computation.
 #[allow(clippy::too_many_arguments)]
 pub(crate) fn classify_frame_priority(
-    held: Query<(), With<MouseHeldMarker>>,
+    held: Query<(), DrivenDragHeld>,
     swiping: Query<&Scrolling>,
     scrolling: Query<(), With<Scrolling>>,
     motion: Query<(), MotionMarkers>,

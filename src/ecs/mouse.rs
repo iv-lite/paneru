@@ -425,6 +425,12 @@ fn mouse_down_trigger(
             }
         }
 
+        // A fresh press takes over from any previous release: clear the
+        // stale settle grace either way, so an armed re-grab — or a native
+        // content drag — inside the grace window never inherits it.
+        scroll_state.members.clear();
+        scroll_state.settle_deadline = None;
+
         // The holder is always tracked: display-drag arming, the adoption
         // pin and drop homing all key off it. Only the click-reshuffle on
         // release honors the hidden ratio (see `mouse_up_trigger`).
@@ -442,13 +448,11 @@ fn mouse_down_trigger(
         // layout slot pinned, so the border needs the grab frame plus the
         // pointer deltas below to follow the cursor at input rate.
         paint.begin(entity, window.frame());
-        // A fresh press takes over from any previous release: the holder
-        // (and the adoption lock on it) owns echo handling from here, so a
-        // stale settle grace must not shadow it — notably an armed re-grab
-        // inside the grace window, whose transfer hit-test needs live
-        // adoption.
-        scroll_state.members.clear();
-        scroll_state.settle_deadline = None; // Arm display transfer only for the grab-time conjunction the
+        // The holder (and the adoption lock on it) owns echo handling from
+        // here — notably an armed re-grab inside the grace window, whose
+        // transfer hit-test needs live adoption. (The grace itself was
+        // already cleared above, for every press kind.)
+        // Arm display transfer only for the grab-time conjunction the
         // user asked for: shortcut held while left-clicking a window.
         // This holder defines the drag target; pressing the shortcut
         // later in the drag never arms.
@@ -1260,7 +1264,7 @@ fn damped_column_drive(
 /// being re-seeded every tick.
 #[allow(clippy::too_many_arguments)]
 fn expire_idle_held_scroll(
-    held: Populated<(Entity, &MouseHeldMarker)>,
+    held: Populated<(Entity, &MouseHeldMarker, Has<DragScrollArmed>)>,
     mut strips: Query<(
         Entity,
         &LayoutStrip,
@@ -1289,7 +1293,7 @@ fn expire_idle_held_scroll(
         SwipeGestureDirection::Natural => -1.0,
         SwipeGestureDirection::Reversed => 1.0,
     };
-    for (_, marker) in held.iter() {
+    for (_, marker, _) in held.iter() {
         let target = marker.0;
         let Some((strip_entity, _, position, scrolling, child)) = strips
             .iter_mut()
@@ -1590,12 +1594,14 @@ fn drag_move_held_column(
                     trace!("synthetic drag: no managed held target, skipping move");
                     continue;
                 };
-                // Paint-only tracking for native-owned drags: the layout
-                // slot stays pinned, but the border needs every pointer
-                // delta at input rate. Advanced for every managed held
-                // target regardless of branch — scroll/column paths ignore
-                // it, the native path paints it.
-                paint.advance(target, delta, time.elapsed());
+                // Paint-only tracking for drags the layout doesn't drive
+                // itself: the slot stays pinned, but the border needs every
+                // pointer delta at input rate. Advanced only for armed or
+                // scroll-driven holders — plain content grabs stay fully
+                // native and cost nothing per event.
+                if armed || scroll_armed {
+                    paint.advance(target, delta, time.elapsed());
+                }
                 if cold.is_some() {
                     // Warmup: track the cursor for paint only; the slot,
                     // strip, and scroll pipeline must not move before the

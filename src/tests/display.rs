@@ -9,9 +9,9 @@ use crate::ecs::layout::{LayoutStrip, PARKED_STRIP_SLIVER};
 use crate::ecs::mouse::{DragModifierState, DragPaintState, DragScrollState, DropPreviewState};
 use crate::ecs::workspace::IgnoredMovedWindows;
 use crate::ecs::{
-    ActiveDisplayMarker, ActiveWorkspaceMarker, Bounds, DockPosition, DragSettleMarker,
-    MouseHeldMarker, Position, RepositionMarker, Scrolling, SpawnWindowTrigger, StaleAxMarker,
-    Timeout, Unmanaged,
+    ActiveDisplayMarker, ActiveWorkspaceMarker, Bounds, DockPosition, DragDisplayArmed,
+    DragScrollArmed, DragSettleMarker, MouseHeldMarker, Position, RepositionMarker, Scrolling,
+    SpawnWindowTrigger, StaleAxMarker, Timeout, Unmanaged,
 };
 use crate::events::Event;
 use crate::manager::{Application, Display, Origin, Size, Window};
@@ -970,11 +970,11 @@ fn test_drag_window_across_display_transfers_strip() {
         .run(commands);
 }
 
-/// A native content drag keeps the layout slot pinned while the OS window
-/// follows the cursor: the paint-only drag offset must accumulate the full
-/// pointer travel (one entry per drag tick here), so the border rides the
-/// cursor at input rate instead of stepping at snapshot epochs. The slot
-/// itself never moves, and release clears the gesture.
+/// A native content drag keeps the layout slot pinned AND accumulates no
+/// paint offset: content grabs advance nothing per event (only armed or
+/// scroll-driven holders paint), so the border stays glued to the slot
+/// instead of tracking pointer travel. The slot itself never moves, and
+/// release clears the gesture.
 #[test]
 fn test_native_drag_accumulates_paint_offset_with_slot_pinned() {
     // Window 0 tiles at (0, 20); grab its content (below the titlebar) with
@@ -1006,16 +1006,16 @@ fn test_native_drag_accumulates_paint_offset_with_slot_pinned() {
             let entity = find_window_entity(0, world);
             let paint = world.resource::<DragPaintState>();
             assert_eq!(paint.target, Some(entity));
-            // Horizontal-only: the (50, 50) pointer travel paints `dx`
-            // while `dy` is dropped.
-            assert_eq!(paint.offset, Origin::new(50, 0));
+            // No per-event advance for content grabs: the offset stays at
+            // the grab frame while the slot stays pinned.
+            assert_eq!(paint.offset, Origin::ZERO);
             assert_eq!(
                 paint.frame_for(entity),
                 Some(IRect::from_corners(
-                    Origin::new(50, TEST_MENUBAR_HEIGHT),
-                    Origin::new(450, 768),
+                    Origin::new(0, TEST_MENUBAR_HEIGHT),
+                    Origin::new(400, 768),
                 )),
-                "grab frame plus horizontal pointer offset, every tick"
+                "grab frame with no pointer offset"
             );
             // The slot never moved: layout truth is still the tiled origin.
             let position = world.entity(entity).get::<Position>().expect("position");
@@ -2758,6 +2758,77 @@ fn test_plain_move_at_edge_does_not_warp() {
             // would have landed at (6, -1100), while no warp leaves it
             // parked.
             assert_eq!(state.cursor_position(), Origin::new(200, 394));
+        })
+        .run(commands);
+}
+
+/// A content press tracks its holder but drives nothing: the holder
+/// carries neither arming marker, so no per-frame costs key off it (paint
+/// stays empty, overlay/snapshot/pump gates stay shut), the strip stays
+/// put, and no scroll state arms. The gesture reads pointer motion but
+/// never writes it.
+#[test]
+fn test_content_press_drives_nothing() {
+    // Deep inside window 0's content (tiles at (0, 20), 400 wide).
+    let grab = CGPoint::new(200.0, 500.0);
+    let commands = vec![
+        Event::MenuOpened { window_id: 0 },
+        Event::MouseDown {
+            point: grab,
+            modifiers: Modifiers::empty(),
+        },
+        Event::MouseDragged {
+            point: CGPoint::new(400.0, 500.0),
+            modifiers: Modifiers::empty(),
+        },
+        Event::MouseDragged {
+            point: CGPoint::new(100.0, 500.0),
+            modifiers: Modifiers::empty(),
+        },
+        Event::MouseUp {
+            point: CGPoint::new(100.0, 500.0),
+            modifiers: Modifiers::empty(),
+        },
+        Event::Command {
+            command: Command::PrintState,
+        },
+    ];
+
+    TestHarness::new()
+        .with_windows(3)
+        .on_iteration(3, |world, _state| {
+            // Mid-gesture: exactly one holder, but with neither arming
+            // marker — tracked for release bookkeeping, driving nothing.
+            let holders: Vec<(Entity, bool, bool)> = world
+                .query_filtered::<(
+                    Entity,
+                    Has<DragDisplayArmed>,
+                    Has<DragScrollArmed>,
+                ), With<MouseHeldMarker>>()
+                .iter(world)
+                .collect();
+            assert_eq!(holders.len(), 1, "content press holds its window");
+            assert!(
+                !holders[0].1 && !holders[0].2,
+                "content holder carries no arming markers"
+            );
+            assert_window_at!(world, 0, 0, TEST_MENUBAR_HEIGHT);
+            assert_window_at!(world, 1, 400, TEST_MENUBAR_HEIGHT);
+            assert_window_at!(world, 2, 800, TEST_MENUBAR_HEIGHT);
+            assert!(
+                world.query::<&Scrolling>().iter(world).next().is_none(),
+                "content drags must not arm the scroll pipeline"
+            );
+            let paint = world.resource::<DragPaintState>();
+            assert_eq!(
+                paint.offset,
+                Origin::ZERO,
+                "content drags advance no paint offset"
+            );
+        })
+        .on_iteration(5, |world, _state| {
+            // Released cleanly with the layout untouched.
+            assert_window_at!(world, 0, 0, TEST_MENUBAR_HEIGHT);
         })
         .run(commands);
 }

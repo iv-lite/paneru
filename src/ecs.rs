@@ -107,13 +107,15 @@ pub fn register_systems(app: &mut bevy::app::App) {
                 || !workspace_changed.is_empty()
                 || !focused_moved.is_empty()
         };
-    // True every frame while the active strip is being scrolled or a mouse
-    // drag is held, so the border tracks the motion instead of the last
-    // dirty tick. Only the overlay uses this — the menu bar keeps the
-    // cheaper `vw_indicator_dirty` gate.
+    // True every frame while the active strip is being scrolled or a
+    // *driven* mouse drag is held, so the border tracks the motion instead
+    // of the last dirty tick. Only armed or scroll-driven holders count:
+    // plain content holders stay fully native and must not force overlay
+    // passes. Only the overlay uses this — the menu bar keeps the cheaper
+    // `vw_indicator_dirty` gate.
     let overlay_tracking_motion =
         |strip_scrolled: Query<(), (With<ActiveWorkspaceMarker>, Changed<Position>)>,
-         drag_held: Query<(), With<MouseHeldMarker>>| {
+         drag_held: Query<(), DrivenDragHeld>| {
             !strip_scrolled.is_empty() || !drag_held.is_empty()
         };
     // Windows appearing or disappearing change the per-window border set
@@ -668,6 +670,16 @@ pub struct DragDisplayArmed;
 /// swallow the native drag; content grabs keep fully native behavior.
 #[derive(Component)]
 pub struct DragScrollArmed;
+
+/// Query filter matching holders that actually drive something: armed or
+/// scroll-driven drags. Plain content holders (tracked for release
+/// bookkeeping only) must not key per-frame costs — overlay passes,
+/// snapshot fast-polling, active pacing — so every such gate filters on
+/// this instead of bare [`MouseHeldMarker`].
+pub(crate) type DrivenDragHeld = (
+    With<MouseHeldMarker>,
+    Or<(With<DragDisplayArmed>, With<DragScrollArmed>)>,
+);
 
 /// Resource indicating whether Mission Control is currently active.
 #[derive(Resource)]
