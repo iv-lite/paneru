@@ -48,7 +48,6 @@ pub mod layout;
 #[cfg(feature = "lua")]
 pub mod layout_ops;
 pub mod mouse;
-pub mod orchestrator;
 pub mod params;
 pub(crate) mod restore;
 pub mod script_state;
@@ -191,29 +190,14 @@ pub fn register_systems(app: &mut bevy::app::App) {
     app.add_message::<InputEvent>();
     app.init_resource::<systems::ParkedCommands>();
     app.init_resource::<crate::ax_writer::AxWriteState>();
-    app.init_resource::<orchestrator::FrameOrchestrator>();
-    app.init_resource::<orchestrator::PerfStats>();
     app.add_systems(
         PreUpdate,
         (
             systems::window_creation_event,
-            // Priority first: the pump sleeps on it two systems later.
-            orchestrator::classify_frame_priority.before(systems::pump_events),
             systems::pump_events,
             systems::demux_input_events.after(systems::pump_events),
             systems::park_cold_commands,
             systems::drain_ax_acks,
-            // Stage mark must run after every member above: the tuple is
-            // otherwise unordered, and an early mark attributes the pump
-            // sleep to the wrong stage (measured: pre=0.00 with the sleep
-            // landing in `upd`).
-            orchestrator::mark_preupdate_end
-                .after(systems::window_creation_event)
-                .after(orchestrator::classify_frame_priority)
-                .after(systems::pump_events)
-                .after(systems::demux_input_events)
-                .after(systems::park_cold_commands)
-                .after(systems::drain_ax_acks),
         ),
     );
     app.add_systems(
@@ -305,26 +289,6 @@ pub fn register_systems(app: &mut bevy::app::App) {
                 .run_if(vw_indicator_dirty.or_eager(strip_count_changed)),
         ),
     );
-    // Own statement: the `Update` tuple above is already at Bevy's
-    // system-config arity limit.
-    app.add_systems(
-        Update,
-        orchestrator::supervise_threads.run_if(on_timer(Duration::from_secs(
-            orchestrator::SUPERVISION_INTERVAL_SECS,
-        ))),
-    );
-    // Stage mark for the perf log: first in `PostUpdate`, explicitly
-    // before the animate chain, so it runs after every `Update` system
-    // (schedules are ordered; the `Update` tuple itself is unordered and
-    // at the arity limit, so the mark cannot live inside it). Systems
-    // registered later by other plugins land in `post` instead —
-    // documented on `log_frame_stats`.
-    app.add_systems(
-        PostUpdate,
-        orchestrator::mark_update_end.before(systems::animate_entities),
-    );
-    // Frame clock close: covers pump → layout → commit → overlay end to end.
-    app.add_systems(Last, orchestrator::log_frame_stats);
 }
 
 /// Registers all the event triggers for the window manager.
@@ -696,7 +660,7 @@ pub struct Initializing;
 /// settled (snapshot primed, layout converged, restore grace over — see
 /// `tick_cold_start`). While present, mutating `Event::Command`s park in
 /// `ParkedCommands` instead of applying to the half-built world, and the
-/// pump stays at the active cadence via the orchestrator priority. Reads are always
+/// pump stays at the active cadence via `FrameActivity`. Reads are always
 /// served; paint is never gated. Removed with a watchdog deadline so a dead
 /// AX source can never stall startup forever. The mock harness never
 /// inserts it — tests opt in explicitly.
@@ -954,17 +918,13 @@ pub fn setup_bevy_app(sender: EventSender, receiver: Receiver<Event>) -> Result<
     // enumeration so no main state crosses threads (only the constructor's
     // sender is shared).
     {
-        let (store, roster, snapshot_handle) = crate::snapshot::spawn_snapshot_thread(
+        let (store, roster) = crate::snapshot::spawn_snapshot_thread(
             crate::manager::WindowManagerOS::new(sender.clone()),
             sender.waker().clone(),
         );
         app.insert_resource(store);
         app.insert_resource(roster);
         app.insert_resource(crate::snapshot::TitleInvalidations::default());
-        app.insert_non_send(orchestrator::ThreadSupervisor {
-            snapshot: Some(snapshot_handle),
-            ..Default::default()
-        });
     }
 
     // AX writer thread: parked on its queue until the `ax_writer` flag
@@ -972,20 +932,12 @@ pub fn setup_bevy_app(sender: EventSender, receiver: Receiver<Event>) -> Result<
     // resource there, so commits fall back to direct). Spawned
     // unconditionally like the snapshot worker: one idle thread is cheaper
     // than lazy-start races on first animation. The ack map is inited by
-    // `register_systems` so both paths share it. Handles feed the
-    // orchestrator's supervisor so a dead worker restarts instead of
-    // silently degrading.
+    // `register_systems` so both paths share it.
     {
-        let (queue, inbox, writer_handle) = crate::ax_writer::spawn_ax_writer();
+        let (queue, inbox) = crate::ax_writer::spawn_ax_writer();
         app.insert_resource(queue);
         app.insert_resource(inbox);
-        app.world_mut()
-            .non_send_mut::<orchestrator::ThreadSupervisor>()
-            .ax_writer = Some(writer_handle);
     }
-
-    // Shared with worker supervision: a dead thread respawns from this.
-    app.insert_resource(sender.clone());
 
     // Run every schedule inline rather than fanning systems out across the task
     // pool: the task-pool handoff measured ~45% of main-thread time against

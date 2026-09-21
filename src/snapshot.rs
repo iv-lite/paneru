@@ -534,9 +534,8 @@ fn run(
     warn!("ax snapshot roster channel disconnected; snapshot thread exiting");
 }
 
-/// Spawns the detached snapshot thread and returns its publication slot,
-/// the roster endpoint, plus the join handle for supervision. Call once
-/// at startup (never in tests: the harness
+/// Spawns the detached snapshot thread and returns its publication slot
+/// plus the roster endpoint. Call once at startup (never in tests: the harness
 /// has no real AX handles, and a thread per harness would leak parked
 /// threads by the hundreds).
 ///
@@ -548,15 +547,15 @@ fn run(
 pub(crate) fn spawn_snapshot_thread(
     window_manager: WindowManagerOS,
     waker: Arc<EventLoopWaker>,
-) -> (SnapshotStore, SnapshotRoster, std::thread::JoinHandle<()>) {
+) -> (SnapshotStore, SnapshotRoster) {
     let (tx, rx) = unbounded();
     let published = Arc::new(ArcSwap::new(Arc::new(AxSnapshot::default())));
     let thread_published = Arc::clone(&published);
-    let handle = std::thread::Builder::new()
+    std::thread::Builder::new()
         .name("paneru-ax-snap".to_string())
         .spawn(move || run(rx, window_manager, thread_published, waker))
         .expect("spawning the ax snapshot thread");
-    (SnapshotStore(published), SnapshotRoster(tx), handle)
+    (SnapshotStore(published), SnapshotRoster(tx))
 }
 
 #[cfg(test)]

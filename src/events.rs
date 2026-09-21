@@ -227,7 +227,7 @@ pub enum Event {
 
 /// `EventSender` is a thin wrapper around a `std::sync::mpsc::Sender` for `Event`s.
 /// It provides a convenient way to send events to the main event loop from various parts of the application.
-#[derive(Clone, Debug, bevy::ecs::resource::Resource)]
+#[derive(Clone, Debug)]
 pub struct EventSender {
     tx: Sender<Event>,
     /// Ends the Cocoa pump's wait once the event is queued. Shared so a

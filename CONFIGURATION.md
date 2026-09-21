@@ -50,7 +50,7 @@ General behavior settings for the window manager.
 | `insert_windows_mid_strip` | Boolean | `false` | When moving a window to another virtual workspace, insert it at the column matching its current on-screen position (keeping it where you see it and shifting the rest) instead of appending it to the end of the destination strip. |
 | `create_virtual_workspace_automatically` | Boolean | `false` | Automatically creates a new virtual workspace when using `window_virtual_south `or Southward gesture controls. |
 | `ax_writer` | Boolean | `true` | Moves AX position commits onto a dedicated writer thread (per-window latest coalescing) instead of blocking the main thread per animation frame. Disable only if testing shows regressions on your app mix (`experimental_ax_writer` still works as a deprecated alias). Apps needing the enhanced-UI workaround always stay synchronous. |
-| `experimental_vsync` | Boolean | `true` | Paces the pump to the display's retrace via a per-screen display link instead of fixed 8/16ms sleeps. Needs macOS 14+, falls back to the sleep ladder when unbound. Set to `false` to force the fixed sleep ladder. While a drag or swipe is in flight the pump always runs at the 8ms cadence regardless of this flag. |
+| `experimental_vsync` | Boolean | `true` | Paces the pump to the display's retrace via a per-screen display link instead of fixed 8/16ms sleeps. Needs macOS 14+, falls back to the sleep ladder when unbound. Set to `false` to force the fixed sleep ladder. |
 
 ---
 

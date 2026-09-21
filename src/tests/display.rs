@@ -2620,12 +2620,15 @@ fn test_empty_baseline_row_survives_display_removal() {
         .run(commands);
 }
 
-/// A config enabling edge warp plus shortcut-armed display drags.
+/// A config enabling edge warp plus shortcut-armed display drags. Focus
+/// follow/parking is off so cursor asserts isolate the warp itself.
 fn warp_drag_config() -> Config {
     (
         MainOptions {
             horizontal_mouse_warp: Some(1),
             mouse_drag_display_modifier: Some(Modifiers::ALT),
+            focus_follows_mouse: Some(false),
+            mouse_follows_focus: Some(false),
             ..Default::default()
         },
         vec![],
@@ -2705,9 +2708,10 @@ fn test_unarmed_drag_at_edge_does_not_warp() {
             vec![EXT_WORKSPACE_ID],
         )
         .on_iteration(2, move |world, state| {
-            // Focus-follow parks the cursor on the window center at menu
-            // open; without the shortcut no warp moves it from there...
-            assert_eq!(state.cursor_position(), Origin::new(200, 394));
+            // Focus follow/parking is off in this config, and the mock
+            // cursor only moves via warp — without the shortcut it sits
+            // at its origin...
+            assert_eq!(state.cursor_position(), Origin::new(0, 0));
             // ...the window stays in its slot while the strip follows the
             // (822, -400) drag horizontally: slot-relative, so y is
             // untouched and x tracks the strip 1:1.
@@ -2724,17 +2728,24 @@ fn test_unarmed_drag_at_edge_does_not_warp() {
         .run(commands);
 }
 
-/// A plain (button-free) mouse move at the display edge never warps, even
-/// with warp configured: edge warp is an armed-drag traversal feature, and
-/// an ungated move arm traps the cursor at shared display corners —
-/// each warp lands near the opposite edge, the user pulls back, and the
-/// next edge touch warps again, ping-ponging between displays.
+/// A plain (button-free) mouse move at the display edge warps once to the
+/// display above, like an armed drag: edge warp is display traversal, not
+/// a drag feature. The landing sits past the edge threshold, so dwelling
+/// at the landing can never immediately re-warp (the shared-corner
+/// ping-pong this guards against).
 #[test]
-fn test_plain_move_at_edge_does_not_warp() {
+fn test_plain_move_at_edge_warps_once_to_interior() {
     // Right edge of the test display (bounds max.x 1024, threshold 3px);
     // no buttons held, no modifier — just a move.
     let edge = CGPoint::new(1022.0, 100.0);
     let commands = vec![
+        Event::MouseMoved {
+            point: edge,
+            modifiers: Modifiers::empty(),
+        },
+        Event::Command {
+            command: Command::PrintState,
+        },
         Event::MouseMoved {
             point: edge,
             modifiers: Modifiers::empty(),
@@ -2753,11 +2764,27 @@ fn test_plain_move_at_edge_does_not_warp() {
             vec![EXT_WORKSPACE_ID],
         )
         .on_iteration(1, move |_world, state| {
-            // Focus parking leaves the cursor on window 0's center, and
-            // the mock cursor only moves via warp — so an armed drag
-            // would have landed at (6, -1100), while no warp leaves it
-            // parked.
-            assert_eq!(state.cursor_position(), Origin::new(200, 394));
+            // External display bounds start at y -1180 (20px menubar):
+            // landing x = left edge + inset (0 + 6), landing y = -1180 +
+            // relative y (100 - 20). Past the 3px threshold either way.
+            let landing = state.cursor_position();
+            assert_eq!(landing, Origin::new(6, -1100));
+            assert!(
+                landing.x > 3 && EXT_DISPLAY_WIDTH - landing.x > 3,
+                "landing must sit off both edges: {landing:?}"
+            );
+        })
+        .on_iteration(3, move |_world, state| {
+            // Repeating the same edge point still lands interior, never
+            // back on a threshold: velocity carry pushes deeper into the
+            // display (never out of it), so no sequence of edge touches
+            // can oscillate. Y stays exact — carry only steers x.
+            let again = state.cursor_position();
+            assert_eq!(again.y, -1100);
+            assert!(
+                again.x > 3 && EXT_DISPLAY_WIDTH - again.x > 3,
+                "repeat landing must sit off both edges: {again:?}"
+            );
         })
         .run(commands);
 }

@@ -2255,23 +2255,6 @@ fn warp_landing(
     };
     let target = warp_to.bounds();
 
-    // Land at the *opposite* edge so the cursor flow is continuous: leaving
-    // the right edge appears at the left edge of the target, and vice versa.
-    // Carry over horizontal velocity so the cursor does not feel "stuck" at
-    // the edge — extrapolate motion forward into the target display.
-    let carry = velocity_x
-        .map_or(0, |v| round_px(v * CARRY_DURATION.as_secs_f64()))
-        .clamp(-MAX_CARRY_PX, MAX_CARRY_PX);
-    let target_x = if on_left_edge {
-        // Cursor was moving leftward; carry is negative. Push further from
-        // the right edge of the target.
-        (target.max.x - LANDING_INSET + carry).clamp(target.min.x + 1, target.max.x - 1)
-    } else {
-        // Cursor was moving rightward; carry is positive. Push further from
-        // the left edge of the target.
-        (target.min.x + LANDING_INSET + carry).clamp(target.min.x + 1, target.max.x - 1)
-    };
-
     // Preserve relative Y offset from the source display's top so vertical
     // motion feels continuous (matches macOS's behavior for side-by-side
     // displays). Apply the configured offset signed by warp direction:
@@ -2298,6 +2281,37 @@ fn warp_landing(
         return None;
     }
 
+    // Land at the *opposite* edge so the cursor flow is continuous: leaving
+    // the right edge appears at the left edge of the target, and vice versa.
+    // Carry over horizontal velocity so the cursor does not feel "stuck" at
+    // the edge — extrapolate motion forward into the target display. The
+    // inset floor keeps the landing off both thresholds whatever the carry
+    // does: without it a fast arrival slams the landing back onto the
+    // opposite edge and the next edge event warps straight back,
+    // ping-ponging between displays at shared corners.
+    let carry = velocity_x
+        .map_or(0, |v| round_px(v * CARRY_DURATION.as_secs_f64()))
+        .clamp(-MAX_CARRY_PX, MAX_CARRY_PX);
+    let lo = target.min.x + EDGE_THRESHOLD + 1;
+    let hi = target.max.x - (EDGE_THRESHOLD + 1);
+    // Absurdly narrow target (under 8px): no interior exists, center it
+    // (overflow-safe: the width is tiny by construction here).
+    if lo > hi {
+        return Some(Origin::new(
+            target.min.x + (target.max.x - target.min.x) / 2,
+            target_y,
+        ));
+    }
+    let target_x = if on_left_edge {
+        // Cursor was moving leftward; carry is negative. Push further from
+        // the right edge of the target.
+        (target.max.x - LANDING_INSET + carry).clamp(lo, hi)
+    } else {
+        // Cursor was moving rightward; carry is positive. Push further from
+        // the left edge of the target.
+        (target.min.x + LANDING_INSET + carry).clamp(lo, hi)
+    };
+
     let landing = Origin::new(target_x, target_y);
     debug!(
         "mouse warp: {} edge of display {} -> display {} at {landing:?}",
@@ -2320,14 +2334,13 @@ fn horizontal_warp_mouse_trigger(
     const VELOCITY_FRESHNESS: Duration = Duration::from_millis(80);
 
     for InputEvent(event) in messages.read() {
-        // Edge-warp fires only for a shortcut-armed display drag in
-        // progress: anything else (plain moves, text selection, resize
-        // handles, unarmed strip drags) keeps native edge behavior. The
-        // grab-time arming is what distinguishes them — see
-        // `DragDisplayArmed`. An ungated move arm traps the cursor at
-        // shared display corners: each warp lands near the opposite
-        // edge, the user pulls back, and the next edge touch warps
-        // again, ping-ponging between displays.
+        // Edge-warp fires on plain moves (display traversal) and mid-drag
+        // for shortcut-armed display drags; other drags (text selection,
+        // resize handles, unarmed strip drags) keep native edge behavior.
+        // The grab-time arming is what distinguishes drags — see
+        // `DragDisplayArmed`. The ping-pong trap at shared corners is
+        // closed structurally in `warp_landing` (landings can never sit on
+        // a threshold), not by gating moves off.
         let armed_drag = |modifiers: &Modifiers| {
             held.iter().any(|(_, _, armed)| armed)
                 && config
@@ -2335,7 +2348,7 @@ fn horizontal_warp_mouse_trigger(
                     .is_some_and(|required| required.matches(*modifiers))
         };
         let point = match event {
-            Event::MouseMoved { point, modifiers } if armed_drag(modifiers) => point,
+            Event::MouseMoved { point, .. } => point,
             Event::MouseDragged { point, modifiers } if armed_drag(modifiers) => point,
             _ => continue,
         };

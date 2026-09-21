@@ -120,16 +120,6 @@ impl AxWriteState {
             > self.acked.get(&win_id).copied().unwrap_or(0)
     }
 
-    /// How many windows have converging writes. The orchestrator keeps the
-    /// pump at the active cadence while this is non-zero instead of
-    /// sleeping through the drain.
-    pub(crate) fn inflight(&self) -> usize {
-        self.issued
-            .iter()
-            .filter(|(win_id, seq)| **seq > self.acked.get(win_id).copied().unwrap_or(0))
-            .count()
-    }
-
     /// Whether `target` is already the newest intent for `win_id`.
     fn already_sent(&self, win_id: WinID, target: Origin) -> bool {
         self.last_sent
@@ -181,18 +171,18 @@ fn run(queue: Receiver<AxWriteJob>, acks: Sender<AxWriteAck>) {
     debug!("ax writer queue disconnected; writer thread exiting");
 }
 
-/// Spawns the detached writer thread and returns its endpoints plus the
-/// join handle for supervision. The ack map lives in `register_systems`
-/// (`AxWriteState` init) so the harness — which never spawns threads —
-/// shares the same resource path. Call once at startup (never in tests).
-pub(crate) fn spawn_ax_writer() -> (AxWriterQueue, AxWriteInbox, std::thread::JoinHandle<()>) {
+/// Spawns the detached writer thread and returns its endpoints. The ack
+/// map lives in `register_systems` (`AxWriteState` init) so the harness —
+/// which never spawns threads — shares the same resource path. Call once
+/// at startup (never in tests).
+pub(crate) fn spawn_ax_writer() -> (AxWriterQueue, AxWriteInbox) {
     let (job_tx, job_rx) = bounded(AX_WRITER_QUEUE_CAP);
     let (ack_tx, ack_rx) = bounded(AX_WRITER_QUEUE_CAP);
-    let handle = std::thread::Builder::new()
+    std::thread::Builder::new()
         .name("paneru-ax-write".to_string())
         .spawn(move || run(job_rx, ack_tx))
         .expect("spawning the ax writer thread");
-    (AxWriterQueue(job_tx), AxWriteInbox(ack_rx), handle)
+    (AxWriterQueue(job_tx), AxWriteInbox(ack_rx))
 }
 
 /// How long the main thread waits for a drain when it must observe quiesced
@@ -295,17 +285,6 @@ mod tests {
         state.acknowledge(1, s1);
         assert!(!state.unacked(1));
         assert!(state.unacked(2), "one window's ack clears only itself");
-    }
-
-    #[test]
-    fn inflight_counts_windows_with_converging_writes() {
-        let mut state = AxWriteState::default();
-        assert_eq!(state.inflight(), 0);
-        let s1 = state.issue(1);
-        state.issue(2);
-        assert_eq!(state.inflight(), 2);
-        state.acknowledge(1, s1);
-        assert_eq!(state.inflight(), 1);
     }
 
     #[test]
