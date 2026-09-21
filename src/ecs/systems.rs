@@ -25,6 +25,7 @@ use super::{
     VerifyWindowPosition,
 };
 
+use crate::ax_writer::{AxWriteInbox, AxWriteState, AxWriterQueue, push_position};
 use crate::config::{Config, decorations::BorderRadiusOption};
 use crate::ecs::display::FloatingLayer;
 use crate::ecs::layout::{Column, LayoutStrip};
@@ -46,7 +47,7 @@ use crate::platform::input::{TapHealth, left_button_held};
 use crate::platform::{PlatformCallbacks, WinID};
 use crate::snapshot::{
     ON_SCREEN_MAX_AGE, SNAPSHOT_FRAME_MAX_AGE, SnapshotRoster, SnapshotStore, on_screen_set,
-    snapshot_live_frame,
+    snapshot_corner_radius, snapshot_live_frame,
 };
 
 /// Processes and applications still inside their spawn grace period, with the
@@ -1497,6 +1498,7 @@ fn overlay_hide_for_swipe(swiping: bool, drag_held: bool) -> bool {
 }
 
 #[instrument(level = Level::TRACE, skip_all)]
+#[allow(clippy::too_many_arguments)]
 pub(crate) fn window_moved_update_frame(
     mut messages: MessageReader<Event>,
     mut windows: MovableWindows,
@@ -1504,6 +1506,8 @@ pub(crate) fn window_moved_update_frame(
     config: Res<Config>,
     drag_modifiers: Res<DragModifierState>,
     scroll_grace: Res<DragScrollState>,
+    writer: Option<Res<AxWriterQueue>>,
+    mut write_state: ResMut<AxWriteState>,
 ) {
     // Adoption reads the echo directly, never the snapshot worker: the event
     // announces a move that just happened, and the 250ms poll may not have
@@ -1553,6 +1557,12 @@ pub(crate) fn window_moved_update_frame(
         if repositioning {
             continue;
         }
+        // Async write still converging: the echo predates the queued write,
+        // so adopting it would regress `Position` and restart the lerp
+        // chase. The ack, not the echo, owns the truth until it lands.
+        if write_state.unacked(window.id()) {
+            continue;
+        }
         // A native session paneru never tracked (press-frame leak, stale
         // suppress gate, tap-disabled gap): push the slot back instead of
         // adopting, or the displaced echo becomes layout permanently and a
@@ -1569,7 +1579,13 @@ pub(crate) fn window_moved_update_frame(
             };
             let drift = (live.min - position.0).abs();
             debug!("untracked native drag of window {entity}, drift {drift:?}: pushing slot back");
-            window.reposition(position.0);
+            push_position(
+                &mut window,
+                position.0,
+                writer.as_deref(),
+                &mut write_state,
+                config.experimental_ax_writer(),
+            );
             continue;
         }
         let Ok(new_frame) = window.update_frame() else {
@@ -1587,7 +1603,13 @@ pub(crate) fn window_moved_update_frame(
             let drift = (new_frame.min - position.0).abs();
             if drift.x > 1 || drift.y > 1 {
                 debug!("scroll grace: echo for {entity} drifted {drift:?}, pushing slot back");
-                window.reposition(position.0);
+                crate::ax_writer::push_position(
+                    &mut window,
+                    position.0,
+                    writer.as_deref(),
+                    &mut write_state,
+                    config.experimental_ax_writer(),
+                );
             }
             continue;
         }
@@ -1810,12 +1832,16 @@ fn abs_cg_rect(frame: IRect, window: &Window) -> NSRect {
 
 /// Resolved corner radius for one bordered window, or `None` when its app is
 /// gone (caller skips the window). Refreshes the cache entry on miss.
+/// Detection prefers the snapshot worker (slow-tick cached, no main-thread
+/// SLS walk) over the direct read; both feed the same cache entry.
+#[allow(clippy::too_many_arguments)]
 fn border_radius_for(
     window_id: WinID,
     windows: &Windows,
     applications: &Query<&Application>,
     config: &Config,
     cache: &mut HashMap<WinID, (Option<f64>, Option<f64>)>,
+    store: Option<&SnapshotStore>,
 ) -> Option<f64> {
     /// Base radius from global config plus one window's detected corners.
     fn base(config: &Config, detected: Option<f64>) -> f64 {
@@ -1831,7 +1857,8 @@ fn border_radius_for(
     let app = applications.get(parent).ok()?;
     let properties = WindowProperties::new(app, window, config);
     let configured = properties.border_radius();
-    let detected = window.border_radius();
+    let detected = snapshot_corner_radius(store, window_id, SNAPSHOT_FRAME_MAX_AGE)
+        .or_else(|| window.border_radius());
     cache.insert(window_id, (configured, detected));
     Some(configured.unwrap_or(base(config, detected)))
 }
@@ -2014,6 +2041,7 @@ pub(super) fn update_overlays(
             &applications,
             &config,
             &mut window_config_cache.radii,
+            store.as_deref(),
         ) else {
             // Parent gone mid-focus: hide rather than freezing the old
             // rect until the next dirty tick.
@@ -2074,6 +2102,7 @@ pub(super) fn update_overlays(
                 &applications,
                 &config,
                 &mut window_config_cache.radii,
+                store.as_deref(),
             ) else {
                 continue;
             };
@@ -2103,6 +2132,7 @@ pub(super) fn update_overlays(
                 &applications,
                 &config,
                 &mut window_config_cache.radii,
+                store.as_deref(),
             )
             .unwrap_or(10.0),
         );
@@ -2127,10 +2157,52 @@ pub(super) fn update_overlays(
 #[instrument(level = Level::TRACE, skip_all)]
 pub(super) fn commit_window_position(
     mut moved_windows: Populated<(&mut Window, &Position), Changed<Position>>,
+    writer: Option<Res<AxWriterQueue>>,
+    mut write_state: ResMut<AxWriteState>,
+    config: Res<Config>,
 ) {
-    moved_windows
-        .par_iter_mut()
-        .for_each(|(mut window, position)| window.reposition(position.0));
+    use crate::ax_writer::push_position;
+
+    if !(config.experimental_ax_writer() && writer.is_some()) {
+        // Synchronous path: default, tests (no queue), dance apps, and
+        // shutdown. Unchanged behavior.
+        moved_windows
+            .par_iter_mut()
+            .for_each(|(mut window, position)| window.reposition(position.0));
+        return;
+    }
+    // Sequential: sends are ~100ns and sequence numbering needs `&mut`.
+    // Every position push (here, adoption/grace push-backs, settle, verify)
+    // routes through `push_position` so the queue stays the single writer.
+    for (mut window, position) in moved_windows {
+        push_position(
+            &mut window,
+            position.0,
+            writer.as_deref(),
+            &mut write_state,
+            true,
+        );
+    }
+}
+
+/// Drains writer completions into the ack map, ahead of the adoption and
+/// verify readers. No world access — never conflicts.
+pub(super) fn drain_ax_acks(
+    inbox: Option<Res<AxWriteInbox>>,
+    mut write_state: ResMut<AxWriteState>,
+) {
+    let Some(inbox) = inbox.as_deref() else {
+        return;
+    };
+    for ack in inbox.0.try_iter() {
+        if !ack.ok {
+            debug!(
+                "ax writer: write for window {} seq {} failed",
+                ack.win_id, ack.seq
+            );
+        }
+        write_state.acknowledge(ack.win_id, ack.seq);
+    }
 }
 
 /// Confirms OS positions against layout intent. Every driven move carries
@@ -2147,6 +2219,7 @@ pub(crate) fn verify_window_position(
         Option<&RepositionMarker>,
     )>,
     store: Option<Res<SnapshotStore>>,
+    write_state: Res<AxWriteState>,
     mut commands: Commands,
 ) {
     for (entity, mut window, position, mut verification, repositioning) in &mut windows {
@@ -2158,6 +2231,12 @@ pub(crate) fn verify_window_position(
         // post-landing check below still sees the entity after animate
         // removed it; otherwise verification would leak unconfirmed forever.
         if repositioning.is_some() {
+            continue;
+        }
+        // Async write still converging: the OS has not seen the latest
+        // target yet, so a drift reading now would re-push a duplicate.
+        // The ack, not this tick, owns the confirmation.
+        if write_state.unacked(window.id()) {
             continue;
         }
         // Prefer the snapshot worker's last read over a synchronous round
@@ -2191,6 +2270,10 @@ pub(crate) fn verify_window_position(
         {
             entity_commands.try_remove::<VerifyWindowPosition>();
         }
+        // NOTE: this push stays synchronous even with the writer flag on:
+        // it only fires on confirmed >1px drift (i.e. the queue already
+        // failed this window), so it must not re-enter the failed queue.
+        // See `push_position` for the single-writer discipline.
     }
 }
 

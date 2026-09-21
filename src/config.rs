@@ -917,6 +917,18 @@ impl Config {
             .is_some_and(|enabled| enabled)
     }
 
+    /// Moves AX position commits onto a dedicated writer thread (per-window
+    /// latest coalescing) instead of blocking the main thread per animation
+    /// frame. Experimental and default-off: enable only after the soak
+    /// criteria in `ax_writer` pass on your app mix. Apps needing the
+    /// enhanced-UI workaround always stay synchronous.
+    pub fn experimental_ax_writer(&self) -> bool {
+        // Default is disabled.
+        self.options()
+            .experimental_ax_writer
+            .is_some_and(|enabled| enabled)
+    }
+
     /// Number of virtual workspaces to pre-create on each physical space at
     /// startup. Default: 1 (just the physical space itself, no extra virtual
     /// workspaces).
@@ -1395,6 +1407,11 @@ pub struct MainOptions {
     /// If a non-enumerated (e.g. South) gesture or window movement would target a nonexistent
     /// virtual workspace, create the workspace automatically.
     pub create_virtual_workspace_automatically: Option<bool>,
+
+    /// Move AX position commits onto a dedicated writer thread instead of
+    /// blocking the main thread per animation frame. Experimental,
+    /// default-off; see `Config::experimental_ax_writer`.
+    pub experimental_ax_writer: Option<bool>,
 }
 
 /// Returns a default set of column widths.

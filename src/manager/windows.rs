@@ -131,6 +131,81 @@ impl Window {
     }
 }
 
+/// Detected corner radius of a window via the `SkyLight` iterator, if the OS
+/// exposes one. Shared by the main-thread [`WindowApi::border_radius`]
+/// (memoized per window) and the snapshot worker (slow-tick cached per
+/// handle): SLS reads move slower than window attributes and corners only
+/// change on theme/scale switches, never per frame.
+#[allow(clippy::cast_precision_loss)]
+pub(crate) fn sls_window_corner_radius(id: WinID) -> Option<f64> {
+    let iterator = super::window_iterator_for_id(id)?;
+    if !unsafe { SLSWindowIteratorAdvance(&raw const *iterator) } {
+        return None;
+    }
+
+    let radii_ref = unsafe {
+        // Load the function dynamicaly, because it exists only on macOS 26.x
+        let s = c"SLSWindowIteratorGetCornerRadii";
+        let p = libc::dlsym(libc::RTLD_DEFAULT, s.as_ptr());
+        if p.is_null() {
+            return None;
+        }
+        let f: unsafe extern "C" fn(*const CFType) -> *mut CFArray<CFNumber> =
+            std::mem::transmute(p);
+        f(&raw const *iterator)
+    };
+    let radii: CFRetained<CFArray<CFNumber>> =
+        unsafe { CFRetained::from_raw(NonNull::new(radii_ref)?) };
+    if radii.is_empty() {
+        return None;
+    }
+    // Get first corner radius (usually all corners are the same)
+    radii.get(0)?.as_i64().map(|v| v as f64)
+}
+
+/// Raw AX position write for the dedicated writer thread: builds the padded
+/// point and sets `kAXPosition` on `element` with no cache write, no
+/// enhanced-UI dance, and no optimistic frame update. Fire-and-forget, like
+/// the write half of [`WindowApi::reposition`]; failures only trace (the
+/// confirm path re-reads truth). Callers must route apps needing the
+/// enhanced-UI workaround elsewhere — see [`enhanced_ui_workaround_absent`].
+pub(crate) fn ax_set_window_position(
+    element: &AXUIWrapper,
+    origin: Origin,
+    h_pad: i32,
+    v_pad: i32,
+) {
+    let mut point = CGPoint::new(f64::from(origin.x + h_pad), f64::from(origin.y + v_pad));
+    let position_ref = unsafe {
+        AXValueCreate(
+            kAXValueTypeCGPoint,
+            NonNull::from(&mut point).as_ptr().cast(),
+        )
+    };
+    let Ok(position) = AXUIWrapper::retain(position_ref) else {
+        return;
+    };
+    unsafe {
+        AXUIElementSetAttributeValue(
+            element.as_ptr(),
+            CFString::from_static_str(kAXPositionAttribute).as_ref(),
+            position.as_ref(),
+        )
+    };
+}
+
+/// Whether `pid` is known to NOT need the `AXEnhancedUserInterface`
+/// workaround (observed absent on an earlier write). The writer thread
+/// serves only such apps async; everyone else stays synchronous on the
+/// main thread, where the disable→write→reenable pairing lives. The set
+/// only grows, so routing converges without ever misrouting a dance app.
+pub(crate) fn enhanced_ui_workaround_absent(pid: Pid) -> bool {
+    ENHANCED_UI_ABSENT
+        .read()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+        .contains(&pid)
+}
+
 /// Retrieves the window ID (`WinID`) from an `AXUIElementRef`.
 ///
 /// # Arguments
@@ -647,7 +722,12 @@ impl WindowApi for WindowOS {
 
     #[instrument(level = Level::TRACE)]
     fn reposition(&mut self, origin: Origin) {
-        if self.frame.min == origin {
+        // 1px tolerance, matching the verifier/audit/drop-home rules: the
+        // animator rounds to integers and can dither across a boundary near
+        // landing, which exact equality would commit as AX traffic every
+        // frame for zero visible motion.
+        let drift = (self.frame.min - origin).abs();
+        if drift.x <= 1 && drift.y <= 1 {
             trace!("already in position.");
             return;
         }
@@ -860,33 +940,10 @@ impl WindowApi for WindowOS {
     // Based on:
     // - https://github.com/y3owk1n/rift/blob/cca067145f0282b532e848bb63d26a38c61f3c14/src/sys/window_server.rs#L175
     // - https://github.com/FelixKratz/JankyBorders/blob/a56a76a8a6ed77325f03655b23fcf525144d120b/src/windows.c#L67
-    #[allow(clippy::cast_precision_loss)]
     fn border_radius(&self) -> Option<f64> {
-        *self.border_radius.get_or_init(|| {
-            let iterator = super::window_iterator_for_id(self.id)?;
-            if !unsafe { SLSWindowIteratorAdvance(&raw const *iterator) } {
-                return None;
-            }
-
-            let radii_ref = unsafe {
-                // Load the function dynamicaly, because it exists only on macOS 26.x
-                let s = c"SLSWindowIteratorGetCornerRadii";
-                let p = libc::dlsym(libc::RTLD_DEFAULT, s.as_ptr());
-                if p.is_null() {
-                    return None;
-                }
-                let f: unsafe extern "C" fn(*const CFType) -> *mut CFArray<CFNumber> =
-                    std::mem::transmute(p);
-                f(&raw const *iterator)
-            };
-            let radii: CFRetained<CFArray<CFNumber>> =
-                unsafe { CFRetained::from_raw(NonNull::new(radii_ref)?) };
-            if radii.is_empty() {
-                return None;
-            }
-            // Get first corner radius (usually all corners are the same)
-            radii.get(0)?.as_i64().map(|v| v as f64)
-        })
+        *self
+            .border_radius
+            .get_or_init(|| sls_window_corner_radius(self.id))
     }
 
     fn toolbar_frame(&self) -> Option<IRect> {

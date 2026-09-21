@@ -281,7 +281,12 @@ fn nearest_float_in_direction(
 fn command_move_focus(
     mut messages: MessageReader<Event>,
     windows: Windows,
-    workspaces: Query<(&LayoutStrip, Entity, Option<&NativeFullscreenMarker>)>,
+    workspaces: Query<(
+        &LayoutStrip,
+        Entity,
+        Option<&NativeFullscreenMarker>,
+        &ChildOf,
+    )>,
     layout_strips: Query<(&LayoutStrip, Entity)>,
     active_display: ActiveDisplay,
     window_manager: Res<WindowManager>,
@@ -306,11 +311,11 @@ fn command_move_focus(
     {
         let mut strip = workspaces
             .into_iter()
-            .find_map(|(strip, entity, _)| (entity == *layout_strip).then_some(strip));
+            .find_map(|(strip, entity, _, _)| (entity == *layout_strip).then_some(strip));
         if strip.is_none() {
             strip = workspaces
                 .into_iter()
-                .find_map(|(strip, _, _)| (strip.id() == *workspace_id).then_some(strip));
+                .find_map(|(strip, _, _, _)| (strip.id() == *workspace_id).then_some(strip));
         }
 
         if let Some(entity) = strip.and_then(|strip| strip.last().ok().and_then(|col| col.top())) {
@@ -350,16 +355,21 @@ fn command_move_focus(
     // appropriate side so subsequent presses behave normally.
     let candidate = if active_strip.contains(focused_entity) {
         get_window_in_direction(direction, focused_entity, active_strip).or_else(|| {
-            // At the right edge going East, enter the fullscreen workspaces.
+            // At the right edge going East, enter a fullscreen workspace on
+            // the SAME display. The search must stay display-local: an
+            // unscoped scan would focus a fullscreen space on the next
+            // display and read as focus bleeding across.
             (matches!(direction, Direction::East)
                 && active_strip.right_neighbour(focused_entity).is_none())
             .then(|| {
                 workspaces
                     .iter()
-                    .find(|(strip, _, fullscreen)| {
-                        fullscreen.is_some() && strip.id() != active_strip.id()
+                    .find(|(strip, _, fullscreen, child)| {
+                        fullscreen.is_some()
+                            && strip.id() != active_strip.id()
+                            && child.parent() == active_display.entity()
                     })
-                    .and_then(|(strip, _, _)| strip.get(0).ok().and_then(|col| col.top()))
+                    .and_then(|(strip, _, _, _)| strip.get(0).ok().and_then(|col| col.top()))
             })
             .flatten()
         })

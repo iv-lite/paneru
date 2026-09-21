@@ -10,6 +10,7 @@ use tracing::{error, warn};
 use tracing_subscriber::{EnvFilter, fmt, prelude::*};
 
 mod accessibility_prompt;
+mod ax_writer;
 mod client;
 mod commands;
 mod config;

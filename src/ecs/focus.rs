@@ -25,8 +25,8 @@ use crate::ecs::layout::LayoutStrip;
 use crate::ecs::params::{ActiveDisplay, GlobalState, WindowCtx, Windows};
 use crate::ecs::workspace::{PreviousStripPosition, RestoreFocusMarker, SnapStripMarker};
 use crate::ecs::{
-    ActiveWorkspaceMarker, Bounds, DockPosition, Position, RaiseWindow, ResizeMarker, Scrolling,
-    SendMessageTrigger, SpawnCommandsExt, StrayFocusEvent,
+    ActiveDisplayMarker, ActiveWorkspaceMarker, Bounds, DockPosition, Position, RaiseWindow,
+    ResizeMarker, Scrolling, SendMessageTrigger, SpawnCommandsExt, StrayFocusEvent,
 };
 use crate::events::Event;
 use crate::manager::{Application, Display, Window, WindowManager, origin_from};
@@ -692,11 +692,30 @@ fn virtual_strip_activated(
     }
 }
 
-fn focus_window_trigger(trigger: On<FocusWindow>, windows: Windows, apps: Query<&Application>) {
+fn focus_window_trigger(
+    trigger: On<FocusWindow>,
+    windows: Windows,
+    apps: Query<&Application>,
+    strips: Query<(&LayoutStrip, &ChildOf)>,
+    displays: Query<(Entity, Has<ActiveDisplayMarker>), With<Display>>,
+    state: GlobalState,
+    mut commands: Commands,
+) {
     let FocusWindow { entity, raise } = *trigger.event();
     let Some(window) = windows.get(entity) else {
         return;
     };
+    // Explicit focus only (`raise`): hover focus (`raise=false`, FFM flag
+    // set) must never steal the active display on a passing hover, and
+    // mid-transfer focus is already placed by the transfer itself.
+    if raise
+        && state.ffm_flag().is_none()
+        && let Some(display) = strips
+            .iter()
+            .find_map(|(strip, child)| strip.contains(entity).then_some(child.parent()))
+    {
+        activate_owner_display(display, &displays, &mut commands);
+    }
     let Some(psn) = windows.psn(window.id(), &apps) else {
         return;
     };
@@ -707,6 +726,26 @@ fn focus_window_trigger(trigger: On<FocusWindow>, windows: Windows, apps: Query<
         window.focus_without_raise(psn, focused_window, focused_psn);
     } else {
         window.focus_with_raise(psn);
+    }
+}
+
+/// Moves `ActiveDisplayMarker` to `display_entity`, if it is not already
+/// there. The previous holder is cleared by the existing
+/// `cleanup_active_display_marker` observer, so this only ever inserts.
+/// Keeps the active display glued to explicit focus arrivals: without it the
+/// workspace activates on the new display while the display marker stays
+/// behind, and the next directional press operates on the wrong strip.
+pub(crate) fn activate_owner_display(
+    display_entity: Entity,
+    displays: &Query<(Entity, Has<ActiveDisplayMarker>), With<Display>>,
+    commands: &mut Commands,
+) {
+    let already_active = displays.get(display_entity).is_ok_and(|(_, active)| active);
+    if already_active {
+        return;
+    }
+    if let Ok(mut entity_commands) = commands.get_entity(display_entity) {
+        entity_commands.try_insert(ActiveDisplayMarker);
     }
 }
 
@@ -800,6 +839,50 @@ mod tests {
 
         assert_eq!(history.last_managed(1), Some(managed));
         assert_eq!(history.last_floating(1), Some(floating));
+    }
+
+    #[test]
+    fn activate_owner_display_moves_marker_to_owner() {
+        use bevy::ecs::system::RunSystemOnce as _;
+
+        let mut world = World::new();
+        let disp_a = world
+            .spawn((
+                Display::new(1, IRect::new(0, 0, 1024, 768), 20),
+                ActiveDisplayMarker,
+            ))
+            .id();
+        let disp_b = world
+            .spawn(Display::new(2, IRect::new(1024, 0, 2048, 768), 20))
+            .id();
+        world.spawn((LayoutStrip::new(9, 0), ChildOf(disp_b)));
+
+        world
+            .run_system_once(
+                move |displays: Query<(Entity, Has<ActiveDisplayMarker>), With<Display>>,
+                      mut commands: Commands| {
+                    activate_owner_display(disp_b, &displays, &mut commands);
+                },
+            )
+            .expect("activating the owner display");
+        assert!(
+            world.entity(disp_b).contains::<ActiveDisplayMarker>(),
+            "owner display gains the marker"
+        );
+        // Already-active display is a no-op (the cleanup observer, not
+        // this helper, clears the previous holder in the real app).
+        world
+            .run_system_once(
+                move |displays: Query<(Entity, Has<ActiveDisplayMarker>), With<Display>>,
+                      mut commands: Commands| {
+                    activate_owner_display(disp_a, &displays, &mut commands);
+                },
+            )
+            .expect("re-activating the current display");
+        assert!(
+            world.entity(disp_a).contains::<ActiveDisplayMarker>(),
+            "already-active display keeps the marker without churn"
+        );
     }
 
     #[test]

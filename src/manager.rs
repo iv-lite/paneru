@@ -44,8 +44,10 @@ use skylight::{
     SLSWindowIteratorGetTags, SLSWindowIteratorGetWindowID, SLSWindowQueryResultCopyWindows,
     SLSWindowQueryWindows,
 };
+pub(crate) use windows::sls_window_corner_radius;
 pub(crate) use windows::snapshot_frame;
 pub use windows::{Window, WindowApi, WindowOS, WindowPadding, ax_window_id, try_ax_window_id};
+pub(crate) use windows::{ax_set_window_position, enhanced_ui_workaround_absent};
 
 #[cfg(test)]
 pub use process::MockProcessApi;

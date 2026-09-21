@@ -24,7 +24,7 @@ use crate::ecs::scroll::px_to_scroll_delta;
 use crate::ecs::workspace::mid_strip_slot;
 use crate::ecs::{
     ActiveWorkspaceMarker, ColdStart, DockPosition, MissionControlActive, Position, Scrolling,
-    SelectedVirtualMarker, SpawnCommandsExt, Unmanaged,
+    SelectedVirtualMarker, SpawnCommandsExt, Unmanaged, VerifyWindowPosition,
 };
 use crate::manager::{Display, Origin, Size, Window, WindowManager, origin_from};
 use crate::overlay::{BorderParams, OverlayManager};
@@ -299,6 +299,7 @@ fn mouse_down_trigger(
     mouse_held: Query<Entity, With<MouseHeldMarker>>,
     mut scroll_state: ResMut<DragScrollState>,
     mut paint: ResMut<DragPaintState>,
+    mut global_state: GlobalState,
     mut logged_config: Local<bool>,
     mut commands: Commands,
 ) {
@@ -317,6 +318,12 @@ fn mouse_down_trigger(
             continue;
         };
         trace!("{point:?}");
+
+        // A press is explicit pointer intent: clear the focus-follows-mouse
+        // reshuffle skip so the click's focus echo can glue the active
+        // display to the clicked window (see `window_focused_trigger`).
+        // Hovers set it again on their own focus path.
+        global_state.set_skip_reshuffle(false);
 
         let Some((window, entity)) = window_manager
             .find_window_at_point(point)
@@ -548,9 +555,16 @@ fn mouse_up_trigger(
         for (held_entity, marker, armed, scroll_armed) in &mouse_held {
             let entity = marker.0;
             if cold.is_some() {
-                // Warmup: release bookkeeping only (despawn below); no
-                // reorder, homing, reshuffle, or inertia until the world
-                // converges.
+                // Warmup: release bookkeeping only (despawn below) plus the
+                // echo shield — the OS window may have moved natively while
+                // the slot stayed pinned, and its echo can arrive after
+                // warmup ends looking legitimate. No reorder, homing,
+                // reshuffle, or inertia until the world converges.
+                arm_release_grace(
+                    release_column_members(entity, &strips),
+                    &mut scroll_state,
+                    &mut commands,
+                );
                 if let Ok(mut entity_commands) = commands.get_entity(held_entity) {
                     entity_commands.try_despawn();
                 }
@@ -570,18 +584,8 @@ fn mouse_up_trigger(
                 // with an echo that must not rewrite the slot (see the
                 // adoption grace in `window_moved_update_frame`), and any
                 // residue gets one settle check (see below).
-                scroll_state.members = strips
-                    .iter()
-                    .find_map(|(_, strip, _, _)| {
-                        strip
-                            .index_of(entity)
-                            .ok()
-                            .and_then(|index| strip.get(index).ok())
-                    })
-                    .map_or_else(|| vec![entity], |column| column.window_iter().collect());
-                scroll_state.settle_deadline = Some(Instant::now() + SCROLL_SETTLE_GRACE);
-                let system_id = commands.register_system(scroll_settle_check);
-                Timeout::callback(SCROLL_SETTLE_DELAY, system_id, &mut commands);
+                let members = release_column_members(entity, &strips);
+                arm_release_grace(members, &mut scroll_state, &mut commands);
                 seed_release_inertia(
                     entity,
                     release_ema_px_s,
@@ -597,15 +601,7 @@ fn mouse_up_trigger(
                 continue;
             }
             // Members of the dragged column (or the lone window).
-            let members: Vec<Entity> = strips
-                .iter()
-                .find_map(|(_, strip, _, _)| {
-                    strip
-                        .index_of(entity)
-                        .ok()
-                        .and_then(|index| strip.get(index).ok())
-                })
-                .map_or_else(|| vec![entity], |column| column.window_iter().collect());
+            let members = release_column_members(entity, &strips);
 
             // Armed same-display drop with the shortcut still held:
             // relocate the column to the nearest slot; the layout chain
@@ -623,18 +619,26 @@ fn mouse_up_trigger(
 
             if !reordered {
                 let mut homed_any = false;
-                for member in members {
+                for member in &members {
                     if let Some(home) =
-                        drop_home(member, &strips, &displays, &scrolling, &windows, &config)
+                        drop_home(*member, &strips, &displays, &scrolling, &windows, &config)
                     {
                         debug!(
                             "mouse up: window {member} dropped off-slot, gliding home to {home:?}"
                         );
-                        commands.reposition_entity(member, home);
+                        commands.reposition_entity(*member, home);
                         homed_any = true;
                     }
                 }
                 if !homed_any {
+                    // Already home, so homing attached no verification: give
+                    // the slot a throttled backstop against swallowed pushes
+                    // and stale-cache equality the echo grace cannot see.
+                    for member in &members {
+                        if let Ok(mut entity_commands) = commands.get_entity(*member) {
+                            entity_commands.try_insert(VerifyWindowPosition::default());
+                        }
+                    }
                     if config.window_hidden_ratio() >= 1.0 {
                         // At max hidden ratio, clicks never reshuffle — but drop
                         // homing above still runs, so dangling drops glide home.
@@ -646,6 +650,12 @@ fn mouse_up_trigger(
                         commands.reshuffle_around(entity);
                     }
                 }
+                // Echo shield for every non-transfer release, not just
+                // scroll drags: a native-owned drag moved the OS window
+                // while the slot stayed pinned, and its lagging echo must
+                // not rewrite the slot. Transfers skip it — the hit-test
+                // needs live adoption on the new strip.
+                arm_release_grace(members, &mut scroll_state, &mut commands);
             }
             if let Ok(mut entity_commands) = commands.get_entity(held_entity) {
                 entity_commands.try_despawn();
@@ -671,12 +681,12 @@ impl Default for DragModifierState {
 }
 
 /// Accumulated travel of the current unmodified left-drag, in pixels, plus
-/// the members of the last released scroll-drag column and their settle
-/// deadline. Written while a header scroll-drag feeds the shared scroll
-/// pipeline; read on release to tell a scroll (keep the new scroll offset,
-/// no homing, no reshuffle) apart from a click (today's focus/reshuffle
-/// behavior). Members stay listed past release so a lagging native echo
-/// cannot rewrite their slots (see the adoption grace in
+/// the members of the last released held column and their settle deadline.
+/// Written on every mouse-up (scroll drags additionally feed the scroll
+/// pipeline mid-gesture); read on release to tell a scroll (keep the new
+/// scroll offset, no homing, no reshuffle) apart from a click (today's
+/// focus/reshuffle behavior). Members stay listed past release so a lagging
+/// native echo cannot rewrite their slots (see the adoption grace in
 /// `window_moved_update_frame`) until one settle check confirms them.
 #[derive(Debug, Resource, Default)]
 pub(crate) struct DragScrollState {
@@ -787,6 +797,41 @@ const MIN_RELEASE_PX_S: f64 = 100.0;
 /// strip at unbounded speed.
 const MAX_RELEASE_PX_S: f64 = 12_000.0;
 
+/// Column members for release handling: the whole column a dragged window
+/// belongs to (so stacked/tabbed mates are covered), or the lone window.
+/// Shared by the scroll branch, the general homing path, and the warmup
+/// bookkeeping so all three agree on who the echo shield covers.
+fn release_column_members(entity: Entity, strips: &ReleaseStrips) -> Vec<Entity> {
+    strips
+        .iter()
+        .find_map(|(_, strip, _, _)| {
+            strip
+                .index_of(entity)
+                .ok()
+                .and_then(|index| strip.get(index).ok())
+        })
+        .map_or_else(|| vec![entity], |column| column.window_iter().collect())
+}
+
+/// Arms the post-release echo shield for `members`: lists them with a
+/// deadline and schedules one settle check. A native-owned drag moved the
+/// OS window while the slot stayed pinned, and its lagging echo must not
+/// rewrite the slot (the permanent-detach path) — the adoption grace
+/// (`window_moved_update_frame`) refuses listed echoes inside the deadline,
+/// and the settle check repairs residue with no echo at all. Previously
+/// scroll-drags only; now every release, since plain content drags detach
+/// the same way.
+fn arm_release_grace(
+    members: Vec<Entity>,
+    scroll_state: &mut DragScrollState,
+    commands: &mut Commands,
+) {
+    scroll_state.members = members;
+    scroll_state.settle_deadline = Some(Instant::now() + SCROLL_SETTLE_GRACE);
+    let system_id = commands.register_system(scroll_settle_check);
+    Timeout::callback(SCROLL_SETTLE_DELAY, system_id, commands);
+}
+
 /// Re-reads OS truth for scroll-released column members once they have had a
 /// moment to land, pushing any displaced window back into its slot.
 ///
@@ -799,6 +844,9 @@ const MAX_RELEASE_PX_S: f64 = 12_000.0;
 fn scroll_settle_check(
     mut scroll_state: ResMut<DragScrollState>,
     mut windows: Query<(&mut Window, &Position)>,
+    writer: Option<Res<crate::ax_writer::AxWriterQueue>>,
+    mut write_state: ResMut<crate::ax_writer::AxWriteState>,
+    config: Res<Config>,
     mut commands: Commands,
 ) {
     if scroll_state.members.is_empty() {
@@ -833,9 +881,16 @@ fn scroll_settle_check(
             // Info, not debug: a repair here means the OS really slipped
             // (suppression leak or an eaten push), which is exactly the
             // signal for whether native sessions are still starting.
-            // Human-rate releases keep this far from spammy.
+            // Human-rate releases keep this far from spammy. Routes through
+            // the single-writer discipline when the flag is on.
             info!("scroll settle: OS window {member} drifted {drift:?}, pushing slot");
-            window.reposition(position.0);
+            crate::ax_writer::push_position(
+                &mut window,
+                position.0,
+                writer.as_deref(),
+                &mut write_state,
+                config.experimental_ax_writer(),
+            );
             pending.push(member);
         }
     }

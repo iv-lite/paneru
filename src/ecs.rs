@@ -184,6 +184,8 @@ pub fn register_systems(app: &mut bevy::app::App) {
     // double-buffered and dropped after a frame like any other message stream.
     app.add_message::<InputEvent>();
     app.init_resource::<systems::ParkedCommands>();
+    app.init_resource::<crate::ax_writer::AxWriteState>();
+    app.init_resource::<crate::ax_writer::AxWriteState>();
     app.add_systems(
         PreUpdate,
         (
@@ -191,6 +193,7 @@ pub fn register_systems(app: &mut bevy::app::App) {
             systems::pump_events,
             systems::demux_input_events.after(systems::pump_events),
             systems::park_cold_commands,
+            systems::drain_ax_acks,
         ),
     );
     app.add_systems(
@@ -900,6 +903,18 @@ pub fn setup_bevy_app(sender: EventSender, receiver: Receiver<Event>) -> Result<
         app.insert_resource(store);
         app.insert_resource(roster);
         app.insert_resource(crate::snapshot::TitleInvalidations::default());
+    }
+
+    // AX writer thread: parked on its queue until the experimental flag
+    // routes commits to it (harness keeps the synchronous path — no queue
+    // resource there, so commits fall back to direct). Spawned
+    // unconditionally like the snapshot worker: one idle thread is cheaper
+    // than lazy-start races on first animation. The ack map is inited by
+    // `register_systems` so both paths share it.
+    {
+        let (queue, inbox) = crate::ax_writer::spawn_ax_writer();
+        app.insert_resource(queue);
+        app.insert_resource(inbox);
     }
 
     // Run every schedule inline rather than fanning systems out across the task

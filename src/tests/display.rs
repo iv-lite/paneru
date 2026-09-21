@@ -733,6 +733,166 @@ fn test_native_drag_accumulates_paint_offset_with_slot_pinned() {
         .run(commands);
 }
 
+/// A plain left-click drag must not detach the window: the OS really moves
+/// under a native content drag while the slot stays pinned, and the lagging
+/// echo after release must push the slot back instead of adopting the
+/// displaced frame (which `commit` would then legitimize).
+#[test]
+fn test_plain_drag_release_ignores_lagging_os_echo() {
+    // Window 0 tiles at (0, 20); grab its content with no shortcut so
+    // native owns the drag, nudge it, and release.
+    let grab = CGPoint::new(200.0, 500.0);
+    let drop = CGPoint::new(210.0, 500.0);
+    let commands = vec![
+        Event::MenuOpened { window_id: 0 },
+        Event::MouseDown {
+            point: grab,
+            modifiers: Modifiers::empty(),
+        },
+        Event::MouseDragged {
+            point: drop,
+            modifiers: Modifiers::empty(),
+        },
+        Event::MouseUp {
+            point: drop,
+            modifiers: Modifiers::empty(),
+        },
+        Event::Command {
+            command: Command::PrintState,
+        },
+        Event::Command {
+            command: Command::PrintState,
+        },
+    ];
+
+    TestHarness::new()
+        .with_windows(1)
+        .on_iteration(3, |world, state| {
+            // The OS window really moved during the drag; its echo lands
+            // after release, when no holder, marker, or button state pins
+            // the slot anymore.
+            state.os_move_window(0, Origin::new(100, TEST_MENUBAR_HEIGHT));
+            let _ = world;
+        })
+        .on_iteration(5, |world, _state| {
+            // Slot holds: the release grace pushed the OS frame back
+            // instead of adopting the displaced echo.
+            let entity = find_window_entity(0, world);
+            let position = world.entity(entity).get::<Position>().expect("position");
+            assert_eq!(position.0, Origin::new(0, TEST_MENUBAR_HEIGHT));
+            assert_on_workspace!(world, 0, TEST_WORKSPACE_ID);
+        })
+        .run(commands);
+}
+
+/// East at the right edge must not enter a fullscreen space on ANOTHER
+/// display: the search stays display-local, so focus (and the border) stay
+/// put instead of bleeding across.
+#[test]
+fn test_east_at_edge_ignores_fullscreen_on_other_display() {
+    let size = Size::new(TEST_WINDOW_WIDTH, TEST_WINDOW_HEIGHT);
+    let origin = Origin::new(0, TEST_MENUBAR_HEIGHT);
+    let ext_origin = Origin::new(0, -EXT_DISPLAY_HEIGHT + TEST_MENUBAR_HEIGHT);
+
+    let harness = TestHarness::new().with_display(
+        EXT_DISPLAY_ID,
+        IRect::new(0, -EXT_DISPLAY_HEIGHT, EXT_DISPLAY_WIDTH, 0),
+        vec![EXT_WORKSPACE_ID],
+    );
+    harness.mock_state.spawn_window(
+        TEST_PROCESS_ID,
+        TEST_WORKSPACE_ID,
+        0,
+        IRect::from_corners(origin, origin + size),
+    );
+    harness.mock_state.spawn_window(
+        TEST_PROCESS_ID,
+        EXT_WORKSPACE_ID,
+        1,
+        IRect::from_corners(ext_origin, ext_origin + size),
+    );
+
+    let commands = vec![
+        Event::MenuOpened { window_id: 0 },
+        Event::Command {
+            command: Command::PrintState,
+        },
+        Event::Command {
+            command: Command::Window(Operation::Focus(Direction::East)),
+        },
+        Event::Command {
+            command: Command::PrintState,
+        },
+    ];
+
+    harness
+        .on_iteration(0, |_world, state| {
+            // Fullscreen the external display's window only.
+            state.update_window(1, |window| {
+                window.is_full_screen = true;
+            });
+            state.activate_workspace(EXT_DISPLAY_ID, EXT_WORKSPACE_ID, true);
+        })
+        .on_iteration(2, |world, _state| {
+            assert_focused!(world, 0);
+            assert_on_workspace!(world, 0, TEST_WORKSPACE_ID);
+        })
+        .run(commands);
+}
+
+/// Focusing across displays moves the active display marker to the focus
+/// owner's display: without this the strip activates on the new display
+/// while the marker stays behind, and the next directional press operates
+/// on the wrong strip (reads as bleed).
+#[test]
+fn test_north_focus_moves_active_display_marker() {
+    let size = Size::new(TEST_WINDOW_WIDTH, TEST_WINDOW_HEIGHT);
+    let origin = Origin::new(0, TEST_MENUBAR_HEIGHT);
+    let ext_origin = Origin::new(0, -EXT_DISPLAY_HEIGHT + TEST_MENUBAR_HEIGHT);
+
+    let harness = TestHarness::new().with_display(
+        EXT_DISPLAY_ID,
+        IRect::new(0, -EXT_DISPLAY_HEIGHT, EXT_DISPLAY_WIDTH, 0),
+        vec![EXT_WORKSPACE_ID],
+    );
+    harness.mock_state.spawn_window(
+        TEST_PROCESS_ID,
+        TEST_WORKSPACE_ID,
+        0,
+        IRect::from_corners(origin, origin + size),
+    );
+    harness.mock_state.spawn_window(
+        TEST_PROCESS_ID,
+        EXT_WORKSPACE_ID,
+        1,
+        IRect::from_corners(ext_origin, ext_origin + size),
+    );
+
+    let commands = vec![
+        Event::MenuOpened { window_id: 0 },
+        Event::Command {
+            command: Command::Window(Operation::Focus(Direction::North)),
+        },
+        Event::Command {
+            command: Command::PrintState,
+        },
+        Event::Command {
+            command: Command::PrintState,
+        },
+    ];
+
+    harness
+        .on_iteration(1, |world, _state| {
+            assert_focused!(world, 1);
+            assert_eq!(dragged_active_display_id(world), EXT_DISPLAY_ID);
+        })
+        .on_iteration(3, |world, _state| {
+            assert_focused!(world, 1);
+            assert_eq!(dragged_active_display_id(world), EXT_DISPLAY_ID);
+        })
+        .run(commands);
+}
+
 /// The same drag without the shortcut held snaps back: no transfer.
 #[test]
 fn test_drag_across_display_without_shortcut_snaps_back() {

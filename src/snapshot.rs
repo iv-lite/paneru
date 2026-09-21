@@ -60,6 +60,10 @@ pub(crate) struct WindowSnapshot {
     pub title: Option<String>,
     pub frame: Option<IRect>,
     pub minimized: bool,
+    /// Detected corner radius, refreshed on slow ticks only (corners change
+    /// on theme/scale switches, never per frame). Lets border attachment
+    /// skip the main-thread SLS read; the direct read stays the fallback.
+    pub corner_radius: Option<f64>,
 }
 
 /// One published AX generation. Monotonic `epoch` is the ordering key later
@@ -190,7 +194,35 @@ fn read_one(win_id: WinID, pid: Option<Pid>, element: &CFRetained<AXUIWrapper>) 
         title: element.title().ok(),
         frame: snapshot_frame(element).ok(),
         minimized: element.minimized().is_ok_and(|minimized| minimized),
+        corner_radius: None,
     }
+}
+
+/// Refreshes slow-cadence per-window data (currently corner radii) and
+/// prunes entries for windows that left the roster. Corners change on
+/// theme/scale switches, never per frame, so the slow tick is the right
+/// cadence — and pruning here keeps the map bounded by the live roster.
+fn refresh_radii(radii: &mut HashMap<WinID, Option<f64>>, handles: &RosterHandles) {
+    radii.retain(|win_id, _| handles.contains_key(win_id));
+    for win_id in handles.keys() {
+        radii.insert(*win_id, crate::manager::sls_window_corner_radius(*win_id));
+    }
+}
+
+/// Reads every rostered handle for one publish tick, attaching the
+/// slow-cached corner radii. Pure over its inputs apart from the AX reads
+/// inside [`read_one`].
+fn snapshot_windows(
+    handles: &RosterHandles,
+    radii: &HashMap<WinID, Option<f64>>,
+) -> HashMap<WinID, WindowSnapshot> {
+    let mut windows = HashMap::with_capacity(handles.len());
+    for (win_id, (pid, element)) in handles {
+        let mut snapshot = read_one(*win_id, *pid, element);
+        snapshot.corner_radius = radii.get(win_id).copied().flatten();
+        windows.insert(*win_id, snapshot);
+    }
+    windows
 }
 
 /// Maximum age of a snapshot on-screen set consumers trust. The worker
@@ -271,6 +303,22 @@ pub(crate) fn snapshot_live_frame(
         .flatten()
 }
 
+/// Detected corner radius for `win_id` from the snapshot worker, if the
+/// store exists, holds the window, and is newer than `max_age`. Same
+/// freshness rules as [`snapshot_live_frame`]: stale or missing data falls
+/// back to the direct SLS read. Pure over the loaded snapshot, so it is
+/// unit testable like the frame matrix.
+pub(crate) fn snapshot_corner_radius(
+    store: Option<&SnapshotStore>,
+    win_id: WinID,
+    max_age: Duration,
+) -> Option<f64> {
+    let guard = store?.0.load();
+    (guard.at.elapsed() < max_age)
+        .then(|| guard.windows.get(&win_id)?.corner_radius)
+        .flatten()
+}
+
 /// Snapshot worker main loop. Drains roster deltas (blocking up to one tick
 /// so an idle roster costs nothing), polls every handle, publishes.
 ///
@@ -301,6 +349,10 @@ fn run(
     let mut active_space: HashMap<u32, WorkspaceId> = HashMap::new();
     let mut epoch: u64 = 0;
     let mut ticks: u64 = 0;
+    // Detected corner radii by window, refreshed on slow ticks only (corners
+    // change on theme/scale switches, never per frame). Pruned to rostered
+    // handles alongside.
+    let mut radii: HashMap<WinID, Option<f64>> = HashMap::new();
     // Poll cadence hint from the main thread (fast while warming up or
     // holding a drag). Slow enumeration below stays tick-counted, so in
     // fast mode it simply runs more often — still on this thread, never
@@ -329,10 +381,7 @@ fn run(
         }
         ticks += 1;
 
-        let mut windows = HashMap::with_capacity(handles.len());
-        for (win_id, (pid, element)) in &handles {
-            windows.insert(*win_id, read_one(*win_id, *pid, element));
-        }
+        let windows = snapshot_windows(&handles, &radii);
         if let Some(ids) = window_manager.windows_on_screen() {
             on_screen = ids.into_iter().collect();
         } else {
@@ -340,6 +389,7 @@ fn run(
         }
 
         if ticks.is_multiple_of(SLOW_EVERY_TICKS) {
+            refresh_radii(&mut radii, &handles);
             let fresh_displays = window_manager.present_displays();
             if fresh_displays.is_empty() {
                 debug!("ax snapshot: empty display list, keeping previous set");
@@ -450,6 +500,7 @@ mod tests {
                 title: None,
                 frame,
                 minimized: false,
+                corner_radius: None,
             },
         );
         SnapshotStore(Arc::new(ArcSwap::new(Arc::new(snapshot))))
@@ -484,6 +535,45 @@ mod tests {
         assert!(snapshot.windows.is_empty());
         let store = SnapshotStore::default();
         assert_eq!(store.0.load().epoch, 0);
+    }
+
+    #[test]
+    fn corner_radius_follows_freshness_rules() {
+        let mut snapshot = AxSnapshot {
+            at: Instant::now(),
+            ..Default::default()
+        };
+        snapshot.windows.insert(
+            1,
+            WindowSnapshot {
+                win_id: 1,
+                pid: None,
+                title: None,
+                frame: None,
+                minimized: false,
+                corner_radius: Some(12.0),
+            },
+        );
+        let store = SnapshotStore(Arc::new(ArcSwap::new(Arc::new(snapshot))));
+        assert_eq!(
+            snapshot_corner_radius(Some(&store), 1, Duration::from_secs(1)),
+            Some(12.0)
+        );
+        assert_eq!(
+            snapshot_corner_radius(Some(&store), 1, Duration::from_nanos(0)),
+            None,
+            "expired snapshots fall back to the direct read"
+        );
+        assert_eq!(
+            snapshot_corner_radius(Some(&store), 2, Duration::from_secs(1)),
+            None,
+            "missing windows fall back to the direct read"
+        );
+        assert_eq!(
+            snapshot_corner_radius(None, 1, Duration::from_secs(1)),
+            None,
+            "absent store (tests) falls back to the direct read"
+        );
     }
 
     #[test]
@@ -548,6 +638,7 @@ mod tests {
                 title: Some(title.to_string()),
                 frame: None,
                 minimized: false,
+                corner_radius: None,
             },
         );
         SnapshotStore(Arc::new(ArcSwap::new(Arc::new(snapshot))))

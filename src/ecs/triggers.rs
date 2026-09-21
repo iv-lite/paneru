@@ -15,11 +15,11 @@ use tracing::{Level, debug, error, info, instrument, trace, warn};
 
 use super::{
     ActiveDisplayMarker, BProcess, FocusedMarker, FreshMarker, MissionControlActive,
-    PreviousManagedStrip, RetryFrontSwitch, SpawnWindowTrigger, StrayFocusEvent, SystemTheme,
-    Timeout, Unmanaged,
+    MouseHeldMarker, PreviousManagedStrip, RetryFrontSwitch, SpawnWindowTrigger, StrayFocusEvent,
+    SystemTheme, Timeout, Unmanaged,
 };
 use crate::config::Config;
-use crate::ecs::focus::FocusHistory;
+use crate::ecs::focus::{FocusHistory, activate_owner_display};
 use crate::ecs::layout::LayoutStrip;
 use crate::ecs::params::{ActiveDisplay, GlobalState, WindowCtx, Windows};
 use crate::ecs::state::PaneruState;
@@ -207,11 +207,14 @@ pub(super) fn theme_change_trigger(
 /// * `global_state` - Focus-follows-mouse and reshuffle flags.
 /// * `ctx` - Window queries, configuration and the command buffer.
 #[instrument(level = Level::DEBUG, skip_all)]
-#[allow(clippy::too_many_lines)]
+#[allow(clippy::too_many_lines, clippy::too_many_arguments)]
 pub(super) fn window_focused_trigger(
     mut messages: MessageReader<Event>,
     applications: Query<&Application>,
     mut workspaces: Query<(Entity, &mut LayoutStrip, Has<ActiveWorkspaceMarker>)>,
+    strip_parents: Query<&ChildOf, With<LayoutStrip>>,
+    displays: Query<(Entity, Has<ActiveDisplayMarker>), With<Display>>,
+    held: Query<&MouseHeldMarker>,
     restore_guards: Query<(Entity, &RestoreFocusMarker)>,
     mut focus_history: ResMut<FocusHistory>,
     global_state: GlobalState,
@@ -328,6 +331,21 @@ pub(super) fn window_focused_trigger(
             && let Ok(mut entity_commands) = ctx.commands.get_entity(strip_entity)
         {
             entity_commands.try_insert(ActiveWorkspaceMarker);
+        }
+
+        // Keep the active display glued to OS-confirmed focus arrivals
+        // (clicks, Cmd-Tab): without this the strip activates on the new
+        // display while the display marker stays behind, and the next
+        // directional press operates on the wrong strip. Hover echoes
+        // (skip_reshuffle set by focus-follows-mouse) and mid-drag echoes
+        // never move it — a hover must not steal the display, and a
+        // transfer places both markers itself.
+        if let Some((strip_entity, _)) = owner
+            && held.is_empty()
+            && !global_state.skip_reshuffle()
+            && let Ok(child) = strip_parents.get(strip_entity)
+        {
+            activate_owner_display(child.parent(), &displays, &mut ctx.commands);
         }
 
         // Record before the already-focused short-circuit below: focus_entity
