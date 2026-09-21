@@ -9,8 +9,9 @@ use crate::ecs::layout::{LayoutStrip, PARKED_STRIP_SLIVER};
 use crate::ecs::mouse::{DragModifierState, DragPaintState, DropPreviewState};
 use crate::ecs::workspace::IgnoredMovedWindows;
 use crate::ecs::{
-    ActiveDisplayMarker, Bounds, DockPosition, DragSettleMarker, MouseHeldMarker, Position,
-    RepositionMarker, Scrolling, SpawnWindowTrigger, StaleAxMarker, Timeout, Unmanaged,
+    ActiveDisplayMarker, ActiveWorkspaceMarker, Bounds, DockPosition, DragSettleMarker,
+    MouseHeldMarker, Position, RepositionMarker, Scrolling, SpawnWindowTrigger, StaleAxMarker,
+    Timeout, Unmanaged,
 };
 use crate::events::Event;
 use crate::manager::{Application, Display, Origin, Size, Window};
@@ -958,6 +959,42 @@ fn test_north_focus_moves_active_display_marker() {
         .on_iteration(3, |world, _state| {
             assert_focused!(world, 1);
             assert_eq!(dragged_active_display_id(world), EXT_DISPLAY_ID);
+        })
+        .run(commands);
+}
+
+/// A header scroll-drag drives the strip 1:1 with the pointer in the same
+/// tick (no `Scroll` message hop): after two 50px drags the strip offset
+/// is exactly -100, not one tick behind.
+#[test]
+fn test_header_drag_drives_strip_same_tick() {
+    // Grab window 0's header (tiles at y=20, so y=30 is titlebar).
+    let grab = CGPoint::new(200.0, 30.0);
+    let commands = vec![
+        Event::MenuOpened { window_id: 0 },
+        Event::MouseDown {
+            point: grab,
+            modifiers: Modifiers::empty(),
+        },
+        Event::MouseDragged {
+            point: CGPoint::new(150.0, 30.0),
+            modifiers: Modifiers::empty(),
+        },
+        Event::MouseDragged {
+            point: CGPoint::new(100.0, 30.0),
+            modifiers: Modifiers::empty(),
+        },
+        Event::Command {
+            command: Command::PrintState,
+        },
+    ];
+
+    TestHarness::new()
+        .with_windows(5)
+        .on_iteration(3, |world, _state| {
+            let mut strips = world.query_filtered::<&Position, With<ActiveWorkspaceMarker>>();
+            let x = strips.single(world).expect("exactly one active strip").0.x;
+            assert_eq!(x, -100, "strip tracks the pointer with no message-hop lag");
         })
         .run(commands);
 }

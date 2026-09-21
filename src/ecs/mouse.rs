@@ -2,7 +2,7 @@ use bevy::app::{App, Plugin, Update};
 use bevy::ecs::entity::Entity;
 use bevy::ecs::hierarchy::ChildOf;
 use bevy::ecs::message::{MessageReader, MessageWriter};
-use bevy::ecs::query::{Has, With};
+use bevy::ecs::query::{Has, With, Without};
 use bevy::ecs::resource::Resource;
 use bevy::ecs::schedule::IntoScheduleConfigs as _;
 use bevy::ecs::system::{Commands, Local, NonSendMut, Populated, Query, Res, ResMut, Single};
@@ -20,11 +20,10 @@ use crate::config::swipe::SwipeGestureDirection;
 use crate::config::{Config, decorations::BorderRadiusOption};
 use crate::ecs::layout::{Column, LayoutStrip, desired_window_frame};
 use crate::ecs::params::{ActiveDisplayMut, GlobalState, Windows};
-use crate::ecs::scroll::px_to_scroll_delta;
 use crate::ecs::workspace::mid_strip_slot;
 use crate::ecs::{
-    ActiveWorkspaceMarker, ColdStart, DockPosition, MissionControlActive, Position, Scrolling,
-    SelectedVirtualMarker, SpawnCommandsExt, Unmanaged, VerifyWindowPosition,
+    ActiveWorkspaceMarker, ColdStart, DockPosition, ManualStripOffset, MissionControlActive,
+    Position, Scrolling, SelectedVirtualMarker, SpawnCommandsExt, Unmanaged, VerifyWindowPosition,
 };
 use crate::manager::{Display, Origin, Size, Window, WindowManager, origin_from};
 use crate::overlay::{BorderParams, OverlayManager};
@@ -84,6 +83,54 @@ fn press_is_on_titlebar(point: &CGPoint, window: &Window) -> bool {
     cursor.y - os_min_y < TITLEBAR_HEIGHT_PX
 }
 
+/// Direct-drives one header scroll-drag delta into the owner strip's
+/// scroll offset, 1:1 with the pointer and same-tick as the column drive.
+/// Keeps the integrator's `Scrolling` state glued to the write (zero
+/// velocity, refreshed lift timestamp) so it no-ops plus clamps regardless
+/// of plugin execution order, and clears a deliberate manual placement now
+/// that the user owns the strip. The release path (offset keep, inertia,
+/// settle) is untouched.
+#[allow(clippy::too_many_arguments)]
+fn drive_scroll_strip(
+    target: Entity,
+    delta_x: i32,
+    strips: &Query<(Entity, &LayoutStrip)>,
+    scroll: &mut ScrollDriveStrips,
+    time: &Time,
+    commands: &mut Commands,
+) {
+    let Some(owner) = strips
+        .iter()
+        .find_map(|(entity, strip)| strip.contains(target).then_some(entity))
+    else {
+        trace!("synthetic drag: held target {target} has no strip, skipping");
+        return;
+    };
+    let Ok((strip_entity, mut strip_position, scrolling)) = scroll.get_mut(owner) else {
+        return;
+    };
+    strip_position.0.x += delta_x;
+    if let Some(mut scrolling) = scrolling {
+        // Keep the integrator's state glued to the direct write: with zero
+        // velocity it no-ops and the constraints just clamp, regardless of
+        // plugin execution order.
+        scrolling.velocity = 0.0;
+        scrolling.is_user_swiping = true;
+        scrolling.last_event = time.elapsed();
+        scrolling.position = f64::from(strip_position.0.x);
+    } else if let Ok(mut entity_commands) = commands.get_entity(strip_entity) {
+        entity_commands.try_insert(Scrolling {
+            velocity: 0.0,
+            position: f64::from(strip_position.0.x),
+            is_user_swiping: true,
+            last_event: time.elapsed(),
+        });
+    }
+    if let Ok(mut entity_commands) = commands.get_entity(strip_entity) {
+        entity_commands.try_remove::<ManualStripOffset>();
+    }
+}
+
 /// Accumulated left-drag travel (px) in the current press, for telling a
 /// strip-scroll drag apart from a click on release. Written by
 /// [`drag_move_held_column`], read and reset by [`mouse_up_trigger`].
@@ -112,7 +159,11 @@ impl Plugin for MouseEventsPlugin {
                     // Ordered after adoption: adoption must read the last
                     // committed OS frame, never this tick's synthetic write,
                     // or it reverts the move from the stale frame.
-                    drag_move_held_column.after(super::systems::window_moved_update_frame),
+                    // In the drag-drive set: the layout chain re-derives
+                    // window frames from strip motion in the same tick.
+                    drag_move_held_column
+                        .after(super::systems::window_moved_update_frame)
+                        .in_set(super::DragDriveSet),
                 )
                     .run_if(mission_control_inactive),
                 mouse_up_trigger,
@@ -431,6 +482,20 @@ type ReleaseStrips<'w, 's> = Query<
     ),
 >;
 
+/// Scroll-drive strips: layout strips with mutable scroll state. The
+/// `Without<Window>` filter keeps the mutable `Position` access disjoint
+/// from window queries in the same system (strips never carry `Window`).
+type ScrollDriveStrips<'w, 's> = Query<
+    'w,
+    's,
+    (
+        Entity,
+        &'static mut Position,
+        Option<&'static mut Scrolling>,
+    ),
+    (With<LayoutStrip>, Without<Window>),
+>;
+
 /// Home slot of a released window on its current strip, recomputed with the
 /// audit's exact math — or `None` when it already sits in its slot (or
 /// lives on no strip). The strip is deliberately left alone: reshuffling
@@ -470,6 +535,44 @@ fn drop_home(
     );
     let drift = (frame.min - home.min).abs();
     (drift.x > 1 || drift.y > 1).then_some(home.min)
+}
+
+/// Reveals the member holding the largest viewport share after a release:
+/// homing glides windows to slots but never moves the strip, so a dropped
+/// window can land half-visible with nothing scheduled. The scroll path
+/// keeps its own settle; every other release funnels here. `ensure_visible`
+/// scrolls the minimal shortfall (animated, no-op when already visible),
+/// computed from slots — so it converges correctly even while homing
+/// glides are still in flight.
+#[allow(clippy::too_many_arguments)]
+fn reveal_most_visible(
+    entity: Entity,
+    strips: &ReleaseStrips,
+    displays: &PreviewDisplays,
+    windows: &Windows,
+    config: &Config,
+    commands: &mut Commands,
+) {
+    use crate::ecs::layout::most_visible_window;
+
+    let Some((_, strip, _, child)) = strips
+        .iter()
+        .find(|(_, strip, _, _)| strip.contains(entity))
+    else {
+        return;
+    };
+    let Ok((_, display, dock, _)) = displays.get(child.parent()) else {
+        return;
+    };
+    let viewport = display.actual_display_bounds(dock, config);
+    let frames: Vec<(Entity, IRect)> = strip
+        .all_windows()
+        .into_iter()
+        .filter_map(|member| windows.frame(member).map(|frame| (member, frame)))
+        .collect();
+    if let Some(winner) = most_visible_window(&frames, viewport) {
+        commands.ensure_visible(winner);
+    }
 }
 
 /// Relocates the dragged column to the nearest slot on an armed
@@ -656,6 +759,11 @@ fn mouse_up_trigger(
                 // not rewrite the slot. Transfers skip it — the hit-test
                 // needs live adoption on the new strip.
                 arm_release_grace(members, &mut scroll_state, &mut commands);
+                // Reveal the most-visible member: homing glides windows to
+                // slots but never moves the strip, so without this a drop
+                // can strand its window half-visible with nothing scheduled
+                // (the audit only re-homes windows, never scrolls).
+                reveal_most_visible(entity, &strips, &displays, &windows, &config, &mut commands);
             }
             if let Ok(mut entity_commands) = commands.get_entity(held_entity) {
                 entity_commands.try_despawn();
@@ -1157,8 +1265,8 @@ fn seed_release_inertia(
 /// Floating/minimized/hidden windows are untouched (they keep native
 /// behavior plus the pin path).
 ///
-/// Exception: a header scroll-drag (grab-time [`DragScrollArmed`]) feeds the
-/// pointer delta into the shared modifier+scroll pipeline instead, when
+/// Exception: a header scroll-drag (grab-time [`DragScrollArmed`]) drives
+/// the owner strip's scroll offset directly, 1:1 with the pointer, when
 /// `left_drag_scrolls_strip` is enabled. The tap swallows the native drag
 /// for those grabs, so no `WindowMoved` echo and no adoption fight; armed
 /// modifier drags take the move path below, content grabs stay fully native.
@@ -1172,16 +1280,17 @@ fn drag_move_held_column(
         Has<DragDisplayArmed>,
         Has<DragScrollArmed>,
     )>,
-    strips: Query<&LayoutStrip>,
     windows: Query<(&Window, Entity, Option<&Unmanaged>)>,
     mut positions: Query<&mut Position, With<Window>>,
-    displays: Query<(&Display, Has<ActiveDisplayMarker>)>,
+    strips: Query<(Entity, &LayoutStrip)>,
+    mut scroll_strips: ScrollDriveStrips,
     config: Res<Config>,
     time: Res<Time>,
     mut scroll_state: ResMut<DragScrollState>,
     mut paint: ResMut<DragPaintState>,
     cold: Option<Res<ColdStart>>,
     mut state: Local<DragMoveState>,
+    mut commands: Commands,
 ) {
     for InputEvent(event) in messages.read() {
         match event {
@@ -1235,8 +1344,10 @@ fn drag_move_held_column(
                     // world converges.
                     continue;
                 }
-                // Header scroll-drag (grab-time armed): feed the pointer delta
-                // into the shared modifier+scroll pipeline (see above).
+                // Header scroll-drag (grab-time armed): drive the owner
+                // strip directly, 1:1 with the pointer and same-tick as the
+                // column drive below — instead of emitting a `Scroll` event
+                // that trails a message hop plus an unordered plugin behind.
                 // Armed modifier drags and legacy (scroll-disabled) drags
                 // take the move path below; content grabs with scrolling
                 // enabled are ignored entirely — native owns them.
@@ -1244,23 +1355,20 @@ fn drag_move_held_column(
                     scroll_state.distance_px += f64::from(delta.x.abs() + delta.y.abs());
                     // Horizontal columns only: vertical travel counts toward
                     // the click threshold but never scrolls.
-                    if delta.x != 0
-                        && let Some(viewport_width) = displays
-                            .iter()
-                            .find_map(|(display, active)| active.then(|| display.bounds().width()))
-                    {
+                    if delta.x != 0 {
                         sample_release_velocity(
                             &mut scroll_state,
                             f64::from(delta.x),
                             time.elapsed(),
                         );
-                        moved.write(Event::Scroll {
-                            delta: px_to_scroll_delta(
-                                f64::from(delta.x),
-                                f64::from(viewport_width),
-                                &config,
-                            ),
-                        });
+                        drive_scroll_strip(
+                            target,
+                            delta.x,
+                            &strips,
+                            &mut scroll_strips,
+                            &time,
+                            &mut commands,
+                        );
                     }
                     continue;
                 }
@@ -1273,7 +1381,7 @@ fn drag_move_held_column(
                 }
                 let members: Vec<Entity> = strips
                     .iter()
-                    .find_map(|strip| {
+                    .find_map(|(_, strip)| {
                         strip
                             .index_of(target)
                             .ok()

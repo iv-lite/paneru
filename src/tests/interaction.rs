@@ -1988,6 +1988,94 @@ fn test_focus_arrival_on_fresh_strip_defers_then_exposes() {
     );
 }
 
+/// One focus press scrolls the strip exactly once: with auto-center the
+/// command centers first and the single Update reshuffle measures the
+/// centered target, so offsets converge monotonically. The old fan-out
+/// scrolled toward the pre-center frame, then reversed — jump-then-slide.
+#[test]
+fn test_focus_arrival_scrolls_strip_once_without_reversal() {
+    let config: Config = (
+        MainOptions {
+            auto_center: Some(true),
+            ..Default::default()
+        },
+        vec![],
+    )
+        .into();
+
+    let mut h = TestHarness::new().with_config(config).with_windows(5);
+    h.run(vec![
+        Event::MenuOpened { window_id: 0 },
+        Event::Command {
+            command: Command::PrintState,
+        },
+    ]);
+    h.app.world_mut().write_message::<Event>(Event::Command {
+        command: Command::Window(Operation::Focus(Direction::Last)),
+    });
+    let mut offsets = Vec::new();
+    for _ in 0..60 {
+        h.app.update();
+        for event in h.mock_state.drain_events() {
+            h.app.world_mut().write_message::<Event>(event);
+        }
+        let world = h.app.world_mut();
+        let mut strips = world.query_filtered::<&Position, With<ActiveWorkspaceMarker>>();
+        offsets.push(strips.single(world).expect("active strip").0.x);
+    }
+    assert!(
+        offsets.windows(2).all(|pair| pair[1] <= pair[0]),
+        "strip offsets must never reverse mid-arrival: {offsets:?}"
+    );
+    assert_focused!(h.app.world_mut(), 4);
+    // 400px window centered in 1024px: x = (1024 - 400) / 2.
+    assert_window_at!(h.app.world_mut(), 4, 312, TEST_MENUBAR_HEIGHT);
+}
+
+/// The one-shot follow warp projects the owner strip's in-flight scroll:
+/// with auto-center off the window sits off-screen until the strip glides,
+/// so the raw frame has no viewport overlap and an unprojected warp would
+/// (correctly refuse and) never fire.
+#[test]
+fn test_mouse_follows_focus_projects_inflight_strip() {
+    let config: Config = (
+        MainOptions {
+            mouse_follows_focus: Some(true),
+            ..Default::default()
+        },
+        vec![],
+    )
+        .into();
+
+    let commands = vec![
+        Event::MenuOpened { window_id: 0 },
+        Event::Command {
+            command: Command::Window(Operation::Focus(Direction::Last)),
+        },
+        Event::Command {
+            command: Command::PrintState,
+        },
+        Event::Command {
+            command: Command::PrintState,
+        },
+    ];
+
+    TestHarness::new()
+        .with_config(config)
+        .with_windows(5)
+        .on_iteration(1, |_world, state| {
+            // Minimal-shortfall scroll exposes 1600..2000 as 624..1024;
+            // the warp lands on its center, not on the empty pre-scroll
+            // overlap (which would suppress the warp entirely).
+            assert_eq!(state.cursor_position(), Origin::new(824, 394));
+        })
+        .on_iteration(3, |world, state| {
+            assert_focused!(world, 4);
+            assert_eq!(state.cursor_position(), Origin::new(824, 394));
+        })
+        .run(commands);
+}
+
 /// Regression: `position_layout_windows`'s offscreen/parking magnitude
 /// heuristic has no way to know a virtual-workspace restore is in progress.
 /// A member window whose last position differs from its recomputed target

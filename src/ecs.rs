@@ -11,7 +11,7 @@ use bevy::ecs::query::{Added, Changed, Or, With};
 use bevy::ecs::resource::Resource;
 use bevy::ecs::schedule::SystemCondition;
 use bevy::ecs::schedule::common_conditions::{not, resource_exists};
-use bevy::ecs::schedule::{ScheduleLabel as _, SingleThreadedExecutor};
+use bevy::ecs::schedule::{ScheduleLabel as _, SingleThreadedExecutor, SystemSet};
 use bevy::ecs::system::{Commands, EntityCommands, Local, Query, Res, SystemId};
 use bevy::prelude::Event as BevyEvent;
 use bevy::tasks::Task;
@@ -313,6 +313,14 @@ pub fn register_triggers(app: &mut bevy::app::App) {
         .add_observer(triggers::cleanup_timeout_trigger)
         .add_observer(restore::restore_window_state);
 }
+
+/// Ordering between pointer-drag writes and the layout chain: drags must
+/// land before `position_layout_strips/windows` re-derive window frames in
+/// the same tick, or strip motion trails the pointer a frame behind. The
+/// scroll integrator only reads `Scrolling` state (kept glued to direct
+/// writes), so it needs no ordering either way.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, SystemSet)]
+pub(super) struct DragDriveSet;
 
 /// Marker component for the currently focused window.
 #[derive(Component)]

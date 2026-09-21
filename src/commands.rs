@@ -23,7 +23,10 @@ use crate::ecs::layout::{
     Column, LayoutStrip, MIN_WINDOW_HEIGHT, StackItem, clamp_origin_to_viewport, strip_signature,
 };
 use crate::ecs::mouse::{DragModifierState, DropPreviewState};
-use crate::ecs::params::{ActiveDisplay, ActiveDisplayMut, Windows, ring_neighbour_of_cursor};
+use crate::ecs::params::{
+    ActiveDisplay, ActiveDisplayMut, GlobalState, Windows, ring_neighbour_of_cursor,
+};
+use crate::ecs::workspace::RestoreFocusMarker;
 use crate::ecs::{
     ActiveDisplayMarker, ActiveWorkspaceMarker, Bounds, ColdStart, DockPosition, DragDisplayArmed,
     FocusedMarker, FullWidthMarker, ManualStripOffset, MissionControlActive, MouseHeldMarker,
@@ -265,6 +268,79 @@ fn nearest_float_in_direction(
     pick_nearest_in_direction(direction, focused_center, candidates)
 }
 
+/// Centers `entity` on arrival when `auto_center` is on, fused with the
+/// caller's strip reshuffle: issuing the window target in the same tick
+/// lets the single Update reshuffle measure it via `moving_frame`, so the
+/// strip scrolls exactly once instead of scrolling to the pre-center frame
+/// and correcting afterwards. Mirrors `autocenter_window_on_focus`, which
+/// then sees the pending marker and stands its own reshuffle down.
+#[allow(clippy::too_many_arguments)]
+fn focus_arrival_center(
+    entity: Entity,
+    windows: &Windows,
+    active_display: &ActiveDisplay,
+    config: &Config,
+    mouse_held: &Query<Entity, With<MouseHeldMarker>>,
+    restored: &Query<&RestoreFocusMarker>,
+    global_state: &GlobalState,
+    commands: &mut Commands,
+) {
+    if config.auto_center()
+        && !global_state.skip_reshuffle()
+        && !global_state.initializing()
+        && mouse_held.is_empty()
+        && restored.iter().all(|marker| marker.entity != entity)
+        && !active_display.active_strip().tabbed(entity)
+        && let Some((_, _, None)) = windows.get_managed(entity)
+        && let Some(size) = windows.size(entity)
+        && let Some(mut origin) = windows.origin(entity)
+    {
+        origin.x = active_display.bounds().center().x - size.x / 2;
+        commands.reposition_entity(entity, origin);
+    }
+}
+
+/// Handles West on a fullscreen space: swaps to the last column of the
+/// owning workspace. Returns true when it consumed the command.
+#[allow(clippy::too_many_arguments)]
+fn focus_fullscreen_west(
+    direction: &Direction,
+    active_display: &ActiveDisplay,
+    workspaces: &Query<(
+        &LayoutStrip,
+        Entity,
+        Option<&NativeFullscreenMarker>,
+        &ChildOf,
+    )>,
+    focus_history: &mut ResMut<FocusHistory>,
+    commands: &mut Commands,
+) -> bool {
+    if let Some(NativeFullscreenMarker {
+        layout_strip,
+        workspace_id,
+        index: _,
+    }) = active_display.fullscreen()
+        && matches!(direction, Direction::West)
+    {
+        let mut strip = workspaces
+            .into_iter()
+            .find_map(|(strip, entity, _, _)| (entity == *layout_strip).then_some(strip));
+        if strip.is_none() {
+            strip = workspaces
+                .into_iter()
+                .find_map(|(strip, _, _, _)| (strip.id() == *workspace_id).then_some(strip));
+        }
+
+        if let Some(entity) = strip.and_then(|strip| strip.last().ok().and_then(|col| col.top())) {
+            debug!("fullscreen: swap raising {entity}");
+            focus_history.pending_focus = Some(entity);
+            commands.focus_entity(entity, true);
+        }
+        return true;
+    }
+    false
+}
+
 /// Handles the "focus" command, moving focus to a window in a specified direction.
 ///
 /// # Arguments
@@ -290,6 +366,10 @@ fn command_move_focus(
     layout_strips: Query<(&LayoutStrip, Entity)>,
     active_display: ActiveDisplay,
     window_manager: Res<WindowManager>,
+    config: Res<Config>,
+    mouse_held: Query<Entity, With<MouseHeldMarker>>,
+    restored: Query<&RestoreFocusMarker>,
+    global_state: GlobalState,
     mut focus_history: ResMut<FocusHistory>,
     mut commands: Commands,
 ) {
@@ -302,27 +382,13 @@ fn command_move_focus(
     let active_strip = active_display.active_strip();
 
     // On a fullscreen space, swap to the last column in the workspace.
-    if let Some(NativeFullscreenMarker {
-        layout_strip,
-        workspace_id,
-        index: _,
-    }) = active_display.fullscreen()
-        && matches!(direction, Direction::West)
-    {
-        let mut strip = workspaces
-            .into_iter()
-            .find_map(|(strip, entity, _, _)| (entity == *layout_strip).then_some(strip));
-        if strip.is_none() {
-            strip = workspaces
-                .into_iter()
-                .find_map(|(strip, _, _, _)| (strip.id() == *workspace_id).then_some(strip));
-        }
-
-        if let Some(entity) = strip.and_then(|strip| strip.last().ok().and_then(|col| col.top())) {
-            debug!("fullscreen: swap raising {entity}");
-            focus_history.pending_focus = Some(entity);
-            commands.focus_entity(entity, true);
-        }
+    if focus_fullscreen_west(
+        direction,
+        &active_display,
+        &workspaces,
+        &mut focus_history,
+        &mut commands,
+    ) {
         return;
     }
 
@@ -389,6 +455,16 @@ fn command_move_focus(
 
     if let Some(entity) = candidate {
         focus_history.pending_focus = Some(entity);
+        focus_arrival_center(
+            entity,
+            &windows,
+            &active_display,
+            &config,
+            &mouse_held,
+            &restored,
+            &global_state,
+            &mut commands,
+        );
         commands.focus_entity(entity, true);
         // Explicitly reshuffle so the target window is brought into view.
         // This avoids a race where focus-follows-mouse leaves skip_reshuffle

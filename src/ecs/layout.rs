@@ -201,6 +201,29 @@ pub(crate) fn origin_exposing(
     clamp_origin_to_viewport(layout + origin, size, viewport) - layout
 }
 
+/// The member holding the largest share of `viewport` right now, for
+/// post-release reveal: after a drop, the strip scrolls so this window is
+/// fully visible. Pure over precomputed frames so the selection is unit
+/// testable; ties resolve to the last member, zero-area frames never win.
+/// Oversize windows still win by share and then left-align (never fully
+/// visible by design).
+pub fn most_visible_window(frames: &[(Entity, IRect)], viewport: IRect) -> Option<Entity> {
+    frames
+        .iter()
+        .filter_map(|(entity, frame)| {
+            let area = f64::from(frame.width().max(0)) * f64::from(frame.height().max(0));
+            if area <= 0.0 {
+                return None;
+            }
+            let visible = frame.intersect(viewport);
+            let share =
+                (f64::from(visible.width().max(0)) * f64::from(visible.height().max(0))) / area;
+            Some((*entity, share))
+        })
+        .max_by(|a, b| a.1.partial_cmp(&b.1).unwrap_or(std::cmp::Ordering::Equal))
+        .map(|(entity, _)| entity)
+}
+
 impl Plugin for LayoutEventsPlugin {
     fn build(&self, app: &mut App) {
         // Wake/display/space transitions relocate windows outside any strip
@@ -234,6 +257,7 @@ impl Plugin for LayoutEventsPlugin {
                     .chain()
                     .after(super::systems::finish_setup)
                     .after(super::triggers::apply_window_positions)
+                    .after(super::DragDriveSet)
                     .before(super::workspace::show_active_workspace)
                     .run_if(not(resource_exists::<Initializing>)),
                 // Slow consistency audit: repairs what the event-driven chain
@@ -2938,5 +2962,46 @@ mod tests {
         }
         assert_eq!(strip.right_neighbour(leader), Some(b));
         assert_eq!(strip.right_neighbour(follower), Some(b));
+    }
+
+    #[test]
+    fn most_visible_window_picks_largest_viewport_share() {
+        let mut world = World::new();
+        let a = world.spawn_empty().id();
+        let b = world.spawn_empty().id();
+        let c = world.spawn_empty().id();
+        let viewport = IRect::new(0, 0, 1024, 768);
+        let frames = vec![
+            (a, IRect::new(0, 0, 400, 768)),
+            (b, IRect::new(900, 0, 1300, 768)),
+            (c, IRect::new(2000, 0, 2400, 768)),
+        ];
+        // a fully visible (1.0) beats b partial (124/400) and c off-screen.
+        assert_eq!(most_visible_window(&frames, viewport), Some(a));
+        // Off-screen only: still returns the max share (0.0), never None,
+        // so release always has a reveal target.
+        let far = vec![(c, IRect::new(2000, 0, 2400, 768))];
+        assert_eq!(most_visible_window(&far, viewport), Some(c));
+    }
+
+    #[test]
+    fn most_visible_window_breaks_ties_and_skips_degenerate() {
+        let mut world = World::new();
+        let a = world.spawn_empty().id();
+        let b = world.spawn_empty().id();
+        let flat = world.spawn_empty().id();
+        let viewport = IRect::new(0, 0, 1024, 768);
+        // Equal shares resolve deterministically (max_by keeps the last).
+        let frames = vec![
+            (a, IRect::new(0, 0, 400, 768)),
+            (b, IRect::new(0, 0, 400, 768)),
+            (flat, IRect::new(10, 10, 10, 20)),
+        ];
+        assert_eq!(most_visible_window(&frames, viewport), Some(b));
+        // Zero-area frames never win, even alone among degenerate input.
+        assert_eq!(
+            most_visible_window(&[(flat, IRect::new(10, 10, 10, 20))], viewport),
+            None
+        );
     }
 }

@@ -17,8 +17,8 @@ use bevy::time::common_conditions::on_timer;
 use tracing::{Level, debug, instrument, trace, warn};
 
 use super::{
-    DeferredExposeMarker, FocusedMarker, MouseHeldMarker, RepositionMarker, SystemTheme, Unmanaged,
-    VerifyWindowPosition,
+    DeferredExposeMarker, FocusedMarker, MouseHeldMarker, RepositionMarker, ReshuffleAroundMarker,
+    SystemTheme, Unmanaged, VerifyWindowPosition,
 };
 use crate::config::Config;
 use crate::ecs::layout::LayoutStrip;
@@ -270,6 +270,7 @@ fn autocenter_window_on_focus(
     focused: Single<Entity, Added<FocusedMarker>>,
     mouse_held: Query<&MouseHeldMarker>,
     restored: Query<&RestoreFocusMarker>,
+    reshuffling: Query<Entity, With<ReshuffleAroundMarker>>,
     global_state: GlobalState,
     active_display: ActiveDisplay,
     mut ctx: WindowCtx,
@@ -298,7 +299,14 @@ fn autocenter_window_on_focus(
         origin.x = center.x - size.x / 2;
         ctx.commands.reposition_entity(entity, origin);
     }
-    ctx.commands.reshuffle_around(entity);
+    // A reshuffle already queued (typically the command's own arrival
+    // reshuffle, issued alongside the centering target above) is measured
+    // post-center by the Update layout pass — stacking a second marker
+    // only re-measures the same arrival. Other focus paths (clicks, hover,
+    // OS echoes) arrive with no marker and reshuffle here as before.
+    if !reshuffling.contains(entity) {
+        ctx.commands.reshuffle_around(entity);
+    }
 }
 
 /// What [`ensure_focused_visible`] checks to decide a window is mid-flight:
@@ -330,6 +338,20 @@ type OwnerStrips<'w, 's> = Query<
         Has<Scrolling>,
         Has<PreviousStripPosition>,
         Has<SnapStripMarker>,
+    ),
+>;
+
+/// Owner strips as [`mouse_follows_focus`] sees them: entity for flight
+/// projection plus the swipe/active flags for its guards.
+type WarpOwnerStrips<'w, 's> = Query<
+    'w,
+    's,
+    (
+        Entity,
+        &'static LayoutStrip,
+        &'static ChildOf,
+        Option<&'static Scrolling>,
+        Has<ActiveWorkspaceMarker>,
     ),
 >;
 
@@ -560,6 +582,7 @@ fn deferred_expose_followup(
 }
 
 #[instrument(level = Level::DEBUG, skip_all, fields(trigger))]
+#[allow(clippy::too_many_arguments)]
 fn mouse_follows_focus(
     focused: Single<Entity, Added<FocusedMarker>>,
     windows: Windows,
@@ -567,12 +590,8 @@ fn mouse_follows_focus(
     config: Res<Config>,
     window_manager: Res<WindowManager>,
     displays: Query<(&Display, Option<&DockPosition>)>,
-    workspaces: Query<(
-        &LayoutStrip,
-        &ChildOf,
-        Option<&Scrolling>,
-        Has<ActiveWorkspaceMarker>,
-    )>,
+    workspaces: WarpOwnerStrips,
+    strip_flight: Query<&RepositionMarker>,
 ) {
     let entity = *focused;
     let Some(window) = windows.get(entity) else {
@@ -580,7 +599,7 @@ fn mouse_follows_focus(
     };
     if workspaces
         .iter()
-        .find_map(|(_, _, scrolling, active)| if active { scrolling } else { None })
+        .find_map(|(_, _, _, scrolling, active)| if active { scrolling } else { None })
         .is_some_and(|scrolling| scrolling.is_user_swiping)
     {
         debug!("Suppressing center mouse due to a swipe");
@@ -599,9 +618,28 @@ fn mouse_follows_focus(
     {
         return;
     }
-    let Some(frame) = windows.moving_frame(entity) else {
+    let Some(mut frame) = windows.moving_frame(entity) else {
         return;
     };
+    // Project the owner strip's in-flight scroll onto the destination slot:
+    // the strip target was issued this tick but hasn't moved `Position`
+    // yet, so the raw moving frame is pre-scroll and the warp would land
+    // off-center as the strip catches up. Project from the *layout* slot
+    // (`layout + strip target`), never by shifting the current frame: an
+    // off-screen window's frame is viewport-parked (sliver), not
+    // layout-plus-offset, so shifting it lands outside the destination.
+    if let Some((strip_entity, _, _, _, _)) = workspaces
+        .iter()
+        .find(|(_, strip, _, _, _)| strip.contains(entity))
+        && let (Ok(RepositionMarker(strip_target)), Some(layout), Some(size)) = (
+            strip_flight.get(strip_entity),
+            windows.layout_position(entity),
+            windows.size(entity),
+        )
+    {
+        let dest = layout.0 + *strip_target;
+        frame = IRect::from_corners(dest, dest + size);
+    }
     // Already there: a click focuses the window under the cursor, and a
     // keyboard move into the window holding the cursor, must not yank it
     // to the center.
@@ -617,7 +655,7 @@ fn mouse_follows_focus(
     }
     let Some(display_bounds) = workspaces
         .into_iter()
-        .find_map(|(strip, child, _, _)| strip.contains(entity).then_some(child))
+        .find_map(|(_, strip, child, _, _)| strip.contains(entity).then_some(child))
         .and_then(|child| displays.get(child.parent()).ok())
         .map(|(display, dock)| display.actual_display_bounds(dock, &config))
     else {
