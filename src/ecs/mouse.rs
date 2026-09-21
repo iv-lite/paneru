@@ -98,6 +98,8 @@ fn drive_scroll_strip(
     scroll: &mut ScrollDriveStrips,
     time: &Time,
     commands: &mut Commands,
+    scroll_state: &mut DragScrollState,
+    config: &Config,
 ) {
     let Some(owner) = strips
         .iter()
@@ -109,6 +111,11 @@ fn drive_scroll_strip(
     let Ok((strip_entity, mut strip_position, scrolling)) = scroll.get_mut(owner) else {
         return;
     };
+    // Sustained-motion friction: the further the strip has travelled from
+    // the grab anchor, the less each new pixel counts. Idle-while-held is
+    // handled by `expire_idle_held_scroll` (no events arrive when the
+    // pointer is still, so it cannot live in this event-driven path).
+    let delta_x = friction_damped_dx(delta_x, strip_position.0.x, scroll_state, config);
     strip_position.0.x += delta_x;
     if let Some(mut scrolling) = scrolling {
         // Keep the integrator's state glued to the direct write: with zero
@@ -194,6 +201,10 @@ impl Plugin for MouseEventsPlugin {
                 .after(drag_move_held_column)
                 .run_if(not(resource_exists::<ColdStart>)),
         );
+        // Ungated by input events: idleness produces no events by
+        // definition. `Populated` keeps it off the schedule while nobody
+        // is dragging.
+        app.add_systems(Update, expire_idle_held_scroll);
     }
 }
 
@@ -658,6 +669,13 @@ fn mouse_up_trigger(
         // into the next press (its MouseDown resets the sampler anyway).
         let release_ema_px_s = std::mem::take(&mut scroll_state.release_ema_px_s);
         scroll_state.last_sample_at = None;
+        // Friction gesture state is per-gesture too: a stale grab anchor or
+        // carry must never leak into the next press (its MouseDown resets
+        // the trackers anyway).
+        scroll_state.friction_grab_x = None;
+        scroll_state.friction_carry_px = 0.0;
+        scroll_state.held_ema_px_s = 0.0;
+        scroll_state.last_drag_move_at = None;
 
         for (held_entity, marker, armed, scroll_armed) in &mouse_held {
             let entity = marker.0;
@@ -812,6 +830,20 @@ pub(crate) struct DragScrollState {
     /// inertia chain then glides, clamps and cleans up like a trackpad fling.
     pub(crate) release_ema_px_s: f64,
     pub(crate) last_sample_at: Option<Duration>,
+    /// Strip x at the first driven motion of the gesture: the anchor for
+    /// distance damping. Set lazily (the press-time strip is unknown until
+    /// the first drive resolves the owner), cleared on every press.
+    pub(crate) friction_grab_x: Option<i32>,
+    /// Fractional damped pixels carried across events so a heavily damped
+    /// drag still creeps instead of quantizing to a standstill.
+    pub(crate) friction_carry_px: f64,
+    /// EMA of the held drag rate (strip px/s, signed): the idle-while-held
+    /// settle seeds the inertia pipeline with this when the pointer goes
+    /// quiet mid-gesture.
+    pub(crate) held_ema_px_s: f64,
+    /// Virtual time of the last drag motion: drives the idle-settle clock
+    /// and the held-EMA gap reset. Cleared on press and release.
+    pub(crate) last_drag_move_at: Option<Duration>,
 }
 
 impl DragScrollState {
@@ -1169,6 +1201,200 @@ struct DragMoveState {
     last: Option<Origin>,
 }
 
+/// Resolves the held target's column members plus the friction-damped
+/// horizontal delta to drive them by. Returns `None` when damping eats the
+/// whole delta: the press anchor is already refreshed by the caller, so
+/// skipping motion cannot jump on re-entry, and with no motion there is no
+/// display transfer either.
+fn damped_column_drive(
+    target: Entity,
+    raw_dx: i32,
+    strips: &Query<(Entity, &LayoutStrip)>,
+    scroll_strips: &ScrollDriveStrips,
+    scroll_state: &mut DragScrollState,
+    config: &Config,
+) -> Option<(Origin, Vec<Entity>)> {
+    let (owner, members): (Option<Entity>, Vec<Entity>) = strips
+        .iter()
+        .find_map(|(entity, strip)| {
+            strip.index_of(target).ok().and_then(|index| {
+                strip
+                    .get(index)
+                    .ok()
+                    .map(|column| (Some(entity), column.window_iter().collect()))
+            })
+        })
+        .unwrap_or((None, vec![target]));
+    let strip_x = owner
+        .and_then(|entity| scroll_strips.get(entity).ok())
+        .map_or(0, |(_, position, _)| position.0.x);
+    let dx = friction_damped_dx(raw_dx, strip_x, scroll_state, config);
+    if dx == 0 {
+        return None;
+    }
+    Some((Origin::new(dx, 0), members))
+}
+
+/// Releases a held strip to the inertia/snap pipeline when the pointer goes
+/// quiet mid-gesture. No `MouseDragged` events arrive while still, so the
+/// event-driven drive path can never settle the strip — without this it
+/// would hang at its last offset until release. Only the held target's own
+/// strip is touched, and only while still user-driven with an idle clock
+/// past `drag_friction_idle_settle`: the held EMA seeds the glide exactly
+/// like a release, so resuming the drag re-drives from the settled offset
+/// with no jump. `Populated` keeps the system off the schedule when nobody
+/// is dragging.
+///
+/// Get-or-insert like the release seed: the swipe lift-timeout reaps a
+/// zero-velocity `Scrolling` ~50ms after the last drive, long before the
+/// ~400ms idle clock fires, so by handoff time there is usually nothing to
+/// mutate — recreate at the strip's current offset instead. Already-handed-off
+/// strips (`!is_user_swiping`) are skipped so the glide decays instead of
+/// being re-seeded every tick.
+#[allow(clippy::too_many_arguments)]
+fn expire_idle_held_scroll(
+    held: Populated<(Entity, &MouseHeldMarker)>,
+    mut strips: Query<(
+        Entity,
+        &LayoutStrip,
+        &Position,
+        Option<&mut Scrolling>,
+        &ChildOf,
+    )>,
+    displays: Query<&Display>,
+    scroll_state: Res<DragScrollState>,
+    config: Res<Config>,
+    time: Res<Time>,
+    cold: Option<Res<ColdStart>>,
+    mut commands: Commands,
+) {
+    if !config.drag_friction_enabled() || cold.is_some() {
+        return;
+    }
+    let Some(last_move) = scroll_state.last_drag_move_at else {
+        return;
+    };
+    if time.elapsed().saturating_sub(last_move) < config.drag_friction_idle_settle() {
+        return;
+    }
+    let now = time.elapsed();
+    let direction = match config.swipe_gesture_direction() {
+        SwipeGestureDirection::Natural => -1.0,
+        SwipeGestureDirection::Reversed => 1.0,
+    };
+    for (_, marker) in held.iter() {
+        let target = marker.0;
+        let Some((strip_entity, _, position, scrolling, child)) = strips
+            .iter_mut()
+            .find(|(_, strip, _, _, _)| strip.contains(target))
+        else {
+            continue;
+        };
+        if scrolling.as_ref().is_some_and(|s| !s.is_user_swiping) {
+            continue;
+        }
+        let viewport_width = displays
+            .get(child.parent())
+            .map_or(0.0, |display| f64::from(display.bounds().width()));
+        // Same units as the release seed: pipeline velocity advances
+        // `velocity * dt * viewport_width * direction`.
+        let velocity = if viewport_width <= f64::EPSILON {
+            0.0
+        } else {
+            scroll_state
+                .held_ema_px_s
+                .clamp(-MAX_RELEASE_PX_S, MAX_RELEASE_PX_S)
+                / (viewport_width * direction)
+        };
+        let offset = f64::from(position.0.x);
+        if let Some(mut scrolling) = scrolling {
+            scrolling.velocity = velocity;
+            scrolling.is_user_swiping = false;
+            scrolling.last_event = now;
+            scrolling.position = offset;
+        } else if let Ok(mut entity_commands) = commands.get_entity(strip_entity) {
+            entity_commands.try_insert(Scrolling {
+                velocity,
+                position: offset,
+                is_user_swiping: false,
+                last_event: now,
+            });
+        }
+        if let Ok(mut entity_commands) = commands.get_entity(strip_entity) {
+            entity_commands.try_insert(DragSettleMarker);
+        }
+        debug!("drag friction: held strip idle, settling at {velocity:.2}");
+    }
+}
+
+/// Folds one horizontal drag segment into the held-motion EMA and stamps
+/// the idle-settle clock. Same 0.3/0.7 smoothing and 150ms gap reset as the
+/// release sampler: a pause reads as holding still, and only post-pause
+/// motion steers the settle velocity.
+fn sample_held_velocity(scroll_state: &mut DragScrollState, dx: f64, now: Duration) {
+    if scroll_state.last_drag_move_at.is_none() {
+        scroll_state.last_drag_move_at = Some(now);
+    } else if let Some(last) = scroll_state.last_drag_move_at {
+        let gap = now.saturating_sub(last);
+        if gap > RELEASE_VELOCITY_GAP_RESET {
+            scroll_state.held_ema_px_s = 0.0;
+        }
+        let dt = gap.as_secs_f64().max(RELEASE_VELOCITY_MIN_STEP_SECS);
+        let instant = dx / dt;
+        scroll_state.held_ema_px_s = RELEASE_VELOCITY_EMA_NEW * instant
+            + (1.0 - RELEASE_VELOCITY_EMA_NEW) * scroll_state.held_ema_px_s;
+        scroll_state.last_drag_move_at = Some(now);
+    }
+}
+
+/// Resolves the held target of a synthetic drag to its window id plus the
+/// grab-time arming flags. `None` when nothing is held, the target has no
+/// window, or it is unmanaged (native-owned).
+fn held_drag_target(
+    held: &Query<(
+        Entity,
+        &MouseHeldMarker,
+        Has<DragDisplayArmed>,
+        Has<DragScrollArmed>,
+    )>,
+    windows: &Query<(&Window, Entity, Option<&Unmanaged>)>,
+) -> Option<(Entity, WinID, bool, bool)> {
+    let (_, marker, armed, scroll_armed) = held.iter().next()?;
+    let target = marker.0;
+    let (window, _, unmanaged) = windows.iter().find(|(_, entity, _)| *entity == target)?;
+    if unmanaged.is_some() {
+        return None;
+    }
+    Some((target, window.id(), armed, scroll_armed))
+}
+
+/// Damps one raw drag delta by the friction factor: exponential falloff
+/// with distance travelled from the gesture's grab anchor, floored at
+/// `drag_friction_min_rate` so a moving pointer never fully glues. The
+/// fractional remainder rides `friction_carry_px` so slow creeps survive
+/// integer truncation. Returns the raw delta untouched when friction is
+/// disabled (factor exactly 1.0, zero carry drift).
+#[allow(clippy::cast_possible_truncation)]
+fn friction_damped_dx(
+    raw_dx: i32,
+    strip_x: i32,
+    scroll_state: &mut DragScrollState,
+    config: &Config,
+) -> i32 {
+    if !config.drag_friction_enabled() || raw_dx == 0 {
+        return raw_dx;
+    }
+    let grab_x = *scroll_state.friction_grab_x.get_or_insert(strip_x);
+    let travelled = f64::from((strip_x - grab_x).abs());
+    let factor = (-travelled / config.drag_friction_distance_tau_px())
+        .exp()
+        .clamp(config.drag_friction_min_rate(), 1.0);
+    let effective = f64::from(raw_dx).mul_add(factor, scroll_state.friction_carry_px);
+    let applied = effective.trunc();
+    scroll_state.friction_carry_px = effective - applied;
+    applied as i32
+}
+
 /// Folds one horizontal drag segment into the release-velocity EMA. The
 /// first sample after a press only stores its time (no `dt` to divide by).
 /// A gap past `RELEASE_VELOCITY_GAP_RESET` zeroes the average first — a
@@ -1304,6 +1530,10 @@ fn drag_move_held_column(
                 scroll_state.distance_px = 0.0;
                 scroll_state.release_ema_px_s = 0.0;
                 scroll_state.last_sample_at = None;
+                scroll_state.friction_grab_x = None;
+                scroll_state.friction_carry_px = 0.0;
+                scroll_state.held_ema_px_s = 0.0;
+                scroll_state.last_drag_move_at = None;
             }
             Event::MouseUp { .. } => {
                 state.last = None;
@@ -1318,24 +1548,25 @@ fn drag_move_held_column(
                     continue;
                 };
                 let delta = pointer - last;
+                // Horizontal-only left-drag: strips lay out side by side, so
+                // vertical pointer travel must never move windows. Feeding `dy`
+                // into column positions drags whole columns off their slots,
+                // and the adoption/verify/audit machinery fighting those
+                // off-slot frames every tick is what turned vertical wiggles
+                // sluggish. Project here so every path below (scroll drive,
+                // column drive, paint, release EMA) only ever sees `dx`; a
+                // pure-vertical wiggle becomes a no-op that also keeps the
+                // press anchor fresh via `state.last` above.
+                let delta = Origin::new(delta.x, 0);
                 if delta == Origin::ZERO {
                     continue;
                 }
-                let Some((_, marker, armed, scroll_armed)) = held.iter().next() else {
-                    trace!("synthetic drag: nothing held, skipping move");
-                    continue;
-                };
-                let target = marker.0;
-                let Some((window, _, unmanaged)) =
-                    windows.iter().find(|(_, entity, _)| *entity == target)
+                let Some((target, window_id, armed, scroll_armed)) =
+                    held_drag_target(&held, &windows)
                 else {
-                    trace!("synthetic drag: held target {target} has no window, skipping");
+                    trace!("synthetic drag: no managed held target, skipping move");
                     continue;
                 };
-                if unmanaged.is_some() {
-                    trace!("synthetic drag: held target is unmanaged, skipping");
-                    continue;
-                }
                 // Paint-only tracking for native-owned drags: the layout
                 // slot stays pinned, but the border needs every pointer
                 // delta at input rate. Advanced for every managed held
@@ -1356,15 +1587,17 @@ fn drag_move_held_column(
                 // take the move path below; content grabs with scrolling
                 // enabled are ignored entirely — native owns them.
                 if scroll_armed {
-                    scroll_state.distance_px += f64::from(delta.x.abs() + delta.y.abs());
-                    // Horizontal columns only: vertical travel counts toward
-                    // the click threshold but never scrolls.
+                    scroll_state.distance_px += f64::from(delta.x.abs());
+                    // Horizontal columns only: `delta.y` is always zero after
+                    // the horizontal projection above; the `dx != 0` gate just
+                    // skips no-op events.
                     if delta.x != 0 {
                         sample_release_velocity(
                             &mut scroll_state,
                             f64::from(delta.x),
                             time.elapsed(),
                         );
+                        sample_held_velocity(&mut scroll_state, f64::from(delta.x), time.elapsed());
                         drive_scroll_strip(
                             target,
                             delta.x,
@@ -1372,6 +1605,8 @@ fn drag_move_held_column(
                             &mut scroll_strips,
                             &time,
                             &mut commands,
+                            &mut scroll_state,
+                            &config,
                         );
                     }
                     continue;
@@ -1383,16 +1618,20 @@ fn drag_move_held_column(
                 if !armed && config.left_drag_scrolls_strip() {
                     continue;
                 }
-                let members: Vec<Entity> = strips
-                    .iter()
-                    .find_map(|(_, strip)| {
-                        strip
-                            .index_of(target)
-                            .ok()
-                            .and_then(|index| strip.get(index).ok())
-                    })
-                    .map_or_else(|| vec![target], |column| column.window_iter().collect());
-                let window_id = window.id();
+                // Held-motion tracking for the idle-settle clock, plus the
+                // same distance damping as the scroll path so a sustained
+                // armed drag eases out instead of running forever.
+                sample_held_velocity(&mut scroll_state, f64::from(delta.x), time.elapsed());
+                let Some((delta, members)) = damped_column_drive(
+                    target,
+                    delta.x,
+                    &strips,
+                    &scroll_strips,
+                    &mut scroll_state,
+                    &config,
+                ) else {
+                    continue;
+                };
                 let mut moved_any = false;
                 for member in members {
                     if let Ok(mut position) = positions.get_mut(member) {
@@ -2231,6 +2470,69 @@ mod tests {
             paint.predicted_frame_for(target, now, 0.0),
             Some(IRect::new(200, 20, 600, 1020))
         );
+    }
+
+    #[test]
+    fn friction_disabled_passes_raw_delta_through() {
+        use crate::config::MainOptions;
+        let config: Config = (
+            MainOptions {
+                drag_friction_enabled: Some(false),
+                ..Default::default()
+            },
+            vec![],
+        )
+            .into();
+        let mut state = DragScrollState {
+            friction_grab_x: Some(0),
+            ..Default::default()
+        };
+        // Even far from the grab anchor the raw delta survives, and no
+        // anchor is even recorded.
+        assert_eq!(friction_damped_dx(-800, 5000, &mut state, &config), -800);
+        assert_eq!(state.friction_grab_x, Some(0));
+        assert!(state.friction_carry_px.abs() < f64::EPSILON);
+        assert_eq!(friction_damped_dx(0, 5000, &mut state, &config), 0);
+    }
+
+    #[test]
+    fn friction_starts_at_unity_then_damps_with_distance() {
+        let config = Config::default();
+        assert!(config.drag_friction_enabled());
+        let mut state = DragScrollState::default();
+        // At the grab anchor the factor is exactly 1.0: full motion.
+        assert_eq!(friction_damped_dx(-200, 0, &mut state, &config), -200);
+        assert_eq!(state.friction_grab_x, Some(0));
+        // One time-constant out the factor is 1/e: -100px damps to -36
+        // with the -0.79px remainder carried for the next event.
+        let damped = friction_damped_dx(-100, 1200, &mut state, &config);
+        assert_eq!(damped, -36);
+        assert!((state.friction_carry_px - (-0.787_5)).abs() < 0.01);
+        // The carry creeps: the same raw delta applies one more pixel.
+        let crept = friction_damped_dx(-100, 1200, &mut state, &config);
+        assert_eq!(crept, -37);
+    }
+
+    #[test]
+    fn friction_floors_at_min_rate_far_from_grab() {
+        let config = Config::default();
+        let mut state = DragScrollState {
+            friction_grab_x: Some(0),
+            ..Default::default()
+        };
+        // Effectively infinitely far: the 0.05 floor turns -100px into -5.
+        assert_eq!(
+            friction_damped_dx(-100, i32::MAX / 2, &mut state, &config),
+            -5
+        );
+    }
+
+    #[test]
+    fn held_velocity_first_sample_only_stamps_time() {
+        let mut state = DragScrollState::default();
+        sample_held_velocity(&mut state, -300.0, Duration::from_millis(100));
+        assert!(state.held_ema_px_s.abs() < f64::EPSILON);
+        assert_eq!(state.last_drag_move_at, Some(Duration::from_millis(100)));
     }
 
     #[test]

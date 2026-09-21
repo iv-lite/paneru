@@ -1221,7 +1221,10 @@ fn manage_window(
     // strip.removes; orphan rescue in find_orphaned_workspaces despawns the
     // strip) the toggle is invisible — the window stays where it floated
     // and the user thinks the keybind is broken. Append to the active
-    // strip and reshuffle so the layout pipeline tiles it.
+    // strip and reshuffle so the layout pipeline tiles it. Forced: a plain
+    // reshuffle preserves the window's on-screen position by scrolling the
+    // strip to it, which would leave the unfloated window sitting at its
+    // +32px popped float offset instead of snapping back to its slot.
     if was_unmanaged
         && !workspaces.iter().any(|(strip, _)| strip.contains(entity))
         && let Some(mut strip) = workspaces
@@ -1229,7 +1232,7 @@ fn manage_window(
             .find_map(|(strip, active)| active.then_some(strip))
     {
         strip.append(entity);
-        commands.reshuffle_around(entity);
+        commands.reshuffle_around_forced(entity);
     }
 }
 

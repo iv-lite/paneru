@@ -278,11 +278,14 @@ fn set_floating(
         }
     }
 
+    // Forced (see `manage_window`): a plain reshuffle would scroll the
+    // strip to the window's popped float offset instead of snapping it
+    // back to its slot.
     if !floating
         && !workspaces.iter().any(|(strip, _)| strip.contains(entity))
         && let Some((mut strip, _)) = workspaces.iter_mut().find(|(_, active)| *active)
     {
         strip.append(entity);
-        commands.reshuffle_around(entity);
+        commands.reshuffle_around_forced(entity);
     }
 }

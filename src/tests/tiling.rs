@@ -488,6 +488,59 @@ fn test_floating_window_does_not_hold_a_slot_in_the_strip() {
         .run(commands);
 }
 
+/// Unfloating re-tiles: toggling `Manage` off a floating window removes
+/// the marker, re-appends it to the active strip when nothing downstream
+/// would (the spawn-floating path strips membership), and the layout
+/// pipeline tiles it back at the left edge — the toggle must not be an
+/// invisible no-op that leaves the window where it floated.
+#[test]
+fn test_unfloating_window_rejoins_strip_and_retiles() {
+    use crate::ecs::{ActiveWorkspaceMarker, Unmanaged};
+
+    let commands = vec![
+        Event::Command {
+            command: Command::PrintState,
+        }, // 0
+        Event::Command {
+            command: Command::Window(Operation::Manage),
+        }, // 1 — float the focused window
+        Event::Command {
+            command: Command::PrintState,
+        }, // 2
+        Event::Command {
+            command: Command::Window(Operation::Manage),
+        }, // 3 — unfloat it again
+        Event::Command {
+            command: Command::PrintState,
+        }, // 4
+    ];
+
+    TestHarness::new()
+        .with_windows(1)
+        .on_iteration(2, |world, _state| {
+            let entity = find_window_entity(0, world);
+            assert!(
+                world.get::<Unmanaged>(entity).is_some(),
+                "first toggle must float the window"
+            );
+        })
+        .on_iteration(4, |world, _state| {
+            let entity = find_window_entity(0, world);
+            assert!(
+                world.get::<Unmanaged>(entity).is_none(),
+                "second toggle must manage the window again"
+            );
+            let mut strips = world.query_filtered::<&LayoutStrip, With<ActiveWorkspaceMarker>>();
+            let strip = strips.single(world).expect("active strip");
+            assert!(
+                strip.contains(entity),
+                "an unfloated window must be back in the active strip"
+            );
+            assert_window_at!(world, 0, 0, TEST_MENUBAR_HEIGHT);
+        })
+        .run(commands);
+}
+
 /// The prod fluid default (no `animation_speed` set → 12): an auto-center
 /// focus glide must still land on the exact slot given a long enough
 /// window. The suite otherwise pins instant speed (see `setup_world`), so

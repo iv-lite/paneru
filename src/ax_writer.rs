@@ -12,8 +12,10 @@
 //! only, never ECS borrows):
 //!
 //! * Main assigns a monotonic `seq` per window per enqueue
-//!   ([`AxWriteState`]) and sends [`AxWriteJob`]s over an unbounded channel
-//!   (bursts must never block the pump).
+//!   ([`AxWriteState`]) and sends [`AxWriteJob`]s over a bounded channel
+//!   ([`AX_WRITER_QUEUE_CAP`]): bursts must never block the pump, and a
+//!   stuck worker must not grow memory either — a full queue drops the
+//!   newest job as superseded (the next frame resends).
 //! * The worker keeps the latest job per window, writes it with
 //!   [`crate::manager::ax_set_window_position`], and reports
 //!   [`AxWriteAck`]s back.
@@ -39,7 +41,7 @@ use std::collections::HashMap;
 use std::time::Duration;
 
 use bevy::ecs::resource::Resource;
-use crossbeam_channel::{Receiver, Sender, TryRecvError, unbounded};
+use crossbeam_channel::{Receiver, Sender, TryRecvError, TrySendError, bounded};
 use objc2_core_foundation::CFRetained;
 use tracing::{debug, trace};
 
@@ -67,8 +69,16 @@ pub(crate) struct AxWriteAck {
     pub ok: bool,
 }
 
-/// Outbound write queue endpoint, held as a resource. Unbounded: animation
-/// bursts must never block the main thread.
+/// Cap on queued async writes. Bursts collapse latest-per-window on drain,
+/// so depth stays near the window count; a full queue means the worker is
+/// stuck, and the push drops the newest job (the next frame resends fresher
+/// truth, the verify backstop covers a settled window) instead of growing
+/// memory or blocking the main thread.
+pub(crate) const AX_WRITER_QUEUE_CAP: usize = 1024;
+
+/// Outbound write queue endpoint, held as a resource. Bounded (see
+/// [`AX_WRITER_QUEUE_CAP`]): animation bursts must never block the main
+/// thread, and must not grow memory without bound either.
 #[derive(Clone, Resource)]
 pub(crate) struct AxWriterQueue(pub Sender<AxWriteJob>);
 
@@ -79,11 +89,14 @@ pub(crate) struct AxWriteInbox(pub Receiver<AxWriteAck>);
 
 /// Issued vs acknowledged sequences per window. `issued > acked` means an
 /// async write is still converging — adoption and verify stand down for
-/// that window instead of fighting the queue.
+/// that window instead of fighting the queue. `last_sent` dedups
+/// same-target re-pushes (settle/verify/commit converging on one origin)
+/// so they never touch AX twice.
 #[derive(Debug, Default, Resource)]
 pub(crate) struct AxWriteState {
     issued: HashMap<WinID, u64>,
     acked: HashMap<WinID, u64>,
+    last_sent: HashMap<WinID, Origin>,
 }
 
 impl AxWriteState {
@@ -105,6 +118,27 @@ impl AxWriteState {
     pub(crate) fn unacked(&self, win_id: WinID) -> bool {
         self.issued.get(&win_id).copied().unwrap_or(0)
             > self.acked.get(&win_id).copied().unwrap_or(0)
+    }
+
+    /// How many windows have converging writes. The orchestrator keeps the
+    /// pump at the active cadence while this is non-zero instead of
+    /// sleeping through the drain.
+    pub(crate) fn inflight(&self) -> usize {
+        self.issued
+            .iter()
+            .filter(|(win_id, seq)| **seq > self.acked.get(win_id).copied().unwrap_or(0))
+            .count()
+    }
+
+    /// Whether `target` is already the newest intent for `win_id`.
+    fn already_sent(&self, win_id: WinID, target: Origin) -> bool {
+        self.last_sent
+            .get(&win_id)
+            .is_some_and(|last| *last == target)
+    }
+
+    fn record_sent(&mut self, win_id: WinID, target: Origin) {
+        self.last_sent.insert(win_id, target);
     }
 }
 
@@ -147,18 +181,18 @@ fn run(queue: Receiver<AxWriteJob>, acks: Sender<AxWriteAck>) {
     debug!("ax writer queue disconnected; writer thread exiting");
 }
 
-/// Spawns the detached writer thread and returns its endpoints. The ack
-/// map lives in `register_systems` (`AxWriteState` init) so the harness —
-/// which never spawns threads — shares the same resource path. Call once
-/// at startup (never in tests).
-pub(crate) fn spawn_ax_writer() -> (AxWriterQueue, AxWriteInbox) {
-    let (job_tx, job_rx) = unbounded();
-    let (ack_tx, ack_rx) = unbounded();
-    std::thread::Builder::new()
+/// Spawns the detached writer thread and returns its endpoints plus the
+/// join handle for supervision. The ack map lives in `register_systems`
+/// (`AxWriteState` init) so the harness — which never spawns threads —
+/// shares the same resource path. Call once at startup (never in tests).
+pub(crate) fn spawn_ax_writer() -> (AxWriterQueue, AxWriteInbox, std::thread::JoinHandle<()>) {
+    let (job_tx, job_rx) = bounded(AX_WRITER_QUEUE_CAP);
+    let (ack_tx, ack_rx) = bounded(AX_WRITER_QUEUE_CAP);
+    let handle = std::thread::Builder::new()
         .name("paneru-ax-write".to_string())
         .spawn(move || run(job_rx, ack_tx))
         .expect("spawning the ax writer thread");
-    (AxWriterQueue(job_tx), AxWriteInbox(ack_rx))
+    (AxWriterQueue(job_tx), AxWriteInbox(ack_rx), handle)
 }
 
 /// How long the main thread waits for a drain when it must observe quiesced
@@ -180,6 +214,11 @@ pub(crate) fn push_position(
     state: &mut AxWriteState,
     enabled: bool,
 ) {
+    // Same target as the newest intent: the OS already has it (or has
+    // something newer converging), so skip the AX round trip entirely.
+    if state.already_sent(window.id(), target) {
+        return;
+    }
     let async_job = enabled
         .then(|| {
             window
@@ -190,21 +229,37 @@ pub(crate) fn push_position(
         .flatten();
     let Some((element, _)) = async_job else {
         window.reposition(target);
+        state.record_sent(window.id(), target);
         return;
     };
     let Some(queue) = queue else {
         window.reposition(target);
+        state.record_sent(window.id(), target);
         return;
     };
     let seq = state.issue(window.id());
-    let _ = queue.0.send(AxWriteJob {
+    let job = AxWriteJob {
         win_id: window.id(),
         element,
         origin: target,
         h_pad: window.horizontal_padding(),
         v_pad: window.vertical_padding(),
         seq,
-    });
+    };
+    match queue.0.try_send(job) {
+        Ok(()) => state.record_sent(window.id(), target),
+        // Full or writer gone: drop the newest job — it is already
+        // superseded by whatever the next frame sends (or by the verify
+        // backstop for a settled window). Acknowledge the phantom sequence
+        // so readers never gate on a write that will never land.
+        Err(TrySendError::Full(_) | TrySendError::Disconnected(_)) => {
+            state.acknowledge(window.id(), seq);
+            debug!(
+                "ax writer: queue full, dropped superseded write for window {}",
+                window.id()
+            );
+        }
+    }
 }
 
 #[cfg(test)]
@@ -235,5 +290,28 @@ mod tests {
         state.acknowledge(1, s1);
         assert!(!state.unacked(1));
         assert!(state.unacked(2), "one window's ack clears only itself");
+    }
+
+    #[test]
+    fn inflight_counts_windows_with_converging_writes() {
+        let mut state = AxWriteState::default();
+        assert_eq!(state.inflight(), 0);
+        let s1 = state.issue(1);
+        state.issue(2);
+        assert_eq!(state.inflight(), 2);
+        state.acknowledge(1, s1);
+        assert_eq!(state.inflight(), 1);
+    }
+
+    #[test]
+    fn same_target_repush_is_deduped() {
+        use crate::manager::Origin;
+        let mut state = AxWriteState::default();
+        let target = Origin::new(10, 20);
+        assert!(!state.already_sent(3, target));
+        state.record_sent(3, target);
+        assert!(state.already_sent(3, target));
+        assert!(!state.already_sent(3, Origin::new(11, 20)));
+        assert!(!state.already_sent(4, target));
     }
 }

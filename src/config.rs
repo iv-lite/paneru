@@ -748,6 +748,42 @@ impl Config {
         self.options().left_drag_scrolls_strip.unwrap_or(true)
     }
 
+    /// Master switch for left-drag friction (distance damping plus
+    /// idle-while-held settle). Default: true.
+    pub fn drag_friction_enabled(&self) -> bool {
+        self.options().drag_friction_enabled.unwrap_or(true)
+    }
+
+    /// Distance constant (px) for the exponential falloff of sustained
+    /// left-drag motion. Clamped to 200..10000.
+    pub fn drag_friction_distance_tau_px(&self) -> f64 {
+        self.options()
+            .drag_friction_distance_tau_px
+            .unwrap_or(1200.0)
+            .clamp(200.0, 10_000.0)
+    }
+
+    /// Stillness after the last drag motion at which a held strip is
+    /// released to the inertia/snap pipeline while the button stays down.
+    /// Clamped to 100ms..5s.
+    pub fn drag_friction_idle_settle(&self) -> Duration {
+        Duration::from_millis(
+            self.options()
+                .drag_friction_idle_settle_ms
+                .unwrap_or(400)
+                .clamp(100, 5000),
+        )
+    }
+
+    /// Floor on the friction factor so a moving pointer never fully glues
+    /// the strip. Clamped to 0..1.
+    pub fn drag_friction_min_rate(&self) -> f64 {
+        self.options()
+            .drag_friction_min_rate
+            .unwrap_or(0.05)
+            .clamp(0.0, 1.0)
+    }
+
     pub fn restore_enabled(&self) -> bool {
         self.inner()
             .restore
@@ -1384,6 +1420,20 @@ pub struct MainOptions {
     /// can't move it either. Modifier-held (armed) drags still move and
     /// transfer as before.
     pub left_drag_scrolls_strip: Option<bool>,
+    /// Master switch for left-drag friction (distance damping plus
+    /// idle-while-held settle). Default: true.
+    pub drag_friction_enabled: Option<bool>,
+    /// Distance constant (px) for the exponential falloff of sustained
+    /// left-drag motion: each new pixel counts
+    /// `exp(-travelled_from_grab / tau)`. Default: 1200.0.
+    pub drag_friction_distance_tau_px: Option<f64>,
+    /// Stillness (ms) after the last drag motion at which a held strip is
+    /// released to the inertia/snap pipeline while the button stays down.
+    /// Default: 400.
+    pub drag_friction_idle_settle_ms: Option<u64>,
+    /// Floor on the friction factor so a moving pointer never fully glues
+    /// the strip. Default: 0.05.
+    pub drag_friction_min_rate: Option<f64>,
     /// Override the system menubar height (in pixels).
     /// When set, this value is used instead of the height reported by macOS.
     pub menubar_height: Option<u16>,
@@ -2203,6 +2253,13 @@ index = 1
     let defaults = Config::default();
     assert_eq!(defaults.swipe_sensitivity(), 0.35);
     assert_eq!(defaults.swipe_deceleration(), 4.0);
+    assert!(defaults.drag_friction_enabled());
+    assert_eq!(defaults.drag_friction_distance_tau_px(), 1200.0);
+    assert_eq!(
+        defaults.drag_friction_idle_settle(),
+        Duration::from_millis(400)
+    );
+    assert_eq!(defaults.drag_friction_min_rate(), 0.05);
 }
 
 #[test]

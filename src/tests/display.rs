@@ -6,7 +6,7 @@ use bevy::time::TimeUpdateStrategy;
 use crate::commands::{Command, Direction, MouseMove, MoveFocus, Operation};
 use crate::config::{Config, MainOptions, WindowParams};
 use crate::ecs::layout::{LayoutStrip, PARKED_STRIP_SLIVER};
-use crate::ecs::mouse::{DragModifierState, DragPaintState, DropPreviewState};
+use crate::ecs::mouse::{DragModifierState, DragPaintState, DragScrollState, DropPreviewState};
 use crate::ecs::workspace::IgnoredMovedWindows;
 use crate::ecs::{
     ActiveDisplayMarker, ActiveWorkspaceMarker, Bounds, DockPosition, DragSettleMarker,
@@ -609,11 +609,301 @@ fn dragged_active_display_id(world: &mut World) -> u32 {
     world.get::<Display>(entity).expect("need display").id()
 }
 
+/// A config with prod-default drag friction enabled (plus instant
+/// animation for exact asserts).
+fn friction_config() -> Config {
+    (
+        MainOptions {
+            animation_speed: Some(1_000_000.0),
+            drag_friction_enabled: Some(true),
+            ..Default::default()
+        },
+        vec![],
+    )
+        .into()
+}
+
+/// A pure-vertical header-drag wiggle moves nothing: horizontal-only drive
+/// turns it into no-ops that only refresh the press anchor, so the strip
+/// stays put, no click-threshold travel accrues, and the release cannot
+/// fling from the vertical motion.
+#[test]
+fn test_vertical_drag_wiggle_moves_nothing() {
+    let grab = CGPoint::new(200.0, 30.0);
+    let commands = vec![
+        Event::MenuOpened { window_id: 0 },
+        Event::MouseDown {
+            point: grab,
+            modifiers: Modifiers::empty(),
+        },
+        Event::MouseDragged {
+            point: CGPoint::new(200.0, 150.0),
+            modifiers: Modifiers::empty(),
+        },
+        Event::MouseDragged {
+            point: CGPoint::new(200.0, 30.0),
+            modifiers: Modifiers::empty(),
+        },
+        Event::MouseUp {
+            point: CGPoint::new(200.0, 30.0),
+            modifiers: Modifiers::empty(),
+        },
+        Event::Command {
+            command: Command::PrintState,
+        },
+    ];
+
+    TestHarness::new()
+        .with_windows(3)
+        .on_iteration(5, |world, _state| {
+            assert_window_at!(world, 0, 0, TEST_MENUBAR_HEIGHT);
+            assert_window_at!(world, 1, 400, TEST_MENUBAR_HEIGHT);
+            assert_window_at!(world, 2, 800, TEST_MENUBAR_HEIGHT);
+            let scrolling = world.query::<&Scrolling>().iter(world).next().is_some();
+            assert!(!scrolling, "no scroll state from a vertical wiggle");
+            let paint = world.resource::<DragScrollState>();
+            assert!(
+                paint.distance_px.abs() < f64::EPSILON,
+                "vertical travel must not count toward the click threshold"
+            );
+        })
+        .run(commands);
+}
+
+/// A sustained scroll-drag damps with distance: the first step off the grab
+/// anchor applies 1:1, then each step counts `exp(-travelled/tau)` with the
+/// fractional remainder carried, so long drags ease out instead of running
+/// 1:1 forever. Idle settle is stretched out here so only the distance term
+/// is under test; the tau is tightened so damping shows within the few
+/// hundred pixels the lift-timeout settle leaves alone (window 1 stays
+/// fully visible throughout, so no reveal corrects the offset).
+#[test]
+fn test_sustained_scroll_drag_damps_travel() {
+    let config: Config = (
+        MainOptions {
+            animation_speed: Some(1_000_000.0),
+            drag_friction_enabled: Some(true),
+            drag_friction_distance_tau_px: Some(200.0),
+            drag_friction_idle_settle_ms: Some(5000),
+            ..Default::default()
+        },
+        vec![],
+    )
+        .into();
+    // Five windows give the strip room without a clamp wall: four -100px
+    // steps would travel -400 raw, but damping lands the strip at -241
+    // (-100, -60, -45, -36 with carry creep).
+    let grab = CGPoint::new(200.0, 30.0);
+    let commands = vec![
+        Event::MenuOpened { window_id: 0 },
+        Event::MouseDown {
+            point: grab,
+            modifiers: Modifiers::empty(),
+        },
+        Event::MouseDragged {
+            point: CGPoint::new(100.0, 30.0),
+            modifiers: Modifiers::empty(),
+        },
+        Event::MouseDragged {
+            point: CGPoint::new(0.0, 30.0),
+            modifiers: Modifiers::empty(),
+        },
+        Event::MouseDragged {
+            point: CGPoint::new(-100.0, 30.0),
+            modifiers: Modifiers::empty(),
+        },
+        Event::MouseDragged {
+            point: CGPoint::new(-200.0, 30.0),
+            modifiers: Modifiers::empty(),
+        },
+        Event::Command {
+            command: Command::PrintState,
+        },
+        Event::Command {
+            command: Command::PrintState,
+        },
+    ];
+
+    TestHarness::new()
+        .with_config(config)
+        .with_windows(5)
+        .on_iteration(2, |world, _state| {
+            assert_window_at!(world, 0, -100, TEST_MENUBAR_HEIGHT);
+        })
+        .on_iteration(5, |world, _state| {
+            assert_window_at!(world, 0, -241, TEST_MENUBAR_HEIGHT);
+        })
+        .run(commands);
+}
+
+/// A held strip whose pointer goes quiet settles without a release: past
+/// the idle timeout the strip is handed to the inertia/snap pipeline with
+/// the held-rate EMA while the button stays down, so the offset keeps
+/// gliding left past where the drives alone left it.
+#[test]
+fn test_idle_hold_releases_strip_to_settle() {
+    let grab = CGPoint::new(200.0, 30.0);
+    let commands = vec![
+        Event::MenuOpened { window_id: 0 },
+        Event::MouseDown {
+            point: grab,
+            modifiers: Modifiers::empty(),
+        },
+        Event::MouseDragged {
+            point: CGPoint::new(-200.0, 30.0),
+            modifiers: Modifiers::empty(),
+        },
+        Event::MouseDragged {
+            point: CGPoint::new(-600.0, 30.0),
+            modifiers: Modifiers::empty(),
+        },
+        Event::Command {
+            command: Command::PrintState,
+        },
+        Event::Command {
+            command: Command::PrintState,
+        },
+        Event::Command {
+            command: Command::PrintState,
+        },
+        Event::Command {
+            command: Command::PrintState,
+        },
+    ];
+
+    TestHarness::new()
+        .with_config(friction_config())
+        .with_windows(5)
+        // No MouseUp is ever sent: the holder must still be down while the
+        // strip already glides and settles on its own.
+        .on_iteration(7, |world, _state| {
+            let held = world
+                .query_filtered::<Entity, With<MouseHeldMarker>>()
+                .iter(world)
+                .count();
+            assert_eq!(held, 1, "button still held, no release sent");
+            // The two damped drives land the strip at -686; the idle handoff
+            // plus glide must have carried it further left since.
+            let mut strips = world.query_filtered::<
+                (&Position, Option<&Scrolling>, Has<DragSettleMarker>),
+                (With<LayoutStrip>, With<ActiveWorkspaceMarker>),
+            >();
+            let (position, scrolling, settled) = strips.single(world).expect("strip");
+            assert!(settled, "idle handoff must arm the drag-release settle");
+            assert!(
+                scrolling.as_ref().is_some_and(|s| !s.is_user_swiping),
+                "held strip must be handed to the pipeline, not user-driven"
+            );
+            assert!(
+                position.0.x < -686,
+                "held strip must keep gliding without a release, got {}",
+                position.0.x
+            );
+        })
+        .run(commands);
+}
+
+/// Resuming a drag after the idle handoff re-drives from the settled
+/// offset with no jump: the pointer comes back, the strip follows it in
+/// the pointer's direction, and the motion never exceeds the raw pointer
+/// travel (damping only ever shrinks it).
+#[test]
+fn test_resumed_drag_after_idle_settle_does_not_jump() {
+    use std::cell::Cell;
+    use std::rc::Rc;
+    let grab = CGPoint::new(200.0, 30.0);
+    let settled_x = Rc::new(Cell::new(0));
+    let probe = settled_x.clone();
+    let commands = vec![
+        Event::MenuOpened { window_id: 0 },
+        Event::MouseDown {
+            point: grab,
+            modifiers: Modifiers::empty(),
+        },
+        Event::MouseDragged {
+            point: CGPoint::new(-200.0, 30.0),
+            modifiers: Modifiers::empty(),
+        },
+        Event::MouseDragged {
+            point: CGPoint::new(-600.0, 30.0),
+            modifiers: Modifiers::empty(),
+        },
+        // Two quiet windows (~400ms) trip the idle handoff mid-gesture.
+        Event::Command {
+            command: Command::PrintState,
+        },
+        Event::Command {
+            command: Command::PrintState,
+        },
+        // Resume: +200px raw to the right while still held.
+        Event::MouseDragged {
+            point: CGPoint::new(-400.0, 30.0),
+            modifiers: Modifiers::empty(),
+        },
+        Event::Command {
+            command: Command::PrintState,
+        },
+        Event::MouseUp {
+            point: CGPoint::new(-400.0, 30.0),
+            modifiers: Modifiers::empty(),
+        },
+    ];
+
+    TestHarness::new()
+        .with_config(friction_config())
+        .with_windows(5)
+        .on_iteration(5, move |world, _state| {
+            let mut strips = world.query_filtered::<
+                (&Position, Option<&Scrolling>),
+                (With<LayoutStrip>, With<ActiveWorkspaceMarker>),
+            >();
+            let (position, scrolling) = strips.single(world).expect("strip");
+            assert!(
+                scrolling.as_ref().is_some_and(|s| !s.is_user_swiping),
+                "idle handoff must have fired before the resume"
+            );
+            probe.set(position.0.x);
+        })
+        .on_iteration(7, move |world, _state| {
+            let mut strips = world.query_filtered::<
+                &Position,
+                (With<LayoutStrip>, With<ActiveWorkspaceMarker>),
+            >();
+            let position = strips.single(world).expect("strip").0.x;
+            let before = settled_x.get();
+            assert!(
+                position >= before,
+                "resumed drag must follow the pointer right from {before}, got {position}"
+            );
+            assert!(
+                position - before <= 200,
+                "resumed motion must not exceed the +200px raw travel (no jump): {before} -> {position}"
+            );
+        })
+        .on_iteration(8, |world, _state| {
+            let held = world
+                .query_filtered::<Entity, With<MouseHeldMarker>>()
+                .iter(world)
+                .count();
+            assert_eq!(held, 0, "release ends the gesture");
+            // All five windows still tile on the strip after the whole
+            // drive-settle-resume-release cycle.
+            let mut strips = world.query_filtered::<
+                &LayoutStrip,
+                (With<LayoutStrip>, With<ActiveWorkspaceMarker>),
+            >();
+            let strip = strips.single(world).expect("strip");
+            assert_eq!(strip.len(), 5);
+        })
+        .run(commands);
+}
+
 /// A config enabling display transfer while Alt is held.
 fn drag_display_config() -> Config {
     (
         MainOptions {
             mouse_drag_display_modifier: Some(Modifiers::ALT),
+            drag_friction_enabled: Some(false),
             ..Default::default()
         },
         vec![],
@@ -714,14 +1004,16 @@ fn test_native_drag_accumulates_paint_offset_with_slot_pinned() {
             let entity = find_window_entity(0, world);
             let paint = world.resource::<DragPaintState>();
             assert_eq!(paint.target, Some(entity));
-            assert_eq!(paint.offset, Origin::new(50, 50));
+            // Horizontal-only: the (50, 50) pointer travel paints `dx`
+            // while `dy` is dropped.
+            assert_eq!(paint.offset, Origin::new(50, 0));
             assert_eq!(
                 paint.frame_for(entity),
                 Some(IRect::from_corners(
-                    Origin::new(50, 70),
-                    Origin::new(450, 818),
+                    Origin::new(50, TEST_MENUBAR_HEIGHT),
+                    Origin::new(450, 768),
                 )),
-                "grab frame plus pointer offset, every tick"
+                "grab frame plus horizontal pointer offset, every tick"
             );
             // The slot never moved: layout truth is still the tiled origin.
             let position = world.entity(entity).get::<Position>().expect("position");
@@ -2800,10 +3092,12 @@ fn test_armed_drag_follows_cursor_without_native_move() {
         .with_config(drag_display_config())
         .with_windows(1)
         .on_iteration(4, move |world, _state| {
-            // Drag delta (100, 100) applied 1:1 onto the slot origin.
+            // Horizontal-only drag: the (100, 100) pointer delta applies its
+            // `dx` 1:1 onto the slot origin while `dy` is dropped, so the
+            // window ends at (100, 20).
             let entity = find_window_entity(0, world);
             let position = world.get::<Position>(entity).expect("need position").0;
-            assert_eq!(position, Origin::new(100, 120));
+            assert_eq!(position, Origin::new(100, TEST_MENUBAR_HEIGHT));
             assert_on_workspace!(world, 0, TEST_WORKSPACE_ID);
         })
         .run(commands);
@@ -2872,9 +3166,10 @@ fn test_armed_drag_does_not_resize_with_overlapping_modifiers() {
 #[test]
 fn test_armed_drag_transfers_display_without_native_move() {
     // Window 0 tiles into slot (0, 20); grab its center while holding Alt,
-    // then drag straight up past the external display's bottom edge (y 0).
-    // Leading PrintStates let startup (incl. initial focus) settle so no
-    // focus-driven reshuffle can race the drag.
+    // then drag right onto the side-by-side external display. Drags are
+    // horizontal-only, so the target display must sit beside the test
+    // display, not above it. Leading PrintStates let startup (incl. initial
+    // focus) settle so no focus-driven reshuffle can race the drag.
     let grab = CGPoint::new(200.0, 500.0);
     let commands = vec![
         Event::MenuOpened { window_id: 0 },
@@ -2889,7 +3184,7 @@ fn test_armed_drag_transfers_display_without_native_move() {
             modifiers: Modifiers::ALT,
         },
         Event::MouseDragged {
-            point: CGPoint::new(200.0, 0.0),
+            point: CGPoint::new(1500.0, 500.0),
             modifiers: Modifiers::ALT,
         },
         Event::Command {
@@ -2905,7 +3200,12 @@ fn test_armed_drag_transfers_display_without_native_move() {
         .with_windows(1)
         .with_display(
             EXT_DISPLAY_ID,
-            IRect::new(0, -EXT_DISPLAY_HEIGHT, EXT_DISPLAY_WIDTH, 0),
+            IRect::new(
+                TEST_DISPLAY_WIDTH,
+                0,
+                TEST_DISPLAY_WIDTH + EXT_DISPLAY_WIDTH,
+                EXT_DISPLAY_HEIGHT,
+            ),
             vec![EXT_WORKSPACE_ID],
         )
         .on_iteration(5, move |world, _state| {
@@ -3070,13 +3370,15 @@ fn test_hidden_ratio_max_still_arms_drag_transfer() {
         MainOptions {
             mouse_drag_display_modifier: Some(Modifiers::ALT),
             window_hidden_ratio: Some(1.0),
+            drag_friction_enabled: Some(false),
             ..Default::default()
         },
         vec![],
     )
         .into();
     // Window 0 tiles into slot (0, 20); grab its center while holding Alt,
-    // then drag straight up past the external display's bottom edge (y 0).
+    // then drag right onto the side-by-side external display (drags are
+    // horizontal-only).
     let grab = CGPoint::new(200.0, 500.0);
     let commands = vec![
         Event::MenuOpened { window_id: 0 },
@@ -3091,7 +3393,7 @@ fn test_hidden_ratio_max_still_arms_drag_transfer() {
             modifiers: Modifiers::ALT,
         },
         Event::MouseDragged {
-            point: CGPoint::new(200.0, 0.0),
+            point: CGPoint::new(1500.0, 500.0),
             modifiers: Modifiers::ALT,
         },
         Event::Command {
@@ -3107,7 +3409,12 @@ fn test_hidden_ratio_max_still_arms_drag_transfer() {
         .with_windows(1)
         .with_display(
             EXT_DISPLAY_ID,
-            IRect::new(0, -EXT_DISPLAY_HEIGHT, EXT_DISPLAY_WIDTH, 0),
+            IRect::new(
+                TEST_DISPLAY_WIDTH,
+                0,
+                TEST_DISPLAY_WIDTH + EXT_DISPLAY_WIDTH,
+                EXT_DISPLAY_HEIGHT,
+            ),
             vec![EXT_WORKSPACE_ID],
         )
         .on_iteration(5, move |world, _state| {
@@ -3122,8 +3429,8 @@ fn test_hidden_ratio_max_still_arms_drag_transfer() {
 #[test]
 fn test_armed_drag_transfers_stacked_column_intact() {
     // Stack windows 0 and 1 (the fused column sits at x=400, the focused
-    // window's old slot), grab window 0 near its top, and drag straight up
-    // past the external display's bottom edge.
+    // window's old slot), grab window 0 near its top, and drag right onto
+    // the side-by-side external display (drags are horizontal-only).
     let grab = CGPoint::new(600.0, 100.0);
     let commands = vec![
         Event::MenuOpened { window_id: 0 },
@@ -3138,7 +3445,7 @@ fn test_armed_drag_transfers_stacked_column_intact() {
             modifiers: Modifiers::ALT,
         },
         Event::MouseDragged {
-            point: CGPoint::new(600.0, -600.0),
+            point: CGPoint::new(1500.0, 100.0),
             modifiers: Modifiers::ALT,
         },
         Event::Command {
@@ -3154,7 +3461,12 @@ fn test_armed_drag_transfers_stacked_column_intact() {
         .with_windows(2)
         .with_display(
             EXT_DISPLAY_ID,
-            IRect::new(0, -EXT_DISPLAY_HEIGHT, EXT_DISPLAY_WIDTH, 0),
+            IRect::new(
+                TEST_DISPLAY_WIDTH,
+                0,
+                TEST_DISPLAY_WIDTH + EXT_DISPLAY_WIDTH,
+                EXT_DISPLAY_HEIGHT,
+            ),
             vec![EXT_WORKSPACE_ID],
         )
         .on_iteration(5, move |world, _state| {

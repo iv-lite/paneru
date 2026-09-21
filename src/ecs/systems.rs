@@ -31,7 +31,10 @@ use crate::config::{Config, decorations::BorderRadiusOption};
 use crate::ecs::display::FloatingLayer;
 use crate::ecs::layout::{Column, LayoutStrip};
 use crate::ecs::mouse::{DragModifierState, DragPaintState, DragScrollState, arm_release_grace};
-use crate::ecs::params::{ActiveDisplay, FrameActivity, Windows};
+use crate::ecs::orchestrator::{
+    FrameOrchestrator, FramePriority, LOOP_TIMEOUT_STEP, pump_timeout_limit,
+};
+use crate::ecs::params::{ActiveDisplay, Windows};
 use crate::ecs::workspace::SnapStripMarker;
 use crate::ecs::{
     ActiveWorkspaceMarker, AnyWindowInFlight, Bounds, BruteforceWindows, ColdStart, FlashMessage,
@@ -104,61 +107,7 @@ const ANIAMTE_SNAP_THRESHOLD: f32 = 8.0;
 /// `ease_out_factor` evaluates near 1.0 and the window jumps. Matches the
 /// scroll integrator's step cap.
 const MAX_ANIMATION_DT_SECS: f64 = 1.0 / 30.0;
-const LOOP_MAX_TIMEOUT_FRAME_ACTIVE_MS: u32 = 16;
-/// Active-frame sleep while a `ProMotion` (120Hz) display is present.
-/// Committing animation at 16ms judders against a 120Hz panel; halving the
-/// sleep smooths it at the cost of ~2x AX traffic during motion (idle and
-/// low-power cadences are untouched).
-const LOOP_MAX_TIMEOUT_PROMOTION_MS: u32 = 8;
-
-/// Active-frame pump sleep for the current display mix. Pure so the matrix
-/// is unit testable; the `NSScreen` query feeding it lives in `pump_events`
-/// (main thread only, absent in tests).
-fn active_timeout_limit(promotion_present: bool) -> u32 {
-    if promotion_present {
-        LOOP_MAX_TIMEOUT_PROMOTION_MS
-    } else {
-        LOOP_MAX_TIMEOUT_FRAME_ACTIVE_MS
-    }
-}
-
-/// Sleep ceiling for one pump pass. Vsync retrace period when bound (and
-/// the frame wants to move), else the fixed active/idle/low-power ladder.
-/// Pure over its inputs so the selection is unit testable; the arming
-/// side-effect lives in the `vsync_period` call feeding it.
-fn pump_timeout_limit(
-    frame_active: bool,
-    low_power: bool,
-    vsync_period: Option<Duration>,
-    promotion: bool,
-) -> u32 {
-    if frame_active {
-        vsync_period.map_or_else(|| active_timeout_limit(promotion), vsync_timeout_ms)
-    } else if low_power {
-        LOOP_MAX_TIMEOUT_LOWPOWER_MS
-    } else {
-        LOOP_MAX_TIMEOUT_MS
-    }
-}
-
-/// Retrace period as whole-millisecond sleep. Periods are small and
-/// positive by construction (measured inter-retrace deltas); sub-ms
-/// precision is lost, which only shortens the backstop sleep — the link's
-/// wake, not the timeout, ends the wait on time.
-#[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
-fn vsync_timeout_ms(period: Duration) -> u32 {
-    (period.as_secs_f64() * 1000.0) as u32
-}
-const LOOP_MAX_TIMEOUT_LOWPOWER_MS: u32 = 2000;
-// Real events (input, IPC, workspace changes, ...) wake the pump immediately
-// via `EventLoopWaker`, so this only bounds how late the free-running 1s
-// `on_timer` systems (`recover_lost_focus`, workspace refresh) can land, and
-// how long a dead event tap can go unnoticed between the 30s health sweeps.
-// Kept well under both: with no genuine work to do, this used to run the
-// whole schedule 20 times a second.
-const LOOP_MAX_TIMEOUT_MS: u32 = 500;
 const TAP_HEALTH_CHECK_INTERVAL: Duration = Duration::from_secs(30);
-const LOOP_TIMEOUT_STEP: u32 = 1;
 
 /// How long [`pump_events`] may spend draining the incoming channel before it
 /// has to hand the frame back, and how many events it may take in one go.
@@ -654,7 +603,7 @@ pub(super) fn publish_snapshot_cadence(
     held: Query<(), With<MouseHeldMarker>>,
     verifying: Query<(), With<VerifyWindowPosition>>,
     roster: Option<Res<SnapshotRoster>>,
-    mut last: Local<bool>,
+    mut orchestrator: ResMut<FrameOrchestrator>,
 ) {
     let Some(roster) = roster.as_deref() else {
         return;
@@ -663,10 +612,11 @@ pub(super) fn publish_snapshot_cadence(
     // awaits confirmation, or while any mouse button is down: the last
     // covers missed-press native drags with no holder (no paint state),
     // whose border would otherwise step at the 250ms idle cadence.
-    // Press-gated, so idle cost is untouched.
+    // Press-gated, so idle cost is untouched. Last-published state lives
+    // in the orchestrator so cadence is observable, not a `Local`.
     let fast = cold.is_some() || !held.is_empty() || !verifying.is_empty() || left_button_held();
-    if fast != *last {
-        *last = fast;
+    if fast != orchestrator.snapshot_fast {
+        orchestrator.snapshot_fast = fast;
         let _ = roster
             .0
             .try_send(crate::snapshot::RosterDelta::SetFastPoll(fast));
@@ -1364,15 +1314,13 @@ pub(crate) fn pump_events(
     mut low_power_mode: Option<ResMut<LowPowerMode>>,
     incoming_events: Option<NonSend<Receiver<Event>>>,
     platform: Option<NonSendMut<Pin<Box<PlatformCallbacks>>>>,
-    activity: FrameActivity,
     active_display: Query<&Display, With<ActiveDisplayMarker>>,
     config: Res<Config>,
-    mut timeout: Local<u32>,
-    mut last_tap_check: Local<Option<Instant>>,
-    // Cached ProMotion presence + last refresh. `NSScreen::screens` per frame
-    // would cost more than the cadence it tunes; displays barely change, so
-    // refresh on wake/display events and every 60s.
-    mut promotion: Local<(bool, Option<Instant>)>,
+    write_state: Option<Res<AxWriteState>>,
+    // Sleep/promotion/tap state lives in the orchestrator resource (not
+    // `Local`s) so pacing is observable and testable. `classify_frame`
+    // runs just before this system and leaves the priority fresh.
+    mut orchestrator: ResMut<FrameOrchestrator>,
 ) {
     let Some((ref mut platform, incoming_events)) = platform.zip(incoming_events) else {
         // No platform interface or incoming event pipe - probably executing in a unit test.
@@ -1383,7 +1331,7 @@ pub(crate) fn pump_events(
     // floor under how soon a pump could start, so an event landing right after
     // one returned had to wait out the rest of it. That latency is worse than
     // the redundant work skipping the wait costs.
-    platform.pump_cocoa_event_loop(f64::from(*timeout) / 1000.0);
+    platform.pump_cocoa_event_loop(f64::from(orchestrator.sleep_ms) / 1000.0);
 
     let deadline = Instant::now() + PUMP_BUDGET;
     let mut received_events = Vec::new();
@@ -1427,7 +1375,7 @@ pub(crate) fn pump_events(
                         | Event::DisplayConfigured { .. }
                 );
                 coalesced.push(&mut received_events, event);
-                *timeout = LOOP_TIMEOUT_STEP;
+                orchestrator.sleep_ms = LOOP_TIMEOUT_STEP;
             }
             Err(RecvTimeoutError::Timeout) => break true,
         }
@@ -1443,24 +1391,34 @@ pub(crate) fn pump_events(
         if let Some(low_power) = low_power_mode.as_deref_mut() {
             low_power.0 = objc2_foundation::NSProcessInfo::processInfo().isLowPowerModeEnabled();
         }
-        *timeout = LOOP_TIMEOUT_STEP;
+        orchestrator.sleep_ms = LOOP_TIMEOUT_STEP;
     }
 
     if drained {
-        let frame_active = activity.mid_frame();
+        // Unacked async writes keep the active cadence: sleeping 500ms with
+        // a drain pending would stall convergence a whole idle window.
+        let frame_active = orchestrator.priority != FramePriority::Idle
+            || write_state
+                .as_deref()
+                .is_some_and(|state| state.inflight() > 0);
         let low_power = low_power_mode
             .as_deref()
             .is_some_and(|low_power| low_power.0);
+        // Cached `ProMotion` presence + last refresh. `NSScreen::screens`
+        // per frame would cost more than the cadence it tunes; displays
+        // barely change, so refresh on wake/display events and every 60s.
         if woke
             || display_changed
-            || promotion
+            || orchestrator
+                .promotion
                 .1
                 .is_none_or(|last| last.elapsed() >= Duration::from_secs(60))
         {
-            promotion.0 = objc2_app_kit::NSScreen::screens(platform.main_thread_marker)
-                .iter()
-                .any(|screen| screen.maximumFramesPerSecond() >= 110);
-            promotion.1 = Some(Instant::now());
+            orchestrator.promotion.0 =
+                objc2_app_kit::NSScreen::screens(platform.main_thread_marker)
+                    .iter()
+                    .any(|screen| screen.maximumFramesPerSecond() >= 110);
+            orchestrator.promotion.1 = Some(Instant::now());
         }
         // Rebind every quiet frame: idempotent (no-op when display and flag
         // are unchanged), so flag flips and display switches apply on the
@@ -1473,19 +1431,23 @@ pub(crate) fn pump_events(
         // end the wait on time. Falls back to the sleep ladder with no
         // period yet, flag off, or pre-macOS-14.
         let timeout_limit = pump_timeout_limit(
-            frame_active,
+            if frame_active {
+                orchestrator.priority
+            } else {
+                FramePriority::Idle
+            },
             low_power,
             if frame_active {
                 platform.vsync_period()
             } else {
                 None
             },
-            promotion.0,
+            orchestrator.promotion.0,
         );
-        *timeout = timeout.min(timeout_limit) + LOOP_TIMEOUT_STEP;
+        orchestrator.sleep_ms = orchestrator.sleep_ms.min(timeout_limit) + LOOP_TIMEOUT_STEP;
     } else {
         // Still backed up: come straight back rather than sleeping on it.
-        *timeout = LOOP_TIMEOUT_STEP;
+        orchestrator.sleep_ms = LOOP_TIMEOUT_STEP;
     }
 
     // macOS can invalidate the event tap while the machine sleeps without ever
@@ -1496,7 +1458,12 @@ pub(crate) fn pump_events(
     // deaths without one. A wake always rebuilds rather than checking: a
     // locally-valid port can still be dead server-side, which the validity
     // and enabled flags cannot see.
-    sweep_input_tap(platform, woke, display_changed, &mut last_tap_check);
+    sweep_input_tap(
+        platform,
+        woke,
+        display_changed,
+        &mut orchestrator.last_tap_check,
+    );
 }
 
 /// Slow tap-health sweep extracted from [`pump_events`] so the pump stays
@@ -2933,13 +2900,14 @@ mod tests {
 
     use bevy::prelude::*;
 
-    use super::active_timeout_limit;
     use super::adoption_distrusted;
     use super::gather_initial_processes;
     use super::overlay_hide_for_swipe;
     use super::overlay_tracks_live;
-    use super::{LOOP_MAX_TIMEOUT_FRAME_ACTIVE_MS, LOOP_MAX_TIMEOUT_PROMOTION_MS};
     use crate::config::Config;
+    use crate::ecs::orchestrator::{
+        LOOP_MAX_TIMEOUT_FRAME_ACTIVE_MS, LOOP_MAX_TIMEOUT_PROMOTION_MS, active_timeout_limit,
+    };
     use crate::events::Event;
 
     /// The input event tap keeps the handle it received on `InitialConfig` and
