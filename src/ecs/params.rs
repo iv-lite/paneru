@@ -436,6 +436,13 @@ impl Windows<'_, '_> {
         self.focus.single().ok()
     }
 
+    /// Whether any focus marker exists at all. Distinguishes a truly
+    /// focusless world from the transient two-marker moment of a focus
+    /// switch without spending a query parameter on it.
+    pub fn has_focus(&self) -> bool {
+        !self.focus.is_empty()
+    }
+
     pub fn iter(&self) -> impl Iterator<Item = (&Window, Entity)> {
         self.all
             .iter()

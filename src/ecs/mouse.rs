@@ -6,7 +6,7 @@ use bevy::ecs::query::{Has, With};
 use bevy::ecs::resource::Resource;
 use bevy::ecs::schedule::IntoScheduleConfigs as _;
 use bevy::ecs::system::{Commands, Local, NonSendMut, Populated, Query, Res, ResMut, Single};
-use bevy::math::IRect;
+use bevy::math::{DVec2, IRect};
 use bevy::time::Time;
 use std::time::{Duration, Instant};
 use tracing::{debug, info, trace, warn};
@@ -720,17 +720,48 @@ impl DragScrollState {
 /// at input rate while the layout slot stays pinned (adoption skips held
 /// windows by design) and the 250ms snapshot would otherwise step.
 ///
+/// Also tracks a per-axis velocity EMA so the border can extrapolate one
+/// vsync lead ahead of the last event instead of painting a frame behind.
 /// Written from the `MouseDragged` stream, read by the overlay's
 /// `native_held` branch. Never written back to `Position`: release homing
 /// still owns the glide home. Seeded at press time (when the OS frame is
 /// at-rest accurate); a missed press simply leaves no gesture and the
 /// border falls back to snapshot/cached frames as before.
-#[derive(Debug, Resource, Default)]
+#[derive(Debug, Resource)]
 pub(crate) struct DragPaintState {
     pub(crate) target: Option<Entity>,
     pub(crate) grab_frame: Option<IRect>,
     pub(crate) offset: Origin,
+    velocity_px_s: DVec2,
+    last_sample_at: Option<Duration>,
 }
+
+impl Default for DragPaintState {
+    fn default() -> Self {
+        Self {
+            target: None,
+            grab_frame: None,
+            offset: Origin::ZERO,
+            velocity_px_s: DVec2::ZERO,
+            last_sample_at: None,
+        }
+    }
+}
+
+/// Gap past which a velocity sample resets: a pause mid-drag means holding
+/// still, and only post-pause motion may steer the prediction. Mirrors the
+/// release-velocity gap so both EMAs agree on what "stopped" means.
+const PAINT_VELOCITY_GAP_RESET: Duration = Duration::from_millis(150);
+
+/// Bound on one extrapolation lead: at 2000px/s and 16ms a lead is 32px,
+/// so 64px caps runaway prediction while never clipping a real drag.
+const PAINT_LEAD_CAP_PX: f64 = 64.0;
+
+/// Staleness bound for prediction: past this the pointer is assumed held
+/// still and the border paints the accumulated offset with no lead. Same
+/// clock (`Time` virtual) as the sampler, so holding still across idle
+/// frames can never drift the rect.
+const PAINT_VELOCITY_STALE_AFTER: Duration = Duration::from_millis(150);
 
 impl DragPaintState {
     /// Seed a new gesture. Overwrites any stale state (e.g. a lost
@@ -739,14 +770,30 @@ impl DragPaintState {
         self.target = Some(target);
         self.grab_frame = Some(grab_frame);
         self.offset = Origin::ZERO;
+        self.velocity_px_s = DVec2::ZERO;
+        self.last_sample_at = None;
     }
 
-    /// Accumulate one drag delta. Ignores deltas for a different target so
-    /// a stale press can never steer another window's border.
-    pub(crate) fn advance(&mut self, target: Entity, delta: Origin) {
-        if self.target == Some(target) {
-            self.offset += delta;
+    /// Accumulate one drag delta sampled at `now`. Ignores deltas for a
+    /// different target so a stale press can never steer another window's
+    /// border.
+    pub(crate) fn advance(&mut self, target: Entity, delta: Origin, now: Duration) {
+        if self.target != Some(target) {
+            return;
         }
+        self.offset += delta;
+        if let Some(last) = self.last_sample_at {
+            let gap = now.saturating_sub(last);
+            if gap > PAINT_VELOCITY_GAP_RESET {
+                self.velocity_px_s = DVec2::ZERO;
+            }
+            // Same floor as the swipe/release pipelines: a catch-up frame
+            // can drive `dt` arbitrarily close to zero.
+            let dt = gap.as_secs_f64().max(1.0 / 1000.0);
+            let instant = DVec2::new(f64::from(delta.x) / dt, f64::from(delta.y) / dt);
+            self.velocity_px_s = self.velocity_px_s * 0.7 + instant * 0.3;
+        }
+        self.last_sample_at = Some(now);
     }
 
     /// Current painted frame for `entity`, or `None` when no gesture tracks
@@ -762,12 +809,47 @@ impl DragPaintState {
         ))
     }
 
+    /// Painted frame extrapolated `lead_secs` ahead along the velocity EMA
+    /// (one vsync period at the call site), or the plain accumulated frame
+    /// when the samples went stale, the lead is non-positive, or no gesture
+    /// tracks the entity. The lead is magnitude-capped so a wrong EMA can
+    /// cost at most one bounded overshoot, corrected next tick.
+    pub(crate) fn predicted_frame_for(
+        &self,
+        entity: Entity,
+        now: Duration,
+        lead_secs: f64,
+    ) -> Option<IRect> {
+        let base = self.frame_for(entity)?;
+        let Some(last) = self.last_sample_at else {
+            return Some(base);
+        };
+        if lead_secs <= 0.0 || now.saturating_sub(last) > PAINT_VELOCITY_STALE_AFTER {
+            return Some(base);
+        }
+        let lead = DVec2::new(
+            (self.velocity_px_s.x * lead_secs).clamp(-PAINT_LEAD_CAP_PX, PAINT_LEAD_CAP_PX),
+            (self.velocity_px_s.y * lead_secs).clamp(-PAINT_LEAD_CAP_PX, PAINT_LEAD_CAP_PX),
+        );
+        #[allow(
+            clippy::cast_possible_truncation,
+            reason = "capped to ±64px, well within i32; sub-pixel precision is lost"
+        )]
+        let lead_origin = Origin::new(lead.x.round() as i32, lead.y.round() as i32);
+        Some(IRect::from_corners(
+            base.min + lead_origin,
+            base.max + lead_origin,
+        ))
+    }
+
     /// End the gesture. Called on mouse-up; the holder despawn covers the
     /// timeout path (a lingering offset is unread without a live holder).
     pub(crate) fn clear(&mut self) {
         self.target = None;
         self.grab_frame = None;
         self.offset = Origin::ZERO;
+        self.velocity_px_s = DVec2::ZERO;
+        self.last_sample_at = None;
     }
 }
 
@@ -889,7 +971,7 @@ fn scroll_settle_check(
                 position.0,
                 writer.as_deref(),
                 &mut write_state,
-                config.experimental_ax_writer(),
+                config.ax_writer_enabled(),
             );
             pending.push(member);
         }
@@ -1146,7 +1228,7 @@ fn drag_move_held_column(
                 // delta at input rate. Advanced for every managed held
                 // target regardless of branch — scroll/column paths ignore
                 // it, the native path paints it.
-                paint.advance(target, delta);
+                paint.advance(target, delta, time.elapsed());
                 if cold.is_some() {
                     // Warmup: track the cursor for paint only; the slot,
                     // strip, and scroll pipeline must not move before the
@@ -1984,8 +2066,8 @@ mod tests {
             Some(grab),
             "zero offset paints grab"
         );
-        paint.advance(target, Origin::new(50, 0));
-        paint.advance(target, Origin::new(0, 30));
+        paint.advance(target, Origin::new(50, 0), Duration::from_millis(100));
+        paint.advance(target, Origin::new(0, 30), Duration::from_millis(120));
         assert_eq!(
             paint.frame_for(target),
             Some(IRect::new(50, 50, 450, 1050)),
@@ -1994,7 +2076,7 @@ mod tests {
 
         let other = Entity::from_raw_u32(9999).expect("test entity");
         assert_eq!(paint.frame_for(other), None, "foreign entity reads nothing");
-        paint.advance(other, Origin::new(500, 500));
+        paint.advance(other, Origin::new(500, 500), Duration::from_millis(140));
         assert_eq!(
             paint.frame_for(target),
             Some(IRect::new(50, 50, 450, 1050)),
@@ -2003,6 +2085,40 @@ mod tests {
 
         paint.clear();
         assert_eq!(paint.frame_for(target), None, "release ends the gesture");
+    }
+
+    #[test]
+    fn drag_paint_predicts_one_lead_ahead_then_goes_stale() {
+        use bevy::ecs::entity::Entity;
+
+        let mut paint = DragPaintState::default();
+        let target = Entity::PLACEHOLDER;
+        let grab = IRect::new(0, 20, 400, 1020);
+        paint.begin(target, grab);
+        // First sample stores its time; the second folds velocity:
+        // 100px in 20ms → 5000px/s on x, EMA 0.3 → 1500px/s.
+        let t0 = Duration::from_millis(100);
+        paint.advance(target, Origin::new(100, 0), t0);
+        paint.advance(target, Origin::new(100, 0), t0 + Duration::from_millis(20));
+        let now = t0 + Duration::from_millis(40);
+        let predicted = paint
+            .predicted_frame_for(target, now, 0.016)
+            .expect("gesture paints");
+        // 1500*0.016 = 24px lead on top of the 200px offset, capped well
+        // below 64.
+        assert_eq!(predicted.min.x, 200 + 24);
+        assert_eq!(predicted.min.y, 20);
+        // Stale samples (held still) paint the accumulated offset, no lead.
+        let late = t0 + Duration::from_millis(500);
+        assert_eq!(
+            paint.predicted_frame_for(target, late, 0.016),
+            Some(IRect::new(200, 20, 600, 1020))
+        );
+        // Non-positive lead is the plain frame.
+        assert_eq!(
+            paint.predicted_frame_for(target, now, 0.0),
+            Some(IRect::new(200, 20, 600, 1020))
+        );
     }
 
     #[test]

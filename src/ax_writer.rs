@@ -1,5 +1,5 @@
-//! Dedicated AX write thread (experimental, behind
-//! `Config::experimental_ax_writer`).
+//! Dedicated AX write thread (behind `Config::ax_writer_enabled`, on by
+//! default).
 //!
 //! Animation frames currently block the main thread on one synchronous
 //! `WindowServer` round-trip per window

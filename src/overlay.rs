@@ -424,7 +424,13 @@ impl OverlayManager {
                     apply_border_layer(&border.window, params);
                     border.params = params.clone();
                 }
-                border.window.orderFront(None::<&AnyObject>);
+                // Reasserting front-order every tick costs a WindowServer
+                // round-trip at display rate; skip it while already visible.
+                // Moves and reskins above don't change frontness, and new
+                // windows order front on creation below.
+                if !border.window.isVisible() {
+                    border.window.orderFront(None::<&AnyObject>);
+                }
             } else {
                 let window = make_border_window(self.mtm, cocoa, params);
                 self.borders.insert(

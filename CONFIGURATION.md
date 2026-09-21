@@ -45,7 +45,8 @@ General behavior settings for the window manager.
 | `virtual_workspace_animations` | Boolean | `false` | If enabled, Paneru will animate virtual workspace swaps. Off by default, because people use virtual workspaces due to the slow animation of the native macOS workspaces. |
 | `insert_windows_mid_strip` | Boolean | `false` | When moving a window to another virtual workspace, insert it at the column matching its current on-screen position (keeping it where you see it and shifting the rest) instead of appending it to the end of the destination strip. |
 | `create_virtual_workspace_automatically` | Boolean | `false` | Automatically creates a new virtual workspace when using `window_virtual_south `or Southward gesture controls. |
-| `experimental_ax_writer` | Boolean | `true` | Moves AX position commits onto a dedicated writer thread (per-window latest coalescing) instead of blocking the main thread per animation frame. Experimental: disable only if soak-testing shows regressions on your app mix. Apps needing the enhanced-UI workaround always stay synchronous. |
+| `ax_writer` | Boolean | `true` | Moves AX position commits onto a dedicated writer thread (per-window latest coalescing) instead of blocking the main thread per animation frame. Disable only if testing shows regressions on your app mix (`experimental_ax_writer` still works as a deprecated alias). Apps needing the enhanced-UI workaround always stay synchronous. |
+| `experimental_vsync` | Boolean | `false` | Paces the pump to the display's retrace via a per-screen display link instead of fixed 8/16ms sleeps. Experimental: needs macOS 14+, falls back to the sleep ladder when unbound. |
 
 ---
 

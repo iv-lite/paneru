@@ -37,6 +37,7 @@ mod mission_control;
 pub mod notify;
 mod process;
 pub mod service;
+pub(crate) mod vsync;
 mod workspace;
 
 /// Type alias for `OSStatus`, a 32-bit integer error code used by macOS system services.
@@ -252,6 +253,9 @@ pub struct PlatformCallbacks {
     mission_control_observer: MissionControlHandler,
     /// Handler for Core Graphics display reconfiguration events.
     display_handler: Option<PinnedDisplayHandler>,
+    /// Display-link vsync pacing (experimental). Lives here — main-thread
+    /// confined like every other platform handle — and only wakes the pump.
+    vsync_link: vsync::VSyncLink,
     notify_handler: Option<PinnedNotifyHandler>,
 }
 
@@ -282,6 +286,7 @@ impl PlatformCallbacks {
         events.waker().install(&cocoa_app);
 
         let workspace_observer = WorkspaceObserver::new(events.clone());
+        let vsync_link = vsync::VSyncLink::new(events.waker().clone());
         Box::pin(PlatformCallbacks {
             main_thread_marker,
             cocoa_app,
@@ -290,6 +295,7 @@ impl PlatformCallbacks {
             workspace_observer,
             mission_control_observer: MissionControlHandler::new(events.clone()),
             display_handler: None,
+            vsync_link,
             notify_handler: None,
             events,
         })
@@ -360,6 +366,28 @@ impl PlatformCallbacks {
         };
         // Safety: as above.
         unsafe { handler.as_mut().get_unchecked_mut() }.force_rebuild_tap()
+    }
+
+    /// Binds the vsync display link to `display_id` iff `enabled`
+    /// (experimental; macOS 14+). Idempotent — safe to call every quiet
+    /// frame, so flag flips and display switches apply immediately.
+    /// Falls back to the sleep ladder when disabled, unsupported, or
+    /// unbound.
+    pub fn ensure_vsync_link(
+        &mut self,
+        display_id: objc2_core_graphics::CGDirectDisplayID,
+        enabled: bool,
+    ) {
+        self.vsync_link
+            .ensure(self.main_thread_marker, display_id, enabled);
+    }
+
+    /// Arms a wake on the next retrace and reports the current period
+    /// estimate, if the link is bound. The pump calls this when it sleeps
+    /// wanting frames; the callback consumes the arm exactly once, so idle
+    /// sleeps (which never arm) pay nothing.
+    pub fn vsync_period(&mut self) -> Option<std::time::Duration> {
+        self.vsync_link.poll_period()
     }
 
     /// Returns `true` when at least one event was dispatched this pass.

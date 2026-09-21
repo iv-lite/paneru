@@ -919,14 +919,22 @@ impl Config {
 
     /// Moves AX position commits onto a dedicated writer thread (per-window
     /// latest coalescing) instead of blocking the main thread per animation
-    /// frame. Experimental but default-on: the synchronous path remains for
-    /// dance apps, resizes, shutdown, and whenever the flag is unset.
-    /// Disable only if soak-testing shows regressions on your app mix.
-    pub fn experimental_ax_writer(&self) -> bool {
+    /// frame. Default-on: the synchronous path remains for dance apps,
+    /// resizes, shutdown, and whenever the flag is unset. Disable only if
+    /// testing shows regressions on your app mix.
+    pub fn ax_writer_enabled(&self) -> bool {
         // Default is enabled.
+        self.options().ax_writer.is_none_or(|enabled| enabled)
+    }
+
+    /// Paces the pump to the display's retrace via a per-screen display
+    /// link instead of fixed 8/16ms sleeps. Experimental, default-off:
+    /// needs macOS 14+ and falls back to the sleep ladder when unbound.
+    pub fn experimental_vsync(&self) -> bool {
+        // Default is disabled.
         self.options()
-            .experimental_ax_writer
-            .is_none_or(|enabled| enabled)
+            .experimental_vsync
+            .is_some_and(|enabled| enabled)
     }
 
     /// Number of virtual workspaces to pre-create on each physical space at
@@ -1409,9 +1417,15 @@ pub struct MainOptions {
     pub create_virtual_workspace_automatically: Option<bool>,
 
     /// Move AX position commits onto a dedicated writer thread instead of
-    /// blocking the main thread per animation frame. Experimental,
-    /// default-on; see `Config::experimental_ax_writer`.
-    pub experimental_ax_writer: Option<bool>,
+    /// blocking the main thread per animation frame. Default-on; see
+    /// `Config::ax_writer_enabled`. The `experimental_ax_writer` spelling
+    /// is accepted as a deprecated alias.
+    #[serde(alias = "experimental_ax_writer")]
+    pub ax_writer: Option<bool>,
+
+    /// Pace the pump to the display's retrace instead of fixed sleeps.
+    /// Experimental, default-off; see `Config::experimental_vsync`.
+    pub experimental_vsync: Option<bool>,
 }
 
 /// Returns a default set of column widths.
@@ -2219,6 +2233,29 @@ window_virtualsendnum_3 = "cmd + alt + shift - 3"
             MoveFocus::Stay
         )))
     ));
+}
+
+#[test]
+fn test_ax_writer_flag_and_alias() {
+    let parse = |options: &str| {
+        let input = format!("[options]\n{options}\n[bindings]\n");
+        let virtual_keys = test_virtual_keymap();
+        Config {
+            inner: Arc::new(ArcSwap::from_pointee(
+                InnerConfig::parse_config_with_virtual_keys(&input, &virtual_keys)
+                    .expect("Failed to parse config"),
+            )),
+        }
+    };
+    // Graduated default: on unless explicitly disabled.
+    assert!(parse("").ax_writer_enabled());
+    assert!(parse("ax_writer = true").ax_writer_enabled());
+    assert!(!parse("ax_writer = false").ax_writer_enabled());
+    // Deprecated spelling still parses.
+    assert!(!parse("experimental_ax_writer = false").ax_writer_enabled());
+    // Vsync stays opt-in.
+    assert!(!parse("").experimental_vsync());
+    assert!(parse("experimental_vsync = true").experimental_vsync());
 }
 
 #[test]

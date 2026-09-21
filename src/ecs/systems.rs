@@ -120,6 +120,34 @@ fn active_timeout_limit(promotion_present: bool) -> u32 {
         LOOP_MAX_TIMEOUT_FRAME_ACTIVE_MS
     }
 }
+
+/// Sleep ceiling for one pump pass. Vsync retrace period when bound (and
+/// the frame wants to move), else the fixed active/idle/low-power ladder.
+/// Pure over its inputs so the selection is unit testable; the arming
+/// side-effect lives in the `vsync_period` call feeding it.
+fn pump_timeout_limit(
+    frame_active: bool,
+    low_power: bool,
+    vsync_period: Option<Duration>,
+    promotion: bool,
+) -> u32 {
+    if frame_active {
+        vsync_period.map_or_else(|| active_timeout_limit(promotion), vsync_timeout_ms)
+    } else if low_power {
+        LOOP_MAX_TIMEOUT_LOWPOWER_MS
+    } else {
+        LOOP_MAX_TIMEOUT_MS
+    }
+}
+
+/// Retrace period as whole-millisecond sleep. Periods are small and
+/// positive by construction (measured inter-retrace deltas); sub-ms
+/// precision is lost, which only shortens the backstop sleep — the link's
+/// wake, not the timeout, ends the wait on time.
+#[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
+fn vsync_timeout_ms(period: Duration) -> u32 {
+    (period.as_secs_f64() * 1000.0) as u32
+}
 const LOOP_MAX_TIMEOUT_LOWPOWER_MS: u32 = 2000;
 // Real events (input, IPC, workspace changes, ...) wake the pump immediately
 // via `EventLoopWaker`, so this only bounds how late the free-running 1s
@@ -1320,6 +1348,8 @@ pub(crate) fn pump_events(
     incoming_events: Option<NonSend<Receiver<Event>>>,
     platform: Option<NonSendMut<Pin<Box<PlatformCallbacks>>>>,
     activity: FrameActivity,
+    active_display: Query<&Display, With<ActiveDisplayMarker>>,
+    config: Res<Config>,
     mut timeout: Local<u32>,
     mut last_tap_check: Local<Option<Instant>>,
     // Cached ProMotion presence + last refresh. `NSScreen::screens` per frame
@@ -1415,13 +1445,26 @@ pub(crate) fn pump_events(
                 .any(|screen| screen.maximumFramesPerSecond() >= 110);
             promotion.1 = Some(Instant::now());
         }
-        let timeout_limit = if frame_active {
-            active_timeout_limit(promotion.0)
-        } else if low_power {
-            LOOP_MAX_TIMEOUT_LOWPOWER_MS
-        } else {
-            LOOP_MAX_TIMEOUT_MS
-        };
+        // Rebind every quiet frame: idempotent (no-op when display and flag
+        // are unchanged), so flag flips and display switches apply on the
+        // next frame instead of waiting out the 60s probe above.
+        if let Some(display) = active_display.iter().next() {
+            platform.ensure_vsync_link(display.id(), config.experimental_vsync());
+        }
+        // Vsync-paced when bound: sleep to the next retrace instead of
+        // the fixed active guess, and let the link's wake (armed below)
+        // end the wait on time. Falls back to the sleep ladder with no
+        // period yet, flag off, or pre-macOS-14.
+        let timeout_limit = pump_timeout_limit(
+            frame_active,
+            low_power,
+            if frame_active {
+                platform.vsync_period()
+            } else {
+                None
+            },
+            promotion.0,
+        );
         *timeout = timeout.min(timeout_limit) + LOOP_TIMEOUT_STEP;
     } else {
         // Still backed up: come straight back rather than sleeping on it.
@@ -1436,6 +1479,18 @@ pub(crate) fn pump_events(
     // deaths without one. A wake always rebuilds rather than checking: a
     // locally-valid port can still be dead server-side, which the validity
     // and enabled flags cannot see.
+    sweep_input_tap(platform, woke, display_changed, &mut last_tap_check);
+}
+
+/// Slow tap-health sweep extracted from [`pump_events`] so the pump stays
+/// under the line budget: rebuild unconditionally after wake, otherwise
+/// check on display changes and every 30s.
+fn sweep_input_tap(
+    platform: &mut Pin<Box<PlatformCallbacks>>,
+    woke: bool,
+    display_changed: bool,
+    last_tap_check: &mut Option<Instant>,
+) {
     if woke {
         *last_tap_check = Some(Instant::now());
         match platform.rebuild_input_tap() {
@@ -1671,7 +1726,7 @@ pub(crate) fn window_moved_update_frame(
                 position.0,
                 writer.as_deref(),
                 &mut write_state,
-                config.experimental_ax_writer(),
+                config.ax_writer_enabled(),
             );
             continue;
         }
@@ -1695,7 +1750,7 @@ pub(crate) fn window_moved_update_frame(
                     position.0,
                     writer.as_deref(),
                     &mut write_state,
-                    config.experimental_ax_writer(),
+                    config.ax_writer_enabled(),
                 );
             }
             continue;
@@ -1835,8 +1890,9 @@ fn pad_snapshot_frame(raw: IRect, window: &Window) -> IRect {
 /// 1. The paint-only drag offset for a native-owned held drag (content grab
 ///    with strip scrolling enabled): the layout slot is pinned stale by
 ///    design (adoption skipped), so the slot would paint detached from the
-///    cursor. Grab frame plus pointer deltas at input rate first, then the
-///    snapshot, then the cached OS frame — never the slot.
+///    cursor. Grab frame plus pointer deltas at input rate, extrapolated one
+///    frame along the velocity EMA, first — then the snapshot, then the
+///    cached OS frame. Never the slot.
 /// 2. The current layout frame while paneru drives or confirms the window —
 ///    any of `RepositionMarker`, `ResizeMarker`, `VerifyWindowPosition`
 ///    present — or while the strip scrolls, a drag is held, or a release
@@ -1960,7 +2016,6 @@ pub(super) fn update_overlays(
     applications: Query<&Application>,
     displays: Query<(Entity, &Display, Has<ActiveDisplayMarker>)>,
     strips: Query<(&LayoutStrip, &ChildOf)>,
-    focus_markers: Query<(), With<FocusedMarker>>,
     drag_held: Query<(
         &MouseHeldMarker,
         Has<DragDisplayArmed>,
@@ -1969,6 +2024,7 @@ pub(super) fn update_overlays(
     flight: FlightMarkers<'_, '_>,
     scroll_grace: Res<DragScrollState>,
     paint: Res<DragPaintState>,
+    time: Res<Time>,
     overlay_mgr: Option<NonSendMut<OverlayManager>>,
     mission_control_active: Res<MissionControlActive>,
     config: Res<Config>,
@@ -2014,7 +2070,7 @@ pub(super) fn update_overlays(
         // moment of a focus switch (`single()` fails on both): only the
         // former hides, so a stale outline can never leak, while the latter
         // holds its rect for a tick instead of hide/show flickering.
-        if focus_markers.is_empty() {
+        if !windows.has_focus() {
             overlay_mgr.hide_all();
         }
         return;
@@ -2079,6 +2135,13 @@ pub(super) fn update_overlays(
                 .iter()
                 .any(|(marker, armed, scroll_armed)| marker.0 == entity && !armed && !scroll_armed)
     };
+    // One-frame velocity lead for the drag paint below: extrapolating the
+    // grab frame plus pointer EMA keeps the border on the cursor at display
+    // rate instead of a frame behind the last event. Stale samples decay
+    // to the plain offset inside the paint state, so holding still can
+    // never drift the rect.
+    let paint_now = time.elapsed();
+    let paint_lead = time.delta_secs_f64().clamp(0.0, 0.05);
     let frame = border_frame_for(
         &windows,
         &flight,
@@ -2086,7 +2149,7 @@ pub(super) fn update_overlays(
         window,
         tracking_live,
         is_native_held(entity),
-        paint.frame_for(entity),
+        paint.predicted_frame_for(entity, paint_now, paint_lead),
         store.as_deref(),
     );
     let focused_abs_cg = abs_cg_rect(frame, window);
@@ -2173,7 +2236,7 @@ pub(super) fn update_overlays(
                 window,
                 tracking_live,
                 is_native_held(entity),
-                paint.frame_for(entity),
+                paint.predicted_frame_for(entity, paint_now, paint_lead),
                 store.as_deref(),
             );
             // Parked-sliver guard, generalized per window across displays.
@@ -2250,7 +2313,7 @@ pub(super) fn commit_window_position(
 ) {
     use crate::ax_writer::push_position;
 
-    if !(config.experimental_ax_writer() && writer.is_some()) {
+    if !(config.ax_writer_enabled() && writer.is_some()) {
         // Synchronous path: default, tests (no queue), dance apps, and
         // shutdown. Unchanged behavior.
         moved_windows
