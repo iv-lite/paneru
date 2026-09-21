@@ -12,12 +12,13 @@
 //! Bevy-first: the orchestrator only holds state and run conditions. The
 //! systems doing the work stay small and live where they always have.
 
+use std::collections::VecDeque;
 use std::time::{Duration, Instant};
 
 use bevy::ecs::query::{Or, With};
 use bevy::ecs::resource::Resource;
 use bevy::ecs::system::{Commands, NonSendMut, Query, Res, ResMut};
-use tracing::error;
+use tracing::{debug, error};
 
 use crate::ax_writer::AxWriteState;
 use crate::ecs::{ColdStart, DragSettleMarker, FlashMessage, MouseHeldMarker, RepositionMarker};
@@ -106,18 +107,31 @@ pub(crate) fn classify_frame(
 /// the frame wants to move), else the fixed active/idle/low-power ladder.
 /// Pure over its inputs so the selection is unit testable; the arming
 /// side-effect lives in the `vsync_period` call feeding it.
+///
+/// `UserDriven` always sleeps the 8ms `ProMotion` cadence, panel or not: a
+/// finger down is the highest-value frame, and 16ms sleeps put a floor
+/// under drag-tracking latency that users read as sluggish. Settles ride
+/// the panel-aware ladder — the glide converges without the extra wakeups.
 pub(crate) fn pump_timeout_limit(
     priority: FramePriority,
     low_power: bool,
     vsync_period: Option<Duration>,
     promotion: bool,
 ) -> u32 {
-    if priority != FramePriority::Idle {
-        vsync_period.map_or_else(|| active_timeout_limit(promotion), vsync_timeout_ms)
-    } else if low_power {
-        LOOP_MAX_TIMEOUT_LOWPOWER_MS
-    } else {
-        LOOP_MAX_TIMEOUT_MS
+    match priority {
+        FramePriority::UserDriven => {
+            vsync_period.map_or(LOOP_MAX_TIMEOUT_PROMOTION_MS, vsync_timeout_ms)
+        }
+        FramePriority::Settle | FramePriority::Background => {
+            vsync_period.map_or_else(|| active_timeout_limit(promotion), vsync_timeout_ms)
+        }
+        FramePriority::Idle => {
+            if low_power {
+                LOOP_MAX_TIMEOUT_LOWPOWER_MS
+            } else {
+                LOOP_MAX_TIMEOUT_MS
+            }
+        }
     }
 }
 
@@ -154,12 +168,17 @@ impl Default for FrameOrchestrator {
 /// Derives [`FramePriority`] from O(1) archetype-emptiness probes before the
 /// pump sleeps on it. No component data is touched. Any live [`Scrolling`]
 /// counts as motion even with no markers: a coasting inertia glide writes
-/// every frame, and sleeping through it would judder the landing.
+/// every frame, and sleeping through it would judder the landing. Stamps
+/// the frame clock for [`log_frame_stats`] at the other end of the
+/// schedules.
 type MotionMarkers = Or<(
     With<DragSettleMarker>,
     With<RepositionMarker>,
     With<ResizeMarker>,
 )>;
+/// Eight probes: held, swipe, scroll, motion, flash, warmup, plus the two
+/// output resources. Splitting would fork the priority computation.
+#[allow(clippy::too_many_arguments)]
 pub(crate) fn classify_frame_priority(
     held: Query<(), With<MouseHeldMarker>>,
     swiping: Query<&Scrolling>,
@@ -168,6 +187,7 @@ pub(crate) fn classify_frame_priority(
     flash: Query<(), With<FlashMessage>>,
     warming: Option<Res<ColdStart>>,
     mut orchestrator: ResMut<FrameOrchestrator>,
+    mut perf: ResMut<PerfStats>,
 ) {
     let user_driving = swiping.iter().any(|scroll| scroll.is_user_swiping);
     orchestrator.priority = classify_frame(
@@ -176,6 +196,70 @@ pub(crate) fn classify_frame_priority(
         warming.is_some(),
         !scrolling.is_empty() || !motion.is_empty(),
         !flash.is_empty(),
+    );
+    perf.frame_start = Some(Instant::now());
+}
+
+/// Rolling frame-time window for the `paneru::perf` log. Two `Instant`
+/// reads per frame (here + [`log_frame_stats`]) — nanoseconds against the
+/// millisecond sleeps and AX round trips being measured. Enable with
+/// `RUST_LOG='paneru::perf=debug'`; silent otherwise.
+pub(crate) const PERF_SAMPLE_WINDOW: usize = 120;
+
+#[derive(Debug, Default, Resource)]
+pub(crate) struct PerfStats {
+    frame_start: Option<Instant>,
+    samples: VecDeque<Duration>,
+    /// Sync re-pushes fired by the verify backstop since the last summary.
+    /// Non-zero during drags means the unacked/animation skips have a hole
+    /// worth investigating; at rest it should sit at zero.
+    pub verify_repushes: u64,
+}
+
+/// Nearest-rank percentile over a sorted sample slice. Pure so the summary
+/// math is unit testable without running frames.
+#[allow(
+    clippy::cast_possible_truncation,
+    clippy::cast_sign_loss,
+    clippy::cast_precision_loss
+)]
+fn percentile(sorted_ms: &[f64], pct: f64) -> f64 {
+    if sorted_ms.is_empty() {
+        return 0.0;
+    }
+    // Rank arithmetic only: `pct` is 0..100 and lengths are frame counts,
+    // so truncation/precision loss cannot mis-rank in practice.
+    let rank = (pct / 100.0 * sorted_ms.len() as f64).ceil() as usize;
+    sorted_ms[rank.clamp(1, sorted_ms.len()) - 1]
+}
+
+/// Closes the frame clock opened by [`classify_frame_priority`] and logs a
+/// p50/p95/max summary every [`PERF_SAMPLE_WINDOW`] frames. Runs in `Last`
+/// so the sample covers pump → layout → commit → overlay end to end.
+/// `debug!` with an explicit target: the suite runs at `warn`, so tests
+/// never pay for formatting.
+pub(crate) fn log_frame_stats(mut perf: ResMut<PerfStats>, orchestrator: Res<FrameOrchestrator>) {
+    let Some(start) = perf.frame_start.take() else {
+        return;
+    };
+    perf.samples.push_back(start.elapsed());
+    if perf.samples.len() < PERF_SAMPLE_WINDOW {
+        return;
+    }
+    let mut sorted: Vec<f64> = perf
+        .samples
+        .drain(..)
+        .map(|d| d.as_secs_f64() * 1000.0)
+        .collect();
+    sorted.sort_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
+    debug!(
+        target: "paneru::perf",
+        "frame ms over {PERF_SAMPLE_WINDOW}: p50={:.2} p95={:.2} max={:.2} priority={:?} verify_repushes={}",
+        percentile(&sorted, 50.0),
+        percentile(&sorted, 95.0),
+        sorted.last().copied().unwrap_or(0.0),
+        orchestrator.priority,
+        std::mem::take(&mut perf.verify_repushes),
     );
 }
 
@@ -262,6 +346,15 @@ mod tests {
             pump_timeout_limit(FramePriority::UserDriven, false, period, false),
             8
         );
+        // Finger down always gets the 8ms cadence, panel or not.
+        assert_eq!(
+            pump_timeout_limit(FramePriority::UserDriven, false, None, false),
+            LOOP_MAX_TIMEOUT_PROMOTION_MS
+        );
+        assert_eq!(
+            pump_timeout_limit(FramePriority::Background, false, None, false),
+            LOOP_MAX_TIMEOUT_FRAME_ACTIVE_MS
+        );
         assert_eq!(
             pump_timeout_limit(FramePriority::Settle, false, None, true),
             LOOP_MAX_TIMEOUT_PROMOTION_MS
@@ -283,6 +376,19 @@ mod tests {
             pump_timeout_limit(FramePriority::Idle, false, period, false),
             LOOP_MAX_TIMEOUT_MS
         );
+    }
+
+    #[test]
+    fn percentile_uses_nearest_rank() {
+        let sorted = vec![1.0, 2.0, 3.0, 4.0];
+        for (pct, want) in [(50.0, 2.0), (95.0, 4.0), (100.0, 4.0)] {
+            let got = percentile(&sorted, pct);
+            assert!(
+                (got - want).abs() < f64::EPSILON,
+                "p{pct}: got {got}, want {want}"
+            );
+        }
+        assert!(percentile(&[], 50.0).abs() < f64::EPSILON);
     }
 
     #[test]

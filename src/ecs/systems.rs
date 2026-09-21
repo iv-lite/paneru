@@ -1623,6 +1623,36 @@ fn overlay_hide_for_swipe(swiping: bool, drag_held: bool) -> bool {
     swiping && !drag_held
 }
 
+/// Throttle window for the holder-less press hit-test below: two SLS round
+/// trips, so at most ~20Hz while a button is held with no tracked grab.
+/// Mirrors the FFM hover throttle; the answer only gates border hiding.
+const PRESS_HIT_THROTTLE: Duration = Duration::from_millis(50);
+
+#[derive(Default)]
+struct PressHitCache {
+    at: Option<Instant>,
+    hit: bool,
+}
+
+/// Whether a press with no tracked holder sits over a managed window.
+/// Cached for [`PRESS_HIT_THROTTLE`]: the overlay ticks every motion frame,
+/// but a 50ms-stale answer is invisible for a hide/show gate.
+fn press_hit_cached(
+    window_manager: &WindowManager,
+    windows: &Windows,
+    cache: &mut PressHitCache,
+) -> bool {
+    if cache.at.is_none_or(|at| at.elapsed() >= PRESS_HIT_THROTTLE) {
+        cache.at = Some(Instant::now());
+        cache.hit = window_manager
+            .cursor_position()
+            .and_then(|point| window_manager.find_window_at_point(&point).ok())
+            .and_then(|id| windows.find(id))
+            .is_some();
+    }
+    cache.hit
+}
+
 #[instrument(level = Level::TRACE, skip_all)]
 #[allow(clippy::too_many_arguments)]
 pub(crate) fn window_moved_update_frame(
@@ -1841,6 +1871,14 @@ pub(super) struct OverlayWindowConfigCache {
     radii: HashMap<WinID, (Option<f64>, Option<f64>)>,
 }
 
+/// Per-tick overlay scratch state, bundled in one `Local` so the system
+/// stays under Bevy's system-param limit.
+#[derive(Default)]
+pub(super) struct OverlayCaches {
+    config: OverlayWindowConfigCache,
+    press_hit: PressHitCache,
+}
+
 /// Windows as the overlay sees them for flight checks: whether paneru is
 /// currently driving or confirming each window.
 type FlightMarkers<'w, 's> = Query<
@@ -2046,7 +2084,7 @@ pub(super) fn update_overlays(
     overlay_mgr: Option<NonSendMut<OverlayManager>>,
     mission_control_active: Res<MissionControlActive>,
     config: Res<Config>,
-    mut window_config_cache: Local<OverlayWindowConfigCache>,
+    mut caches: Local<OverlayCaches>,
     store: Option<Res<SnapshotStore>>,
     window_manager: Res<WindowManager>,
 ) {
@@ -2092,13 +2130,12 @@ pub(super) fn update_overlays(
     // Dim surfaces stay frozen (never hidden — no flash) and the
     // drop-preview ghost keeps painting on its own window.
     let holder_held = !drag_held.is_empty();
+    // Two SLS round trips per tick while any button is held with no holder
+    // (missed-press native drags). Throttled like the FFM hover hit-test:
+    // the answer only gates border hiding, so 50ms staleness is invisible.
     let pressed_without_holder = !holder_held
         && left_button_held()
-        && window_manager
-            .cursor_position()
-            .and_then(|point| window_manager.find_window_at_point(&point).ok())
-            .and_then(|id| windows.find(id))
-            .is_some();
+        && press_hit_cached(&window_manager, &windows, &mut caches.press_hit);
     if holder_held || pressed_without_holder {
         overlay_mgr.hide_borders();
         return;
@@ -2219,7 +2256,7 @@ pub(super) fn update_overlays(
     // The corner radius feeds every bordered window plus the dim cutout
     // hole, so a config change invalidates the whole cache at once.
     if config.is_changed() {
-        window_config_cache.radii.clear();
+        caches.config.radii.clear();
     }
 
     // Desired borders: the focused window with active styling, plus — when
@@ -2233,7 +2270,7 @@ pub(super) fn update_overlays(
             &windows,
             &applications,
             &config,
-            &mut window_config_cache.radii,
+            &mut caches.config.radii,
             store.as_deref(),
         ) else {
             // Parent gone mid-focus: hide rather than freezing the old
@@ -2295,7 +2332,7 @@ pub(super) fn update_overlays(
                 &windows,
                 &applications,
                 &config,
-                &mut window_config_cache.radii,
+                &mut caches.config.radii,
                 store.as_deref(),
             ) else {
                 continue;
@@ -2325,7 +2362,7 @@ pub(super) fn update_overlays(
                 &windows,
                 &applications,
                 &config,
-                &mut window_config_cache.radii,
+                &mut caches.config.radii,
                 store.as_deref(),
             )
             .unwrap_or(10.0),
@@ -2343,9 +2380,7 @@ pub(super) fn update_overlays(
         .map(|(id, _, _)| *id)
         .chain((dim_opacity > 0.0).then_some(focused_window_id))
         .collect();
-    window_config_cache
-        .radii
-        .retain(|id, _| wanted.contains(id));
+    caches.config.radii.retain(|id, _| wanted.contains(id));
 }
 
 #[instrument(level = Level::TRACE, skip_all)]
@@ -2414,6 +2449,7 @@ pub(crate) fn verify_window_position(
     )>,
     store: Option<Res<SnapshotStore>>,
     write_state: Res<AxWriteState>,
+    mut perf: ResMut<crate::ecs::orchestrator::PerfStats>,
     mut commands: Commands,
 ) {
     for (entity, mut window, position, mut verification, repositioning) in &mut windows {
@@ -2459,6 +2495,7 @@ pub(crate) fn verify_window_position(
         }
 
         window.reposition(position.0);
+        perf.verify_repushes += 1;
         if verification.tick()
             && let Ok(mut entity_commands) = commands.get_entity(entity)
         {

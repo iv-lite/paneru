@@ -219,6 +219,11 @@ pub(crate) fn push_position(
     if state.already_sent(window.id(), target) {
         return;
     }
+    // Per-push cost here is two `OnceLock` reads plus one uncontended
+    // `RwLock` read — nanoseconds against the AX write it routes. A
+    // per-window cache would need `WindowApi` trait churn (the atomic
+    // lives on `WindowOS`, not the `Window` newtype) for no measurable
+    // gain, so the global set stays the fast path.
     let async_job = enabled
         .then(|| {
             window

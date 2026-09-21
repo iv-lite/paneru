@@ -11,6 +11,7 @@ use objc2_foundation::{
     NSAttributedString, NSDictionary, NSMutableCopying, NSPoint, NSRect, NSSize, NSString,
 };
 use std::collections::HashMap;
+use std::time::{Duration, Instant};
 
 use crate::platform::WinID;
 
@@ -262,6 +263,12 @@ fn make_overlay_window(mtm: MainThreadMarker, cocoa_frame: NSRect) -> Retained<N
 }
 // ── OverlayManager ──────────────────────────────────────────────────────
 
+/// How long a cached primary-screen height stays valid. Displays barely
+/// change, and `NSScreen::screens` per overlay tick costs more than the
+/// staleness it prevents; display add/remove also rebuilds the surfaces,
+/// which re-probes unconditionally (see `screen_height`).
+const SCREEN_HEIGHT_CACHE: Duration = Duration::from_secs(60);
+
 pub struct OverlayManager {
     mtm: MainThreadMarker,
     /// One overlay window per display. macOS will not reliably let a single
@@ -277,6 +284,10 @@ pub struct OverlayManager {
     /// layer-backed windows (see `BorderOverlay`); entries not in the latest
     /// sync are ordered out and dropped.
     borders: HashMap<WinID, BorderOverlay>,
+    /// Cached [`primary_screen_height`]: up to three overlay entry points
+    /// need it per tick (`update`, `sync_borders`, `show_drop_preview`),
+    /// and each probe walks `NSScreen::screens` on the main thread.
+    screen_h: Option<(Instant, f64)>,
 }
 
 impl OverlayManager {
@@ -287,7 +298,22 @@ impl OverlayManager {
             hidden: false,
             drop_preview: None,
             borders: HashMap::new(),
+            screen_h: None,
         }
+    }
+
+    /// Primary-screen height, cached for [`SCREEN_HEIGHT_CACHE`]. Callers
+    /// that already know the display set changed (surface rebuild) pass
+    /// `refresh = true` to re-probe immediately.
+    fn screen_height(&mut self, refresh: bool) -> f64 {
+        if refresh
+            || self
+                .screen_h
+                .is_none_or(|(at, _)| at.elapsed() >= SCREEN_HEIGHT_CACHE)
+        {
+            self.screen_h = Some((Instant::now(), primary_screen_height(self.mtm)));
+        }
+        self.screen_h.map_or(0.0, |(_, h)| h)
     }
 
     /// Update the per-display dim surfaces.
@@ -301,8 +327,10 @@ impl OverlayManager {
         focused_abs_cg: Option<NSRect>,
         cutout_radius: f64,
     ) {
-        let screen_h = primary_screen_height(self.mtm);
         let screens = NSScreen::screens(self.mtm);
+        // Display add/remove rebuilds from scratch below; re-probe the
+        // cached height on that tick so a new primary applies at once.
+        let screen_h = self.screen_height(self.overlays.len() != screens.len());
 
         // The focused window in Cocoa global coords (shared across all screens).
         let focused_cocoa = focused_abs_cg.map(|cg| cg_abs_to_cocoa(cg, screen_h));
@@ -406,7 +434,7 @@ impl OverlayManager {
     /// genuine param changes rewrite layer properties. Cost is O(changed),
     /// never O(all windows).
     pub fn sync_borders(&mut self, desired: &[(WinID, NSRect, BorderParams)]) {
-        let screen_h = primary_screen_height(self.mtm);
+        let screen_h = self.screen_height(false);
         self.borders.retain(|id, border| {
             let keep = desired.iter().any(|(want, _, _)| want == id);
             if !keep {
@@ -452,7 +480,7 @@ impl OverlayManager {
     /// landing slot, `abs_cg` in absolute CG coords. Reuses its window across
     /// ticks, redrawing only when the rect or params change.
     pub fn show_drop_preview(&mut self, abs_cg: NSRect, border: &BorderParams) {
-        let cocoa = cg_abs_to_cocoa(abs_cg, primary_screen_height(self.mtm));
+        let cocoa = cg_abs_to_cocoa(abs_cg, self.screen_height(false));
         if let Some((window, rect, params)) = &mut self.drop_preview {
             if nsrect_eq(*rect, cocoa) && *params == *border {
                 window.orderFront(None::<&AnyObject>);
@@ -706,17 +734,28 @@ impl FlashMessageView {
 pub struct FlashMessageManager {
     mtm: MainThreadMarker,
     window: Option<Retained<NSWindow>>,
+    screen_h: Option<(Instant, f64)>,
 }
 
 impl FlashMessageManager {
     pub fn new(mtm: MainThreadMarker) -> Self {
-        Self { mtm, window: None }
+        Self {
+            mtm,
+            window: None,
+            screen_h: None,
+        }
     }
 
     #[allow(clippy::cast_precision_loss)]
     pub fn show(&mut self, message: &str, opacity: f32, top_right_abs_cg: NSPoint) {
         let is_badge = message.chars().count() <= 2;
-        let screen_h = primary_screen_height(self.mtm);
+        if self
+            .screen_h
+            .is_none_or(|(at, _)| at.elapsed() >= SCREEN_HEIGHT_CACHE)
+        {
+            self.screen_h = Some((Instant::now(), primary_screen_height(self.mtm)));
+        }
+        let screen_h = self.screen_h.map_or(0.0, |(_, h)| h);
 
         let size = if is_badge {
             NSSize::new(150.0, 150.0)

@@ -1694,8 +1694,20 @@ fn position_layout_windows(
     config: Res<Config>,
     mut commands: Commands,
 ) {
-    let mut strip_contexts = EntityHashMap::default();
+    // Entities whose slots moved this tick. Contexts are only built for
+    // strips holding at least one of them: during a single-strip scroll
+    // the idle strips skip the rebuild instead of rehashing every window
+    // every frame. Sized by the positioned count — each gets exactly one
+    // entry, so the map never rehashes mid-build.
+    let positioned: EntityHashSet = positioned_windows
+        .iter()
+        .map(|(entity, ..)| entity)
+        .collect();
+    let mut strip_contexts = EntityHashMap::with_capacity(positioned.len());
     for (strip_entity, layout_strip, Position(strip_position), swiping, child_of) in &workspaces {
+        if !strip_has_changed_window(layout_strip, &positioned) {
+            continue;
+        }
         let snap_settling = snap_guards.iter().any(|guard| guard.strip == strip_entity);
         insert_strip_window_contexts(
             &mut strip_contexts,
@@ -2023,6 +2035,19 @@ mod tests {
 
     fn test_viewport() -> IRect {
         IRect::new(0, 0, 1024, 768)
+    }
+
+    #[test]
+    fn context_rebuild_gate_skips_strips_without_positioned_windows() {
+        let mut world = World::new();
+        let a = world.spawn_empty().id();
+        let b = world.spawn_empty().id();
+        let mut strip = LayoutStrip::new(2, 0);
+        strip.append(a);
+        strip.append(b);
+        let positioned: EntityHashSet = [a].into_iter().collect();
+        assert!(strip_has_changed_window(&strip, &positioned));
+        assert!(!strip_has_changed_window(&strip, &EntityHashSet::default()));
     }
 
     #[test]

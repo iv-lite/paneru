@@ -190,6 +190,7 @@ pub fn register_systems(app: &mut bevy::app::App) {
     app.init_resource::<systems::ParkedCommands>();
     app.init_resource::<crate::ax_writer::AxWriteState>();
     app.init_resource::<orchestrator::FrameOrchestrator>();
+    app.init_resource::<orchestrator::PerfStats>();
     app.add_systems(
         PreUpdate,
         (
@@ -299,6 +300,8 @@ pub fn register_systems(app: &mut bevy::app::App) {
             orchestrator::SUPERVISION_INTERVAL_SECS,
         ))),
     );
+    // Frame clock close: covers pump → layout → commit → overlay end to end.
+    app.add_systems(Last, orchestrator::log_frame_stats);
 }
 
 /// Registers all the event triggers for the window manager.

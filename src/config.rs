@@ -964,13 +964,14 @@ impl Config {
     }
 
     /// Paces the pump to the display's retrace via a per-screen display
-    /// link instead of fixed 8/16ms sleeps. Experimental, default-off:
-    /// needs macOS 14+ and falls back to the sleep ladder when unbound.
+    /// link instead of fixed 8/16ms sleeps. Default-on: needs macOS 14+
+    /// and falls back to the sleep ladder when unbound, so pre-14 machines
+    /// and explicit `experimental_vsync = false` behave as before.
     pub fn experimental_vsync(&self) -> bool {
-        // Default is disabled.
+        // Default is enabled.
         self.options()
             .experimental_vsync
-            .is_some_and(|enabled| enabled)
+            .is_none_or(|enabled| enabled)
     }
 
     /// Number of virtual workspaces to pre-create on each physical space at
@@ -1479,7 +1480,7 @@ pub struct MainOptions {
     pub ax_writer: Option<bool>,
 
     /// Pace the pump to the display's retrace instead of fixed sleeps.
-    /// Experimental, default-off; see `Config::experimental_vsync`.
+    /// Default-on; see `Config::experimental_vsync`.
     pub experimental_vsync: Option<bool>,
 }
 
@@ -2315,9 +2316,10 @@ fn test_ax_writer_flag_and_alias() {
     assert!(!parse("ax_writer = false").ax_writer_enabled());
     // Deprecated spelling still parses.
     assert!(!parse("experimental_ax_writer = false").ax_writer_enabled());
-    // Vsync stays opt-in.
-    assert!(!parse("").experimental_vsync());
+    // Vsync graduated default: on unless explicitly disabled.
+    assert!(parse("").experimental_vsync());
     assert!(parse("experimental_vsync = true").experimental_vsync());
+    assert!(!parse("experimental_vsync = false").experimental_vsync());
 }
 
 #[test]
