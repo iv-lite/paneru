@@ -379,6 +379,11 @@ fn apply_snap_force(
 ) {
     const CENTER_MAGNETIC_FORCE: f64 = 10.0;
     const SNAP_DISPLAY_RATIO: f64 = 0.45;
+    /// Ceiling for the magnetic snap reach: the ratio scales to >1500px on
+    /// ultrawide viewports, where centering would yank the focused column
+    /// across the monitor and open gaps between neighbors. Past this the
+    /// strip glides to its driven offset and only snaps when close.
+    const SNAP_THRESHOLD_MAX_PX: f64 = 600.0;
 
     // With `center_single_column`, a lone column gets the same magnetic
     // centering so a swipe can't leave it off-center; the nearest-column
@@ -394,7 +399,8 @@ fn apply_snap_force(
 
     let viewport = active_display.actual_bounds(&config);
     let viewport_center = viewport.center().x;
-    let snap_threshold = SNAP_DISPLAY_RATIO * f64::from(viewport.width());
+    let snap_threshold =
+        (SNAP_DISPLAY_RATIO * f64::from(viewport.width())).min(SNAP_THRESHOLD_MAX_PX);
 
     let (strip_entity, layout_strip, position, ref mut scroll, settle) = *strip;
 

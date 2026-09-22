@@ -232,6 +232,21 @@ pub fn try_ax_window_id(element_ref: AXUIElementRef) -> Option<WinID> {
     Some(window_id)
 }
 
+/// Reads the owning pid straight off a raw accessibility element, without a
+/// constructed [`WindowOS`]. Shared by [`WindowApi::pid`] and the live
+/// window-creation path, which must resolve the owning app (for bundle
+/// scoped `manage=true` rules) before role validation can run.
+pub fn pid_of_element(element: &CFRetained<AXUIWrapper>) -> Result<Pid> {
+    let pid: Pid = unsafe {
+        NonNull::new_unchecked(element.as_ptr::<Pid>())
+            .byte_add(0x10)
+            .read()
+    };
+    (pid != 0).then_some(pid).ok_or(Error::InvalidInput(format!(
+        "can not get pid from {element:?}.",
+    )))
+}
+
 // const CPS_ALL_WINDOWS: u32 = 0x100;
 const CPS_USER_GENERATED: u32 = 0x200;
 // const CPS_NO_WINDOWS: u32 = 0x400;
@@ -264,21 +279,6 @@ pub struct WindowOS {
 }
 
 impl WindowOS {
-    /// Creates a new `Window` instance using an empty configuration.
-    /// Non-standard windows are rejected unless they match a `manage = true` rule.
-    ///
-    /// # Arguments
-    ///
-    /// * `element` - A `CFRetained<AXUIWrapper>` reference to the Accessibility UI element.
-    ///
-    /// # Returns
-    ///
-    /// `Ok(Window)` if the window is created successfully, otherwise `Err(Error)`.
-    #[instrument(level = Level::TRACE, ret)]
-    pub fn new(element: &CFRetained<AXUIWrapper>) -> Result<Self> {
-        Self::new_with_config(element, &Config::default(), None)
-    }
-
     /// Creates a new `Window` instance.
     ///
     /// # Arguments
@@ -905,17 +905,7 @@ impl WindowApi for WindowOS {
 
     fn pid(&self) -> Result<Pid> {
         self.pid
-            .get_or_init(|| {
-                let pid: Pid = unsafe {
-                    NonNull::new_unchecked(self.ax_element.as_ptr::<Pid>())
-                        .byte_add(0x10)
-                        .read()
-                };
-                (pid != 0).then_some(pid).ok_or(Error::InvalidInput(format!(
-                    "can not get pid from {:?}.",
-                    self.ax_element
-                )))
-            })
+            .get_or_init(|| pid_of_element(&self.ax_element))
             .clone()
     }
 

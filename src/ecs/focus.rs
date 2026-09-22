@@ -101,7 +101,7 @@ pub struct FocusEventsPlugin;
 impl Plugin for FocusEventsPlugin {
     fn build(&self, app: &mut App) {
         app.init_resource::<FocusHistory>();
-        app.add_systems(Update, (detect_focus_rejection, fix_window_size_on_focus));
+        app.add_systems(Update, (detect_focus_rejection, clamp_window_size_on_focus));
         app.add_systems(
             PostUpdate,
             (
@@ -209,18 +209,40 @@ fn shares_a_tab_group(
 }
 
 #[instrument(level = Level::DEBUG, skip_all, fields(focused))]
-fn fix_window_size_on_focus(
+fn clamp_window_size_on_focus(
     focused: Single<Entity, Added<FocusedMarker>>,
-    mut windows: Query<(&mut Window, &mut Bounds, Has<ResizeMarker>)>,
+    mut windows: Query<(&mut Window, &Bounds, Has<ResizeMarker>)>,
 ) {
-    if let Ok((mut window, mut bounds, resizing)) = windows.get_mut(*focused)
-        && !resizing
-        && let Ok(frame) = window.update_frame()
-        && frame.size() != bounds.0
-    {
-        debug!("fixing window {} size!", window.id());
-        bounds.0 = frame.size();
+    let Ok((mut window, bounds, resizing)) = windows.get_mut(*focused) else {
+        return;
+    };
+    if resizing {
+        return;
     }
+    let Ok(frame) = window.update_frame() else {
+        return;
+    };
+    if frame.size() == bounds.0 {
+        return;
+    }
+    // Sub-pixel OS rounding dither (even-pixel clamps, padding): harmless,
+    // adopt quietly so no `Changed<Bounds>` churn follows every focus.
+    let drift = (frame.size() - bounds.0).abs();
+    if drift.x <= 1 && drift.y <= 1 {
+        return;
+    }
+    // Anything larger is never adopted: the tile is the truth, and adopting
+    // OS drift here is what grew windows to viewport size over repeated
+    // focuses (adopt -> strip dirty -> column master widens -> tile
+    // conformance writes it back -> commit pushes it to the OS). Pull the
+    // app back to its tile instead; `Window::resize` no-ops on <=1px.
+    warn!(
+        "focus: clamping window {} from OS size {} back to tile size {}",
+        window.id(),
+        frame.size(),
+        bounds.0
+    );
+    window.resize(bounds.0);
 }
 
 #[instrument(level = Level::DEBUG, skip_all, fields(focused))]
@@ -320,7 +342,10 @@ fn autocenter_window_on_focus(
     // focus paths (clicks, hover, OS echoes) arrive with no marker and
     // reshuffle here as before. Skipped entirely once centering drove the
     // strip itself: a follow-up reshuffle would overwrite the centering
-    // target with a mere expose offset.
+    // target with a mere expose offset. Plain (not forced): a forced
+    // re-clamp would discard a deliberate `ManualStripOffset` centering on
+    // every refocus — vacated-slot closing on detach paths is already
+    // forced at the detach site itself.
     if !centered && !reshuffling.contains(entity) {
         ctx.commands.reshuffle_around(entity);
     }

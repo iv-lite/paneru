@@ -8,8 +8,8 @@ use crate::commands::{Command, Direction, MoveFocus, Operation};
 use crate::config::{Config, MainOptions, WindowParams, parse_command};
 use crate::ecs::display::FloatingLayer;
 use crate::ecs::{
-    ActiveWorkspaceMarker, Bounds, DragSettleMarker, FocusedMarker, ManualStripOffset,
-    NativeFullscreenMarker, Position, Scrolling, Unmanaged, layout::LayoutStrip,
+    ActiveWorkspaceMarker, Bounds, DragSettleMarker, FocusedMarker, LayoutPosition,
+    ManualStripOffset, NativeFullscreenMarker, Position, Scrolling, Unmanaged, layout::LayoutStrip,
 };
 use crate::ecs::{RepositionMarker, SpawnWindowTrigger};
 use crate::events::Event;
@@ -2839,6 +2839,200 @@ fn test_strip_redrive_mid_burst_lands_exactly() {
             read_pos(world, *member),
             *start + Origin::new(-300, 0),
             "member {member:?} must land exactly on its rigid slot"
+        );
+    }
+}
+
+/// Focusing a window whose OS frame drifted must pull the app back to its
+/// tile instead of adopting the drift into layout: adoption is what grew
+/// windows to viewport size over repeated focuses (adopt -> strip dirty ->
+/// column master widens -> tile conformance writes it back -> commit pushes
+/// it to the OS). Regression: OS drift + focus must leave `Bounds` untouched
+/// and shrink the OS frame back.
+#[test]
+fn test_focus_clamps_os_drift_back_to_tile() {
+    let mut h = TestHarness::new().with_windows(2);
+    quiesce(&mut h);
+    let one = find_window_entity(1, h.app.world_mut());
+    let tile = h.app.world_mut().get::<Bounds>(one).expect("bounds").0;
+    // Simulate app-side growth (self-resize, native drag, rounding): the OS
+    // frame inflates while layout truth stays tiled.
+    let grown = Size::new(tile.x + 200, tile.y + 100);
+    h.mock_state.update_window(1, |w| {
+        w.frame.max = w.frame.min + grown;
+    });
+    // Focus window 1; the clamp must restore the OS frame, not adopt it.
+    h.app.world_mut().write_message::<Event>(Event::Command {
+        command: Command::Window(Operation::Focus(Direction::Last)),
+    });
+    for _ in 0..10 {
+        pump_frame(&mut h);
+    }
+    let world = h.app.world_mut();
+    assert_eq!(
+        world.get::<Bounds>(one).expect("bounds").0,
+        tile,
+        "Bounds must never adopt OS drift on focus"
+    );
+    let mut os_size = Size::new(0, 0);
+    h.mock_state.update_window(1, |w| {
+        os_size = w.frame.size();
+    });
+    assert_eq!(os_size, tile, "OS frame must be pulled back to the tile");
+}
+
+/// On an ultrawide viewport a focus glide is long (2000px+) and the strip
+/// is narrow relative to it: visible, unmarked neighbors must still hold
+/// formation within 2px on every tick. Parked/offscreen pairs and members
+/// carrying their own chase marker (edge reveals) are exempt — only the
+/// visible rigid riders must never separate. Regression for election
+/// losers stranded mid-glide on long flights.
+/// Baseline for [`test_ultrawide_focus_glide_holds_visible_formation`]:
+/// ten windows on a 3440px display, focus forced onto window 0, strip
+/// normalized to a known offset and settled. Returns the harness, member
+/// entities, strip entity, baseline origins, baseline gaps, and which pairs
+/// start edge-to-edge (parked members legitimately snap to slot on glide
+/// start and are exempt from formation).
+#[allow(clippy::too_many_lines)]
+fn ultrawide_glide_baseline() -> (
+    TestHarness,
+    Vec<Entity>,
+    Entity,
+    Vec<Origin>,
+    Vec<i32>,
+    Vec<bool>,
+) {
+    let wide: IRect = IRect::new(0, 0, 3440, 1440);
+    let config: Config = (
+        MainOptions {
+            animation_speed: Some(12.0),
+            auto_center: Some(true),
+            ..Default::default()
+        },
+        vec![],
+    )
+        .into();
+    let mut h = TestHarness::new()
+        .with_display(TEST_DISPLAY_ID, wide, vec![TEST_WORKSPACE_ID])
+        .with_config(config)
+        .with_windows(10);
+    quiesce(&mut h);
+
+    let members: Vec<Entity> = (0..10)
+        .map(|id| find_window_entity(id, h.app.world_mut()))
+        .collect();
+    let strip = {
+        let world = h.app.world_mut();
+        let mut q = world.query_filtered::<Entity, With<ActiveWorkspaceMarker>>();
+        q.single(world).expect("exactly one active strip")
+    };
+    // Guarantee a genuine focus change below: spawn may already have left
+    // the focus on the last window, in which case `Focus(Last)` would be a
+    // repeat (ensure-visible snap, no animated glide to measure).
+    h.app.world_mut().write_message::<Event>(Event::Command {
+        command: Command::Window(Operation::Focus(Direction::First)),
+    });
+    for _ in 0..60 {
+        pump_frame(&mut h);
+        let world = h.app.world_mut();
+        let focused: Vec<WinID> = world
+            .query_filtered::<(&Window, Entity), With<FocusedMarker>>()
+            .iter(world)
+            .map(|(w, _)| w.id())
+            .collect();
+        if focused == vec![0] {
+            break;
+        }
+    }
+    // Normalize like the ride tests: the flight must start from a known
+    // offset with every member exactly home.
+    h.app
+        .world_mut()
+        .entity_mut(strip)
+        .insert(Position(Origin::new(0, 20)));
+    quiesce(&mut h);
+    let read_pos = |world: &mut World, e: Entity| world.get::<Position>(e).expect("position").0;
+    let base: Vec<Origin> = members
+        .iter()
+        .map(|e| read_pos(h.app.world_mut(), *e))
+        .collect();
+    let base_gaps: Vec<i32> = base.windows(2).map(|w| w[1].x - w[0].x).collect();
+    let in_formation: Vec<bool> = base_gaps
+        .iter()
+        .map(|gap| *gap == TEST_WINDOW_WIDTH)
+        .collect();
+    (h, members, strip, base, base_gaps, in_formation)
+}
+
+#[test]
+fn test_ultrawide_focus_glide_holds_visible_formation() {
+    let wide: IRect = IRect::new(0, 0, 3440, 1440);
+    let (mut h, members, strip, _base, base_gaps, in_formation) = ultrawide_glide_baseline();
+    let read_pos = |world: &mut World, e: Entity| world.get::<Position>(e).expect("position").0;
+    let read_size = |world: &mut World, e: Entity| world.get::<Bounds>(e).expect("bounds").0;
+    h.app.world_mut().write_message::<Event>(Event::Command {
+        command: Command::Window(Operation::Focus(Direction::Last)),
+    });
+
+    let visible = |world: &mut World, e: Entity| {
+        let pos = read_pos(world, e);
+        let size = read_size(world, e);
+        let center = pos + size / 2;
+        wide.contains(center)
+    };
+    let mut saw_flight = false;
+    for tick in 0..80 {
+        pump_frame(&mut h);
+        let world = h.app.world_mut();
+        if world.get::<RepositionMarker>(strip).is_some() {
+            saw_flight = true;
+        }
+        let current: Vec<Origin> = members.iter().map(|e| read_pos(world, *e)).collect();
+        for (i, pair) in current.windows(2).enumerate() {
+            let (a, b) = (members[i], members[i + 1]);
+            if !in_formation[i]
+                || world.get::<RepositionMarker>(a).is_some()
+                || world.get::<RepositionMarker>(b).is_some()
+                || !visible(world, a)
+                || !visible(world, b)
+            {
+                continue;
+            }
+            let gap = pair[1].x - pair[0].x;
+            assert!(
+                (gap - base_gaps[i]).abs() <= 2,
+                "tick {tick}: visible pair {i} detached: gap {gap} vs {}",
+                base_gaps[i]
+            );
+        }
+    }
+    assert!(
+        saw_flight,
+        "the strip must actually have animated for the test to mean anything"
+    );
+    let world = h.app.world_mut();
+    assert!(
+        world.get::<RepositionMarker>(strip).is_none(),
+        "the strip must have landed within the step budget"
+    );
+    // Exact landing for every member still on screen: each must sit exactly
+    // on its layout slot displaced by the landed strip offset. Slot truth,
+    // not baseline truth: members parked at baseline legitimately unpark
+    // onto their slots mid-glide.
+    for member in &members {
+        if world.get::<RepositionMarker>(*member).is_some() || !visible(world, *member) {
+            continue;
+        }
+        // Slot truth, not baseline truth: members parked at baseline
+        // legitimately unpark onto their slots mid-glide.
+        let slot = world
+            .get::<LayoutPosition>(*member)
+            .map(|l| l.0)
+            .expect("layout slot");
+        assert_eq!(
+            read_pos(world, *member),
+            slot + read_pos(world, strip),
+            "visible member {member:?} must land exactly on its slot"
         );
     }
 }

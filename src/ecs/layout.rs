@@ -1699,10 +1699,11 @@ fn near_home(plan: &RidePlan) -> bool {
 }
 /// Election fuzz for the rigid ride: residuals within this Chebyshev
 /// distance count as the same motion. Covers integer-rounding splits
-/// between siblings converging one flight (a 1px tail difference must not
+/// between siblings converging one flight (per-tick `round()` can separate
+/// neighbors by a couple of px on long glides — a split that small must not
 /// break an otherwise unanimous ride); genuine slides sit orders of
 /// magnitude further apart and still elect nothing.
-const RIDE_MATCH_PX: i32 = 2;
+const RIDE_MATCH_PX: i32 = 4;
 
 fn cheby(a: (i32, i32), b: (i32, i32)) -> i32 {
     (a.0 - b.0).abs().max((a.1 - b.1).abs())
@@ -2322,11 +2323,11 @@ mod tests {
             world.spawn_empty().id(),
         );
         // A stale tail marker must not disqualify a sibling moving with
-        // the strip, and 1px rounding splits must not break unanimity.
+        // the strip, and small rounding splits must not break unanimity.
         assert_eq!(
             elect_ride_delta(&[
                 ride_plan(a, (-300, 0), false),
-                ride_plan(b, (-301, 0), false),
+                ride_plan(b, (-303, 0), false),
                 ride_plan(c, (-300, 0), false),
             ]),
             Some((-300, 0))

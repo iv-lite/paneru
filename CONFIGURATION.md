@@ -308,6 +308,17 @@ horizontal_padding = 5
 bindings_passthrough = ["ctrl-h", "ctrl-l"]
 ```
 
+**Java apps (e.g. DBeaver):** Java windows often report non-standard
+accessibility roles, so Paneru ignores them by default. Force-manage them
+with a bundle-scoped `manage` rule (applies to windows launched both before
+and while Paneru is running — find the Bundle ID via `paneru query`):
+```toml
+[windows.dbeaver]
+title = ".*"
+bundle_id = "org.jkiss.dbeaver.core.product"
+manage = true
+```
+
 ### Copying a window rule
 
 Neither the bundle ID nor the exact window title is visible anywhere in the UI,

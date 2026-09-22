@@ -12,6 +12,7 @@ use bevy::math::IRect;
 use bevy::tasks::AsyncComputeTaskPool;
 use bevy::tasks::futures_lite::future;
 use bevy::time::Time;
+use objc2_core_foundation::CFRetained;
 use objc2_foundation::{NSPoint, NSRect, NSSize};
 use std::collections::{HashMap, HashSet, VecDeque};
 use std::pin::Pin;
@@ -42,6 +43,7 @@ use crate::ecs::{
 use crate::events::{Event, InputEvent};
 use crate::manager::{
     Application, Display, Origin, Process, Window, WindowManager, WindowOS, bruteforce_windows,
+    pid_of_element,
 };
 use crate::overlay::{FlashMessageManager, OverlayManager};
 use crate::platform::input::{TapHealth, left_button_held};
@@ -50,6 +52,7 @@ use crate::snapshot::{
     ON_SCREEN_MAX_AGE, SNAPSHOT_FRAME_MAX_AGE, SnapshotRoster, SnapshotStore, on_screen_set,
     snapshot_corner_radius, snapshot_live_frame,
 };
+use crate::util::AXUIWrapper;
 
 /// Processes and applications still inside their spawn grace period, with the
 /// `FreshMarker` that says whether the spawn actually completed in time.
@@ -2892,17 +2895,41 @@ pub(crate) fn update_low_power_state(low_power_mode: Option<ResMut<LowPowerMode>
 }
 
 #[instrument(level = Level::DEBUG, skip_all)]
-pub(crate) fn window_creation_event(mut messages: MessageReader<Event>, mut commands: Commands) {
+pub(crate) fn window_creation_event(
+    mut messages: MessageReader<Event>,
+    applications: Query<&Application>,
+    config: Option<Res<Config>>,
+    mut commands: Commands,
+) {
+    // Resolve the owning app's bundle for the live path: Java-style windows
+    // with non-standard roles are only manageable via a bundle-scoped
+    // `manage=true` rule, and the default-config validation below would drop
+    // them before any app linkage exists. `None` bundle degrades to the old
+    // title-only matching.
+    let bundle_for = |element: &CFRetained<AXUIWrapper>| {
+        pid_of_element(element).ok().and_then(|pid| {
+            applications
+                .iter()
+                .find(|app| app.pid() == pid)
+                .and_then(|app| app.bundle_id())
+        })
+    };
     for event in messages.read() {
         let Event::WindowCreated { element } = event else {
             continue;
         };
 
-        if let Ok(window) = WindowOS::new(element)
-            .inspect_err(|err| {
-                trace!("not adding window {element:?}: {err}");
-            })
-            .map(|window| Window::new(Box::new(window)))
+        let bundle = bundle_for(element);
+        let config = config.as_deref();
+        if let Ok(window) = WindowOS::new_with_config(
+            element,
+            config.unwrap_or(&Config::default()),
+            bundle.as_deref(),
+        )
+        .inspect_err(|err| {
+            trace!("not adding window {element:?}: {err}");
+        })
+        .map(|window| Window::new(Box::new(window)))
         {
             commands.trigger(SpawnWindowTrigger(vec![window]));
         }
