@@ -1,3 +1,4 @@
+use std::collections::{HashMap, VecDeque};
 use std::sync::mpsc::Receiver;
 use std::time::{Duration, Instant};
 
@@ -24,7 +25,10 @@ use bevy::{
     ecs::{component::Component, entity::Entity, schedule::IntoScheduleConfigs},
 };
 use derive_more::{Deref, DerefMut};
+use objc2_core_foundation::CFRetained;
 use tracing::{Level, error, instrument, warn};
+
+use crate::util::AXUIWrapper;
 
 use crate::commands::register_commands;
 use crate::config::snippet::SnippetDialect;
@@ -202,6 +206,10 @@ pub fn register_systems(app: &mut bevy::app::App) {
     // double-buffered and dropped after a frame like any other message stream.
     app.add_message::<InputEvent>();
     app.init_resource::<systems::ParkedCommands>();
+    app.init_resource::<crate::ecs::PendingValidations>();
+    app.init_resource::<crate::ecs::AdoptionCalm>();
+    app.init_resource::<crate::ecs::UserFocus>();
+    app.init_resource::<crate::ecs::LastPress>();
     app.init_resource::<crate::ecs::BurstClock>();
     app.init_resource::<crate::ecs::DisplayGeneration>();
     app.init_resource::<crate::ax_writer::AxWriteState>();
@@ -209,6 +217,7 @@ pub fn register_systems(app: &mut bevy::app::App) {
         PreUpdate,
         (
             systems::window_creation_event,
+            systems::retry_pending_validations.after(systems::window_creation_event),
             systems::pump_events,
             systems::demux_input_events.after(systems::pump_events),
             systems::park_cold_commands,
@@ -808,7 +817,169 @@ impl ColdStart {
 #[derive(Resource, Debug, Default)]
 pub struct DisplayGeneration(pub u64);
 
-/// Bevy event trigger for spawning new windows.
+/// A focus arrival the user asked for (keyboard command just now): set by
+/// command handlers alongside the focus they issue. OS echoes (app
+/// self-raise, notification steal, stale retries) never set it, so arrival
+/// systems can tell user intent from ambient focus noise: intent may
+/// rearrange (center, reshuffle); noise may only refocus and reveal.
+#[derive(Resource, Debug, Default)]
+pub struct UserFocus {
+    pub entity: Option<Entity>,
+    pub at: Duration,
+}
+
+/// How long a keyboard-issued focus counts as the arrival's cause. Past
+/// this, a focus change reads as ambient again (slow AX echoes must not
+/// inherit intent forever).
+pub const USER_FOCUS_CAUSE_WINDOW: Duration = Duration::from_millis(500);
+
+/// Last mouse press (time + absolute point), for click correlation:
+/// a focus landing within the window under a fresh press is user intent
+/// even though it arrives as an OS echo (clicks raise natively).
+#[derive(Resource, Debug, Default)]
+pub struct LastPress {
+    pub at: Duration,
+    pub point: Origin,
+}
+
+/// How long a press lends intent to a focus landing inside its window.
+pub const PRESS_FOCUS_CAUSE_WINDOW: Duration = Duration::from_millis(400);
+
+/// Bounded retry queue for live window validations that failed transiently
+/// (slow AX reads, not-yet-published roles, missing app linkage at
+/// `kAXCreated` time). Each entry re-attempts a few times with growing
+/// backoff, then drops: a permanently invalid window must not spin forever.
+/// Duplicate spawns are harmless (the spawn trigger drops dup `WinID`s).
+#[derive(Resource, Debug, Default)]
+pub struct PendingValidations {
+    queue: Vec<PendingValidation>,
+}
+
+/// Retries per element before giving up.
+const PENDING_VALIDATION_TRIES: u8 = 3;
+/// Cap on queued elements; oldest drops first under app-spawn storms.
+const PENDING_VALIDATION_CAP: usize = 64;
+
+#[derive(Debug)]
+struct PendingValidation {
+    element: CFRetained<AXUIWrapper>,
+    tries: u8,
+    next_retry: Duration,
+}
+
+impl PendingValidations {
+    /// Queues a failed validation for retry, starting in 500ms.
+    pub fn queue(&mut self, element: &CFRetained<AXUIWrapper>, now: Duration) {
+        if self.queue.len() >= PENDING_VALIDATION_CAP {
+            self.queue.remove(0);
+        }
+        self.queue.push(PendingValidation {
+            element: element.clone(),
+            tries: PENDING_VALIDATION_TRIES,
+            next_retry: now + Duration::from_millis(500),
+        });
+    }
+
+    /// Growing backoff by tries remaining: 1s, then 2s.
+    fn retry_delay(tries: u8) -> Duration {
+        Duration::from_millis(
+            500 * 2_u64.pow(u32::from(PENDING_VALIDATION_TRIES.saturating_sub(tries))),
+        )
+    }
+}
+
+/// Damping for chronic native resizers (Electron breathing, progress-driven
+/// re-layout): windows that adopt small OS sizes over and over hold the tile
+/// instead of chasing app jitter. Button-held resizes (live user edge-drags)
+/// always adopt; large deltas reset the episode. See `damp`.
+#[derive(Resource, Debug, Default)]
+pub struct AdoptionCalm {
+    recent: HashMap<WinID, (VecDeque<Duration>, bool)>,
+}
+
+/// Small adoptions before damping engages, inside the trailing window.
+const ADOPTION_CALM_COUNT: usize = 5;
+/// Trailing window a burst of small adoptions must fit in to count as jitter.
+const ADOPTION_CALM_WINDOW: Duration = Duration::from_secs(60);
+/// Deltas at/above this are genuine resizes: adopted, and reset the episode.
+const ADOPTION_CALM_PX: i32 = 8;
+
+impl AdoptionCalm {
+    /// Records a small button-up size adoption for `win` at `now`; returns
+    /// `true` when the window is now breathing and this adoption should be
+    /// skipped (tile holds). Warns once per episode; large deltas and quiet
+    /// stretches reset it.
+    pub fn damp(&mut self, win: WinID, now: Duration, delta_px: i32) -> bool {
+        if delta_px >= ADOPTION_CALM_PX {
+            self.recent.remove(&win);
+            return false;
+        }
+        let (recent, warned) = self.recent.entry(win).or_default();
+        while recent
+            .front()
+            .is_some_and(|at| now.saturating_sub(*at) > ADOPTION_CALM_WINDOW)
+        {
+            recent.pop_front();
+        }
+        recent.push_back(now);
+        if recent.len() > ADOPTION_CALM_COUNT {
+            if !*warned {
+                *warned = true;
+                warn!(
+                    "adoption damping: window {win} resized itself repeatedly; holding tile size"
+                );
+            }
+            return true;
+        }
+        false
+    }
+}
+
+#[cfg(test)]
+mod adoption_calm_tests {
+    use super::*;
+
+    #[test]
+    fn chronic_jitter_damps_then_large_resets() {
+        let mut calm = AdoptionCalm::default();
+        let start = Duration::from_secs(100);
+        // Five small adoptions inside the window still adopt...
+        for i in 0..ADOPTION_CALM_COUNT {
+            let now = start + Duration::from_millis(i as u64 * 20);
+            assert!(!calm.damp(7, now, 2), "small adoption {i} adopts");
+        }
+        // ...the sixth is held.
+        assert!(
+            calm.damp(7, start + Duration::from_millis(120), 2),
+            "chronic jitter holds the tile"
+        );
+        // A large resize is genuine: adopts and resets the episode.
+        assert!(
+            !calm.damp(7, start + Duration::from_millis(140), 50),
+            "large resize resets"
+        );
+        assert!(
+            !calm.damp(7, start + Duration::from_millis(160), 2),
+            "fresh episode adopts again"
+        );
+        // Other windows are independent.
+        assert!(!calm.damp(9, start, 2));
+    }
+
+    #[test]
+    fn quiet_stretch_resets_the_episode() {
+        let mut calm = AdoptionCalm::default();
+        for i in 0..ADOPTION_CALM_COUNT {
+            assert!(!calm.damp(7, Duration::from_secs(i as u64), 2));
+        }
+        // Past the trailing window, history drains and adoption resumes.
+        assert!(
+            !calm.damp(7, Duration::from_secs(120), 2),
+            "quiet stretch resets"
+        );
+    }
+}
+
 #[derive(BevyEvent)]
 pub struct SpawnWindowTrigger(pub Vec<Window>);
 

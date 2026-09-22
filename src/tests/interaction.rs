@@ -2477,14 +2477,21 @@ fn test_focus_centers_strip_with_all_members_riding() {
     // Hand focus to the middle window directly: the animation path under
     // test starts at `Added<FocusedMarker>`, like any OS/command focus.
     // Slot 400 centers at strip offset 512 - 200 - 400 = -88, so every
-    // member stays visible for the whole flight.
+    // member stays visible for the whole flight. Seed user intent alongside
+    // (as a keyboard command would): ambient OS focus must not rearrange.
     {
+        use crate::ecs::UserFocus;
+
         let world = h.app.world_mut();
         let mut focused = world.query_filtered::<Entity, With<FocusedMarker>>();
         for entity in focused.iter(world).collect::<Vec<_>>() {
             world.entity_mut(entity).remove::<FocusedMarker>();
         }
         world.entity_mut(members[1]).insert(FocusedMarker);
+        let now = world.resource::<Time>().elapsed();
+        let mut intent = world.resource_mut::<UserFocus>();
+        intent.entity = Some(members[1]);
+        intent.at = now;
     }
 
     let mut prev = base.clone();
@@ -3076,6 +3083,103 @@ fn test_first_animated_tick_always_moves() {
     assert!(
         world.get::<RepositionMarker>(strip).is_some(),
         "the leg must still be flying after the kick"
+    );
+}
+
+/// A natively jittering window stops moving layout after a burst of small
+/// self-resizes: the first few adopt (indistinguishable from user intent),
+/// then the tile holds; a large resize still adopts and resets the episode.
+#[test]
+fn test_chronic_native_jitter_stops_adopting() {
+    let mut h = TestHarness::new().with_windows(1);
+    quiesce(&mut h);
+    let entity = find_window_entity(0, h.app.world_mut());
+    let tile = h.app.world_mut().get::<Bounds>(entity).expect("bounds").0;
+    // Five 2px breaths adopt like user resizes...
+    for _ in 0..5 {
+        let mut grown = Size::new(0, 0);
+        h.mock_state.update_window(0, |w| {
+            grown = w.frame.size() + Size::new(2, 0);
+            w.frame.max = w.frame.min + grown;
+        });
+        h.mock_state.os_resize_window(0, grown);
+        pump_frame(&mut h);
+        pump_frame(&mut h);
+    }
+    let after_breathing = h.app.world_mut().get::<Bounds>(entity).expect("bounds").0;
+    assert_eq!(
+        after_breathing,
+        tile + Size::new(10, 0),
+        "early jitter still adopts"
+    );
+    // ...then the tile holds against further jitter.
+    let mut grown = Size::new(0, 0);
+    h.mock_state.update_window(0, |w| {
+        grown = w.frame.size() + Size::new(2, 0);
+        w.frame.max = w.frame.min + grown;
+    });
+    h.mock_state.os_resize_window(0, grown);
+    pump_frame(&mut h);
+    pump_frame(&mut h);
+    assert_eq!(
+        h.app.world_mut().get::<Bounds>(entity).expect("bounds").0,
+        after_breathing,
+        "chronic jitter must hold the tile"
+    );
+    // A large resize is genuine: adopts and resets.
+    let mut big = Size::new(0, 0);
+    h.mock_state.update_window(0, |w| {
+        big = w.frame.size() + Size::new(100, 0);
+        w.frame.max = w.frame.min + big;
+    });
+    h.mock_state.os_resize_window(0, big);
+    pump_frame(&mut h);
+    pump_frame(&mut h);
+    assert_eq!(
+        h.app.world_mut().get::<Bounds>(entity).expect("bounds").0,
+        big,
+        "large resize adopts and resets the episode"
+    );
+}
+
+/// An OS-echo focus (app self-raise: no command, no press) refocuses and
+/// reveals but never rearranges: the strip must not run the centering glide
+/// (which would take it negative here). The marker still moves so focus
+/// state stays truthful.
+#[test]
+fn test_os_echo_focus_reveals_without_rearranging() {
+    let config: Config = (
+        MainOptions {
+            animation_speed: Some(12.0),
+            auto_center: Some(true),
+            ..Default::default()
+        },
+        vec![],
+    )
+        .into();
+    let mut h = TestHarness::new().with_config(config).with_windows(2);
+    quiesce(&mut h);
+    let strip = {
+        let world = h.app.world_mut();
+        let mut q = world.query_filtered::<Entity, With<ActiveWorkspaceMarker>>();
+        q.single(world).expect("exactly one active strip")
+    };
+    let read_pos = |world: &mut World, e: Entity| world.get::<Position>(e).expect("position").0;
+    // Settle with window 0 focused and centered; the echo below then moves
+    // focus to window 1 without any user intent on record.
+    for _ in 0..30 {
+        pump_frame(&mut h);
+    }
+    h.mock_state.focus_window(1);
+    for _ in 0..30 {
+        pump_frame(&mut h);
+    }
+    let world = h.app.world_mut();
+    assert_focused!(world, 1);
+    assert!(
+        read_pos(world, strip).x >= 0,
+        "OS-echo focus must never run the centering glide (strip went {:?})",
+        read_pos(world, strip)
     );
 }
 

@@ -10,6 +10,7 @@ use bevy::ecs::schedule::SystemCondition as _;
 use bevy::ecs::schedule::common_conditions::{not, resource_exists};
 use bevy::ecs::system::{Commands, Query, Res, ResMut, Single};
 use bevy::math::IRect;
+use bevy::time::Time;
 use objc2_core_graphics::CGDirectDisplayID;
 use tracing::{Level, instrument};
 use tracing::{debug, error, info};
@@ -32,7 +33,7 @@ use crate::ecs::{
     ActiveDisplayMarker, ActiveWorkspaceMarker, Bounds, ColdStart, DockPosition, DragDisplayArmed,
     FocusedMarker, FullWidthMarker, Initializing, ManualStripOffset, MissionControlActive,
     MouseHeldMarker, NativeFullscreenMarker, RaiseWindow, SelectedVirtualMarker, SpawnCommandsExt,
-    Timeout, Unmanaged,
+    Timeout, Unmanaged, UserFocus,
 };
 use crate::events::Event;
 use crate::manager::{Application, Display, Origin, Size, Window, WindowManager, origin_from};
@@ -419,6 +420,8 @@ fn command_move_focus(
     restored: Query<&RestoreFocusMarker>,
     global_state: GlobalState,
     mut focus_history: ResMut<FocusHistory>,
+    time: Res<Time>,
+    mut user_focus: ResMut<UserFocus>,
     mut commands: Commands,
 ) {
     // Drain every queued press: N rapid repeats in one pump batch become
@@ -450,6 +453,10 @@ fn command_move_focus(
             &mut commands,
         ) {
             arrival = Some(entity);
+            // Keyboard-issued focus carries user intent: arrival systems may
+            // rearrange for it (center, reshuffle). OS echoes never set this.
+            user_focus.entity = Some(entity);
+            user_focus.at = time.elapsed();
             continue;
         }
         // North/South fall-through past the strip is handled inline below

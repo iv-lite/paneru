@@ -35,7 +35,7 @@ use crate::ecs::params::{ActiveDisplay, FrameActivity, Windows};
 use crate::ecs::workspace::SnapStripMarker;
 use crate::ecs::{
     ActiveWorkspaceMarker, AnyWindowInFlight, Bounds, BruteforceWindows, ColdStart, FlashMessage,
-    FocusedMarker, Initializing, LowPowerMode, MissionControlActive, Position,
+    FocusedMarker, Initializing, LowPowerMode, MissionControlActive, PendingValidations, Position,
     ReadDisplayProperties, ResendMarker, RestoreWindowState, Scrolling, SendMessageTrigger,
     SpawnCommandsExt, Unmanaged, WidthRatio, WindowProperties,
 };
@@ -747,6 +747,8 @@ pub(crate) fn finish_setup(
     config: Option<Res<Config>>,
     session: Option<Res<crate::ecs::restore::SessionRestore>>,
     restoration: Option<Res<crate::ecs::state::PaneruState>>,
+    time: Res<Time>,
+    mut user_focus: ResMut<crate::ecs::UserFocus>,
     mut commands: Commands,
 ) {
     if !process_query.is_empty() {
@@ -863,9 +865,13 @@ pub(crate) fn finish_setup(
     sort_startup_strips_by_live_x(&windows, &mut workspaces);
 
     // Focus the leftmost column top of the active strip after the sync sort.
+    // Boot focus counts as user intent (there is no prior arrangement to
+    // preserve), so arrival systems may center/reshuffle for it.
     for (_, strip, active_strip, _) in &workspaces {
         if active_strip && let Some(entity) = strip.first().ok().and_then(|column| column.top()) {
             commands.focus_entity(entity, true);
+            user_focus.entity = Some(entity);
+            user_focus.at = time.elapsed();
             focused_managed_window = true;
         }
     }
@@ -1746,6 +1752,14 @@ fn sweep_input_tap(
     }
 }
 
+/// Clock + damping state for native-resize adoption, bundled so
+/// `window_resized_update_frame` stays under Bevy's system-param limit.
+#[derive(bevy::ecs::system::SystemParam)]
+pub(super) struct ResizeCalm<'w> {
+    time: Res<'w, Time>,
+    calm: ResMut<'w, crate::ecs::AdoptionCalm>,
+}
+
 #[instrument(level = Level::TRACE, skip_all)]
 pub(super) fn window_resized_update_frame(
     mut messages: MessageReader<Event>,
@@ -1754,6 +1768,7 @@ pub(super) fn window_resized_update_frame(
     held: Query<(Entity, &MouseHeldMarker, Has<DragDisplayArmed>)>,
     config: Res<Config>,
     drag_modifiers: Res<DragModifierState>,
+    mut calm: ResizeCalm<'_>,
 ) {
     for event in messages.read() {
         let Event::WindowResized { window_id } = event else {
@@ -1800,6 +1815,17 @@ pub(super) fn window_resized_update_frame(
 
         let old_frame = IRect::from_corners(position.0, position.0 + bounds.0);
         if old_frame.size() != new_frame.size() {
+            // Chronic native breathers (Electron re-layout, progress-driven
+            // resizes): small button-up adoptions arriving over and over are
+            // app jitter, not user intent — holding a button means a live
+            // user edge-drag, which always adopts. Past the threshold the
+            // tile holds and the OS frame is left alone (logged once per
+            // episode); a large resize resets the episode.
+            let jitter = (new_frame.size() - old_frame.size()).abs();
+            let jitter = jitter.x.max(jitter.y);
+            if !left_button_held() && calm.calm.damp(window.id(), calm.time.elapsed(), jitter) {
+                continue;
+            }
             if tabbed {
                 bounds.bypass_change_detection().0 = new_frame.size();
             } else {
@@ -3047,6 +3073,8 @@ pub(crate) fn window_creation_event(
     mut messages: MessageReader<Event>,
     applications: Query<&Application>,
     config: Option<Res<Config>>,
+    time: Res<Time>,
+    mut pending: ResMut<PendingValidations>,
     mut commands: Commands,
 ) {
     // Resolve the owning app's bundle for the live path: Java-style windows
@@ -3054,20 +3082,12 @@ pub(crate) fn window_creation_event(
     // `manage=true` rule, and the default-config validation below would drop
     // them before any app linkage exists. `None` bundle degrades to the old
     // title-only matching.
-    let bundle_for = |element: &CFRetained<AXUIWrapper>| {
-        pid_of_element(element).ok().and_then(|pid| {
-            applications
-                .iter()
-                .find(|app| app.pid() == pid)
-                .and_then(|app| app.bundle_id())
-        })
-    };
     for event in messages.read() {
         let Event::WindowCreated { element } = event else {
             continue;
         };
 
-        let bundle = bundle_for(element);
+        let bundle = bundle_for_element(&applications, element);
         let config = config.as_deref();
         if let Ok(window) = WindowOS::new_with_config(
             element,
@@ -3080,7 +3100,78 @@ pub(crate) fn window_creation_event(
         .map(|window| Window::new(Box::new(window)))
         {
             commands.trigger(SpawnWindowTrigger(vec![window]));
+        } else {
+            // Slow launchers (Java/Gecko beachballs, transient subroles)
+            // often fail validation for a few hundred ms and then publish
+            // cleanly. Queue a bounded retry instead of dropping: the next
+            // Space switch was the only retry path, and hot-reloaded
+            // `manage=true` rules deserve a live second chance too.
+            // Duplicate spawns are harmless (the trigger drops dup WinIDs).
+            pending.queue(element, time.elapsed());
         }
+    }
+}
+
+/// Resolves the owning app's bundle for a raw window element, for rule
+/// matching before any entity exists. Shared by the live creation path and
+/// its retry below.
+fn bundle_for_element(
+    applications: &Query<&Application>,
+    element: &CFRetained<AXUIWrapper>,
+) -> Option<String> {
+    pid_of_element(element).ok().and_then(|pid| {
+        applications
+            .iter()
+            .find(|app| app.pid() == pid)
+            .and_then(|app| app.bundle_id())
+    })
+}
+
+/// Re-attempts live validations that failed transiently (slow AX reads,
+/// not-yet-published roles, missing app linkage). Bounded per element so a
+/// permanently invalid window cannot spin forever; the queue itself is
+/// capped for the same reason.
+pub(crate) fn retry_pending_validations(
+    applications: Query<&Application>,
+    config: Option<Res<Config>>,
+    time: Res<Time>,
+    mut pending: ResMut<PendingValidations>,
+    mut commands: Commands,
+) {
+    let now = time.elapsed();
+    let config = config.as_deref();
+    let mut spawned = Vec::new();
+    pending.queue.retain_mut(|entry| {
+        if now < entry.next_retry {
+            return true;
+        }
+        let bundle = bundle_for_element(&applications, &entry.element);
+        match WindowOS::new_with_config(
+            &entry.element,
+            config.unwrap_or(&Config::default()),
+            bundle.as_deref(),
+        )
+        .map(|window| Window::new(Box::new(window)))
+        {
+            Ok(window) => {
+                spawned.push(window);
+                false
+            }
+            Err(err) => {
+                entry.tries -= 1;
+                entry.next_retry = now + PendingValidations::retry_delay(entry.tries);
+                if entry.tries == 0 {
+                    debug!("pending validation exhausted for element: {err}");
+                    false
+                } else {
+                    trace!("pending validation retry deferred: {err}");
+                    true
+                }
+            }
+        }
+    });
+    if !spawned.is_empty() {
+        commands.trigger(SpawnWindowTrigger(spawned));
     }
 }
 

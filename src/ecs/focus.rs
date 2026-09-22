@@ -17,8 +17,9 @@ use bevy::time::common_conditions::on_timer;
 use tracing::{Level, debug, instrument, trace, warn};
 
 use super::{
-    DeferredExposeMarker, FocusedMarker, MouseHeldMarker, PositionDrive, RepositionMarker,
-    ReshuffleAroundMarker, SystemTheme, Unmanaged,
+    DeferredExposeMarker, FocusedMarker, LastPress, MouseHeldMarker, PRESS_FOCUS_CAUSE_WINDOW,
+    PositionDrive, RepositionMarker, ReshuffleAroundMarker, SystemTheme, USER_FOCUS_CAUSE_WINDOW,
+    Unmanaged, UserFocus,
 };
 use crate::config::Config;
 use crate::ecs::layout::LayoutStrip;
@@ -289,14 +290,53 @@ fn detect_focus_rejection(
 
 #[instrument(level = Level::DEBUG, skip_all, fields(trigger))]
 #[allow(clippy::too_many_arguments)]
+/// Whether a focus arrival on `entity` was user-initiated (a keyboard
+/// command naming it just now, or a mouse press just now inside its frame)
+/// as opposed to ambient OS noise (app self-raise, notification steal,
+/// Cmd-Tab front-switch, stale retry). Intent may rearrange (center,
+/// reshuffle); noise may only refocus and reveal — an app must never move
+/// the user's strip by raising itself.
+pub fn user_initiated_focus(
+    user: &UserFocus,
+    press: &LastPress,
+    now: Duration,
+    entity: Entity,
+    frame: IRect,
+) -> bool {
+    if user.entity == Some(entity) && now.saturating_sub(user.at) <= USER_FOCUS_CAUSE_WINDOW {
+        return true;
+    }
+    if now.saturating_sub(press.at) <= PRESS_FOCUS_CAUSE_WINDOW && frame.contains(press.point) {
+        return true;
+    }
+    false
+}
+
+/// User-intent clocks for focus arrivals, bundled so
+/// `autocenter_window_on_focus` stays under Bevy's system-param limit.
+#[derive(bevy::ecs::system::SystemParam)]
+struct FocusIntent<'w> {
+    user_focus: Res<'w, UserFocus>,
+    last_press: Res<'w, LastPress>,
+    time: Res<'w, Time>,
+}
+
+/// Arrival guards for `autocenter_window_on_focus`, bundled for the same
+/// param-limit reason.
+#[derive(bevy::ecs::system::SystemParam)]
+struct FocusArrivalGuards<'w, 's> {
+    mouse_held: Query<'w, 's, &'static MouseHeldMarker>,
+    restored: Query<'w, 's, &'static RestoreFocusMarker>,
+    reshuffling: Query<'w, 's, Entity, With<ReshuffleAroundMarker>>,
+}
+
 fn autocenter_window_on_focus(
     focused: Single<Entity, Added<FocusedMarker>>,
-    mouse_held: Query<&MouseHeldMarker>,
-    restored: Query<&RestoreFocusMarker>,
-    reshuffling: Query<Entity, With<ReshuffleAroundMarker>>,
+    guards: FocusArrivalGuards<'_, '_>,
     strips: Query<(Entity, &LayoutStrip)>,
     global_state: GlobalState,
     active_display: ActiveDisplay,
+    intent: FocusIntent<'_>,
     mut ctx: WindowCtx,
 ) {
     let entity = *focused;
@@ -304,14 +344,30 @@ fn autocenter_window_on_focus(
     // Skip auto-centering when this focus came from a workspace restore, since
     // the strip is already at its saved origin. window_focused_trigger and
     // timeout_ticker are responsible for clearing the marker.
-    if restored.iter().any(|marker| marker.entity == entity) {
+    if guards.restored.iter().any(|marker| marker.entity == entity) {
         return;
     }
 
-    if global_state.skip_reshuffle() || global_state.initializing() || !mouse_held.is_empty() {
+    if global_state.skip_reshuffle() || global_state.initializing() || !guards.mouse_held.is_empty()
+    {
         return;
     }
     if active_display.active_strip().tabbed(entity) {
+        return;
+    }
+    // Ambient OS focus (self-raise, notification steal, front-switch) must
+    // not rearrange the strip: refocus and reveal still run (marker move,
+    // `ensure_focused_visible` below), but centering and reshuffling belong
+    // to user intent only.
+    if !ctx.windows.frame(entity).is_some_and(|frame| {
+        user_initiated_focus(
+            &intent.user_focus,
+            &intent.last_press,
+            intent.time.elapsed(),
+            entity,
+            frame,
+        )
+    }) {
         return;
     }
     // Center by moving the STRIP, never the window: the focused window keeps
@@ -346,7 +402,7 @@ fn autocenter_window_on_focus(
     // re-clamp would discard a deliberate `ManualStripOffset` centering on
     // every refocus — vacated-slot closing on detach paths is already
     // forced at the detach site itself.
-    if !centered && !reshuffling.contains(entity) {
+    if !centered && !guards.reshuffling.contains(entity) {
         ctx.commands.reshuffle_around(entity);
     }
 }

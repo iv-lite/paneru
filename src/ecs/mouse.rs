@@ -22,9 +22,9 @@ use crate::ecs::layout::{Column, LayoutStrip, desired_window_frame};
 use crate::ecs::params::{ActiveDisplayMut, GlobalState, Windows};
 use crate::ecs::workspace::mid_strip_slot;
 use crate::ecs::{
-    ActiveWorkspaceMarker, ColdStart, DockPosition, ManualStripOffset, MissionControlActive,
-    Position, RepositionMarker, Scrolling, SelectedVirtualMarker, SpawnCommandsExt, TitlebarGrab,
-    Unmanaged,
+    ActiveWorkspaceMarker, ColdStart, DockPosition, LastPress, ManualStripOffset,
+    MissionControlActive, Position, RepositionMarker, Scrolling, SelectedVirtualMarker,
+    SpawnCommandsExt, TitlebarGrab, Unmanaged,
 };
 use crate::manager::{Display, Origin, Size, Window, WindowManager, origin_from};
 use crate::overlay::{BorderParams, OverlayManager};
@@ -367,6 +367,8 @@ fn mouse_down_trigger(
     mut paint: ResMut<DragPaintState>,
     mut global_state: GlobalState,
     mut logged_config: Local<bool>,
+    time: Res<Time>,
+    mut last_press: ResMut<LastPress>,
     mut commands: Commands,
 ) {
     if !*logged_config {
@@ -388,8 +390,12 @@ fn mouse_down_trigger(
         // A press is explicit pointer intent: clear the focus-follows-mouse
         // reshuffle skip so the click's focus echo can glue the active
         // display to the clicked window (see `window_focused_trigger`).
-        // Hovers set it again on their own focus path.
+        // Hovers set it again on their own focus path. The press is also
+        // recorded so a focus landing inside its window reads as user
+        // intent even though clicks raise natively (OS echo).
         global_state.set_skip_reshuffle(false);
+        last_press.at = time.elapsed();
+        last_press.point = origin_from(*point);
 
         let Some((window, entity)) = window_manager
             .find_window_at_point(point)
