@@ -1807,12 +1807,16 @@ pub(crate) fn window_moved_update_frame(
             };
             let drift = (live.min - position.0).abs();
             debug!("untracked native drag of window {entity}, drift {drift:?}: pushing slot back");
+            // Joins the in-flight commit frame: this push-back belongs to
+            // the motion already converging, not a new one.
+            let epoch = write_state.current_epoch();
             push_position(
                 &mut window,
                 position.0,
                 writer.as_deref(),
                 &mut write_state,
                 config.ax_writer_enabled(),
+                epoch,
             );
             continue;
         }
@@ -1831,12 +1835,14 @@ pub(crate) fn window_moved_update_frame(
             let drift = (new_frame.min - position.0).abs();
             if drift.x > 1 || drift.y > 1 {
                 debug!("scroll grace: echo for {entity} drifted {drift:?}, pushing slot back");
+                let epoch = write_state.current_epoch();
                 crate::ax_writer::push_position(
                     &mut window,
                     position.0,
                     writer.as_deref(),
                     &mut write_state,
                     config.ax_writer_enabled(),
+                    epoch,
                 );
             }
             continue;
@@ -2473,6 +2479,10 @@ pub(super) fn commit_window_position(
 ) {
     use crate::ax_writer::push_position;
 
+    // Open the commit frame: every push below — across all displays —
+    // joins one epoch, so whole-frame convergence stays observable even
+    // though the worker drains latest-per-window.
+    let epoch = write_state.begin_frame();
     if !(config.ax_writer_enabled() && writer.is_some()) {
         // Synchronous path: default, tests (no queue), dance apps, and
         // shutdown. Unchanged behavior.
@@ -2491,12 +2501,14 @@ pub(super) fn commit_window_position(
             writer.as_deref(),
             &mut write_state,
             true,
+            epoch,
         );
     }
 }
 
 /// Drains writer completions into the ack map, ahead of the adoption and
-/// verify readers. No world access — never conflicts.
+/// verify readers. No world access — never conflicts. Advances the landed
+/// frame frontier and runs the stuck-writer watchdog.
 pub(super) fn drain_ax_acks(
     inbox: Option<Res<AxWriteInbox>>,
     mut write_state: ResMut<AxWriteState>,
@@ -2511,7 +2523,17 @@ pub(super) fn drain_ax_acks(
                 ack.win_id, ack.seq
             );
         }
-        write_state.acknowledge(ack.win_id, ack.seq);
+        write_state.acknowledge(ack.win_id, ack.seq, ack.epoch);
+    }
+    // Stuck-worker watchdog: whole commit frames keep issuing while none
+    // land — the OS never sees the motion, so say so loudly instead of
+    // letting siblings converge on stale frames forever.
+    if let Some(gap) = write_state.check_stall() {
+        warn!(
+            "ax writer: no commit frame landed for {gap} frames; \
+             the writer thread may be stuck (latest landed: {})",
+            write_state.last_landed(),
+        );
     }
 }
 

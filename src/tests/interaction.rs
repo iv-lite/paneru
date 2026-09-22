@@ -2382,6 +2382,28 @@ fn test_strip_translation_rides_members_together() {
     }
 }
 
+/// Commit ticks open writer epochs even on the synchronous path (the
+/// harness has no queue): after motion settles, epochs advanced and
+/// nothing is left in flight.
+#[test]
+fn test_commit_advances_writer_epochs() {
+    use crate::ax_writer::AxWriteState;
+
+    let mut h = TestHarness::new().with_windows(3);
+    h.run(vec![Event::MenuOpened { window_id: 0 }]);
+    let world = h.app.world_mut();
+    let state = world.resource::<AxWriteState>();
+    assert!(
+        state.current_epoch() > 0,
+        "commits must open epochs while moving"
+    );
+    assert_eq!(
+        state.last_landed(),
+        0,
+        "with no queue nothing async can land"
+    );
+}
+
 /// A genuine slot change with a static strip must still animate each window
 /// independently: rigid riding is for strip translation only, never for
 /// topology. Guards against over-correcting the ride into teleports.

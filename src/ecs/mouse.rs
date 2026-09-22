@@ -1110,12 +1110,14 @@ fn scroll_settle_check(
             // Human-rate releases keep this far from spammy. Routes through
             // the single-writer discipline when the flag is on.
             info!("scroll settle: OS window {member} drifted {drift:?}, pushing slot");
+            let epoch = write_state.current_epoch();
             crate::ax_writer::push_position(
                 &mut window,
                 position.0,
                 writer.as_deref(),
                 &mut write_state,
                 config.ax_writer_enabled(),
+                epoch,
             );
             pending.push(member);
         }
