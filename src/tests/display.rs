@@ -609,13 +609,12 @@ fn dragged_active_display_id(world: &mut World) -> u32 {
     world.get::<Display>(entity).expect("need display").id()
 }
 
-/// A config with prod-default drag friction enabled (plus instant
-/// animation for exact asserts).
-fn friction_config() -> Config {
+/// A config with instant animation for exact asserts. Held drags track
+/// the pointer 1:1 with no friction by construction.
+fn drag_assert_config() -> Config {
     (
         MainOptions {
             animation_speed: Some(1_000_000.0),
-            drag_friction_enabled: Some(true),
             ..Default::default()
         },
         vec![],
@@ -670,31 +669,25 @@ fn test_vertical_drag_wiggle_moves_nothing() {
         .run(commands);
 }
 
-/// A sustained scroll-drag damps with recent travel: the first step applies
-/// 1:1, then each step counts `exp(-recent_debt/tau)` with the fractional
-/// remainder carried, so sustained fast motion eases out instead of running
-/// 1:1 forever — while slow motion tracks exactly. Idle settle is stretched
-/// out here so only the damping term is under test; the tau is tightened so
-/// damping shows within the few hundred pixels the lift-timeout settle
-/// leaves alone (window 1 stays fully visible throughout, so no reveal
-/// corrects the offset).
+/// A sustained scroll-drag tracks the pointer 1:1: there is no friction
+/// while the strip moves — every step applies its full delta the same tick,
+/// so sustained fast motion never eases out. Friction lives only on the
+/// release path, once the drag had motion and the button comes up (the
+/// release glide owns it there).
 #[test]
-fn test_sustained_scroll_drag_damps_travel() {
+fn test_sustained_scroll_drag_tracks_pointer_one_to_one() {
     let config: Config = (
         MainOptions {
             animation_speed: Some(1_000_000.0),
-            drag_friction_enabled: Some(true),
-            drag_friction_distance_tau_px: Some(200.0),
-            drag_friction_idle_settle_ms: Some(5000),
             ..Default::default()
         },
         vec![],
     )
         .into();
     // Five windows give the strip room without a clamp wall: four -100px
-    // steps would travel -400 raw, but recent-travel damping lands the
-    // strip at -319 (-100, -77, -72, -70 with carry creep across the
-    // 200ms command windows).
+    // steps travel -400 raw, and the strip lands exactly there — window 1
+    // stays fully visible throughout, so no sliver parking or reveal
+    // corrects its offset (window 0 does park into its sliver at -400).
     let grab = CGPoint::new(200.0, 30.0);
     let commands = vec![
         Event::MenuOpened { window_id: 0 },
@@ -733,17 +726,17 @@ fn test_sustained_scroll_drag_damps_travel() {
             assert_window_at!(world, 0, -100, TEST_MENUBAR_HEIGHT);
         })
         .on_iteration(5, |world, _state| {
-            assert_window_at!(world, 0, -319, TEST_MENUBAR_HEIGHT);
+            assert_window_at!(world, 1, 0, TEST_MENUBAR_HEIGHT);
         })
         .run(commands);
 }
 
-/// A held strip whose pointer goes quiet settles without a release: past
-/// the idle timeout the strip is handed to the inertia/snap pipeline with
-/// the held-rate EMA while the button stays down, so the offset keeps
-/// gliding left past where the drives alone left it.
+/// A held strip whose pointer goes quiet stays put: with no friction
+/// while held and no handoff before release, the raw-driven offset simply
+/// waits — no glide, no settle arming — until the button comes up and the
+/// release path owns whatever motion follows.
 #[test]
-fn test_idle_hold_releases_strip_to_settle() {
+fn test_idle_hold_keeps_strip_put_until_release() {
     let grab = CGPoint::new(200.0, 30.0);
     let commands = vec![
         Event::MenuOpened { window_id: 0 },
@@ -774,43 +767,39 @@ fn test_idle_hold_releases_strip_to_settle() {
     ];
 
     TestHarness::new()
-        .with_config(friction_config())
+        .with_config(drag_assert_config())
         .with_windows(5)
         // No MouseUp is ever sent: the holder must still be down while the
-        // strip already glides and settles on its own.
+        // strip sits exactly where the raw drives left it.
         .on_iteration(7, |world, _state| {
             let held = world
                 .query_filtered::<Entity, With<MouseHeldMarker>>()
                 .iter(world)
                 .count();
             assert_eq!(held, 1, "button still held, no release sent");
-            // The two damped drives land the strip at -737; the idle handoff
-            // plus glide must have carried it further left since.
+            // Two raw -400px drives land the strip at -800; nothing may
+            // carry it further while held.
             let mut strips = world.query_filtered::<
                 (&Position, Option<&Scrolling>, Has<DragSettleMarker>),
                 (With<LayoutStrip>, With<ActiveWorkspaceMarker>),
             >();
             let (position, scrolling, settled) = strips.single(world).expect("strip");
-            assert!(settled, "idle handoff must arm the drag-release settle");
+            assert!(!settled, "no settle may arm before release");
             assert!(
-                scrolling.as_ref().is_some_and(|s| !s.is_user_swiping),
-                "held strip must be handed to the pipeline, not user-driven"
+                scrolling.is_none(),
+                "no pipeline handoff while held: {scrolling:?}"
             );
-            assert!(
-                position.0.x < -686,
-                "held strip must keep gliding without a release, got {}",
-                position.0.x
-            );
+            assert_eq!(position.0.x, -800, "held strip must wait at its raw offset");
         })
         .run(commands);
 }
 
-/// Resuming a drag after the idle handoff re-drives from the settled
-/// offset with no jump: the pointer comes back, the strip follows it in
-/// the pointer's direction, and the motion never exceeds the raw pointer
-/// travel (damping only ever shrinks it).
+/// Resuming a drag after a quiet hold re-drives 1:1 from the kept offset
+/// with no jump: the pointer comes back, the strip follows it in the
+/// pointer's direction, and the motion never exceeds the raw pointer
+/// travel.
 #[test]
-fn test_resumed_drag_after_idle_settle_does_not_jump() {
+fn test_resumed_drag_after_quiet_hold_follows_pointer() {
     use std::cell::Cell;
     use std::rc::Rc;
     let grab = CGPoint::new(200.0, 30.0);
@@ -830,7 +819,7 @@ fn test_resumed_drag_after_idle_settle_does_not_jump() {
             point: CGPoint::new(-600.0, 30.0),
             modifiers: Modifiers::empty(),
         },
-        // Two quiet windows (~400ms) trip the idle handoff mid-gesture.
+        // Two quiet windows (~400ms): the strip must simply wait.
         Event::Command {
             command: Command::PrintState,
         },
@@ -852,7 +841,7 @@ fn test_resumed_drag_after_idle_settle_does_not_jump() {
     ];
 
     TestHarness::new()
-        .with_config(friction_config())
+        .with_config(drag_assert_config())
         .with_windows(5)
         .on_iteration(5, move |world, _state| {
             let mut strips = world.query_filtered::<
@@ -861,8 +850,12 @@ fn test_resumed_drag_after_idle_settle_does_not_jump() {
             >();
             let (position, scrolling) = strips.single(world).expect("strip");
             assert!(
-                scrolling.as_ref().is_some_and(|s| !s.is_user_swiping),
-                "idle handoff must have fired before the resume"
+                scrolling.is_none(),
+                "quiet hold must hand nothing to the pipeline"
+            );
+            assert_eq!(
+                position.0.x, -800,
+                "quiet hold must wait at its raw offset"
             );
             probe.set(position.0.x);
         })
@@ -889,7 +882,7 @@ fn test_resumed_drag_after_idle_settle_does_not_jump() {
                 .count();
             assert_eq!(held, 0, "release ends the gesture");
             // All five windows still tile on the strip after the whole
-            // drive-settle-resume-release cycle.
+            // drive-quiet-resume-release cycle.
             let mut strips = world.query_filtered::<
                 &LayoutStrip,
                 (With<LayoutStrip>, With<ActiveWorkspaceMarker>),
@@ -900,12 +893,74 @@ fn test_resumed_drag_after_idle_settle_does_not_jump() {
         .run(commands);
 }
 
+/// A programmatic strip move cancels a live release glide instead of
+/// fighting it: a seeded `Scrolling` velocity plus a fresh
+/// `RepositionMarker` (what keyboard focus issues) must hand the strip to
+/// the animator in one tick — scroll state removed, settle marker gone —
+/// so the glide can't overwrite the animated offset behind its back and
+/// stall the transition midway. Without the cancel the integrator and the
+/// constraints re-apply the stale glide offset every frame while the
+/// animator lerps away from it.
+#[test]
+fn test_driven_strip_move_cancels_live_glide() {
+    let mut h = TestHarness::new().with_windows(3);
+    h.run(vec![Event::MenuOpened { window_id: 0 }]);
+    // A hot release glide mid-flight, plus a settle marker as the release
+    // path leaves them, plus the focus move arriving on top of it.
+    let world = h.app.world_mut();
+    let (strip, strip_x, strip_y) = {
+        let mut strips = world.query_filtered::<
+            (Entity, &Position),
+            (With<LayoutStrip>, With<ActiveWorkspaceMarker>),
+        >();
+        let (strip, position) = strips.single(world).expect("strip");
+        (strip, position.0.x, position.0.y)
+    };
+    world.entity_mut(strip).insert((
+        Scrolling {
+            velocity: 5.0,
+            position: f64::from(strip_x),
+            is_user_swiping: false,
+            last_event: Duration::ZERO,
+        },
+        RepositionMarker(Origin::new(strip_x - 400, strip_y)),
+        DragSettleMarker,
+    ));
+    for _ in 0..6 {
+        h.app.update();
+        for event in h.mock_state.drain_events() {
+            h.app.world_mut().write_message::<Event>(event);
+        }
+    }
+    let world = h.app.world_mut();
+    let mut strips = world.query_filtered::<(
+        Entity,
+        &Position,
+        Option<&Scrolling>,
+        Option<&DragSettleMarker>,
+    ), (With<LayoutStrip>, With<ActiveWorkspaceMarker>)>();
+    let (_, position, scrolling, settle) = strips.single(world).expect("strip");
+    // Neutralized (or reaped as spent): either way no velocity remains to
+    // overwrite the animator, and the settle path no longer steers through
+    // the stale offset.
+    assert!(
+        scrolling.is_none_or(|s| s.velocity == 0.0),
+        "live glide must be cancelled by the driven move"
+    );
+    assert!(
+        settle.is_none(),
+        "settle marker must not outlive the driven move"
+    );
+    // Converged at the driven target: with instant test animation the
+    // animator lands once the glide stops fighting it.
+    assert_eq!(position.0.x, -400);
+}
+
 /// A config enabling display transfer while Alt is held.
 fn drag_display_config() -> Config {
     (
         MainOptions {
             mouse_drag_display_modifier: Some(Modifiers::ALT),
-            drag_friction_enabled: Some(false),
             ..Default::default()
         },
         vec![],
@@ -3508,7 +3563,6 @@ fn test_hidden_ratio_max_still_arms_drag_transfer() {
         MainOptions {
             mouse_drag_display_modifier: Some(Modifiers::ALT),
             window_hidden_ratio: Some(1.0),
-            drag_friction_enabled: Some(false),
             ..Default::default()
         },
         vec![],

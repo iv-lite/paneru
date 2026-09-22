@@ -271,12 +271,11 @@ fn setup_world() -> App {
     // Instant animation speed: prod defaults to fluid motion, but the
     // suite's 200ms command windows assert exact rest positions, which a
     // glide would still be traveling toward. Tests covering animation set
-    // their own speed explicitly. Same for drag friction: prod damps
-    // sustained drags, but the suite pins exact 1:1 pointer tracking;
-    // friction tests opt back in explicitly.
+    // their own speed explicitly. Held drags track the pointer 1:1 with no
+    // friction by construction, so the suite pins exact pointer tracking
+    // everywhere.
     let harness_options = MainOptions {
         animation_speed: Some(1_000_000.0),
-        drag_friction_enabled: Some(false),
         ..Default::default()
     };
     let harness_config: Config = (harness_options, Vec::new()).into();
