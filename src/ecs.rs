@@ -258,7 +258,7 @@ pub fn register_systems(app: &mut bevy::app::App) {
         PostUpdate,
         (
             (
-                systems::drop_orphan_tween_legs,
+                systems::settle_orphan_drives,
                 systems::animate_entities,
                 systems::commit_window_position.run_if(not(resource_exists::<Initializing>)),
                 // Throttled: each check is a synchronous AX read per window.
@@ -352,7 +352,8 @@ pub type AnyWindowInFlight = (
     Or<(
         With<RepositionMarker>,
         With<ResizeMarker>,
-        With<VerifyWindowPosition>,
+        With<PositionDrive>,
+        With<SizeDrive>,
     )>,
 );
 
@@ -385,24 +386,93 @@ pub struct RepositionMarker(pub Origin);
 #[derive(Component, Debug, Deref, DerefMut)]
 pub struct ResizeMarker(pub Size);
 
-/// In-flight tween state for a driven move: `start` is the presented frame
-/// when the leg began, `target` the intent it converges on, `started` the
-/// virtual timestamp of the leg, `duration` its fixed length. Inserted lazily
-/// by the animator so the dozens of `reposition_entity` call sites stay
-/// untouched; removed together with [`RepositionMarker`] on landing.
-/// A changed target retargets (start = current presented frame) instead of
-/// restarting, so focus-spam stays fluid.
+/// A dropped async write awaiting resend: the queue was full (or the writer
+/// gone) when the target was pushed, and no `Changed` will refire to retry
+/// it. Commit picks these up alongside changed windows and drops the marker
+/// once the resend lands in the queue (or dedups).
+#[derive(Component)]
+pub struct ResendMarker;
+
+/// One driven motion, unifying what used to be three components
+/// (`RepositionMarker` intent + tween leg + verify marker): the tween leg
+/// (`start`, `started`, `duration`) plus the confirmation `phase`.
+/// Born lazily by the animator so the dozens of `reposition_entity` call
+/// sites stay untouched; the animator advances `Animating` legs, the
+/// verifier consumes `Verifying` ones. A changed target retargets (start =
+/// current presented frame) instead of restarting, so focus-spam stays
+/// fluid. Because intent and confirmation share one component, orphan legs
+/// (the old tween-without-marker haunting) are structurally rare and swept
+/// by `drop_orphan_drives`.
 #[derive(Component, Debug)]
-pub struct PositionTween {
+pub struct PositionDrive {
     pub start: Origin,
     pub target: Origin,
     pub started: Duration,
     pub duration: Duration,
+    pub phase: DrivePhase,
 }
 
-/// In-flight tween state for a driven resize. Mirrors [`PositionTween`].
+/// Confirmation phase of a [`PositionDrive`] (mirrored for sizes by removal:
+/// resizes carry no confirm step, so [`SizeDrive`] has no phase).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum DrivePhase {
+    /// Gliding toward `target`; owned by the animator.
+    Animating,
+    /// Landed; owned by the verifier. `remaining` bounds the re-push retries
+    /// (matches the old 3-tick verify budget).
+    Verifying { remaining: u8 },
+}
+
+/// Confirmation budget for a landed leg.
+pub const DRIVE_VERIFY_RETRIES: u8 = 3;
+
+impl PositionDrive {
+    /// Fresh leg: glides `start -> target` on the shared burst phase.
+    pub fn animating(start: Origin, target: Origin, started: Duration, duration: Duration) -> Self {
+        Self {
+            start,
+            target,
+            started,
+            duration,
+            phase: DrivePhase::Animating,
+        }
+    }
+
+    /// Pure confirmation leg (no glide): for moves completed without the
+    /// animator (rigid rides, snap assigns, release backstops).
+    pub fn verifying() -> Self {
+        Self {
+            start: Origin::ZERO,
+            target: Origin::ZERO,
+            started: Duration::ZERO,
+            duration: Duration::ZERO,
+            phase: DrivePhase::Verifying {
+                remaining: DRIVE_VERIFY_RETRIES,
+            },
+        }
+    }
+
+    pub fn is_verifying(&self) -> bool {
+        matches!(self.phase, DrivePhase::Verifying { .. })
+    }
+
+    /// Ticks the confirmation budget; `true` when exhausted (drop the drive).
+    pub fn tick(&mut self) -> bool {
+        match &mut self.phase {
+            DrivePhase::Verifying { remaining } => {
+                *remaining = remaining.saturating_sub(1);
+                *remaining == 0
+            }
+            DrivePhase::Animating => false,
+        }
+    }
+}
+
+/// In-flight tween state for a driven resize. Mirrors [`PositionDrive`]'s
+/// leg without the confirm phase (sizes are confirmed by the resize
+/// verifier trigger instead).
 #[derive(Component, Debug)]
-pub struct SizeTween {
+pub struct SizeDrive {
     pub start: Size,
     pub target: Size,
     pub started: Duration,
@@ -630,24 +700,6 @@ pub enum DockPosition {
     Hidden,
 }
 
-#[derive(Component)]
-pub struct VerifyWindowPosition {
-    remaining: u8,
-}
-
-impl Default for VerifyWindowPosition {
-    fn default() -> Self {
-        Self { remaining: 3 }
-    }
-}
-
-impl VerifyWindowPosition {
-    pub fn tick(&mut self) -> bool {
-        self.remaining = self.remaining.saturating_sub(1);
-        self.remaining == 0
-    }
-}
-
 #[derive(Deref, DerefMut, Resource)]
 pub struct LowPowerMode(pub bool);
 
@@ -758,6 +810,15 @@ pub trait SpawnCommandsExt {
 
     fn resize_entity(&mut self, entity: Entity, size: Size);
 
+    /// Seats a confirmation leg for a move completed without the animator
+    /// (rigid strip rides, snap assigns, release backstops): without it a
+    /// swallowed OS push drifts silently until the 5s audit. The verify pass
+    /// is throttled and tolerant, so this costs one read per landing, not
+    /// per frame. Call only when no `RepositionMarker` is live — a driven
+    /// leg verifies itself at landing, and overwriting its leg would destroy
+    /// the tween state the animator owns.
+    fn ensure_verifying(&mut self, entity: Entity);
+
     fn reshuffle_around(&mut self, entity: Entity);
 
     /// Like [`SpawnCommandsExt::reshuffle_around`], but forces the strip
@@ -792,12 +853,17 @@ impl SpawnCommandsExt for Commands<'_, '_> {
     #[instrument(level = Level::TRACE, skip(self))]
     fn reposition_entity(&mut self, entity: Entity, origin: Origin) {
         if let Ok(mut entity_commands) = self.get_entity(entity) {
-            // Every driven move carries its own verification: without it a
-            // swallowed OS push (stale-cache equality, eaten AX call) drifts
-            // silently until the 5s audit. The verify pass is throttled and
-            // tolerant, so this costs one read per landing, not per frame.
+            // The animator births the `PositionDrive` leg (and transitions it
+            // to verifying on landing); confirmation rides along without a
+            // second component here.
             entity_commands.try_insert(RepositionMarker(origin));
-            entity_commands.try_insert(VerifyWindowPosition::default());
+        }
+    }
+
+    #[instrument(level = Level::TRACE, skip(self))]
+    fn ensure_verifying(&mut self, entity: Entity) {
+        if let Ok(mut entity_commands) = self.get_entity(entity) {
+            entity_commands.try_insert(PositionDrive::verifying());
         }
     }
 

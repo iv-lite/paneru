@@ -21,8 +21,8 @@ use crate::ecs::params::Windows;
 use crate::ecs::workspace::SnapStripMarker;
 use crate::ecs::{
     ActiveWorkspaceMarker, Bounds, DockPosition, EnsureVisibleMarker, Initializing, LayoutPosition,
-    ManualStripOffset, MouseHeldMarker, Position, RepositionMarker, ReshuffleAroundMarker,
-    ResizeMarker, Scrolling, SpawnCommandsExt, Unmanaged, VerifyWindowPosition,
+    ManualStripOffset, MouseHeldMarker, Position, PositionDrive, RepositionMarker,
+    ReshuffleAroundMarker, ResizeMarker, Scrolling, SpawnCommandsExt, Unmanaged,
 };
 use crate::errors::{Error, Result};
 use crate::events::Event;
@@ -176,6 +176,7 @@ type RideMembers<'w, 's> = Query<
         &'static mut Position,
         &'static mut Bounds,
         Option<&'static mut RepositionMarker>,
+        Option<&'static PositionDrive>,
     ),
     (With<Window>, Without<LayoutStrip>),
 >;
@@ -1578,14 +1579,20 @@ fn ride_strip_motion(
             // dropped, while genuinely diverging slides lose the election
             // and keep animating below. `near_home` additionally snaps
             // aboard windows whose own slide had all but converged.
-            if let Ok((_, _, _, mut position, mut bounds, _)) = members.get_mut(plan.entity) {
+            if let Ok((_, _, _, mut position, mut bounds, _, drive)) = members.get_mut(plan.entity)
+            {
                 position.0 = plan.frame.min;
                 if bounds.0 != plan.frame.size() {
                     bounds.0 = plan.frame.size();
                 }
                 if let Ok(mut entity_commands) = commands.get_entity(plan.entity) {
                     entity_commands.try_remove::<RepositionMarker>();
-                    entity_commands.try_insert(VerifyWindowPosition::default());
+                    // A leg left behind without its marker is settled into
+                    // verifying by the orphan pass; a member with no leg at
+                    // all still needs confirmation seated explicitly.
+                    if drive.is_none() {
+                        entity_commands.try_insert(PositionDrive::verifying());
+                    }
                 }
             }
         } else {
@@ -1596,7 +1603,7 @@ fn ride_strip_motion(
             // so the leg bends smoothly and still lands exactly — including
             // the final correction after the strip settles, which skipping
             // would strand stale.
-            if let Ok((_, _, _, _, mut bounds, marker)) = members.get_mut(plan.entity) {
+            if let Ok((_, _, _, _, mut bounds, marker, _)) = members.get_mut(plan.entity) {
                 if bounds.0 != plan.frame.size() {
                     bounds.0 = plan.frame.size();
                 }
@@ -1626,7 +1633,7 @@ fn collect_riders(
     strip_contexts: &EntityHashMap<StripWindowContext>,
 ) -> Vec<Rider> {
     let mut riders = Vec::new();
-    for (entity, window, layout_position, position, bounds, _) in members {
+    for (entity, window, layout_position, position, bounds, _, _) in members {
         let Some(context) = strip_contexts.get(&entity).copied() else {
             continue;
         };

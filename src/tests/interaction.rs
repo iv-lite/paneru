@@ -3861,13 +3861,13 @@ fn test_foreign_window_move_is_adopted() {
         .run(commands);
 }
 
-/// Every driven move carries verification: `reposition_entity` attaches a
-/// `VerifyWindowPosition` alongside the move marker.
+/// A landed move hands its drive to the verifier: the intent marker is
+/// consumed at landing and a verifying drive remains until the OS confirms.
 #[test]
-fn test_reposition_entity_attaches_verification() {
+fn test_landed_move_hands_drive_to_verifier() {
     use bevy::ecs::system::RunSystemOnce as _;
 
-    use crate::ecs::VerifyWindowPosition;
+    use crate::ecs::PositionDrive;
 
     let mut harness = TestHarness::new().with_windows(1);
     harness.run(vec![Event::MenuOpened { window_id: 0 }]);
@@ -3880,23 +3880,29 @@ fn test_reposition_entity_attaches_verification() {
             commands.reposition_entity(entity, Origin::new(0, TEST_MENUBAR_HEIGHT));
         })
         .expect("reposition runs");
+    world
+        .run_system_once(crate::ecs::systems::animate_entities)
+        .expect("animate runs");
+    let world = harness.world();
     assert!(
-        world.get::<RepositionMarker>(entity).is_some(),
-        "needs a move marker"
+        world.get::<RepositionMarker>(entity).is_none(),
+        "marker is consumed at landing"
     );
     assert!(
-        world.get::<VerifyWindowPosition>(entity).is_some(),
-        "every driven move carries verification"
+        world
+            .get::<PositionDrive>(entity)
+            .is_some_and(crate::ecs::PositionDrive::is_verifying),
+        "landed leg verifies until the OS confirms"
     );
 }
 
 /// Sub-pixel OS rounding converges the verifier instead of spinning it:
-/// 1px of drift removes the marker with no push, real drift pushes once.
+/// 1px of drift removes the drive with no push, real drift pushes once.
 #[test]
 fn test_verify_tolerates_one_pixel_rounding() {
     use bevy::ecs::system::RunSystemOnce as _;
 
-    use crate::ecs::VerifyWindowPosition;
+    use crate::ecs::PositionDrive;
 
     let mut harness = TestHarness::new().with_windows(1);
     harness.run(vec![Event::MenuOpened { window_id: 0 }]);
@@ -3907,26 +3913,24 @@ fn test_verify_tolerates_one_pixel_rounding() {
     });
     let world = harness.world();
     let entity = find_window_entity(0, world);
-    world
-        .entity_mut(entity)
-        .insert(VerifyWindowPosition::default());
+    world.entity_mut(entity).insert(PositionDrive::verifying());
     world
         .run_system_once(crate::ecs::systems::verify_window_position)
         .expect("verify runs");
     let world = harness.world();
     assert!(
-        world.get::<VerifyWindowPosition>(entity).is_none(),
+        world.get::<PositionDrive>(entity).is_none(),
         "1px rounding must converge, not spin"
     );
 }
 
 /// A genuinely displaced OS window is pushed back into its slot by verify,
-// with the marker surviving until the mock confirms.
+// with the drive surviving until the mock confirms.
 #[test]
 fn test_verify_pushes_back_displaced_window() {
     use bevy::ecs::system::RunSystemOnce as _;
 
-    use crate::ecs::VerifyWindowPosition;
+    use crate::ecs::PositionDrive;
 
     let mut harness = TestHarness::new().with_windows(1);
     harness.run(vec![Event::MenuOpened { window_id: 0 }]);
@@ -3939,9 +3943,7 @@ fn test_verify_pushes_back_displaced_window() {
         window.frame = IRect::from_corners(min, min + window.frame.size());
     });
     let world = harness.world();
-    world
-        .entity_mut(entity)
-        .insert(VerifyWindowPosition::default());
+    world.entity_mut(entity).insert(PositionDrive::verifying());
     world
         .run_system_once(crate::ecs::systems::verify_window_position)
         .expect("verify runs");

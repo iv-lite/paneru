@@ -23,10 +23,9 @@ use tracing::{Level, debug, error, info, instrument, trace, warn};
 use super::{
     ActiveDisplayMarker, BProcess, DragDisplayArmed, DragScrollArmed, ExistingMarker, FreshMarker,
     MouseHeldMarker, RepositionMarker, ResizeMarker, RetryFrontSwitch, SpawnWindowTrigger, Timeout,
-    VerifyWindowPosition,
 };
 
-use crate::ax_writer::{AxWriteInbox, AxWriteState, AxWriterQueue, push_position};
+use crate::ax_writer::{AxWriteInbox, AxWriteState, AxWriterQueue, PushOutcome, push_position};
 use crate::commands::{Command, Operation};
 use crate::config::{Config, decorations::BorderRadiusOption};
 use crate::ecs::display::FloatingLayer;
@@ -37,8 +36,8 @@ use crate::ecs::workspace::SnapStripMarker;
 use crate::ecs::{
     ActiveWorkspaceMarker, AnyWindowInFlight, Bounds, BruteforceWindows, ColdStart, FlashMessage,
     FocusedMarker, Initializing, LowPowerMode, MissionControlActive, Position,
-    ReadDisplayProperties, RestoreWindowState, Scrolling, SendMessageTrigger, SpawnCommandsExt,
-    Unmanaged, WidthRatio, WindowProperties,
+    ReadDisplayProperties, ResendMarker, RestoreWindowState, Scrolling, SendMessageTrigger,
+    SpawnCommandsExt, Unmanaged, WidthRatio, WindowProperties,
 };
 use crate::events::{Event, InputEvent};
 use crate::manager::{
@@ -76,7 +75,7 @@ type MovableWindows<'w, 's> = Query<
         &'static Bounds,
         Option<&'static Unmanaged>,
         Has<RepositionMarker>,
-        Has<VerifyWindowPosition>,
+        Option<&'static crate::ecs::PositionDrive>,
     ),
     Without<LayoutStrip>,
 >;
@@ -109,7 +108,7 @@ type TweenedPositions<'w, 's> = Populated<
         Entity,
         &'static RepositionMarker,
         Has<Window>,
-        Option<&'static mut crate::ecs::PositionTween>,
+        Option<&'static mut crate::ecs::PositionDrive>,
     ),
 >;
 
@@ -122,8 +121,23 @@ type TweenedSizes<'w, 's> = Populated<
         &'static mut Bounds,
         Entity,
         &'static ResizeMarker,
-        Option<&'static mut crate::ecs::SizeTween>,
+        Option<&'static mut crate::ecs::SizeDrive>,
     ),
+>;
+
+/// Windows as the commit sees them: changed frames plus dropped-write
+/// resends awaiting another attempt.
+type CommittedWindows<'w, 's> = Populated<
+    'w,
+    's,
+    (
+        &'static mut Window,
+        &'static Position,
+        Entity,
+        Has<FocusedMarker>,
+        Has<ResendMarker>,
+    ),
+    Or<(Changed<Position>, With<ResendMarker>)>,
 >;
 
 /// Fixed-duration tweens land exactly on their deadline, so no settle band
@@ -675,7 +689,7 @@ pub(super) fn tick_cold_start(
 pub(super) fn publish_snapshot_cadence(
     cold: Option<Res<ColdStart>>,
     held: Query<(), crate::ecs::DrivenDragHeld>,
-    verifying: Query<(), With<VerifyWindowPosition>>,
+    drives: Query<&crate::ecs::PositionDrive>,
     roster: Option<Res<SnapshotRoster>>,
     mut last: Local<bool>,
 ) {
@@ -689,7 +703,9 @@ pub(super) fn publish_snapshot_cadence(
     // buy the 30ms AX storm. A genuinely missed press (no holder at all)
     // degrades to 250ms borders — the overlay paints those from throttled
     // direct reads, not the snapshot.
-    let fast = cold.is_some() || !held.is_empty() || !verifying.is_empty();
+    let fast = cold.is_some()
+        || !held.is_empty()
+        || drives.iter().any(crate::ecs::PositionDrive::is_verifying);
     if fast != *last {
         *last = fast;
         let _ = roster
@@ -1117,30 +1133,36 @@ pub(super) fn retry_front_switch(
 }
 
 /// Animates window movement.
-/// Fraction of the remaining distance an exponential ease-out consumes in a
-/// frame, given a decay `rate` (per second) and the frame's `delta` in seconds.
-/// Drops tween legs whose markers are gone. Markers are removed in several
-/// places (rigid strip rides, snap assigns, drag releases) while the leg
-/// lives next to the marker: without this, a stale leg survives and the next
-/// glide retargets off its ancient `start` instead of birthing fresh on the
-/// shared burst phase. `Populated` skips the system when no orphans exist.
+/// Settles tween legs whose markers are gone. Markers are dropped in several
+/// places (rigid strip rides transition the leg instead, but snap assigns
+/// and drag releases may drop them) while the leg lives next to the marker:
+/// converting a marker-less animating leg to verifying (instead of deleting
+/// it) keeps the placed frame confirmed. Without this, a stale leg survives
+/// and the next glide retargets off its ancient `start` instead of birthing
+/// fresh on the shared burst phase — the retarget path already resets phase
+/// and start on a new marker, so a settled-then-reused leg still glides
+/// correctly. Verifying-phase legs are owned by the verifier and never
+/// touched here. `Populated` skips the system when no drives exist.
 #[instrument(level = Level::TRACE, skip_all)]
-pub(super) fn drop_orphan_tween_legs(
+pub(super) fn settle_orphan_drives(
     orphaned_positions: Populated<
-        Entity,
-        (With<crate::ecs::PositionTween>, Without<RepositionMarker>),
+        (Entity, &mut crate::ecs::PositionDrive),
+        Without<RepositionMarker>,
     >,
-    orphaned_sizes: Populated<Entity, (With<crate::ecs::SizeTween>, Without<ResizeMarker>)>,
+    orphaned_sizes: Populated<Entity, (With<crate::ecs::SizeDrive>, Without<ResizeMarker>)>,
     mut commands: Commands,
 ) {
-    for entity in orphaned_positions {
-        if let Ok(mut entity_commands) = commands.get_entity(entity) {
-            entity_commands.try_remove::<crate::ecs::PositionTween>();
+    for (_entity, mut drive) in orphaned_positions {
+        if drive.is_verifying() {
+            continue;
         }
+        drive.phase = crate::ecs::DrivePhase::Verifying {
+            remaining: crate::ecs::DRIVE_VERIFY_RETRIES,
+        };
     }
     for entity in orphaned_sizes {
         if let Ok(mut entity_commands) = commands.get_entity(entity) {
-            entity_commands.try_remove::<crate::ecs::SizeTween>();
+            entity_commands.try_remove::<crate::ecs::SizeDrive>();
         }
     }
 }
@@ -1175,7 +1197,7 @@ fn seam_snap_target(current: Origin, target: Origin, displays: &[IRect]) -> Opti
 /// * `config` - The `Config` resource, used for animation duration.
 /// * `commands` - Bevy commands to manage tween state and remove the `RepositionMarker` on landing.
 #[instrument(level = Level::TRACE, skip_all)]
-pub(super) fn animate_entities(
+pub(crate) fn animate_entities(
     animate: TweenedPositions,
     displays: Query<&Display>,
     time: Res<Time>,
@@ -1198,16 +1220,17 @@ pub(super) fn animate_entities(
     let base = config.animation_duration();
     let display_bounds: Vec<IRect> = displays.iter().map(Display::bounds).collect();
 
-    for (mut position, entity, RepositionMarker(origin), is_window, tween) in animate {
+    for (mut position, entity, RepositionMarker(origin), is_window, drive) in animate {
         // Seam-snapping applies to windows, which paint: a strip
         // scroll offset is not a frame, so strips always tween (a
         // negative scroll target is routine, not a seam crossing).
+        // Snapped jumps still verify: the OS must actually land there.
         if is_window && let Some(snapped) = seam_snap_target(position.0, *origin, &display_bounds) {
             trace!("entity {entity} seam-snapping to {snapped}");
             position.0 = snapped;
             if let Ok(mut entity_commands) = commands.get_entity(entity) {
                 entity_commands.try_remove::<RepositionMarker>();
-                entity_commands.try_remove::<crate::ecs::PositionTween>();
+                entity_commands.try_insert(crate::ecs::PositionDrive::verifying());
             }
             continue;
         }
@@ -1215,7 +1238,7 @@ pub(super) fn animate_entities(
             position.0 = *origin;
             if let Ok(mut entity_commands) = commands.get_entity(entity) {
                 entity_commands.try_remove::<RepositionMarker>();
-                entity_commands.try_remove::<crate::ecs::PositionTween>();
+                entity_commands.try_insert(crate::ecs::PositionDrive::verifying());
             }
             continue;
         }
@@ -1224,19 +1247,20 @@ pub(super) fn animate_entities(
         // retargets carry phase across small creeps (composed strip-plus-
         // slot recomputes, ride-outlier refreshes) so easing bends instead
         // of restarting at zero velocity every tick — and start over on
-        // genuine jumps, which deserve the full glide.
-        let (start, started, duration) = match tween {
-            Some(tween) if tween.target == *origin => (tween.start, tween.started, tween.duration),
-            Some(mut tween) => {
+        // genuine jumps, which deserve the full glide. Any retarget resumes
+        // driving, even if the old leg had already entered verifying.
+        let (start, started, duration) = match drive {
+            Some(drive) if drive.target == *origin => (drive.start, drive.started, drive.duration),
+            Some(mut drive) => {
                 let remaining = (origin.as_vec2() - position.0.as_vec2()).length();
-                let total = (origin.as_vec2() - tween.start.as_vec2())
+                let total = (origin.as_vec2() - drive.start.as_vec2())
                     .length()
                     .max(remaining);
                 let duration = retarget_duration(remaining, total, base);
-                let drift = (origin.as_vec2() - tween.target.as_vec2()).length();
-                let elapsed = now.saturating_sub(tween.started);
+                let drift = (origin.as_vec2() - drive.target.as_vec2()).length();
+                let elapsed = now.saturating_sub(drive.started);
                 let prior = if drift <= RETARGET_CARRY_PX {
-                    (elapsed.as_secs_f32() / tween.duration.as_secs_f32().max(f32::EPSILON))
+                    (elapsed.as_secs_f32() / drive.duration.as_secs_f32().max(f32::EPSILON))
                         .clamp(0.0, 1.0)
                 } else {
                     0.0
@@ -1244,11 +1268,12 @@ pub(super) fn animate_entities(
                 let started = now
                     .checked_sub(Duration::from_secs_f32(prior * duration.as_secs_f32()))
                     .unwrap_or(now);
-                tween.start = position.0;
-                tween.target = *origin;
-                tween.started = started;
-                tween.duration = duration;
-                (tween.start, tween.started, tween.duration)
+                drive.start = position.0;
+                drive.target = *origin;
+                drive.started = started;
+                drive.duration = duration;
+                drive.phase = crate::ecs::DrivePhase::Animating;
+                (drive.start, drive.started, drive.duration)
             }
             None => {
                 let (started, opened) = birth_phase(now, bursts.opened);
@@ -1256,12 +1281,9 @@ pub(super) fn animate_entities(
                     bursts.opened = Some(now);
                 }
                 if let Ok(mut entity_commands) = commands.get_entity(entity) {
-                    entity_commands.try_insert(crate::ecs::PositionTween {
-                        start: position.0,
-                        target: *origin,
-                        started,
-                        duration: base,
-                    });
+                    entity_commands.try_insert(crate::ecs::PositionDrive::animating(
+                        position.0, *origin, started, base,
+                    ));
                 }
                 (position.0, started, base)
             }
@@ -1276,9 +1298,16 @@ pub(super) fn animate_entities(
             position.0,
         );
         position.0 = if finished { *origin } else { new_pos };
-        if finished && let Ok(mut entity_commands) = commands.get_entity(entity) {
-            entity_commands.try_remove::<RepositionMarker>();
-            entity_commands.try_remove::<crate::ecs::PositionTween>();
+        if finished {
+            // Landing hands the leg to the verifier: the marker (intent
+            // delivered to the tween) is dropped and the drive enters
+            // verifying, so the commit's AX push gets confirmed. Seating a
+            // fresh verifying leg (rather than mutating the old one) is
+            // exact here — the glide is over, only the budget matters.
+            if let Ok(mut entity_commands) = commands.get_entity(entity) {
+                entity_commands.try_remove::<RepositionMarker>();
+                entity_commands.try_insert(crate::ecs::PositionDrive::verifying());
+            }
         }
     }
 }
@@ -1315,7 +1344,7 @@ pub(super) fn animate_resize_entities(
             bounds.0 = *size;
             if let Ok(mut entity_commands) = commands.get_entity(entity) {
                 entity_commands.try_remove::<ResizeMarker>();
-                entity_commands.try_remove::<crate::ecs::SizeTween>();
+                entity_commands.try_remove::<crate::ecs::SizeDrive>();
             }
             continue;
         }
@@ -1350,7 +1379,7 @@ pub(super) fn animate_resize_entities(
                     bursts.opened = Some(now);
                 }
                 if let Ok(mut entity_commands) = commands.get_entity(entity) {
-                    entity_commands.try_insert(crate::ecs::SizeTween {
+                    entity_commands.try_insert(crate::ecs::SizeDrive {
                         start: bounds.0,
                         target: *size,
                         started,
@@ -1372,7 +1401,7 @@ pub(super) fn animate_resize_entities(
         bounds.0 = if finished { *size } else { new_size };
         if finished && let Ok(mut entity_commands) = commands.get_entity(entity) {
             entity_commands.try_remove::<ResizeMarker>();
-            entity_commands.try_remove::<crate::ecs::SizeTween>();
+            entity_commands.try_remove::<crate::ecs::SizeDrive>();
         }
     }
 }
@@ -1843,7 +1872,7 @@ fn press_hit_cached(
 const HELD_PAINT_REFRESH: Duration = Duration::from_millis(50);
 
 #[instrument(level = Level::TRACE, skip_all)]
-#[allow(clippy::too_many_arguments)]
+#[allow(clippy::too_many_arguments, clippy::too_many_lines)]
 pub(crate) fn window_moved_update_frame(
     mut messages: MessageReader<Event>,
     mut windows: MovableWindows,
@@ -1854,6 +1883,7 @@ pub(crate) fn window_moved_update_frame(
     writer: Option<Res<AxWriterQueue>>,
     mut write_state: ResMut<AxWriteState>,
     mut paint_refresh: Local<HashMap<WinID, Instant>>,
+    mut commands: Commands,
 ) {
     // Adoption reads the echo directly, never the snapshot worker: the event
     // announces a move that just happened, and the 250ms poll may not have
@@ -1869,13 +1899,14 @@ pub(crate) fn window_moved_update_frame(
             continue;
         };
 
-        let Some((entity, mut window, mut position, bounds, unmanaged, repositioning, verifying)) =
+        let Some((entity, mut window, mut position, bounds, unmanaged, repositioning, drive)) =
             windows
                 .iter_mut()
                 .find(|window| window.1.id() == *window_id)
         else {
             continue;
         };
+        let verifying = drive.as_ref().is_some_and(|drive| drive.is_verifying());
         if matches!(unmanaged, Some(Unmanaged::Minimized | Unmanaged::Hidden)) {
             continue;
         }
@@ -1954,16 +1985,22 @@ pub(crate) fn window_moved_update_frame(
             let drift = (live.min - position.0).abs();
             debug!("untracked native drag of window {entity}, drift {drift:?}: pushing slot back");
             // Joins the in-flight commit frame: this push-back belongs to
-            // the motion already converging, not a new one.
+            // the motion already converging, not a new one. A dropped write
+            // reseats the resend marker (no echo will retry a settled push).
             let epoch = write_state.current_epoch();
-            push_position(
+            if push_position(
                 &mut window,
                 position.0,
                 writer.as_deref(),
                 &mut write_state,
                 config.ax_writer_enabled(),
                 epoch,
-            );
+                false,
+            ) == PushOutcome::DroppedFull
+                && let Ok(mut entity_commands) = commands.get_entity(entity)
+            {
+                entity_commands.try_insert(ResendMarker);
+            }
             continue;
         }
         let Ok(new_frame) = window.update_frame() else {
@@ -1982,14 +2019,19 @@ pub(crate) fn window_moved_update_frame(
             if drift.x > 1 || drift.y > 1 {
                 debug!("scroll grace: echo for {entity} drifted {drift:?}, pushing slot back");
                 let epoch = write_state.current_epoch();
-                crate::ax_writer::push_position(
+                if crate::ax_writer::push_position(
                     &mut window,
                     position.0,
                     writer.as_deref(),
                     &mut write_state,
                     config.ax_writer_enabled(),
                     epoch,
-                );
+                    false,
+                ) == PushOutcome::DroppedFull
+                    && let Ok(mut entity_commands) = commands.get_entity(entity)
+                {
+                    entity_commands.try_insert(ResendMarker);
+                }
             }
             continue;
         }
@@ -2111,10 +2153,16 @@ type FlightMarkers<'w, 's> = Query<
     (
         Has<RepositionMarker>,
         Has<ResizeMarker>,
-        Has<VerifyWindowPosition>,
+        Option<&'static crate::ecs::PositionDrive>,
     ),
     With<Window>,
 >;
+
+/// Whether a flight-check row means paneru owns the frame right now.
+fn flight_driving(row: &(bool, bool, Option<&crate::ecs::PositionDrive>)) -> bool {
+    let (repositioning, resizing, drive) = row;
+    *repositioning || *resizing || drive.as_ref().is_some_and(|drive| drive.is_verifying())
+}
 
 /// Snapshot frames are raw CG-decoded rects: re-apply the window's padding
 /// (the inverse of `update_frame`'s strip) so snapshot and direct reads
@@ -2140,7 +2188,7 @@ fn pad_snapshot_frame(raw: IRect, window: &Window) -> IRect {
 ///    frame along the velocity EMA, first — then the snapshot, then the
 ///    cached OS frame. Never the slot.
 /// 2. The current layout frame while paneru drives or confirms the window —
-///    any of `RepositionMarker`, `ResizeMarker`, `VerifyWindowPosition`
+///    a `RepositionMarker`/`ResizeMarker` leg or a verifying [`PositionDrive`]
 ///    present — or while the strip scrolls, a drag is held, or a release
 ///    settles. This rides the tweened `Position` each frame instead of
 ///    jumping to the `RepositionMarker` target, so focus moves, reshuffles
@@ -2178,12 +2226,7 @@ fn border_frame_for(
         }
         return window.frame();
     }
-    let driving = tracking_live
-        || flight
-            .get(entity)
-            .is_ok_and(|(repositioning, resizing, verifying)| {
-                repositioning || resizing || verifying
-            });
+    let driving = tracking_live || flight.get(entity).is_ok_and(|row| flight_driving(&row));
     if driving {
         // Ride the tween: `frame()` is the current presented `Position` —
         // the exact rect just committed to AX on the same tick — while
@@ -2611,12 +2654,13 @@ pub(super) fn update_overlays(
 
 #[instrument(level = Level::TRACE, skip_all)]
 pub(super) fn commit_window_position(
-    mut moved_windows: Populated<(&mut Window, &Position), Changed<Position>>,
+    mut moved_windows: CommittedWindows,
     writer: Option<Res<AxWriterQueue>>,
     mut write_state: ResMut<AxWriteState>,
     config: Res<Config>,
+    mut commands: Commands,
 ) {
-    use crate::ax_writer::push_position;
+    use crate::ax_writer::{PushOutcome, push_position};
 
     // Open the commit frame: every push below — across all displays —
     // joins one epoch, so whole-frame convergence stays observable even
@@ -2627,21 +2671,32 @@ pub(super) fn commit_window_position(
         // shutdown. Unchanged behavior.
         moved_windows
             .par_iter_mut()
-            .for_each(|(mut window, position)| window.reposition(position.0));
+            .for_each(|(mut window, position, _, _, _)| window.reposition(position.0));
         return;
     }
     // Sequential: sends are ~100ns and sequence numbering needs `&mut`.
     // Every position push (here, adoption/grace push-backs, settle, verify)
     // routes through `push_position` so the queue stays the single writer.
-    for (mut window, position) in moved_windows {
-        push_position(
+    // DroppedFull reseats the resend marker (a settled window's `Changed`
+    // will not refire); anything else clears it. Focused windows drain
+    // ahead of the batch on the worker.
+    for (mut window, position, entity, focused, _) in moved_windows {
+        let outcome = push_position(
             &mut window,
             position.0,
             writer.as_deref(),
             &mut write_state,
             true,
             epoch,
+            focused,
         );
+        if let Ok(mut entity_commands) = commands.get_entity(entity) {
+            if outcome == PushOutcome::DroppedFull {
+                entity_commands.try_insert(ResendMarker);
+            } else {
+                entity_commands.try_remove::<ResendMarker>();
+            }
+        }
     }
 }
 
@@ -2676,31 +2731,38 @@ pub(super) fn drain_ax_acks(
     }
 }
 
-/// Confirms OS positions against layout intent. Every driven move carries
-/// verification (see `reposition_entity`), so this is the universal drift
-/// backstop between commits and the 5s audit — throttled to ~100ms per
-/// window instead of every frame, since each check is a synchronous AX read.
+/// Confirms OS positions against layout intent. Every driven move lands into
+/// a verifying [`PositionDrive`] (or seats one directly for animator-free
+/// moves like rigid rides), so this is the universal drift backstop between
+/// commits and the 5s audit — throttled to ~100ms per window instead of
+/// every frame, since each check can be a synchronous AX read. When the
+/// writer queue is active and the window has no unacked writes, the per-
+/// window ack state confirms immediately without a read; otherwise the
+/// snapshot (free) then a direct read (sync) decide, with a bounded re-push
+/// budget.
 #[instrument(level = Level::TRACE, skip_all)]
 pub(crate) fn verify_window_position(
     mut windows: Populated<(
         Entity,
         &mut Window,
         &Position,
-        &mut VerifyWindowPosition,
+        &mut crate::ecs::PositionDrive,
         Option<&RepositionMarker>,
     )>,
     store: Option<Res<SnapshotStore>>,
-    write_state: Res<AxWriteState>,
+    mut write_state: ResMut<AxWriteState>,
+    writer: Option<Res<AxWriterQueue>>,
+    config: Res<Config>,
     mut commands: Commands,
 ) {
-    for (entity, mut window, position, mut verification, repositioning) in &mut windows {
+    // Cheap shared reads hoisted out of the per-window loop.
+    let queue_active = config.ax_writer_enabled() && writer.is_some();
+    for (entity, mut window, position, mut drive, repositioning) in &mut windows {
+        if !drive.is_verifying() {
+            continue;
+        }
         // While the animator is driving, re-pushing the target fights it and
-        // the optimistic frame already matches: only confirm once it lands.
-        // No tick here either — the marker's life mirrors the animation's,
-        // which converges monotonically and drops the marker itself. The
-        // marker is optional (rather than required) precisely so the
-        // post-landing check below still sees the entity after animate
-        // removed it; otherwise verification would leak unconfirmed forever.
+        // the optimistic frame already matches: only confirm settled legs.
         if repositioning.is_some() {
             continue;
         }
@@ -2709,6 +2771,28 @@ pub(crate) fn verify_window_position(
         // The ack, not this tick, owns the confirmation.
         if write_state.unacked(window.id()) {
             continue;
+        }
+        // Acked, per window: every write issued for this window has landed
+        // on the worker, so confirm without a synchronous AX read — unless
+        // a free snapshot already shows drift (an app refusing the write
+        // still needs the re-push below, not blind trust: acks are
+        // fire-and-forget). No queue (tests, dance apps, sync path):
+        // straight to the read below.
+        if queue_active {
+            if let Some(raw) =
+                snapshot_live_frame(store.as_deref(), window.id(), SNAPSHOT_FRAME_MAX_AGE)
+            {
+                let drift = (pad_snapshot_frame(raw, &window).min - position.0).abs();
+                if drift.x > 1 || drift.y > 1 {
+                    // Snapshot-confirmed drift: fall through to re-push.
+                } else if let Ok(mut entity_commands) = commands.get_entity(entity) {
+                    entity_commands.try_remove::<crate::ecs::PositionDrive>();
+                    continue;
+                }
+            } else if let Ok(mut entity_commands) = commands.get_entity(entity) {
+                entity_commands.try_remove::<crate::ecs::PositionDrive>();
+                continue;
+            }
         }
         // Prefer the snapshot worker's last read over a synchronous round
         // trip. Absent in tests (identical behavior there), stale, or
@@ -2730,21 +2814,24 @@ pub(crate) fn verify_window_position(
         let drift = (live.min - position.0).abs();
         if drift.x <= 1 && drift.y <= 1 {
             if let Ok(mut entity_commands) = commands.get_entity(entity) {
-                entity_commands.try_remove::<VerifyWindowPosition>();
+                entity_commands.try_remove::<crate::ecs::PositionDrive>();
             }
             continue;
         }
 
         window.reposition(position.0);
-        if verification.tick()
-            && let Ok(mut entity_commands) = commands.get_entity(entity)
-        {
-            entity_commands.try_remove::<VerifyWindowPosition>();
-        }
         // NOTE: this push stays synchronous even with the writer flag on:
         // it only fires on confirmed >1px drift (i.e. the queue already
         // failed this window), so it must not re-enter the failed queue.
+        // It is still accounted in `AxWriteState` so the dedup filter and
+        // the unacked gate see the same truth as queued writes.
         // See `push_position` for the single-writer discipline.
+        write_state.mark_sent(window.id(), position.0);
+        if drive.tick()
+            && let Ok(mut entity_commands) = commands.get_entity(entity)
+        {
+            entity_commands.try_remove::<crate::ecs::PositionDrive>();
+        }
     }
 }
 

@@ -72,6 +72,9 @@ pub(crate) struct AxWriteJob {
     pub v_pad: i32,
     pub seq: u64,
     pub epoch: u64,
+    /// Focused window's write: drained ahead of the batch so the window the
+    /// user is looking at paints first.
+    pub priority: bool,
 }
 
 /// Write completion: the worker accepted the newest job it had for the
@@ -209,12 +212,20 @@ impl AxWriteState {
 
     /// Keeps at most [`EPOCH_MEMBER_CAP`] unlanded epochs resident, oldest
     /// first, so a never-acking window cannot grow memory while the rest of
-    /// the world keeps issuing. Pruned epochs read as landed (vacuous) —
-    /// consistent with the newer-supersedes rule, since anything that old
-    /// is buried under at least a capful of fresher frames.
+    /// the world keeps issuing. Only landed epochs are pruned: dropping an
+    /// epoch with still-traveling members would read as landed (vacuous)
+    /// while the per-window gate still blocks — frame truth must never
+    /// overtake window truth. If nothing is landed, length temporarily
+    /// exceeds the cap while stuck (the watchdog is already warning); it
+    /// drains as soon as acks resume.
     fn prune_members(&mut self) {
         while self.epoch_members.len() > EPOCH_MEMBER_CAP {
-            let oldest = self.epoch_members.keys().min().copied();
+            let oldest = self
+                .epoch_members
+                .keys()
+                .filter(|epoch| self.landed(**epoch))
+                .min()
+                .copied();
             if let Some(oldest) = oldest {
                 self.epoch_members.remove(&oldest);
             } else {
@@ -230,12 +241,26 @@ impl AxWriteState {
         self.last_landed
     }
 
-    /// Stuck-writer watchdog: returns the issued-behind-landed gap when it
-    /// newly deserves a warning (past [`STUCK_WRITER_EPOCHS`], larger than
-    /// any gap already reported). Callers reset by draining: once the
+    /// Stuck-writer watchdog: returns how far the oldest still-traveling
+    /// commit frame has fallen behind when it newly deserves a warning
+    /// (past [`STUCK_WRITER_EPOCHS`], larger than any gap already
+    /// reported). Measured against the oldest *unlanded* epoch — not the
+    /// landed frontier — so empty/idle frames (which advance vacuously)
+    /// can never trip it, and a gap with nothing in flight resets the edge
+    /// instead of warning: a quiet pump is not a stuck worker. Once the
     /// worker catches up the gap shrinks and the edge re-arms.
     pub(crate) fn check_stall(&mut self) -> Option<u64> {
-        let gap = self.current.saturating_sub(self.last_landed);
+        let oldest_open = self
+            .epoch_members
+            .keys()
+            .filter(|epoch| !self.landed(**epoch))
+            .min()
+            .copied();
+        let Some(oldest) = oldest_open else {
+            self.last_warned_gap = 0;
+            return None;
+        };
+        let gap = self.current.saturating_sub(oldest);
         if gap < STUCK_WRITER_EPOCHS {
             self.last_warned_gap = 0;
             return None;
@@ -257,6 +282,15 @@ impl AxWriteState {
 
     fn record_sent(&mut self, win_id: WinID, target: Origin) {
         self.last_sent.insert(win_id, target);
+    }
+
+    /// Accounts a synchronous write that deliberately bypassed the queue
+    /// (verify backstop, exit cleanup): the dedup filter and the unacked
+    /// gate must see the same truth as queued writes, or a bypassed target
+    /// gets re-pushed (duplicate AX traffic) or gated on forever. Records
+    /// intent only — no sequence is issued, so no ack will (or must) arrive.
+    pub(crate) fn mark_sent(&mut self, win_id: WinID, target: Origin) {
+        self.record_sent(win_id, target);
     }
 }
 
@@ -286,16 +320,21 @@ fn run(queue: Receiver<AxWriteJob>, acks: Sender<AxWriteAck>) {
                 }
             }
         }
-        // Deterministic intra-batch order (by window id): every display's
-        // strips ride on the same tick, and the batch must paint in a stable
-        // order rather than `HashMap` iteration order so siblings converge
-        // together, reproducibly.
+        // Deterministic intra-batch order: priority (focused) windows
+        // first, then by window id. Every display's strips ride on the same
+        // tick, and the batch must paint in a stable order rather than
+        // `HashMap` iteration order so siblings converge together,
+        // reproducibly.
         let mut batch: Vec<_> = batch.into_iter().collect();
-        batch.sort_by_key(|(win_id, _)| *win_id);
+        batch.sort_by_key(|(win_id, job)| (!job.priority, *win_id));
         for (win_id, job) in batch {
             ax_set_window_position(&job.element, job.origin, job.h_pad, job.v_pad);
             trace!("ax writer: wrote window {win_id} seq {}", job.seq);
-            let _ = acks.send(AxWriteAck {
+            // Best effort: if the main thread stopped draining (shutdown,
+            // wedged pump), the writer must degrade to dropping completions
+            // — never wedge itself behind a full ack channel. A dropped ack
+            // only delays convergence detection; verify rediscovers by read.
+            let _ = acks.try_send(AxWriteAck {
                 win_id,
                 seq: job.seq,
                 epoch: job.epoch,
@@ -326,6 +365,20 @@ pub(crate) fn spawn_ax_writer() -> (AxWriterQueue, AxWriteInbox) {
 #[allow(dead_code)]
 pub(crate) const AX_WRITE_DRAIN_TIMEOUT: Duration = Duration::from_millis(500);
 
+/// Outcome of one [`push_position`] routing decision. Callers that own
+/// their own retry (commit's resend marker, settle checks) act on
+/// `DroppedFull`; fire-and-forget sites ignore it.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum PushOutcome {
+    /// Already the newest intent — no AX traffic.
+    Deduped,
+    /// Written (async job queued or synchronous fallback).
+    Sent,
+    /// Queue full or writer gone — phantom-acked so readers never gate on
+    /// a write that will never land. The target still needs a resend.
+    DroppedFull,
+}
+
 /// Routes one position push through the single-writer discipline: async job
 /// when the flag is on and the window is servable (element present, no
 /// enhanced-UI dance), synchronous [`WindowApi::reposition`] otherwise.
@@ -337,6 +390,10 @@ pub(crate) const AX_WRITE_DRAIN_TIMEOUT: Duration = Duration::from_millis(500);
 /// [`AxWriteState::begin_frame`], or [`AxWriteState::current_epoch`] for
 /// push-backs joining the in-flight frame): the worker echoes it back in
 /// the ack so frame completion stays observable.
+///
+/// `priority` marks the focused window's write: the worker drains priority
+/// jobs ahead of the rest so the window the user is looking at paints
+/// first. Plain data (no ECS access from the worker).
 pub(crate) fn push_position(
     window: &mut Window,
     target: Origin,
@@ -344,11 +401,12 @@ pub(crate) fn push_position(
     state: &mut AxWriteState,
     enabled: bool,
     epoch: u64,
-) {
+    priority: bool,
+) -> PushOutcome {
     // Same target as the newest intent: the OS already has it (or has
     // something newer converging), so skip the AX round trip entirely.
     if state.already_sent(window.id(), target) {
-        return;
+        return PushOutcome::Deduped;
     }
     // Per-push cost here is two `OnceLock` reads plus one uncontended
     // `RwLock` read — nanoseconds against the AX write it routes. A
@@ -366,12 +424,12 @@ pub(crate) fn push_position(
     let Some((element, _)) = async_job else {
         window.reposition(target);
         state.record_sent(window.id(), target);
-        return;
+        return PushOutcome::Sent;
     };
     let Some(queue) = queue else {
         window.reposition(target);
         state.record_sent(window.id(), target);
-        return;
+        return PushOutcome::Sent;
     };
     let seq = state.issue(window.id(), epoch);
     let job = AxWriteJob {
@@ -382,9 +440,13 @@ pub(crate) fn push_position(
         v_pad: window.vertical_padding(),
         seq,
         epoch,
+        priority,
     };
     match queue.0.try_send(job) {
-        Ok(()) => state.record_sent(window.id(), target),
+        Ok(()) => {
+            state.record_sent(window.id(), target);
+            PushOutcome::Sent
+        }
         // Full or writer gone: drop the newest job — it is already
         // superseded by whatever the next frame sends (or by the verify
         // backstop for a settled window). Acknowledge the phantom sequence
@@ -395,6 +457,7 @@ pub(crate) fn push_position(
                 "ax writer: queue full, dropped superseded write for window {}",
                 window.id()
             );
+            PushOutcome::DroppedFull
         }
     }
 }
@@ -511,20 +574,68 @@ mod tests {
     }
 
     #[test]
-    fn landed_epochs_prune_and_cap_members() {
+    fn unlanded_epochs_are_retained_not_pruned() {
         let mut state = AxWriteState::default();
         let e1 = state.begin_frame();
         let s1 = state.issue(1, e1);
         state.acknowledge(1, s1, e1);
         assert_eq!(state.last_landed(), 1);
-        // A window that stops acking keeps only recent epochs resident.
+        // A window that stops acking: its epochs stay resident so frame
+        // truth never overtakes the per-window gate...
+        let mut pending = Vec::new();
         for _ in 0..(EPOCH_MEMBER_CAP + 4) {
             let e = state.begin_frame();
-            state.issue(9, e);
+            pending.push((state.issue(9, e), e));
+        }
+        assert_eq!(
+            state.epoch_members.len(),
+            EPOCH_MEMBER_CAP + 4,
+            "unlanded epochs stay resident while stuck"
+        );
+        assert!(
+            !state.landed(pending[0].1),
+            "a never-acked epoch never reads as landed"
+        );
+        // ...and drain once acks resume.
+        for (seq, epoch) in pending {
+            state.acknowledge(9, seq, epoch);
         }
         assert!(
             state.epoch_members.len() <= EPOCH_MEMBER_CAP,
-            "unlanded epochs stay bounded"
+            "landed epochs prune back down"
         );
+    }
+
+    #[test]
+    fn idle_frames_advance_vacuously_without_warning() {
+        let mut state = AxWriteState::default();
+        // Motion converges, then the pump idles: empty commits must not
+        // trip the watchdog. The frontier rests at the last pushed epoch
+        // (only acks advance it); idleness reads off the empty unlanded
+        // set, not the frontier gap.
+        let e1 = state.begin_frame();
+        let s1 = state.issue(1, e1);
+        state.acknowledge(1, s1, e1);
+        for _ in 0..(STUCK_WRITER_EPOCHS + 5) {
+            state.begin_frame();
+        }
+        assert_eq!(state.last_landed(), 1);
+        assert_eq!(
+            state.check_stall(),
+            None,
+            "idle frames are not a stuck worker"
+        );
+    }
+
+    #[test]
+    fn marked_sends_dedup_without_sequence() {
+        use crate::manager::Origin;
+        let mut state = AxWriteState::default();
+        let target = Origin::new(10, 20);
+        // A synchronous bypass records intent without issuing: dedup sees
+        // it, but no ack can (or must) arrive.
+        state.mark_sent(3, target);
+        assert!(state.already_sent(3, target));
+        assert!(!state.unacked(3));
     }
 }

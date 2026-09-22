@@ -24,7 +24,7 @@ use crate::ecs::workspace::mid_strip_slot;
 use crate::ecs::{
     ActiveWorkspaceMarker, ColdStart, DockPosition, ManualStripOffset, MissionControlActive,
     Position, RepositionMarker, Scrolling, SelectedVirtualMarker, SpawnCommandsExt, TitlebarGrab,
-    Unmanaged, VerifyWindowPosition,
+    Unmanaged,
 };
 use crate::manager::{Display, Origin, Size, Window, WindowManager, origin_from};
 use crate::overlay::{BorderParams, OverlayManager};
@@ -676,6 +676,7 @@ fn mouse_up_trigger(
     mut scroll_state: ResMut<DragScrollState>,
     mut paint: ResMut<DragPaintState>,
     cold: Option<Res<ColdStart>>,
+    in_flight: Query<(), With<RepositionMarker>>,
     mut commands: Commands,
 ) {
     for InputEvent(event) in messages.read() {
@@ -776,9 +777,12 @@ fn mouse_up_trigger(
                     // Already home, so homing attached no verification: give
                     // the slot a throttled backstop against swallowed pushes
                     // and stale-cache equality the echo grace cannot see.
+                    // Only when no leg is driving: an in-flight leg verifies
+                    // itself at landing, and seating a fresh drive here would
+                    // clobber the tween state the animator owns.
                     for member in &members {
-                        if let Ok(mut entity_commands) = commands.get_entity(*member) {
-                            entity_commands.try_insert(VerifyWindowPosition::default());
+                        if in_flight.get(*member).is_err() {
+                            commands.ensure_verifying(*member);
                         }
                     }
                     if config.window_hidden_ratio() >= 1.0 {
@@ -1124,6 +1128,7 @@ fn scroll_settle_check(
                 &mut write_state,
                 config.ax_writer_enabled(),
                 epoch,
+                false,
             );
             pending.push(member);
         }

@@ -17,8 +17,8 @@ use bevy::time::common_conditions::on_timer;
 use tracing::{Level, debug, instrument, trace, warn};
 
 use super::{
-    DeferredExposeMarker, FocusedMarker, MouseHeldMarker, RepositionMarker, ReshuffleAroundMarker,
-    SystemTheme, Unmanaged, VerifyWindowPosition,
+    DeferredExposeMarker, FocusedMarker, MouseHeldMarker, PositionDrive, RepositionMarker,
+    ReshuffleAroundMarker, SystemTheme, Unmanaged,
 };
 use crate::config::Config;
 use crate::ecs::layout::LayoutStrip;
@@ -359,7 +359,7 @@ type FlightMarkers<'w, 's> = Query<
     (
         Has<RepositionMarker>,
         Has<ResizeMarker>,
-        Has<VerifyWindowPosition>,
+        Option<&'static PositionDrive>,
     ),
     With<Window>,
 >;
@@ -462,7 +462,9 @@ fn ensure_focused_visible(
     // trajectory (boot layout, swipe momentum, restores).
     if flight
         .get(entity)
-        .is_ok_and(|(repositioning, resizing, verifying)| repositioning || resizing || verifying)
+        .is_ok_and(|(repositioning, resizing, drive)| {
+            repositioning || resizing || drive.as_ref().is_some_and(|drive| drive.is_verifying())
+        })
     {
         return;
     }
@@ -583,8 +585,10 @@ fn deferred_expose_followup(
         }
         if flight
             .get(entity)
-            .is_ok_and(|(repositioning, resizing, verifying)| {
-                repositioning || resizing || verifying
+            .is_ok_and(|(repositioning, resizing, drive)| {
+                repositioning
+                    || resizing
+                    || drive.as_ref().is_some_and(|drive| drive.is_verifying())
             })
         {
             continue;
