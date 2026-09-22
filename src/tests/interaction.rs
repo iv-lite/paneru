@@ -2575,6 +2575,91 @@ fn test_maximize_tiled_windows_disabled_keeps_native_size() {
         .run(commands);
 }
 
+/// A keyboard focus press drives exactly one strip flight: the arrival
+/// itself never marks the window, offsets converge monotonically, and the
+/// window lands centered. Regression for keyboard-sluggish/mouse-smooth:
+/// the command path used to center the window, reshuffle the strip, and
+/// let the echo expose-correct mid-flight — three competing targets.
+/// Focusing the offscreen last window exercises the echo path too: the
+/// in-flight echo finds it offscreen and must stand down, not overwrite.
+/// (Edge reveals mid-flight may still chase with fresh-frame targets;
+/// only the arrival double-drive and echo rewrites are forbidden here.)
+#[test]
+fn test_keyboard_focus_flies_strip_once_without_rewrite() {
+    let config: Config = (
+        MainOptions {
+            animation_speed: Some(12.0),
+            auto_center: Some(true),
+            ..Default::default()
+        },
+        vec![],
+    )
+        .into();
+    let mut h = TestHarness::new().with_config(config).with_windows(5);
+    quiesce(&mut h);
+
+    let strip = {
+        let world = h.app.world_mut();
+        let mut q = world.query_filtered::<Entity, With<ActiveWorkspaceMarker>>();
+        q.single(world).expect("exactly one active strip")
+    };
+    let read_pos = |world: &mut World, e: Entity| world.get::<Position>(e).expect("position").0;
+    // Normalize like the ride tests: the flight must start from a known
+    // offset with every member exactly home.
+    h.app
+        .world_mut()
+        .entity_mut(strip)
+        .insert(Position(Origin::new(0, 20)));
+    quiesce(&mut h);
+
+    h.app.world_mut().write_message::<Event>(Event::Command {
+        command: Command::Window(Operation::Focus(Direction::Last)),
+    });
+
+    let mut offsets = vec![read_pos(h.app.world_mut(), strip).x];
+    let mut saw_flight = false;
+    let focused = find_window_entity(4, h.app.world_mut());
+    for tick in 0..60 {
+        pump_frame(&mut h);
+        let world = h.app.world_mut();
+        if world.get::<RepositionMarker>(strip).is_some() {
+            saw_flight = true;
+        }
+        // The arrival itself must not mark the window: centering rides the
+        // strip from tick zero (the old window-level centering marked it
+        // immediately). Later edge reveals may chase legitimately — those
+        // carry fresh-frame targets, not stale absolute ones.
+        if tick < 3 {
+            assert!(
+                world.get::<RepositionMarker>(focused).is_none(),
+                "tick {tick}: arrival centering must move the strip, never the window"
+            );
+        }
+        offsets.push(read_pos(world, strip).x);
+    }
+    assert!(
+        saw_flight,
+        "the strip must actually have animated for the test to mean anything"
+    );
+    assert!(
+        offsets.windows(2).all(|pair| pair[1] <= pair[0]),
+        "strip offsets must never reverse mid-arrival: {offsets:?}"
+    );
+    // Slot 1600 centered in 1024: strip at -1288, window at 312. Deliberately
+    // unclamped, mirroring reshuffle under auto_center.
+    let world = h.app.world_mut();
+    assert!(
+        world.get::<RepositionMarker>(strip).is_none(),
+        "the strip must have landed within the step budget"
+    );
+    assert_eq!(
+        read_pos(world, strip),
+        Origin::new(-1288, 20),
+        "strip must land on the centering offset"
+    );
+    assert_window_at!(world, 4, 312, TEST_MENUBAR_HEIGHT);
+}
+
 /// A genuine slot change with a static strip must still animate each window
 /// independently: rigid riding is for strip translation only, never for
 /// topology. Guards against over-correcting the ride into teleports.

@@ -297,23 +297,32 @@ fn nearest_float_in_direction(
     pick_nearest_in_direction(direction, focused_center, candidates)
 }
 
-/// Centers `entity` on arrival when `auto_center` is on, fused with the
-/// caller's strip reshuffle: issuing the window target in the same tick
-/// lets the single Update reshuffle measure it via `moving_frame`, so the
-/// strip scrolls exactly once instead of scrolling to the pre-center frame
-/// and correcting afterwards. Mirrors `autocenter_window_on_focus`, which
-/// then sees the pending marker and stands its own reshuffle down.
+/// Centers `entity` on arrival when `auto_center` is on, by moving the
+/// STRIP, never the window: the focused window keeps no animation marker
+/// of its own, so it rides the strip rigidly with its siblings (see
+/// `ride_strip_motion`) instead of chasing a stale target while the strip
+/// settles underneath it. Returns true when it centered, in which case the
+/// caller must skip its reshuffle: a follow-up reshuffle would overwrite
+/// the centering target with a mere expose offset. Mirrors
+/// `autocenter_window_on_focus`, which recomputes the identical target and
+/// harmlessly overwrites it.
 #[allow(clippy::too_many_arguments)]
 fn focus_arrival_center(
     entity: Entity,
     windows: &Windows,
+    workspaces: &Query<(
+        &LayoutStrip,
+        Entity,
+        Option<&NativeFullscreenMarker>,
+        &ChildOf,
+    )>,
     active_display: &ActiveDisplay,
     config: &Config,
     mouse_held: &Query<Entity, With<MouseHeldMarker>>,
     restored: &Query<&RestoreFocusMarker>,
     global_state: &GlobalState,
     commands: &mut Commands,
-) {
+) -> bool {
     if config.auto_center()
         && !global_state.skip_reshuffle()
         && !global_state.initializing()
@@ -322,11 +331,22 @@ fn focus_arrival_center(
         && !active_display.active_strip().tabbed(entity)
         && let Some((_, _, None)) = windows.get_managed(entity)
         && let Some(size) = windows.size(entity)
-        && let Some(mut origin) = windows.origin(entity)
+        && let Some(layout) = windows.layout_position(entity)
+        && let Some(strip_entity) = workspaces
+            .iter()
+            .find_map(|(strip, strip_entity, _, _)| strip.contains(entity).then_some(strip_entity))
     {
-        origin.x = active_display.bounds().center().x - size.x / 2;
-        commands.reposition_entity(entity, origin);
+        let viewport = active_display.bounds();
+        let center = viewport.center();
+        // Deliberately unclamped, mirroring `reshuffle_layout_strip` and
+        // `autocenter_window_on_focus`: under `auto_center` the edge
+        // invariant is unenforced (magnetic centering owns out-of-range
+        // offsets).
+        let strip_target = Origin::new(center.x - size.x / 2 - layout.0.x, viewport.min.y);
+        commands.reposition_entity(strip_entity, strip_target);
+        return true;
     }
+    false
 }
 
 /// Handles West on a fullscreen space: swaps to the last column of the
@@ -550,9 +570,10 @@ fn focus_move_step(
 
     if let Some(entity) = candidate {
         focus_history.pending_focus = Some(entity);
-        focus_arrival_center(
+        let centered = focus_arrival_center(
             entity,
             windows,
+            workspaces,
             active_display,
             config,
             mouse_held,
@@ -561,10 +582,15 @@ fn focus_move_step(
             commands,
         );
         commands.focus_entity(entity, true);
-        // Explicitly reshuffle so the target window is brought into view.
-        // This avoids a race where focus-follows-mouse leaves skip_reshuffle
-        // set, causing the WindowFocused handler to skip the reshuffle.
-        commands.reshuffle_around(entity);
+        // Explicitly reshuffle so the target window is brought into view —
+        // unless centering already drove the strip itself, which a
+        // follow-up reshuffle would overwrite with a mere expose offset.
+        // This also avoids a race where focus-follows-mouse leaves
+        // skip_reshuffle set, causing the WindowFocused handler to skip
+        // the reshuffle.
+        if !centered {
+            commands.reshuffle_around(entity);
+        }
         return Some(entity);
     }
 

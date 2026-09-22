@@ -26,8 +26,8 @@ use crate::ecs::state::PaneruState;
 use crate::ecs::workspace::RestoreFocusMarker;
 use crate::ecs::{
     ActiveWorkspaceMarker, Bounds, DockPosition, Initializing, LayoutPosition, Position,
-    ResizeMarker, RestoreWindowState, Scrolling, SendMessageTrigger, SpawnCommandsExt, WidthRatio,
-    WindowProperties,
+    RepositionMarker, ResizeMarker, RestoreWindowState, Scrolling, SendMessageTrigger,
+    SpawnCommandsExt, WidthRatio, WindowProperties,
 };
 use crate::events::{DestroySource, Event};
 use crate::manager::{
@@ -213,6 +213,7 @@ pub(super) fn window_focused_trigger(
     applications: Query<&Application>,
     mut workspaces: Query<(Entity, &mut LayoutStrip, Has<ActiveWorkspaceMarker>)>,
     strip_parents: Query<&ChildOf, With<LayoutStrip>>,
+    strip_flight: Query<(Has<RepositionMarker>, Has<Scrolling>), With<LayoutStrip>>,
     displays: Query<(Entity, Has<ActiveDisplayMarker>), With<Display>>,
     held: Query<&MouseHeldMarker>,
     restore_guards: Query<(Entity, &RestoreFocusMarker)>,
@@ -378,7 +379,16 @@ pub(super) fn window_focused_trigger(
             // information, so it must not re-derive the strip offset — that
             // threw away a manual centering. Expose the window if it has been
             // scrolled off an edge, and otherwise leave the strip alone.
-            if !global_state.skip_reshuffle() && !global_state.initializing() {
+            // Standing down while the owner strip is mid-flight, too: the
+            // echo of a command-driven raise lands here while the centering
+            // glide is still converging, and re-deriving then would restart
+            // it with a mere expose offset.
+            let strip_in_flight = owner.is_some_and(|(strip_entity, _)| {
+                strip_flight
+                    .get(strip_entity)
+                    .is_ok_and(|(repositioning, scrolling)| repositioning || scrolling)
+            });
+            if !strip_in_flight && !global_state.skip_reshuffle() && !global_state.initializing() {
                 ctx.commands.ensure_visible(entity);
             }
             continue;

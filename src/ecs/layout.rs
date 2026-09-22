@@ -162,8 +162,8 @@ type MovedStrips<'w, 's> = Populated<
     Changed<Position>,
 >;
 
-/// Strip members as [`ride_strip_motion`] sees them: identity, slot, live
-/// frame, and whether an independent slide is already in flight.
+/// Strip members as [`ride_strip_motion`] sees them: identity, slot, and
+/// the live frame the ride is free to overwrite.
 type RideMembers<'w, 's> = Query<
     'w,
     's,
@@ -173,7 +173,6 @@ type RideMembers<'w, 's> = Query<
         &'static LayoutPosition,
         &'static mut Position,
         &'static mut Bounds,
-        Has<RepositionMarker>,
     ),
     (With<Window>, Without<LayoutStrip>),
 >;
@@ -1576,7 +1575,7 @@ fn ride_strip_motion(
             // dropped, while genuinely diverging slides lose the election
             // and keep animating below. `near_home` additionally snaps
             // aboard windows whose own slide had all but converged.
-            if let Ok((_, _, _, mut position, mut bounds, _)) = members.get_mut(plan.entity) {
+            if let Ok((_, _, _, mut position, mut bounds)) = members.get_mut(plan.entity) {
                 position.0 = plan.frame.min;
                 if bounds.0 != plan.frame.size() {
                     bounds.0 = plan.frame.size();
@@ -1591,7 +1590,7 @@ fn ride_strip_motion(
             // fresh frame (refreshing an in-flight target, repairing a
             // perturbation, or sliding into a new slot).
             commands.reposition_entity(plan.entity, plan.frame.min);
-            if let Ok((_, _, _, _, mut bounds, _)) = members.get_mut(plan.entity)
+            if let Ok((_, _, _, _, mut bounds)) = members.get_mut(plan.entity)
                 && bounds.0 != plan.frame.size()
             {
                 bounds.0 = plan.frame.size();
@@ -1608,7 +1607,6 @@ struct Rider {
     size: Size,
     pos: Origin,
     h_pad: i32,
-    in_flight: bool,
     context: StripWindowContext,
 }
 
@@ -1617,7 +1615,7 @@ fn collect_riders(
     strip_contexts: &EntityHashMap<StripWindowContext>,
 ) -> Vec<Rider> {
     let mut riders = Vec::new();
-    for (entity, window, layout_position, position, bounds, in_flight) in members {
+    for (entity, window, layout_position, position, bounds) in members {
         let Some(context) = strip_contexts.get(&entity).copied() else {
             continue;
         };
@@ -1627,7 +1625,6 @@ fn collect_riders(
             size: bounds.0,
             pos: position.0,
             h_pad: window.horizontal_padding(),
-            in_flight,
             context,
         });
     }
@@ -1639,7 +1636,6 @@ fn collect_riders(
 struct RidePlan {
     entity: Entity,
     frame: IRect,
-    in_flight: bool,
     forced: bool,
     residual: (i32, i32),
 }
@@ -1671,7 +1667,6 @@ fn plan_strip_rides(
         plans.push(RidePlan {
             entity: rider.entity,
             frame,
-            in_flight: rider.in_flight,
             forced: rider.context.swiping || rider.context.snap_settling,
             residual: (rider.pos.x - frame.min.x, rider.pos.y - frame.min.y),
         });
@@ -1684,13 +1679,13 @@ fn plan_strip_rides(
 /// matches the old animator settle band, so invisible tails never flip a
 /// ride into a chase. Genuine slides stay far outside it and animate.
 const RIDE_SNAP_PX: i32 = 8;
-
 /// Whether `plan`'s window is close enough to its fresh frame to snap
-/// aboard the rigid ride rather than chase it.
+/// aboard the rigid ride rather than chase it, marker or not: a correction
+/// this small is invisible either way, while a fresh chase marker would
+/// lag the siblings it could have ridden with.
 fn near_home(plan: &RidePlan) -> bool {
-    plan.in_flight && plan.residual.0.abs() <= RIDE_SNAP_PX && plan.residual.1.abs() <= RIDE_SNAP_PX
+    plan.residual.0.abs() <= RIDE_SNAP_PX && plan.residual.1.abs() <= RIDE_SNAP_PX
 }
-
 /// Election fuzz for the rigid ride: residuals within this Chebyshev
 /// distance count as the same motion. Covers integer-rounding splits
 /// between siblings converging one flight (a 1px tail difference must not
@@ -2281,11 +2276,10 @@ mod tests {
         IRect::new(0, 0, 1024, 768)
     }
 
-    fn ride_plan(entity: Entity, residual: (i32, i32), in_flight: bool, forced: bool) -> RidePlan {
+    fn ride_plan(entity: Entity, residual: (i32, i32), forced: bool) -> RidePlan {
         RidePlan {
             entity,
             frame: IRect::new(0, 0, 10, 10),
-            in_flight,
             forced,
             residual,
         }
@@ -2296,23 +2290,20 @@ mod tests {
         let mut world = World::new();
         let a = world.spawn_empty().id();
         // Lone window: nothing to ride with.
-        assert_eq!(
-            elect_ride_delta(&[ride_plan(a, (-300, 0), false, false)]),
-            None
-        );
+        assert_eq!(elect_ride_delta(&[ride_plan(a, (-300, 0), false)]), None);
         // Even split: no majority, both keep animating.
         let b = world.spawn_empty().id();
         assert_eq!(
             elect_ride_delta(&[
-                ride_plan(a, (-300, 0), false, false),
-                ride_plan(b, (300, 0), false, false),
+                ride_plan(a, (-300, 0), false),
+                ride_plan(b, (300, 0), false),
             ]),
             None
         );
     }
 
     #[test]
-    fn elect_ride_delta_counts_in_flight_siblings_and_fuzzes_tails() {
+    fn elect_ride_delta_counts_every_sibling_and_fuzzes_tails() {
         let mut world = World::new();
         let (a, b, c) = (
             world.spawn_empty().id(),
@@ -2323,18 +2314,18 @@ mod tests {
         // the strip, and 1px rounding splits must not break unanimity.
         assert_eq!(
             elect_ride_delta(&[
-                ride_plan(a, (-300, 0), true, false),
-                ride_plan(b, (-301, 0), false, false),
-                ride_plan(c, (-300, 0), false, false),
+                ride_plan(a, (-300, 0), false),
+                ride_plan(b, (-301, 0), false),
+                ride_plan(c, (-300, 0), false),
             ]),
             Some((-300, 0))
         );
         // A genuinely diverging slide loses and keeps animating.
         assert_eq!(
             elect_ride_delta(&[
-                ride_plan(a, (-300, 0), false, false),
-                ride_plan(b, (-300, 0), false, false),
-                ride_plan(c, (120, 40), true, false),
+                ride_plan(a, (-300, 0), false),
+                ride_plan(b, (-300, 0), false),
+                ride_plan(c, (120, 40), false),
             ]),
             Some((-300, 0))
         );
@@ -2342,9 +2333,9 @@ mod tests {
         // nothing.
         assert_eq!(
             elect_ride_delta(&[
-                ride_plan(a, (-300, 0), false, true),
-                ride_plan(b, (-300, 0), false, true),
-                ride_plan(c, (-300, 0), false, false),
+                ride_plan(a, (-300, 0), true),
+                ride_plan(b, (-300, 0), true),
+                ride_plan(c, (-300, 0), false),
             ]),
             None
         );
@@ -2354,10 +2345,10 @@ mod tests {
     fn near_home_only_snaps_converged_tails() {
         let mut world = World::new();
         let a = world.spawn_empty().id();
-        assert!(near_home(&ride_plan(a, (8, -8), true, false)));
-        assert!(near_home(&ride_plan(a, (0, 0), true, false)));
-        assert!(!near_home(&ride_plan(a, (9, 0), true, false)));
-        assert!(!near_home(&ride_plan(a, (0, 0), false, false)));
+        assert!(near_home(&ride_plan(a, (8, -8), false)));
+        assert!(near_home(&ride_plan(a, (0, 0), false)));
+        assert!(!near_home(&ride_plan(a, (9, 0), false)));
+        assert!(!near_home(&ride_plan(a, (120, 40), false)));
     }
 
     #[test]
