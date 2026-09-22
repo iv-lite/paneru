@@ -748,6 +748,15 @@ impl Config {
         self.options().left_drag_scrolls_strip.unwrap_or(true)
     }
 
+    /// Whether tiled windows are resized to fill their tile slot — at
+    /// launch when windows snap into strips and on every later layout
+    /// change. Default: true. Disable to tile windows at their native
+    /// sizes instead: slots are then derived from member sizes and
+    /// positions stay managed while sizes are never touched.
+    pub fn maximize_tiled_windows(&self) -> bool {
+        self.options().maximize_tiled_windows.unwrap_or(true)
+    }
+
     /// Override the system menubar height (in pixels).
     pub fn restore_enabled(&self) -> bool {
         self.inner()
@@ -926,17 +935,6 @@ impl Config {
     pub fn ax_writer_enabled(&self) -> bool {
         // Default is enabled.
         self.options().ax_writer.is_none_or(|enabled| enabled)
-    }
-
-    /// Paces the pump to the display's retrace via a per-screen display
-    /// link instead of fixed 8/16ms sleeps. Default-on: needs macOS 14+
-    /// and falls back to the sleep ladder when unbound, so pre-14 machines
-    /// and explicit `experimental_vsync = false` behave as before.
-    pub fn experimental_vsync(&self) -> bool {
-        // Default is enabled.
-        self.options()
-            .experimental_vsync
-            .is_none_or(|enabled| enabled)
     }
 
     /// Number of virtual workspaces to pre-create on each physical space at
@@ -1386,6 +1384,9 @@ pub struct MainOptions {
     /// can't move it either. Modifier-held (armed) drags still move and
     /// transfer as before.
     pub left_drag_scrolls_strip: Option<bool>,
+    /// Resize tiled windows to fill their tile slot. See
+    /// [`Config::maximize_tiled_windows`].
+    pub maximize_tiled_windows: Option<bool>,
     /// Override the system menubar height (in pixels).
     /// When set, this value is used instead of the height reported by macOS.
     pub menubar_height: Option<u16>,
@@ -1429,10 +1430,6 @@ pub struct MainOptions {
     /// is accepted as a deprecated alias.
     #[serde(alias = "experimental_ax_writer")]
     pub ax_writer: Option<bool>,
-
-    /// Pace the pump to the display's retrace instead of fixed sleeps.
-    /// Default-on; see `Config::experimental_vsync`.
-    pub experimental_vsync: Option<bool>,
 }
 
 /// Returns a default set of column widths.
@@ -2205,6 +2202,7 @@ index = 1
     let defaults = Config::default();
     assert_eq!(defaults.swipe_sensitivity(), 0.35);
     assert_eq!(defaults.swipe_deceleration(), 4.0);
+    assert!(defaults.maximize_tiled_windows());
 }
 
 #[test]
@@ -2260,10 +2258,6 @@ fn test_ax_writer_flag_and_alias() {
     assert!(!parse("ax_writer = false").ax_writer_enabled());
     // Deprecated spelling still parses.
     assert!(!parse("experimental_ax_writer = false").ax_writer_enabled());
-    // Vsync graduated default: on unless explicitly disabled.
-    assert!(parse("").experimental_vsync());
-    assert!(parse("experimental_vsync = true").experimental_vsync());
-    assert!(!parse("experimental_vsync = false").experimental_vsync());
 }
 
 #[test]

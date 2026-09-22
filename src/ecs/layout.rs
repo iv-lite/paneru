@@ -11,7 +11,7 @@ use bevy::ecs::schedule::common_conditions::{not, resource_exists};
 use bevy::ecs::system::{Commands, Local, ParamSet, Populated, Query, Res};
 use bevy::math::IRect;
 use bevy::time::common_conditions::on_timer;
-use std::collections::{HashMap, HashSet, VecDeque};
+use std::collections::{HashSet, VecDeque};
 use std::time::Duration;
 use stdext::function_name;
 use tracing::{Level, instrument, trace, warn};
@@ -1252,7 +1252,10 @@ fn layout_strip_changed(
             if layout_position.0 != frame.min {
                 layout_position.0 = frame.min;
             }
-            if bounds.0 != frame.size() {
+            // Slot-size conformance ("maximize into the tile") is optional:
+            // with `maximize_tiled_windows` off, members keep native sizes
+            // and slots keep deriving from them — positions stay managed.
+            if config.maximize_tiled_windows() && bounds.0 != frame.size() {
                 bounds.0 = frame.size();
             }
         }
@@ -1517,16 +1520,16 @@ fn ensure_visible_in_strip(
 ///
 /// Per member of each moved strip:
 /// * swiping / snap-settling strips ride directly and drop markers (as before).
-/// * members already carrying a `RepositionMarker` (an independent slot-change
-///   slide overlapping strip motion) get their target refreshed via
-///   `reposition_entity`, so the slide composes with the strip instead of
-///   chasing a stale target.
-/// * everyone else votes: the strip-motion delta is the majority residual
-///   (`position - frame`). Bearers ride rigidly (direct-assign + verify, no
-///   marker); outliers (a perturbed window, a fresh slot change) animate back
-///   via `reposition_entity`, preserving the old repair/slide behavior. The
-///   majority must be strict and at least a pair, so a lone window or an
-///   evenly split swap keeps animating exactly as before.
+/// * everyone votes (in flight or not): the strip-motion delta is the
+///   majority residual (`position - frame`, fuzzed by [`RIDE_MATCH_PX`]).
+///   Bearers ride rigidly (direct-assign + verify, markers dropped) — a
+///   stale tail marker never disqualifies a sibling moving with the strip.
+/// * outliers (a perturbed window, a fresh slot change mid-flight) keep
+///   animating back via `reposition_entity`, preserving the old
+///   repair/slide behavior, while all-but-converged tails snap aboard
+///   directly (see [`near_home`]). The majority must be strict and at
+///   least a pair, so a lone window or an evenly split swap keeps
+///   animating exactly as before.
 #[instrument(level = Level::DEBUG, skip_all)]
 fn ride_strip_motion(
     moved_strips: MovedStrips,
@@ -1562,12 +1565,17 @@ fn ride_strip_motion(
 
     for plan in &plans {
         if plan.forced
-            || (!plan.in_flight && ride_delta.is_some_and(|delta| delta == plan.residual))
+            || ride_delta.is_some_and(|delta| cheby(delta, plan.residual) <= RIDE_MATCH_PX)
+            || near_home(plan)
         {
             // Rigid ride: the strip moved under a settled window, so the
             // window is already conceptually there — assign, don't animate.
             // Carries verification like every driven move (see
             // `reposition_entity`), minus the marker the animator would chase.
+            // Matching members ride even mid-slide: a stale tail marker is
+            // dropped, while genuinely diverging slides lose the election
+            // and keep animating below. `near_home` additionally snaps
+            // aboard windows whose own slide had all but converged.
             if let Ok((_, _, _, mut position, mut bounds, _)) = members.get_mut(plan.entity) {
                 position.0 = plan.frame.min;
                 if bounds.0 != plan.frame.size() {
@@ -1671,24 +1679,53 @@ fn plan_strip_rides(
     plans
 }
 
-/// The strip-motion delta: the strict-majority residual among voters
-/// (neither forced nor in flight), carried by at least a pair. A lone window
-/// or an evenly split swap has no "together" to keep and animates exactly as
-/// before, so those elect nothing.
+/// Snap-aboard radius for the rigid ride: an in-flight window this close
+/// (Chebyshev) to its fresh frame snaps aboard instead of re-targeting —
+/// matches the old animator settle band, so invisible tails never flip a
+/// ride into a chase. Genuine slides stay far outside it and animate.
+const RIDE_SNAP_PX: i32 = 8;
+
+/// Whether `plan`'s window is close enough to its fresh frame to snap
+/// aboard the rigid ride rather than chase it.
+fn near_home(plan: &RidePlan) -> bool {
+    plan.in_flight && plan.residual.0.abs() <= RIDE_SNAP_PX && plan.residual.1.abs() <= RIDE_SNAP_PX
+}
+
+/// Election fuzz for the rigid ride: residuals within this Chebyshev
+/// distance count as the same motion. Covers integer-rounding splits
+/// between siblings converging one flight (a 1px tail difference must not
+/// break an otherwise unanimous ride); genuine slides sit orders of
+/// magnitude further apart and still elect nothing.
+const RIDE_MATCH_PX: i32 = 2;
+
+fn cheby(a: (i32, i32), b: (i32, i32)) -> i32 {
+    (a.0 - b.0).abs().max((a.1 - b.1).abs())
+}
+
+/// The strip-motion delta: the center of the largest cluster of residuals
+/// within [`RIDE_MATCH_PX`], carried by at least a strict-majority pair.
+/// In-flight members vote too: a stale tail marker must not disqualify a
+/// sibling that is moving with the strip — matching the elected delta
+/// rides (the marker is dropped), while genuinely diverging slides lose
+/// the election and keep animating. A lone window or an evenly split swap
+/// elects nothing and animates exactly as before.
 fn elect_ride_delta(plans: &[RidePlan]) -> Option<(i32, i32)> {
-    let mut tally: HashMap<(i32, i32), usize> = HashMap::new();
-    let mut cast = 0usize;
-    for plan in plans {
-        if plan.forced || plan.in_flight {
-            continue;
+    let voters: Vec<(i32, i32)> = plans
+        .iter()
+        .filter(|plan| !plan.forced)
+        .map(|plan| plan.residual)
+        .collect();
+    let mut best: Option<((i32, i32), usize)> = None;
+    for candidate in &voters {
+        let count = voters
+            .iter()
+            .filter(|residual| cheby(**residual, *candidate) <= RIDE_MATCH_PX)
+            .count();
+        if best.is_none_or(|(_, n)| count > n) {
+            best = Some((*candidate, count));
         }
-        cast += 1;
-        *tally.entry(plan.residual).or_insert(0) += 1;
     }
-    tally
-        .into_iter()
-        .max_by_key(|(_, count)| *count)
-        .filter(|(_, count)| *count >= 2 && *count * 2 > cast)
+    best.filter(|(_, count)| *count >= 2 && *count * 2 > voters.len())
         .map(|(delta, _)| delta)
 }
 
@@ -2242,6 +2279,85 @@ mod tests {
 
     fn test_viewport() -> IRect {
         IRect::new(0, 0, 1024, 768)
+    }
+
+    fn ride_plan(entity: Entity, residual: (i32, i32), in_flight: bool, forced: bool) -> RidePlan {
+        RidePlan {
+            entity,
+            frame: IRect::new(0, 0, 10, 10),
+            in_flight,
+            forced,
+            residual,
+        }
+    }
+
+    #[test]
+    fn elect_ride_delta_needs_a_strict_majority_pair() {
+        let mut world = World::new();
+        let a = world.spawn_empty().id();
+        // Lone window: nothing to ride with.
+        assert_eq!(
+            elect_ride_delta(&[ride_plan(a, (-300, 0), false, false)]),
+            None
+        );
+        // Even split: no majority, both keep animating.
+        let b = world.spawn_empty().id();
+        assert_eq!(
+            elect_ride_delta(&[
+                ride_plan(a, (-300, 0), false, false),
+                ride_plan(b, (300, 0), false, false),
+            ]),
+            None
+        );
+    }
+
+    #[test]
+    fn elect_ride_delta_counts_in_flight_siblings_and_fuzzes_tails() {
+        let mut world = World::new();
+        let (a, b, c) = (
+            world.spawn_empty().id(),
+            world.spawn_empty().id(),
+            world.spawn_empty().id(),
+        );
+        // A stale tail marker must not disqualify a sibling moving with
+        // the strip, and 1px rounding splits must not break unanimity.
+        assert_eq!(
+            elect_ride_delta(&[
+                ride_plan(a, (-300, 0), true, false),
+                ride_plan(b, (-301, 0), false, false),
+                ride_plan(c, (-300, 0), false, false),
+            ]),
+            Some((-300, 0))
+        );
+        // A genuinely diverging slide loses and keeps animating.
+        assert_eq!(
+            elect_ride_delta(&[
+                ride_plan(a, (-300, 0), false, false),
+                ride_plan(b, (-300, 0), false, false),
+                ride_plan(c, (120, 40), true, false),
+            ]),
+            Some((-300, 0))
+        );
+        // Forced members don't vote: two swiping plus one voter elects
+        // nothing.
+        assert_eq!(
+            elect_ride_delta(&[
+                ride_plan(a, (-300, 0), false, true),
+                ride_plan(b, (-300, 0), false, true),
+                ride_plan(c, (-300, 0), false, false),
+            ]),
+            None
+        );
+    }
+
+    #[test]
+    fn near_home_only_snaps_converged_tails() {
+        let mut world = World::new();
+        let a = world.spawn_empty().id();
+        assert!(near_home(&ride_plan(a, (8, -8), true, false)));
+        assert!(near_home(&ride_plan(a, (0, 0), true, false)));
+        assert!(!near_home(&ride_plan(a, (9, 0), true, false)));
+        assert!(!near_home(&ride_plan(a, (0, 0), false, false)));
     }
 
     #[test]

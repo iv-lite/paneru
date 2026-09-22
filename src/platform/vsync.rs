@@ -1,5 +1,4 @@
-//! Display-link vsync pacing (experimental, behind
-//! `Config::experimental_vsync`).
+//! Display-link vsync pacing.
 //!
 //! The pump otherwise sleeps fixed 8/16ms guesses that beat against the real
 //! retrace. A `CADisplayLink` bound to the active display (macOS 14+, via

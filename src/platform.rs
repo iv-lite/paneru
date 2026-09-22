@@ -369,8 +369,8 @@ impl PlatformCallbacks {
     }
 
     /// Binds the vsync display link to `display_id` iff `enabled`
-    /// (experimental; macOS 14+). Idempotent — safe to call every quiet
-    /// frame, so flag flips and display switches apply immediately.
+    /// (macOS 14+). Idempotent — safe to call every quiet frame, so
+    /// display switches apply immediately.
     /// Falls back to the sleep ladder when disabled, unsupported, or
     /// unbound.
     pub fn ensure_vsync_link(

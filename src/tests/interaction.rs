@@ -2269,6 +2269,36 @@ fn test_under_threshold_move_animates_without_snap_strip_marker() {
     );
 }
 
+/// One frame: update, then report whether the mock still has echoes to
+/// deliver. Shared by the motion tests below, which all measure from a
+/// true resting baseline.
+fn pump_frame(h: &mut TestHarness) -> bool {
+    h.app.update();
+    let mut drained = false;
+    for e in h.mock_state.drain_events() {
+        drained = true;
+        h.app.world_mut().write_message::<Event>(e);
+    }
+    drained
+}
+
+/// Runs frames until no animation markers, mock echoes, or snap guards
+/// remain (cap 300): true rest for tests that measure motion from a
+/// baseline. A stale focus echo would legitimately supersede a manual
+/// strip marker via `autocenter_window_on_focus`, and a live
+/// `SnapStripMarker` forces direct placement — both must be gone first.
+fn quiesce(h: &mut TestHarness) {
+    for _ in 0..300 {
+        let drained = pump_frame(h);
+        let world = h.app.world_mut();
+        let mut markers = world.query_filtered::<(), With<RepositionMarker>>();
+        let mut guards = world.query_filtered::<(), With<crate::ecs::workspace::SnapStripMarker>>();
+        if !drained && markers.iter(world).next().is_none() && guards.iter(world).next().is_none() {
+            break;
+        }
+    }
+}
+
 /// A pure strip translation must ride every member rigidly: no per-window
 /// `RepositionMarker` at any point, identical per-tick deltas across
 /// siblings, and a shared landing tick. Regression: the old
@@ -2287,31 +2317,8 @@ fn test_strip_translation_rides_members_together() {
         .into();
 
     let mut h = TestHarness::new().with_config(config).with_windows(3);
-    // One frame: update, then report whether the mock still has echoes to
-    // deliver. Quiescence needs everything quiet — markers settled, no
-    // pending mock events (a stale focus echo would legitimately supersede
-    // the manual strip marker below via `autocenter_window_on_focus`), and
-    // no live `SnapStripMarker` guards (the startup restore guard forces
-    // direct placement for its first 500ms, like the old heuristic did).
-    let step = |h: &mut TestHarness| {
-        h.app.update();
-        let mut drained = false;
-        for e in h.mock_state.drain_events() {
-            drained = true;
-            h.app.world_mut().write_message::<Event>(e);
-        }
-        drained
-    };
     // Settle the spawn layout so the baseline below is true rest.
-    for _ in 0..300 {
-        let drained = step(&mut h);
-        let world = h.app.world_mut();
-        let mut markers = world.query_filtered::<(), With<RepositionMarker>>();
-        let mut guards = world.query_filtered::<(), With<crate::ecs::workspace::SnapStripMarker>>();
-        if !drained && markers.iter(world).next().is_none() && guards.iter(world).next().is_none() {
-            break;
-        }
-    }
+    quiesce(&mut h);
 
     let members: Vec<Entity> = [0, 1, 2]
         .into_iter()
@@ -2323,7 +2330,22 @@ fn test_strip_translation_rides_members_together() {
         q.single(world).expect("exactly one active strip")
     };
     let read_pos = |world: &mut World, e: Entity| world.get::<Position>(e).expect("position").0;
+    // Normalize: settle history may leave the strip at a centered offset
+    // (or a few px into a tail). The flight under test must start from a
+    // known offset, so place the strip directly and re-quiesce: the ride
+    // re-seats every member rigidly, and any refresh markers the move
+    // itself created converge before the baseline below is read.
+    h.app
+        .world_mut()
+        .entity_mut(strip)
+        .insert(Position(Origin::new(0, 20)));
+    quiesce(&mut h);
     let base_strip = read_pos(h.app.world_mut(), strip);
+    assert_eq!(
+        base_strip,
+        Origin::new(0, 20),
+        "test setup: strip must normalize exactly"
+    );
     let base: Vec<Origin> = members
         .iter()
         .map(|e| read_pos(h.app.world_mut(), *e))
@@ -2338,8 +2360,8 @@ fn test_strip_translation_rides_members_together() {
 
     let mut prev = base.clone();
     let mut saw_flight = false;
-    for tick in 0..30 {
-        step(&mut h);
+    for tick in 0..40 {
+        pump_frame(&mut h);
         let world = h.app.world_mut();
         if world.get::<RepositionMarker>(strip).is_some() {
             saw_flight = true;
@@ -2404,6 +2426,155 @@ fn test_commit_advances_writer_epochs() {
     );
 }
 
+/// Focusing a window centers it by moving the STRIP, never the window:
+/// no window-level marker at any tick, identical per-tick deltas across
+/// every member including the focused one, shared landing with the window
+/// centered. Regression for move-a-bit-then-creep (a window lerp chasing
+/// a strip lerp) and mid-flight disjointness.
+#[test]
+fn test_focus_centers_strip_with_all_members_riding() {
+    let config: Config = (
+        MainOptions {
+            animation_speed: Some(12.0),
+            auto_center: Some(true),
+            ..Default::default()
+        },
+        vec![],
+    )
+        .into();
+    // Three windows: focusing the middle one shifts the strip -88px with
+    // every member on-screen throughout, so the whole strip must ride as
+    // one (fully offscreen members keep their edge-docked slivers instead
+    // — that docking is load-bearing for display adoption, not drift).
+    let mut h = TestHarness::new().with_config(config).with_windows(3);
+    // Settle the spawn layout so the baseline below is true rest.
+    quiesce(&mut h);
+
+    let members: Vec<Entity> = [0, 1, 2]
+        .into_iter()
+        .map(|id| find_window_entity(id, h.app.world_mut()))
+        .collect();
+    let strip = {
+        let world = h.app.world_mut();
+        let mut q = world.query_filtered::<Entity, With<ActiveWorkspaceMarker>>();
+        q.single(world).expect("exactly one active strip")
+    };
+    let read_pos = |world: &mut World, e: Entity| world.get::<Position>(e).expect("position").0;
+    // Normalize: settle history may leave the strip at a centered offset
+    // (spawn focus re-centers once `Initializing` lifts). The flight under
+    // test must start from a known offset, so place the strip directly and
+    // re-quiesce before reading the baseline.
+    h.app
+        .world_mut()
+        .entity_mut(strip)
+        .insert(Position(Origin::new(0, 20)));
+    quiesce(&mut h);
+    let base: Vec<Origin> = members
+        .iter()
+        .map(|e| read_pos(h.app.world_mut(), *e))
+        .collect();
+
+    // Hand focus to the middle window directly: the animation path under
+    // test starts at `Added<FocusedMarker>`, like any OS/command focus.
+    // Slot 400 centers at strip offset 512 - 200 - 400 = -88, so every
+    // member stays visible for the whole flight.
+    {
+        let world = h.app.world_mut();
+        let mut focused = world.query_filtered::<Entity, With<FocusedMarker>>();
+        for entity in focused.iter(world).collect::<Vec<_>>() {
+            world.entity_mut(entity).remove::<FocusedMarker>();
+        }
+        world.entity_mut(members[1]).insert(FocusedMarker);
+    }
+
+    let mut prev = base.clone();
+    let mut saw_flight = false;
+    for tick in 0..40 {
+        pump_frame(&mut h);
+        let world = h.app.world_mut();
+        if world.get::<RepositionMarker>(strip).is_some() {
+            saw_flight = true;
+        }
+        for member in &members {
+            assert!(
+                world.get::<RepositionMarker>(*member).is_none(),
+                "tick {tick}: focus must move the strip, never a window"
+            );
+        }
+        let current: Vec<Origin> = members.iter().map(|e| read_pos(world, *e)).collect();
+        let step_deltas: Vec<(i32, i32)> = current
+            .iter()
+            .zip(prev.iter())
+            .map(|(c, p)| (c.x - p.x, c.y - p.y))
+            .collect();
+        assert!(
+            step_deltas.windows(2).all(|w| w[0] == w[1]),
+            "tick {tick}: siblings must move by identical deltas, got {step_deltas:?}"
+        );
+        prev = current;
+    }
+    assert!(
+        saw_flight,
+        "the strip must actually have animated for the test to mean anything"
+    );
+    // Window 1 (slot x 400, width 400) centered in the 1024 viewport:
+    // strip at 512 - 200 - 400 = -88, window at 312.
+    let world = h.app.world_mut();
+    assert!(
+        world.get::<RepositionMarker>(strip).is_none(),
+        "the strip must have landed within the step budget"
+    );
+    assert_eq!(
+        read_pos(world, members[1]),
+        Origin::new(312, TEST_MENUBAR_HEIGHT),
+        "focused window must land centered"
+    );
+    for (member, start) in members.iter().zip(base.iter()) {
+        assert_eq!(
+            read_pos(world, *member),
+            *start + Origin::new(-88, 0),
+            "member {member:?} must land exactly on its rigid slot"
+        );
+    }
+}
+
+/// With `maximize_tiled_windows` off, members keep their native sizes
+/// while positions stay managed: slots derive from member sizes and the
+/// layout tiles at native dimensions instead of conforming windows.
+#[test]
+fn test_maximize_tiled_windows_disabled_keeps_native_size() {
+    let config: Config = (
+        MainOptions {
+            maximize_tiled_windows: Some(false),
+            ..Default::default()
+        },
+        vec![],
+    )
+        .into();
+
+    let commands = vec![
+        Event::MenuOpened { window_id: 0 },
+        Event::Command {
+            command: Command::PrintState,
+        },
+    ];
+
+    TestHarness::new()
+        .with_config(config)
+        .with_windows(3)
+        .on_iteration(1, |world, _state| {
+            // Native spawn size preserved on all three...
+            assert_window_size!(world, 0, TEST_WINDOW_WIDTH, TEST_WINDOW_HEIGHT);
+            assert_window_size!(world, 1, TEST_WINDOW_WIDTH, TEST_WINDOW_HEIGHT);
+            assert_window_size!(world, 2, TEST_WINDOW_WIDTH, TEST_WINDOW_HEIGHT);
+            // ...while positions still tile side by side.
+            assert_window_at!(world, 0, 0, TEST_MENUBAR_HEIGHT);
+            assert_window_at!(world, 1, 400, TEST_MENUBAR_HEIGHT);
+            assert_window_at!(world, 2, 800, TEST_MENUBAR_HEIGHT);
+        })
+        .run(commands);
+}
+
 /// A genuine slot change with a static strip must still animate each window
 /// independently: rigid riding is for strip translation only, never for
 /// topology. Guards against over-correcting the ride into teleports.
@@ -2419,25 +2590,8 @@ fn test_slot_change_still_animates_independently() {
         .into();
 
     let mut h = TestHarness::new().with_config(config).with_windows(3);
-    // Quiescence needs everything quiet — see the ride test above.
-    let step = |h: &mut TestHarness| {
-        h.app.update();
-        let mut drained = false;
-        for e in h.mock_state.drain_events() {
-            drained = true;
-            h.app.world_mut().write_message::<Event>(e);
-        }
-        drained
-    };
-    for _ in 0..300 {
-        let drained = step(&mut h);
-        let world = h.app.world_mut();
-        let mut markers = world.query_filtered::<(), With<RepositionMarker>>();
-        let mut guards = world.query_filtered::<(), With<crate::ecs::workspace::SnapStripMarker>>();
-        if !drained && markers.iter(world).next().is_none() && guards.iter(world).next().is_none() {
-            break;
-        }
-    }
+    // Settle the spawn layout so the swap below is the only motion.
+    quiesce(&mut h);
 
     let strip = {
         let world = h.app.world_mut();
@@ -2450,7 +2604,7 @@ fn test_slot_change_still_animates_independently() {
         .get_mut::<LayoutStrip>(strip)
         .expect("strip")
         .swap(0, 1);
-    step(&mut h);
+    pump_frame(&mut h);
 
     let world = h.app.world_mut();
     assert!(

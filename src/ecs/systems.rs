@@ -96,10 +96,10 @@ type ResizableWindows<'w, 's> = Query<
 >;
 
 /// Settle band for the exponential animator: residuals inside it snap to the
-/// target and drop the marker. Must exceed one sluggish frame's travel, or a
-/// slow machine creeps toward the target for seconds, re-driving AX commits
-/// (and borders) the whole way instead of landing.
-const ANIAMTE_SNAP_THRESHOLD: f32 = 8.0;
+/// target and drop the marker. Kept tight (about one frame's tail travel at
+/// the default rate) so siblings land on the same tick instead of popping
+/// home one frame apart; the tail costs a few extra AX commits per landing.
+const ANIMATE_SNAP_THRESHOLD: f32 = 2.0;
 
 /// Cap for animation time steps. A main-thread stall (synchronous AX IPC)
 /// must shed time instead of teleporting: without the cap the next
@@ -143,13 +143,12 @@ fn pump_timeout_limit(
     }
 }
 
-/// Retrace period as whole-millisecond sleep. Periods are small and
-/// positive by construction (measured inter-retrace deltas); sub-ms
-/// precision is lost, which only shortens the backstop sleep — the link's
-/// wake, not the timeout, ends the wait on time.
+/// Retrace period as whole-millisecond sleep. Rounded (not truncated) so
+/// the backstop sits on the retrace instead of systematically short of it —
+/// the link's wake, not the timeout, still ends the wait on time.
 #[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
 fn vsync_timeout_ms(period: Duration) -> u32 {
-    (period.as_secs_f64() * 1000.0) as u32
+    (period.as_secs_f64() * 1000.0).round() as u32
 }
 const LOOP_MAX_TIMEOUT_LOWPOWER_MS: u32 = 2000;
 // Real events (input, IPC, workspace changes, ...) wake the pump immediately
@@ -1172,7 +1171,7 @@ pub(super) fn animate_entities(
             // Snap once the shortfall fits inside the settle band (or after
             // one effectively-complete tick), so the marker is dropped
             // promptly instead of creeping for seconds on a slow machine.
-            let finished = (target - lerped).length() <= ANIAMTE_SNAP_THRESHOLD;
+            let finished = (target - lerped).length() <= ANIMATE_SNAP_THRESHOLD;
             let new_pos = if finished {
                 *origin
             } else {
@@ -1219,7 +1218,7 @@ pub(super) fn animate_resize_entities(
             let current = bounds.0.as_vec2();
             let lerped = current.lerp(target, t);
 
-            let finished = (target - lerped).length() <= ANIAMTE_SNAP_THRESHOLD;
+            let finished = (target - lerped).length() <= ANIMATE_SNAP_THRESHOLD;
             let new_size = if finished {
                 *size
             } else {
@@ -1370,13 +1369,14 @@ pub(crate) fn pump_events(
     platform: Option<NonSendMut<Pin<Box<PlatformCallbacks>>>>,
     activity: FrameActivity,
     active_display: Query<&Display, With<ActiveDisplayMarker>>,
-    config: Res<Config>,
     mut timeout: Local<u32>,
     mut last_tap_check: Local<Option<Instant>>,
     // Cached ProMotion presence + last refresh. `NSScreen::screens` per frame
     // would cost more than the cadence it tunes; displays barely change, so
     // refresh on wake/display events and every 60s.
     mut promotion: Local<(bool, Option<Instant>)>,
+    // Last seen vsync-bind state, for transition-only logging below.
+    mut vsync_bound: Local<bool>,
 ) {
     let Some((ref mut platform, incoming_events)) = platform.zip(incoming_events) else {
         // No platform interface or incoming event pipe - probably executing in a unit test.
@@ -1466,26 +1466,31 @@ pub(crate) fn pump_events(
                 .any(|screen| screen.maximumFramesPerSecond() >= 110);
             promotion.1 = Some(Instant::now());
         }
-        // Rebind every quiet frame: idempotent (no-op when display and flag
-        // are unchanged), so flag flips and display switches apply on the
-        // next frame instead of waiting out the 60s probe above.
+        // Rebind every quiet frame: idempotent (no-op when display
+        // is unchanged), so display switches apply on the next frame
+        // instead of waiting out the 60s probe above.
         if let Some(display) = active_display.iter().next() {
-            platform.ensure_vsync_link(display.id(), config.experimental_vsync());
+            platform.ensure_vsync_link(display.id(), true);
         }
         // Vsync-paced when bound: sleep to the next retrace instead of
         // the fixed active guess, and let the link's wake (armed below)
         // end the wait on time. Falls back to the sleep ladder with no
-        // period yet, flag off, or pre-macOS-14.
-        let timeout_limit = pump_timeout_limit(
-            frame_active,
-            low_power,
-            if frame_active {
-                platform.vsync_period()
-            } else {
-                None
-            },
-            promotion.0,
-        );
+        // period yet or pre-macOS-14. Transitions log once (not per
+        // frame): a silently unbound link reads as ordinary judder.
+        let period = if frame_active {
+            platform.vsync_period()
+        } else {
+            None
+        };
+        if period.is_some() != *vsync_bound {
+            *vsync_bound = period.is_some();
+            if let Some(period) = period {
+                debug!("pump: vsync link bound, pacing active frames to {period:?}");
+            } else if frame_active {
+                debug!("pump: vsync link unbound during active frame, on sleep ladder");
+            }
+        }
+        let timeout_limit = pump_timeout_limit(frame_active, low_power, period, promotion.0);
         *timeout = timeout.min(timeout_limit) + LOOP_TIMEOUT_STEP;
     } else {
         // Still backed up: come straight back rather than sleeping on it.
@@ -3043,6 +3048,7 @@ mod tests {
     use super::gather_initial_processes;
     use super::overlay_hide_for_swipe;
     use super::overlay_tracks_live;
+    use super::vsync_timeout_ms;
     use super::{LOOP_MAX_TIMEOUT_FRAME_ACTIVE_MS, LOOP_MAX_TIMEOUT_PROMOTION_MS};
     use crate::config::Config;
     use crate::events::Event;
@@ -3071,6 +3077,23 @@ mod tests {
         app.update();
 
         assert_eq!(tap_config.swipe_gesture_fingers(), Some(3));
+    }
+
+    #[test]
+    fn vsync_backstop_rounds_to_the_retrace() {
+        use std::time::Duration;
+        // Truncation parked the backstop systematically short (16.667 ->
+        // 16, 8.333 -> 8), beating against the link wake every frame.
+        assert_eq!(
+            vsync_timeout_ms(Duration::from_nanos(16_666_667)),
+            17,
+            "60Hz backstop sits on the retrace"
+        );
+        assert_eq!(
+            vsync_timeout_ms(Duration::from_nanos(8_333_333)),
+            8,
+            "120Hz backstop sits on the retrace"
+        );
     }
 
     #[test]

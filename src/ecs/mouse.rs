@@ -23,8 +23,8 @@ use crate::ecs::params::{ActiveDisplayMut, GlobalState, Windows};
 use crate::ecs::workspace::mid_strip_slot;
 use crate::ecs::{
     ActiveWorkspaceMarker, ColdStart, DockPosition, ManualStripOffset, MissionControlActive,
-    Position, Scrolling, SelectedVirtualMarker, SpawnCommandsExt, TitlebarGrab, Unmanaged,
-    VerifyWindowPosition,
+    Position, RepositionMarker, Scrolling, SelectedVirtualMarker, SpawnCommandsExt, TitlebarGrab,
+    Unmanaged, VerifyWindowPosition,
 };
 use crate::manager::{Display, Origin, Size, Window, WindowManager, origin_from};
 use crate::overlay::{BorderParams, OverlayManager};
@@ -115,6 +115,12 @@ fn drive_scroll_strip(
     // Raw hand truth: release-velocity samplers already fold the undamped
     // delta, so seeding from strip truth and seeding from the pointer agree.
     strip_position.0.x += delta_x;
+    if let Ok(mut entity_commands) = commands.get_entity(strip_entity) {
+        // Latest intent wins: a stale programmatic flight (kept alive by
+        // the tight snap band's tail) would drag the strip back toward its
+        // old target behind the hand. The hand owns the strip now.
+        entity_commands.try_remove::<RepositionMarker>();
+    }
     if let Some(mut scrolling) = scrolling {
         // Keep the integrator's state glued to the direct write: with zero
         // velocity it no-ops and the constraints just clamp, regardless of
@@ -1463,6 +1469,12 @@ fn drag_move_held_column(
                     if let Ok(mut position) = positions.get_mut(member) {
                         position.0 += delta;
                         moved_any = true;
+                    }
+                    // Latest intent wins, as in `drive_scroll_strip`: a
+                    // stale slide marker would drag the member back toward
+                    // its old target behind the hand.
+                    if let Ok(mut entity_commands) = commands.get_entity(member) {
+                        entity_commands.try_remove::<RepositionMarker>();
                     }
                 }
                 // Emit only when a transfer could follow (armed + shortcut

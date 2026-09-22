@@ -10,8 +10,8 @@ use crate::ecs::mouse::{DragModifierState, DragPaintState, DragScrollState, Drop
 use crate::ecs::workspace::IgnoredMovedWindows;
 use crate::ecs::{
     ActiveDisplayMarker, ActiveWorkspaceMarker, Bounds, DockPosition, DragDisplayArmed,
-    DragScrollArmed, DragSettleMarker, MouseHeldMarker, Position, RepositionMarker, Scrolling,
-    SpawnWindowTrigger, StaleAxMarker, Timeout, Unmanaged,
+    DragScrollArmed, DragSettleMarker, LayoutPosition, MouseHeldMarker, Position, RepositionMarker,
+    Scrolling, SpawnWindowTrigger, StaleAxMarker, Timeout, Unmanaged,
 };
 use crate::events::Event;
 use crate::manager::{Application, Display, Origin, Size, Window};
@@ -3283,7 +3283,7 @@ fn test_armed_drag_follows_cursor_without_native_move() {
 
     TestHarness::new()
         .with_config(drag_display_config())
-        .with_windows(1)
+        .with_windows(2)
         .on_iteration(4, move |world, _state| {
             // Horizontal-only drag: the (100, 100) pointer delta applies its
             // `dx` 1:1 onto the slot origin while `dy` is dropped, so the
@@ -3478,6 +3478,8 @@ fn test_display_move_clamps_width_to_target_viewport() {
         Event::Command {
             command: Command::PrintState,
         },
+        // Extra quiet window: the tighter snap band needs the resize tail
+        // to converge before the exact-size assert below.
         Event::Command {
             command: Command::PrintState,
         },
@@ -3499,7 +3501,7 @@ fn test_display_move_clamps_width_to_target_viewport() {
                 "setup: window must be oversized before the move"
             );
         })
-        .on_iteration(3, move |world, _state| {
+        .on_iteration(4, move |world, _state| {
             assert_on_workspace!(world, 0, EXT_WORKSPACE_ID);
             assert_window_size!(
                 world,
@@ -3731,16 +3733,41 @@ fn test_armed_drop_reorders_column_to_nearest_slot() {
         .run(commands);
 }
 
+/// Strip x plus two members' layout-slot x: the rigid-motion baseline a
+/// drive must preserve exactly (slots, unlike live positions, carry no
+/// settle tails).
+fn strip_baseline(world: &mut World, a: WinID, b: WinID) -> (i32, i32, i32) {
+    let ea = find_window_entity(a, world);
+    let eb = find_window_entity(b, world);
+    let mut strips = world.query::<(&LayoutStrip, &Position)>();
+    let strip_x = strips
+        .iter(world)
+        .find(|(strip, _)| strip.contains(ea))
+        .expect("need owning strip")
+        .1
+        .0
+        .x;
+    let xa = world.get::<LayoutPosition>(ea).expect("need slot").0.x;
+    let xb = world.get::<LayoutPosition>(eb).expect("need slot").0.x;
+    (strip_x, xa, xb)
+}
+
 /// An unarmed drag pans the strip with the cursor instead of moving the
 /// column: members stay in their slots, and release glides and then settles
 /// to reveal the nearest window (no homing, no reshuffle) — the shortcut
 /// stays the relocation gate.
 #[test]
 fn test_unarmed_drag_scrolls_strip() {
+    use std::cell::Cell;
+    use std::rc::Rc;
     // Stacked column sits at x=400 (see transfer test); grab window 0's
     // titlebar (slot y=20, so y=25 is header) and drag right without the
     // shortcut.
     let grab = CGPoint::new(600.0, 30.0);
+    // Pre-drag (strip x, member offsets from the strip): the +300 drag
+    // below must preserve all three exactly.
+    let baseline = Rc::new(Cell::new((0, 0, 0)));
+    let probe = baseline.clone();
     let mut commands = vec![
         Event::MenuOpened { window_id: 0 },
         Event::Command {
@@ -3775,25 +3802,36 @@ fn test_unarmed_drag_scrolls_strip() {
     TestHarness::new()
         .with_config(drag_display_config())
         .with_windows(2)
+        .on_iteration(3, move |world, _state| {
+            probe.set(strip_baseline(world, 0, 1));
+        })
         .on_iteration(4, move |world, _state| {
-            // strip (slot-relative): the strip followed to 700 and the
-            // column stayed in its slot, instead of tearing off to 700 over
-            // a strip left behind at 400.
-            for id in [0, 1] {
+            // The +300 drag lands on the strip exactly, and stacked mates
+            // keep their slot offsets (rigid 1:1, no lag, no markers).
+            let (sx, o0, o1) = baseline.get();
+            let first = find_window_entity(0, world);
+            let mut strips = world.query::<(&LayoutStrip, &Position)>();
+            let strip_x = strips
+                .iter(world)
+                .find(|(strip, _)| strip.contains(first))
+                .expect("need owning strip")
+                .1
+                .0
+                .x;
+            assert_eq!(strip_x, sx + 300, "strip must track the drag exactly");
+            for (id, off) in [(0, o0), (1, o1)] {
                 let entity = find_window_entity(id, world);
                 let position = world.get::<Position>(entity).expect("need position").0;
+                assert!(
+                    world.get::<RepositionMarker>(entity).is_none(),
+                    "stacked mate {id} must ride, not animate"
+                );
                 assert_eq!(
-                    position.x, 700,
+                    position.x,
+                    sx + 300 + off,
                     "stacked mate {id} must scroll with its strip"
                 );
             }
-            let first = find_window_entity(0, world);
-            let mut strips = world.query::<(&LayoutStrip, &Position)>();
-            let (_, position) = strips
-                .iter(world)
-                .find(|(strip, _)| strip.contains(first))
-                .expect("need owning strip");
-            assert_eq!(position.0.x, 700);
         })
         .on_iteration(6, move |world, _state| {
             // Release flung the strip: the glide is still running with the

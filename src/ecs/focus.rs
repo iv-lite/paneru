@@ -29,7 +29,7 @@ use crate::ecs::{
     ResizeMarker, Scrolling, SendMessageTrigger, SpawnCommandsExt, StrayFocusEvent,
 };
 use crate::events::Event;
-use crate::manager::{Application, Display, Window, WindowManager, origin_from};
+use crate::manager::{Application, Display, Origin, Window, WindowManager, origin_from};
 use crate::platform::WorkspaceId;
 
 const REFRESH_WINDOW_CHECK_FREQ_MS: u64 = 1000;
@@ -266,11 +266,13 @@ fn detect_focus_rejection(
 }
 
 #[instrument(level = Level::DEBUG, skip_all, fields(trigger))]
+#[allow(clippy::too_many_arguments)]
 fn autocenter_window_on_focus(
     focused: Single<Entity, Added<FocusedMarker>>,
     mouse_held: Query<&MouseHeldMarker>,
     restored: Query<&RestoreFocusMarker>,
     reshuffling: Query<Entity, With<ReshuffleAroundMarker>>,
+    strips: Query<(Entity, &LayoutStrip)>,
     global_state: GlobalState,
     active_display: ActiveDisplay,
     mut ctx: WindowCtx,
@@ -290,21 +292,36 @@ fn autocenter_window_on_focus(
     if active_display.active_strip().tabbed(entity) {
         return;
     }
+    // Center by moving the STRIP, never the window: the focused window keeps
+    // no animation marker of its own, so it rides the strip rigidly with its
+    // siblings (see `ride_strip_motion`) instead of chasing a stale target
+    // while the strip settles underneath it. The window still lands
+    // centered — the centering offset is just expressed in strip space.
+    let mut centered = false;
     if ctx.config.auto_center()
         && let Some((_, _, None)) = ctx.windows.get_managed(entity)
         && let Some(size) = ctx.windows.size(entity)
-        && let Some(mut origin) = ctx.windows.origin(entity)
+        && let Some(layout) = ctx.windows.layout_position(entity)
+        && let Some((strip_entity, _)) = strips.iter().find(|(_, strip)| strip.contains(entity))
     {
-        let center = active_display.bounds().center();
-        origin.x = center.x - size.x / 2;
-        ctx.commands.reposition_entity(entity, origin);
+        let viewport = active_display.bounds();
+        let center = viewport.center();
+        // Deliberately unclamped, mirroring `reshuffle_layout_strip`: under
+        // `auto_center` the edge invariant is unenforced (magnetic centering
+        // owns out-of-range offsets), so clamping here would uncenter edge
+        // windows and fight the snap force that keeps them centered.
+        let strip_target = Origin::new(center.x - size.x / 2 - layout.0.x, viewport.min.y);
+        ctx.commands.reposition_entity(strip_entity, strip_target);
+        centered = true;
     }
     // A reshuffle already queued (typically the command's own arrival
-    // reshuffle, issued alongside the centering target above) is measured
-    // post-center by the Update layout pass — stacking a second marker
-    // only re-measures the same arrival. Other focus paths (clicks, hover,
-    // OS echoes) arrive with no marker and reshuffle here as before.
-    if !reshuffling.contains(entity) {
+    // reshuffle) is measured post-strip-move by the Update layout pass —
+    // stacking a second marker only re-measures the same arrival. Other
+    // focus paths (clicks, hover, OS echoes) arrive with no marker and
+    // reshuffle here as before. Skipped entirely once centering drove the
+    // strip itself: a follow-up reshuffle would overwrite the centering
+    // target with a mere expose offset.
+    if !centered && !reshuffling.contains(entity) {
         ctx.commands.reshuffle_around(entity);
     }
 }
