@@ -1116,6 +1116,32 @@ pub(super) fn retry_front_switch(
 /// Animates window movement.
 /// Fraction of the remaining distance an exponential ease-out consumes in a
 /// frame, given a decay `rate` (per second) and the frame's `delta` in seconds.
+/// Drops tween legs whose markers are gone. Markers are removed in several
+/// places (rigid strip rides, snap assigns, drag releases) while the leg
+/// lives next to the marker: without this, a stale leg survives and the next
+/// glide retargets off its ancient `start` instead of birthing fresh on the
+/// shared burst phase. `Populated` skips the system when no orphans exist.
+#[instrument(level = Level::TRACE, skip_all)]
+pub(super) fn drop_orphan_tween_legs(
+    orphaned_positions: Populated<
+        Entity,
+        (With<crate::ecs::PositionTween>, Without<RepositionMarker>),
+    >,
+    orphaned_sizes: Populated<Entity, (With<crate::ecs::SizeTween>, Without<ResizeMarker>)>,
+    mut commands: Commands,
+) {
+    for entity in orphaned_positions {
+        if let Ok(mut entity_commands) = commands.get_entity(entity) {
+            entity_commands.try_remove::<crate::ecs::PositionTween>();
+        }
+    }
+    for entity in orphaned_sizes {
+        if let Ok(mut entity_commands) = commands.get_entity(entity) {
+            entity_commands.try_remove::<crate::ecs::SizeTween>();
+        }
+    }
+}
+
 /// Jump-cuts instead of sliding whenever an animation would cross a display
 /// seam: sets the position straight to the target and drops the marker, so no
 /// intermediate frame ever paints onto a neighboring display. Points outside
@@ -1151,14 +1177,20 @@ pub(super) fn animate_entities(
     displays: Query<&Display>,
     time: Res<Time>,
     config: Res<Config>,
+    mut bursts: ResMut<crate::ecs::BurstClock>,
     mut commands: Commands,
 ) {
-    use crate::ecs::animation::{eased_factor, retarget_duration, tween_finished, tween_ivec2};
+    use crate::ecs::animation::{
+        RETARGET_CARRY_PX, birth_phase, eased_factor, retarget_duration, tween_finished,
+        tween_ivec2,
+    };
 
-    // Time-based tween: progress derives from the virtual clock, so a stall
-    // simply advances progress (correct) instead of teleporting (the old
-    // uncapped-exponential failure mode). Same deadline for every window, so
-    // siblings land together and the border rides the presented frame.
+    // Time-based tween on a shared burst phase: progress derives from the
+    // virtual clock, and legs born into the same young burst share one
+    // `started` stamp — strips, windows and resizes move in lockstep even
+    // when their markers land on adjacent ticks. A stall advances progress
+    // (correct) instead of teleporting (the old uncapped-exponential
+    // failure mode), and the border rides the presented frame.
     let now = time.elapsed();
     let base = config.animation_duration();
     let display_bounds: Vec<IRect> = displays.iter().map(Display::bounds).collect();
@@ -1184,9 +1216,12 @@ pub(super) fn animate_entities(
             }
             continue;
         }
-        // Lazily seed the leg, or retarget when the intent moved under us:
-        // start from the current presented frame with a proportionally
-        // shortened duration instead of restarting the full glide.
+        // Lazily seed the leg, or retarget when the intent moved under us.
+        // Births join the burst phase while it is young (lockstep);
+        // retargets carry phase across small creeps (composed strip-plus-
+        // slot recomputes, ride-outlier refreshes) so easing bends instead
+        // of restarting at zero velocity every tick — and start over on
+        // genuine jumps, which deserve the full glide.
         let (start, started, duration) = match tween {
             Some(tween) if tween.target == *origin => (tween.start, tween.started, tween.duration),
             Some(mut tween) => {
@@ -1195,22 +1230,37 @@ pub(super) fn animate_entities(
                     .length()
                     .max(remaining);
                 let duration = retarget_duration(remaining, total, base);
+                let drift = (origin.as_vec2() - tween.target.as_vec2()).length();
+                let elapsed = now.saturating_sub(tween.started);
+                let prior = if drift <= RETARGET_CARRY_PX {
+                    (elapsed.as_secs_f32() / tween.duration.as_secs_f32().max(f32::EPSILON))
+                        .clamp(0.0, 1.0)
+                } else {
+                    0.0
+                };
+                let started = now
+                    .checked_sub(Duration::from_secs_f32(prior * duration.as_secs_f32()))
+                    .unwrap_or(now);
                 tween.start = position.0;
                 tween.target = *origin;
-                tween.started = now;
+                tween.started = started;
                 tween.duration = duration;
                 (tween.start, tween.started, tween.duration)
             }
             None => {
+                let (started, opened) = birth_phase(now, bursts.opened);
+                if opened {
+                    bursts.opened = Some(now);
+                }
                 if let Ok(mut entity_commands) = commands.get_entity(entity) {
                     entity_commands.try_insert(crate::ecs::PositionTween {
                         start: position.0,
                         target: *origin,
-                        started: now,
+                        started,
                         duration: base,
                     });
                 }
-                (position.0, now, base)
+                (position.0, started, base)
             }
         };
         let elapsed = now.saturating_sub(started);
@@ -1245,11 +1295,15 @@ pub(super) fn animate_resize_entities(
     animate: TweenedSizes,
     time: Res<Time>,
     config: Res<Config>,
+    mut bursts: ResMut<crate::ecs::BurstClock>,
     mut commands: Commands,
 ) {
-    use crate::ecs::animation::{eased_factor, retarget_duration, tween_finished, tween_ivec2};
+    use crate::ecs::animation::{
+        RETARGET_CARRY_PX, birth_phase, eased_factor, retarget_duration, tween_finished,
+        tween_ivec2,
+    };
 
-    // Same fixed-tween clock as positions so size and origin stay in step.
+    // Same shared burst phase as positions so size and origin stay in step.
     let now = time.elapsed();
     let base = config.animation_duration();
 
@@ -1270,22 +1324,37 @@ pub(super) fn animate_resize_entities(
                     .length()
                     .max(remaining);
                 let duration = retarget_duration(remaining, total, base);
+                let drift = (size.as_vec2() - tween.target.as_vec2()).length();
+                let elapsed = now.saturating_sub(tween.started);
+                let prior = if drift <= RETARGET_CARRY_PX {
+                    (elapsed.as_secs_f32() / tween.duration.as_secs_f32().max(f32::EPSILON))
+                        .clamp(0.0, 1.0)
+                } else {
+                    0.0
+                };
+                let started = now
+                    .checked_sub(Duration::from_secs_f32(prior * duration.as_secs_f32()))
+                    .unwrap_or(now);
                 tween.start = bounds.0;
                 tween.target = *size;
-                tween.started = now;
+                tween.started = started;
                 tween.duration = duration;
                 (tween.start, tween.started, tween.duration)
             }
             None => {
+                let (started, opened) = birth_phase(now, bursts.opened);
+                if opened {
+                    bursts.opened = Some(now);
+                }
                 if let Ok(mut entity_commands) = commands.get_entity(entity) {
                     entity_commands.try_insert(crate::ecs::SizeTween {
                         start: bounds.0,
                         target: *size,
-                        started: now,
+                        started,
                         duration: base,
                     });
                 }
-                (bounds.0, now, base)
+                (bounds.0, started, base)
             }
         };
         let elapsed = now.saturating_sub(started);
@@ -2116,21 +2185,48 @@ fn border_frame_for(
         // Ride the tween: `frame()` is the current presented `Position` —
         // the exact rect just committed to AX on the same tick — while
         // `moving_frame()` would substitute the final target and jump ahead
-        // of the window. One shared clock, one shared frame: border and
-        // window land together.
+        // of the window. One shared burst phase, one shared frame: border and
+        // window land together. The lead over last-known OS truth is clamped
+        // (see `clamp_lead_to_os`): async AX trails the presented frame by a
+        // tick or two, and during stalls the presented frame advances while
+        // no commit lands — unclamped, the border visibly outruns the glass.
         if let Some(frame) = windows.frame(entity) {
             // Trace-only pin for drag-detach diagnosis: during motion each
             // overlay tick must log a live frame that advances; a frozen
             // rect here with a scrolling strip means the layout stopped
             // rewriting window positions (not an overlay gating miss).
             trace!("overlay live frame for {entity}: {frame:?}");
-            return frame;
+            return clamp_lead_to_os(frame, window.frame());
         }
         trace!("overlay driving {entity} but no layout frame, falling back to OS frame");
     } else if let Some(raw) = snapshot_live_frame(store, window.id(), SNAPSHOT_FRAME_MAX_AGE) {
         return pad_snapshot_frame(raw, window);
     }
     window.frame()
+}
+
+/// Max lead of the presented tween frame over last-known OS truth while
+/// driving. At rest the layout frame is exact, so this binds only mid-glide:
+/// it keeps the border hugging the glass instead of running ahead of it.
+const BORDER_LEAD_MAX_PX: i32 = 24;
+
+/// Clamps `frame` to within [`BORDER_LEAD_MAX_PX`] of `os` per edge,
+/// preserving direction. Pure math — unit tested.
+fn clamp_lead_to_os(frame: IRect, os: IRect) -> IRect {
+    let clamp_edge = |presented: i32, truth: i32| {
+        let lead = presented - truth;
+        if lead.abs() <= BORDER_LEAD_MAX_PX {
+            presented
+        } else {
+            truth + BORDER_LEAD_MAX_PX * lead.signum()
+        }
+    };
+    IRect::new(
+        clamp_edge(frame.min.x, os.min.x),
+        clamp_edge(frame.min.y, os.min.y),
+        clamp_edge(frame.max.x, os.max.x),
+        clamp_edge(frame.max.y, os.max.y),
+    )
 }
 
 /// Absolute CG rect of a layout frame, corrected for window padding.
@@ -3418,5 +3514,21 @@ mod seam_tests {
             target
         );
         assert!(tween_finished(duration, duration));
+    }
+
+    #[test]
+    fn border_lead_clamps_to_os_truth() {
+        use super::clamp_lead_to_os;
+        let os = IRect::new(0, 20, 400, 768);
+        // Small leads pass through untouched.
+        let near = IRect::new(10, 20, 410, 768);
+        assert_eq!(clamp_lead_to_os(near, os), near);
+        // A runaway presented frame is held within the bound, per edge.
+        let far = IRect::new(100, 20, 500, 768);
+        assert_eq!(clamp_lead_to_os(far, os), IRect::new(24, 20, 424, 768));
+        // Works backing up too (negative lead).
+        assert_eq!(clamp_lead_to_os(os, far), IRect::new(76, 20, 476, 768));
+        // Already there never drifts.
+        assert_eq!(clamp_lead_to_os(os, os), os);
     }
 }

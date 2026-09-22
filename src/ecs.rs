@@ -190,6 +190,7 @@ pub fn register_systems(app: &mut bevy::app::App) {
     // double-buffered and dropped after a frame like any other message stream.
     app.add_message::<InputEvent>();
     app.init_resource::<systems::ParkedCommands>();
+    app.init_resource::<crate::ecs::BurstClock>();
     app.init_resource::<crate::ax_writer::AxWriteState>();
     app.add_systems(
         PreUpdate,
@@ -257,6 +258,7 @@ pub fn register_systems(app: &mut bevy::app::App) {
         PostUpdate,
         (
             (
+                systems::drop_orphan_tween_legs,
                 systems::animate_entities,
                 systems::commit_window_position.run_if(not(resource_exists::<Initializing>)),
                 // Throttled: each check is a synchronous AX read per window.
@@ -405,6 +407,23 @@ pub struct SizeTween {
     pub target: Size,
     pub started: Duration,
     pub duration: Duration,
+}
+
+/// Shared birth-phase stamp for tween legs (see
+/// [`animation::BURST_JOIN_WINDOW`]): the virtual timestamp at which the
+/// current motion burst opened. Legs born while the burst is young adopt it
+/// so strips, windows and resizes share phase; late births open a fresh
+/// burst instead. Written only by the animator, which owns every leg birth —
+/// see `animate_entities` / `animate_resize_entities`.
+///
+/// Global rather than per-strip: windows parent to applications, not strips,
+/// so per-strip scoping would need a containment walk per birth in the hot
+/// loop. Co-born legs share phase either way (which is the lockstep that
+/// matters); the worst cross-talk is an unrelated leg adopting a stamp up
+/// to 50ms old, i.e. a slightly shorter glide, never a delay.
+#[derive(Resource, Debug, Default)]
+pub struct BurstClock {
+    pub opened: Option<Duration>,
 }
 
 /// Marker component indicating that windows around the marked entity need to be reshuffled.

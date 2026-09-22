@@ -2660,6 +2660,189 @@ fn test_keyboard_focus_flies_strip_once_without_rewrite() {
     assert_window_at!(world, 4, 312, TEST_MENUBAR_HEIGHT);
 }
 
+/// A focus-driven strip glide keeps siblings in lockstep: the pairwise gap
+/// constant within 2px on every tick of the flight, shared landing, exact
+/// slots. Regression for per-leg phase divergence (independent `started`
+/// stamps), which read as stripes separating mid-glide. Two windows keep
+/// the scenario free of parking and edge reveals, so every member must ride
+/// rigidly with no marker of its own at any tick.
+#[test]
+fn test_focus_glide_keeps_siblings_in_lockstep() {
+    let config: Config = (
+        MainOptions {
+            animation_speed: Some(12.0),
+            auto_center: Some(true),
+            ..Default::default()
+        },
+        vec![],
+    )
+        .into();
+    let mut h = TestHarness::new().with_config(config).with_windows(2);
+    quiesce(&mut h);
+
+    let members: Vec<Entity> = [0, 1]
+        .into_iter()
+        .map(|id| find_window_entity(id, h.app.world_mut()))
+        .collect();
+    let strip = {
+        let world = h.app.world_mut();
+        let mut q = world.query_filtered::<Entity, With<ActiveWorkspaceMarker>>();
+        q.single(world).expect("exactly one active strip")
+    };
+    let read_pos = |world: &mut World, e: Entity| world.get::<Position>(e).expect("position").0;
+    h.app
+        .world_mut()
+        .entity_mut(strip)
+        .insert(Position(Origin::new(0, 20)));
+    quiesce(&mut h);
+    let base: Vec<Origin> = members
+        .iter()
+        .map(|e| read_pos(h.app.world_mut(), *e))
+        .collect();
+    let base_gap = base[1].x - base[0].x;
+
+    h.app.world_mut().write_message::<Event>(Event::Command {
+        command: Command::Window(Operation::Focus(Direction::Last)),
+    });
+
+    let mut saw_flight = false;
+    for tick in 0..60 {
+        pump_frame(&mut h);
+        let world = h.app.world_mut();
+        if world.get::<RepositionMarker>(strip).is_some() {
+            saw_flight = true;
+        }
+        for member in &members {
+            assert!(
+                world.get::<RepositionMarker>(*member).is_none(),
+                "tick {tick}: strip members must ride, never animate independently"
+            );
+        }
+        let current: Vec<Origin> = members.iter().map(|e| read_pos(world, *e)).collect();
+        let gap = current[1].x - current[0].x;
+        assert!(
+            (gap - base_gap).abs() <= 2,
+            "tick {tick}: siblings drifted out of formation: gap {gap} vs {base_gap}"
+        );
+    }
+    assert!(
+        saw_flight,
+        "the strip must actually have animated for the test to mean anything"
+    );
+    let world = h.app.world_mut();
+    assert!(
+        world.get::<RepositionMarker>(strip).is_none(),
+        "the strip must have landed within the step budget"
+    );
+    // Window 1 (400 wide) centered in 1024: strip at -88, window at 312.
+    assert_eq!(
+        read_pos(world, strip),
+        Origin::new(-88, 20),
+        "strip must land on the centering offset"
+    );
+    for (member, start) in members.iter().zip(base.iter()) {
+        assert_eq!(
+            read_pos(world, *member),
+            *start + Origin::new(-88, 0),
+            "member {member:?} must land exactly on its rigid slot"
+        );
+    }
+    assert_window_at!(world, 1, 312, TEST_MENUBAR_HEIGHT);
+}
+
+/// Re-driving a gliding strip mid-burst must still land exactly: the fresh
+/// intent replaces the old one, legs re-phase on the shared burst stamp,
+/// and no stale target survives — including the final correction after the
+/// strip settles. Regression for stranded 3px tails.
+#[test]
+fn test_strip_redrive_mid_burst_lands_exactly() {
+    let config: Config = (
+        MainOptions {
+            animation_speed: Some(12.0),
+            ..Default::default()
+        },
+        vec![],
+    )
+        .into();
+    let mut h = TestHarness::new().with_config(config).with_windows(3);
+    quiesce(&mut h);
+
+    let members: Vec<Entity> = [0, 1, 2]
+        .into_iter()
+        .map(|id| find_window_entity(id, h.app.world_mut()))
+        .collect();
+    let strip = {
+        let world = h.app.world_mut();
+        let mut q = world.query_filtered::<Entity, With<ActiveWorkspaceMarker>>();
+        q.single(world).expect("exactly one active strip")
+    };
+    let read_pos = |world: &mut World, e: Entity| world.get::<Position>(e).expect("position").0;
+    h.app
+        .world_mut()
+        .entity_mut(strip)
+        .insert(Position(Origin::new(0, 20)));
+    quiesce(&mut h);
+    let base: Vec<Origin> = members
+        .iter()
+        .map(|e| read_pos(h.app.world_mut(), *e))
+        .collect();
+
+    // First drive, then re-drive past the join window (5 ticks = 100ms, well
+    // outside it) so the second leg opens a fresh burst with a full glide.
+    // The re-drive stops at -300: member 0 (-300..100) stays on screen, so no
+    // sliver parking interferes with the rigid-slot assertions below.
+    h.app
+        .world_mut()
+        .entity_mut(strip)
+        .insert(RepositionMarker(Origin::new(-200, 20)));
+    for _ in 0..5 {
+        pump_frame(&mut h);
+    }
+    h.app
+        .world_mut()
+        .entity_mut(strip)
+        .insert(RepositionMarker(Origin::new(-300, 20)));
+
+    let mut offsets = vec![read_pos(h.app.world_mut(), strip).x];
+    let mut saw_flight = false;
+    for tick in 0..40 {
+        pump_frame(&mut h);
+        let world = h.app.world_mut();
+        if world.get::<RepositionMarker>(strip).is_some() {
+            saw_flight = true;
+        }
+        for member in &members {
+            assert!(
+                world.get::<RepositionMarker>(*member).is_none(),
+                "tick {tick}: strip members must ride, never animate independently"
+            );
+        }
+        offsets.push(read_pos(world, strip).x);
+    }
+    assert!(saw_flight, "the re-drive must actually have flown");
+    assert!(
+        offsets.windows(2).all(|pair| pair[1] <= pair[0]),
+        "strip offsets must never reverse after the re-drive: {offsets:?}"
+    );
+    let world = h.app.world_mut();
+    assert!(
+        world.get::<RepositionMarker>(strip).is_none(),
+        "the strip must have landed within the step budget"
+    );
+    assert_eq!(
+        read_pos(world, strip),
+        Origin::new(-300, 20),
+        "strip must land exactly on the re-driven offset"
+    );
+    for (member, start) in members.iter().zip(base.iter()) {
+        assert_eq!(
+            read_pos(world, *member),
+            *start + Origin::new(-300, 0),
+            "member {member:?} must land exactly on its rigid slot"
+        );
+    }
+}
+
 /// A genuine slot change with a static strip must still animate each window
 /// independently: rigid riding is for strip translation only, never for
 /// topology. Guards against over-correcting the ride into teleports.

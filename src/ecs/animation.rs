@@ -1,9 +1,16 @@
 //! Fixed-duration tween math for window motion.
 //!
-//! Replaces the old infinite exponential lerp (`t = 1 - e^(-rate*dt)`).
 //! A tween has a deadline: `progress = (now - started) / duration` through
-//! `ease_out_cubic`, so siblings land on the same tick and the border can
-//! ride the exact presented frame instead of a guessed one-step chase.
+//! a gentle `smootherstep` curve, so siblings land on the same tick and the
+//! border can ride the exact presented frame. `smootherstep` — not a
+//! front-loaded ease-out — keeps every step AX-sized: a fast-attack curve
+//! spends ~35% of the distance on the first tick, which the coalesced AX
+//! writer turns into a visible jump-then-crawl.
+//!
+//! Legs born into the same young burst share one phase stamp (see
+//! [`BURST_JOIN_WINDOW`]): strips, windows and resizes move in lockstep even
+//! when their markers land on adjacent ticks. Legs born later open a fresh
+//! burst with a full leg — never a rushed hop.
 //!
 //! Pure math only — no Bevy, no `AppKit` — so it stays unit testable.
 
@@ -17,13 +24,30 @@ pub const DEFAULT_ANIMATION_DURATION_MS: u64 = 150;
 /// Shortest retargeted glide: interrupts stay fluid without popping.
 pub const MIN_ANIMATION_DURATION_MS: u64 = 40;
 
+/// Legs born within this long of a burst's opening adopt the burst's phase
+/// stamp instead of starting at zero progress, so a strip scroll plus the
+/// window slides issued on the next tick move in lockstep. Older than this,
+/// a birth opens a fresh burst with a full leg — a late-arriving move is
+/// never squeezed into the previous burst's dying ticks.
+pub const BURST_JOIN_WINDOW: Duration = Duration::from_millis(50);
+
+/// Joins two retargets into one glide: below this distance between the old
+/// and new target the leg carries its phase (a creep, e.g. a composed
+/// strip-plus-slot recompute or a ride-outlier refresh); above it the leg
+/// starts over at zero progress (a genuine new move that deserves the full
+/// glide instead of inheriting a nearly-spent phase).
+pub const RETARGET_CARRY_PX: f32 = 32.0;
+
 /// Upper bound for migrated legacy speeds (e.g. `animation_speed = 0.5`).
 pub const MAX_ANIMATION_DURATION_MS: u64 = 4000;
 
-/// Cubic ease-out: fast attack, gentle landing. `p` is clamped 0..1.
-pub fn ease_out_cubic(p: f32) -> f32 {
+/// Smootherstep: gentle attack *and* landing, zero velocity at both ends.
+/// `p` is clamped 0..1. At 20ms into a 150ms glide this covers ~4% of the
+/// distance (vs ~35% for a cubic ease-out), so every committed step stays
+/// small enough for the async AX writer to track without jumping.
+pub fn smootherstep(p: f32) -> f32 {
     let p = p.clamp(0.0, 1.0);
-    1.0 - (1.0 - p) * (1.0 - p) * (1.0 - p)
+    p * p * p * (p * (p * 6.0 - 15.0) + 10.0)
 }
 
 /// Eased 0..1 factor for `elapsed` into `duration`.
@@ -34,7 +58,19 @@ pub fn eased_factor(elapsed: Duration, duration: Duration) -> f32 {
         return 1.0;
     }
     let total = duration.as_secs_f32().max(f32::EPSILON);
-    ease_out_cubic(elapsed.as_secs_f32() / total)
+    smootherstep(elapsed.as_secs_f32() / total)
+}
+
+/// Birth phase for a fresh leg: legs born within [`BURST_JOIN_WINDOW`] of
+/// the burst's opening adopt its stamp (lockstep with siblings); older
+/// births open a fresh burst at `now` with the full leg. Pure so the join
+/// rule is unit testable; the caller stores the returned stamp back into
+/// the shared clock only when it opens (`opened == true`).
+pub fn birth_phase(now: Duration, burst_opened: Option<Duration>) -> (Duration, bool) {
+    match burst_opened {
+        Some(opened) if now.saturating_sub(opened) <= BURST_JOIN_WINDOW => (opened, false),
+        _ => (now, true),
+    }
 }
 
 /// Whether the tween covering `elapsed` of `duration` has landed.
@@ -101,16 +137,44 @@ mod tests {
     use super::*;
 
     #[test]
-    fn ease_out_cubic_pins_ends() {
-        assert!(ease_out_cubic(0.0).abs() < 1e-6);
-        assert!((ease_out_cubic(1.0) - 1.0).abs() < 1e-6);
+    fn smootherstep_pins_ends_and_midpoint() {
+        assert!(smootherstep(0.0).abs() < 1e-6);
+        assert!((smootherstep(1.0) - 1.0).abs() < 1e-6);
+        assert!((smootherstep(0.5) - 0.5).abs() < 1e-6);
     }
 
     #[test]
-    fn ease_out_cubic_front_loads() {
-        // Half the time covers 7/8 of the distance — fast attack.
-        assert!((ease_out_cubic(0.5) - 0.875).abs() < 1e-6);
-        assert!(ease_out_cubic(0.25) > 0.25);
+    fn smootherstep_is_gentle_at_both_ends() {
+        // Zero end velocities: small first *and* last steps, so committed
+        // frames stay AX-sized through the whole glide.
+        assert!(smootherstep(0.25) < 0.25, "gentle attack");
+        assert!(smootherstep(0.75) > 0.75, "gentle landing");
+        // A 20ms tick of a 150ms glide covers ~4%, not ~35%.
+        assert!(smootherstep(20.0 / 150.0) < 0.06);
+    }
+
+    #[test]
+    fn burst_births_share_phase_while_young() {
+        let opened = Duration::from_millis(1000);
+        // Same tick and adjacent ticks join the burst.
+        assert_eq!(
+            birth_phase(opened, Some(opened)),
+            (opened, false),
+            "same-tick birth joins"
+        );
+        assert_eq!(
+            birth_phase(opened + Duration::from_millis(40), Some(opened)),
+            (opened, false),
+            "adjacent-tick birth joins"
+        );
+        // A late arrival opens a fresh burst with a full leg — never a hop.
+        assert_eq!(
+            birth_phase(opened + Duration::from_millis(51), Some(opened)),
+            (opened + Duration::from_millis(51), true),
+            "late birth opens fresh"
+        );
+        // No burst yet: first birth opens.
+        assert_eq!(birth_phase(opened, None), (opened, true));
     }
 
     #[test]

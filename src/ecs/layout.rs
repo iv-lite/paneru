@@ -162,8 +162,10 @@ type MovedStrips<'w, 's> = Populated<
     Changed<Position>,
 >;
 
-/// Strip members as [`ride_strip_motion`] sees them: identity, slot, and
-/// the live frame the ride is free to overwrite.
+/// Strip members as [`ride_strip_motion`] sees them: identity, slot, the
+/// live frame the ride is free to overwrite, and the current animated
+/// target (steered in place for outliers instead of re-issued, so easing
+/// never restarts mid-glide).
 type RideMembers<'w, 's> = Query<
     'w,
     's,
@@ -173,6 +175,7 @@ type RideMembers<'w, 's> = Query<
         &'static LayoutPosition,
         &'static mut Position,
         &'static mut Bounds,
+        Option<&'static mut RepositionMarker>,
     ),
     (With<Window>, Without<LayoutStrip>),
 >;
@@ -1575,7 +1578,7 @@ fn ride_strip_motion(
             // dropped, while genuinely diverging slides lose the election
             // and keep animating below. `near_home` additionally snaps
             // aboard windows whose own slide had all but converged.
-            if let Ok((_, _, _, mut position, mut bounds)) = members.get_mut(plan.entity) {
+            if let Ok((_, _, _, mut position, mut bounds, _)) = members.get_mut(plan.entity) {
                 position.0 = plan.frame.min;
                 if bounds.0 != plan.frame.size() {
                     bounds.0 = plan.frame.size();
@@ -1586,14 +1589,22 @@ fn ride_strip_motion(
                 }
             }
         } else {
-            // Outlier or overlapping independent slide: animate toward the
-            // fresh frame (refreshing an in-flight target, repairing a
-            // perturbation, or sliding into a new slot).
-            commands.reposition_entity(plan.entity, plan.frame.min);
-            if let Ok((_, _, _, _, mut bounds)) = members.get_mut(plan.entity)
-                && bounds.0 != plan.frame.size()
-            {
-                bounds.0 = plan.frame.size();
+            // Outlier or overlapping independent slide: steer the existing
+            // leg's intent to the fresh frame in place instead of re-issuing
+            // (which would restart easing every tick the strip moves). The
+            // animator phase-carries small creeps and restarts genuine jumps,
+            // so the leg bends smoothly and still lands exactly — including
+            // the final correction after the strip settles, which skipping
+            // would strand stale.
+            if let Ok((_, _, _, _, mut bounds, marker)) = members.get_mut(plan.entity) {
+                if bounds.0 != plan.frame.size() {
+                    bounds.0 = plan.frame.size();
+                }
+                if let Some(mut marker) = marker {
+                    marker.0 = plan.frame.min;
+                } else {
+                    commands.reposition_entity(plan.entity, plan.frame.min);
+                }
             }
         }
     }
@@ -1615,7 +1626,7 @@ fn collect_riders(
     strip_contexts: &EntityHashMap<StripWindowContext>,
 ) -> Vec<Rider> {
     let mut riders = Vec::new();
-    for (entity, window, layout_position, position, bounds) in members {
+    for (entity, window, layout_position, position, bounds, _) in members {
         let Some(context) = strip_contexts.get(&entity).copied() else {
             continue;
         };
