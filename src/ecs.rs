@@ -635,6 +635,13 @@ pub struct DragDisplayArmed;
 #[derive(Component)]
 pub struct DragScrollArmed;
 
+/// Marker on a [`MouseHeldMarker`] holder recording a titlebar grab: the
+/// press landed on the window's titlebar. Drag, slide and friction math
+/// runs only for such holders — content grabs drive nothing and compute
+/// nothing, so the pointer path stays untouched.
+#[derive(Component)]
+pub struct TitlebarGrab;
+
 /// Query filter matching holders that actually drive something: armed or
 /// scroll-driven drags. Plain content holders (tracked for release
 /// bookkeeping only) must not key per-frame costs — overlay passes,
