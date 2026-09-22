@@ -288,8 +288,38 @@ fn detect_focus_rejection(
     }
 }
 
-#[instrument(level = Level::DEBUG, skip_all, fields(trigger))]
-#[allow(clippy::too_many_arguments)]
+/// What caused a focus arrival on `entity`: a mouse press just now inside
+/// its frame, a keyboard command naming it just now, or neither (ambient
+/// OS noise: app self-raise, notification steal, Cmd-Tab front-switch,
+/// stale retry). Pure so arrival systems share one verdict; the harness
+/// has no clock, so cause attribution is unit tested here, not in the
+/// observers below.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum FocusCause {
+    Press,
+    Keyboard,
+    Ambient,
+}
+
+/// Classifies a focus arrival on `entity` with `frame` at `now`.
+/// Press wins over keyboard: a keyboard focus landing in a just-clicked
+/// window still must not move the cursor the click owns.
+pub fn focus_cause(
+    user: &UserFocus,
+    press: &LastPress,
+    now: Duration,
+    entity: Entity,
+    frame: IRect,
+) -> FocusCause {
+    if now.saturating_sub(press.at) <= PRESS_FOCUS_CAUSE_WINDOW && frame.contains(press.point) {
+        return FocusCause::Press;
+    }
+    if user.entity == Some(entity) && now.saturating_sub(user.at) <= USER_FOCUS_CAUSE_WINDOW {
+        return FocusCause::Keyboard;
+    }
+    FocusCause::Ambient
+}
+
 /// Whether a focus arrival on `entity` was user-initiated (a keyboard
 /// command naming it just now, or a mouse press just now inside its frame)
 /// as opposed to ambient OS noise (app self-raise, notification steal,
@@ -303,13 +333,10 @@ pub fn user_initiated_focus(
     entity: Entity,
     frame: IRect,
 ) -> bool {
-    if user.entity == Some(entity) && now.saturating_sub(user.at) <= USER_FOCUS_CAUSE_WINDOW {
-        return true;
-    }
-    if now.saturating_sub(press.at) <= PRESS_FOCUS_CAUSE_WINDOW && frame.contains(press.point) {
-        return true;
-    }
-    false
+    !matches!(
+        focus_cause(user, press, now, entity, frame),
+        FocusCause::Ambient
+    )
 }
 
 /// User-intent clocks for focus arrivals, bundled so
@@ -694,6 +721,8 @@ fn mouse_follows_focus(
     displays: Query<(&Display, Option<&DockPosition>)>,
     workspaces: WarpOwnerStrips,
     strip_flight: Query<&RepositionMarker>,
+    held: Query<&MouseHeldMarker>,
+    intent: FocusIntent<'_>,
 ) {
     let entity = *focused;
     let Some(window) = windows.get(entity) else {
@@ -720,9 +749,34 @@ fn mouse_follows_focus(
     {
         return;
     }
-    let Some(mut frame) = windows.moving_frame(entity) else {
+    // A keyboard focus change mid-drag must not fight the hand.
+    if !held.is_empty() {
+        trace!("drag in flight, skipping warp for window {}", window.id());
+        return;
+    }
+    let Some(raw_frame) = windows.moving_frame(entity) else {
         return;
     };
+    // Cursor placement by cause: a click owns its cursor (never yank it),
+    // a keyboard move always recenters onto the window (even when the
+    // cursor is already inside), ambient noise only warps a cursor left
+    // outside. Press wins over keyboard — a keyboard focus landing in a
+    // just-clicked window still must not move the click's cursor.
+    let cause = focus_cause(
+        &intent.user_focus,
+        &intent.last_press,
+        intent.time.elapsed(),
+        entity,
+        raw_frame,
+    );
+    if matches!(cause, FocusCause::Press) {
+        trace!(
+            "press owns the cursor for window {}, skipping warp",
+            window.id()
+        );
+        return;
+    }
+    let mut frame = raw_frame;
     // Project the owner strip's in-flight scroll onto the destination slot:
     // the strip target was issued this tick but hasn't moved `Position`
     // yet, so the raw moving frame is pre-scroll and the warp would land
@@ -742,12 +796,14 @@ fn mouse_follows_focus(
         let dest = layout.0 + *strip_target;
         frame = IRect::from_corners(dest, dest + size);
     }
-    // Already there: a click focuses the window under the cursor, and a
-    // keyboard move into the window holding the cursor, must not yank it
-    // to the center.
-    if window_manager
-        .cursor_position()
-        .is_some_and(|point| frame.contains(origin_from(point)))
+    // Keyboard intent always recenters: a keyboard move into the window
+    // holding the cursor must still land on its center. Ambient arrivals
+    // (and clicks, already returned above) leave a cursor that is already
+    // inside alone.
+    if !matches!(cause, FocusCause::Keyboard)
+        && window_manager
+            .cursor_position()
+            .is_some_and(|point| frame.contains(origin_from(point)))
     {
         trace!(
             "cursor already inside window {}, skipping warp",
@@ -1117,6 +1173,89 @@ mod tests {
             "and must not take it out of the layout"
         );
         assert_eq!(world.resource::<FocusHistory>().pending_focus, None);
+    }
+
+    #[test]
+    fn focus_cause_prefers_press_over_keyboard() {
+        let mut world = World::new();
+        let entity = world.spawn(()).id();
+        let frame = IRect::new(400, 20, 800, 620);
+        let now = Duration::from_secs(10);
+        let user = UserFocus {
+            entity: Some(entity),
+            at: now,
+        };
+        let press = LastPress {
+            at: now,
+            point: Origin::new(410, 60),
+        };
+        assert_eq!(
+            focus_cause(&user, &press, now, entity, frame),
+            FocusCause::Press
+        );
+        assert!(user_initiated_focus(&user, &press, now, entity, frame));
+    }
+
+    #[test]
+    fn focus_cause_keyboard_without_press() {
+        let mut world = World::new();
+        let entity = world.spawn(()).id();
+        let frame = IRect::new(400, 20, 800, 620);
+        let now = Duration::from_secs(10);
+        let user = UserFocus {
+            entity: Some(entity),
+            at: now,
+        };
+        let elsewhere = LastPress {
+            at: now,
+            point: Origin::new(0, 0),
+        };
+        assert_eq!(
+            focus_cause(&user, &elsewhere, now, entity, frame),
+            FocusCause::Keyboard
+        );
+        assert!(user_initiated_focus(&user, &elsewhere, now, entity, frame));
+    }
+
+    #[test]
+    fn focus_cause_ambient_without_intent() {
+        let mut world = World::new();
+        let entity = world.spawn(()).id();
+        let other = world.spawn(()).id();
+        let frame = IRect::new(400, 20, 800, 620);
+        let now = Duration::from_secs(10);
+        // Keyboard named another window, press landed outside the frame.
+        let user = UserFocus {
+            entity: Some(other),
+            at: now,
+        };
+        let press = LastPress {
+            at: now,
+            point: Origin::new(0, 0),
+        };
+        assert_eq!(
+            focus_cause(&user, &press, now, entity, frame),
+            FocusCause::Ambient
+        );
+        assert!(!user_initiated_focus(&user, &press, now, entity, frame));
+        // Expired keyboard intent reads as ambient again.
+        let old_user = UserFocus {
+            entity: Some(entity),
+            at: now.saturating_sub(Duration::from_secs(1)),
+        };
+        assert_eq!(
+            focus_cause(&old_user, &press, now, entity, frame),
+            FocusCause::Ambient
+        );
+        // Expired press inside the frame reads as ambient again.
+        let old_press = LastPress {
+            at: now.saturating_sub(Duration::from_secs(1)),
+            point: Origin::new(410, 60),
+        };
+        assert_eq!(
+            focus_cause(&UserFocus::default(), &old_press, now, entity, frame),
+            FocusCause::Ambient
+        );
     }
 
     #[test]

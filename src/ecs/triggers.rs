@@ -195,7 +195,7 @@ pub(super) fn theme_change_trigger(
 }
 
 /// Handles the event when a window gains focus. It updates the focused window, PSN, and reshuffles windows.
-/// It also centers the mouse on the focused window if focus-follows-mouse is enabled.
+/// Cursor centering on focus lives in `mouse_follows_focus` (`focus.rs`) and keys off `mouse_follows_focus`.
 ///
 /// # Arguments
 ///

@@ -2947,10 +2947,10 @@ fn test_mouse_follows_focus_warps_when_cursor_outside() {
         .run(commands);
 }
 
-/// ...while a cursor already inside the newly focused window stays put: no
-/// yank to the center on either click-focus or keyboard focus.
+/// `mouse_follows_focus` centers the cursor on keyboard focus moves even
+/// when it is already inside the newly focused window.
 #[test]
-fn test_mouse_follows_focus_skips_warp_when_cursor_inside() {
+fn test_mouse_follows_focus_centers_when_cursor_inside() {
     let commands = vec![
         Event::MenuOpened { window_id: 0 },
         Event::Command {
@@ -2977,10 +2977,124 @@ fn test_mouse_follows_focus_skips_warp_when_cursor_inside() {
             assert_focused!(world, 1);
             let entity = find_window_entity(1, world);
             let position = world.get::<Position>(entity).expect("need position").0;
+            let size = world.get::<Bounds>(entity).expect("need bounds").0;
+            assert_eq!(
+                state.cursor_position(),
+                IRect::from_corners(position, position + size).center(),
+                "keyboard focus must recenter even an inside cursor"
+            );
+        })
+        .run(commands);
+}
+
+/// A click owns its cursor: focusing the clicked point's window never
+/// warps, even though a keyboard command names it right after the press.
+#[test]
+fn test_mouse_follows_focus_click_never_warps() {
+    // Window 1 tiles into the (400, 20) slot: park the cursor there (the
+    // hand behind the click), press and release, then keyboard-focus it.
+    let press = CGPoint::new(410.0, 60.0);
+    let commands = vec![
+        Event::MenuOpened { window_id: 0 },
+        Event::MouseDown {
+            point: press,
+            modifiers: Modifiers::empty(),
+        },
+        Event::MouseUp {
+            point: press,
+            modifiers: Modifiers::empty(),
+        },
+        Event::Command {
+            command: Command::Window(Operation::Focus(Direction::East)),
+        },
+        Event::Command {
+            command: Command::PrintState,
+        },
+    ];
+
+    TestHarness::new()
+        .with_windows(2)
+        .on_iteration(0, move |_world, state| {
+            state.set_cursor(Origin::new(410, 60));
+        })
+        .on_iteration(4, move |world, state| {
+            assert_focused!(world, 1);
+            let entity = find_window_entity(1, world);
+            let position = world.get::<Position>(entity).expect("need position").0;
+            assert_eq!(
+                state.cursor_position(),
+                Origin::new(position.x + 10, position.y + 40),
+                "click focus must leave the cursor at the press point"
+            );
+        })
+        .run(commands);
+}
+
+/// Ambient OS focus (no keyboard command, no press) keeps legacy behavior:
+/// an outside cursor warps to the visible center ...
+#[test]
+fn test_mouse_follows_focus_ambient_warps_outside_cursor() {
+    let commands = vec![
+        Event::MenuOpened { window_id: 0 },
+        Event::Command {
+            command: Command::PrintState,
+        },
+        Event::WindowFocused { window_id: 1 },
+        Event::Command {
+            command: Command::PrintState,
+        },
+    ];
+
+    TestHarness::new()
+        .with_windows(2)
+        .on_iteration(1, move |_world, state| {
+            // Answer the app's focus query with window 1 so the arrival
+            // is kept instead of redirected.
+            state.set_focused_window(1);
+        })
+        .on_iteration(3, move |world, state| {
+            assert_focused!(world, 1);
+            let entity = find_window_entity(1, world);
+            let position = world.get::<Position>(entity).expect("need position").0;
+            let size = world.get::<Bounds>(entity).expect("need bounds").0;
+            assert_eq!(
+                state.cursor_position(),
+                IRect::from_corners(position, position + size).center()
+            );
+        })
+        .run(commands);
+}
+
+/// ... while an inside cursor stays put on ambient arrivals.
+#[test]
+fn test_mouse_follows_focus_ambient_skips_warp_when_cursor_inside() {
+    let commands = vec![
+        Event::MenuOpened { window_id: 0 },
+        Event::Command {
+            command: Command::PrintState,
+        },
+        Event::WindowFocused { window_id: 1 },
+        Event::Command {
+            command: Command::PrintState,
+        },
+    ];
+
+    TestHarness::new()
+        .with_windows(2)
+        .on_iteration(1, move |world, state| {
+            state.set_focused_window(1);
+            let entity = find_window_entity(1, world);
+            let position = world.get::<Position>(entity).expect("need position").0;
+            state.set_cursor(Origin::new(position.x + 10, position.y + 10));
+        })
+        .on_iteration(3, move |world, state| {
+            assert_focused!(world, 1);
+            let entity = find_window_entity(1, world);
+            let position = world.get::<Position>(entity).expect("need position").0;
             assert_eq!(
                 state.cursor_position(),
                 Origin::new(position.x + 10, position.y + 10),
-                "cursor already inside must not warp to the center"
+                "ambient focus must not move an inside cursor"
             );
         })
         .run(commands);
@@ -3987,9 +4101,9 @@ fn test_content_drag_keeps_native_and_scrolls_nothing() {
         .run(commands);
 }
 
-/// A grab below the 28px titlebar strip does NOT scroll-arm — even where
-/// the app exposes a tall AX toolbar: only the titlebar band drives,
-/// everything else stays native.
+/// A grab below the 28px titlebar strip does NOT scroll-arm when the AX
+/// hit-test reports content or a toolbar control there: only the titlebar
+/// band and blank toolbar chrome drive, everything else stays native.
 #[test]
 fn test_toolbar_grab_stays_native() {
     // Window 0 tiles at (0, 20); y=60 sits below the titlebar band, in
@@ -4033,6 +4147,64 @@ fn test_toolbar_grab_stays_native() {
             assert!(
                 world.query::<&Scrolling>().iter(world).next().is_none(),
                 "a toolbar grab must not arm the scroll pipeline"
+            );
+        })
+        .run(commands);
+}
+
+/// A grab on blank toolbar chrome (below the 28px titlebar band, with the
+/// AX hit-test reporting no interactive control in the way) scroll-drives
+/// the strip exactly like a titlebar grab: the window never leaves its
+/// slot — the strip glides under the hand instead.
+#[test]
+fn test_toolbar_blank_grab_scrolls_strip() {
+    // 5 tiled windows: 2000px strip on a 1024px display. Grab window 0's
+    // toolbar at y=60 (below the titlebar band) and drag left.
+    let commands = vec![
+        Event::MenuOpened { window_id: 0 },
+        Event::MouseDown {
+            point: CGPoint::new(300.0, 60.0),
+            modifiers: Modifiers::empty(),
+        },
+        Event::MouseDragged {
+            point: CGPoint::new(-100.0, 60.0),
+            modifiers: Modifiers::empty(),
+        },
+        Event::MouseDragged {
+            point: CGPoint::new(-500.0, 60.0),
+            modifiers: Modifiers::empty(),
+        },
+        Event::MouseUp {
+            point: CGPoint::new(-500.0, 60.0),
+            modifiers: Modifiers::empty(),
+        },
+        Event::Command {
+            command: Command::PrintState,
+        },
+    ];
+
+    TestHarness::new()
+        .with_window(0, |w| w.toolbar_blank = true)
+        .with_window(1, |_| {})
+        .with_window(2, |_| {})
+        .with_window(3, |_| {})
+        .with_window(4, |_| {})
+        .with_focused_window(0)
+        .on_iteration(3, |world, _state| {
+            // Finger travel so far: -800 through the shared pipeline.
+            assert!(
+                strip_x_of_window_0(world) <= -785,
+                "toolbar drag segments must have scrolled the strip, got {}",
+                strip_x_of_window_0(world)
+            );
+        })
+        .on_iteration(4, |world, _state| {
+            // The window stays tiled in its strip: no detach, no float.
+            let entity = find_window_entity(0, world);
+            let mut strips = world.query::<(&LayoutStrip, &Position)>();
+            assert!(
+                strips.iter(world).any(|(strip, _)| strip.contains(entity)),
+                "a toolbar drag must never detach the window from its strip"
             );
         })
         .run(commands);

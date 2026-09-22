@@ -52,19 +52,27 @@ const TITLEBAR_HEIGHT_PX: i32 = 28;
 /// strip and native edge resize must keep working.
 const RESIZE_MARGIN_PX: i32 = 6;
 
+/// Where a press landed: the draggable header (titlebar band or blank
+/// toolbar chrome) versus everything that must stay native (content,
+/// buttons, text fields, tab drags, ...). Only header presses scroll
+/// the strip and swallow the native drag.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum PressKind {
+    Titlebar,
+    ToolbarBlank,
+    Content,
+}
+
 /// Whether a press landed on the window's titlebar as opposed to its
 /// content. Only titlebar grabs scroll the columns and swallow the native
 /// drag; everything else keeps fully native behavior (text selection,
 /// sliders, tab drags, toolbar interaction, ...).
 ///
 /// Pure geometry: the top `TITLEBAR_HEIGHT_PX` of the window, minus the
-/// resize margins. Deliberately not the app's `AXToolbar` rect — unified
-/// toolbars span regions users read as window content (tabs, toolbars),
-/// and arming there made left-drag scroll fire from inside the window.
-/// Fullscreen windows and sheets/drawers never count — they have no
-/// draggable header. Best-effort: any AX failure falls back to geometry
-/// and a press outside the window can never classify, so this never
-/// blocks input.
+/// resize margins. Fullscreen windows and sheets/drawers never count —
+/// they have no draggable header. Best-effort: any AX failure falls back
+/// to geometry and a press outside the window can never classify, so
+/// this never blocks input.
 fn press_is_on_titlebar(point: &CGPoint, window: &Window) -> bool {
     if window.is_full_screen() || window.child_role().unwrap_or(false) {
         return false;
@@ -82,6 +90,24 @@ fn press_is_on_titlebar(point: &CGPoint, window: &Window) -> bool {
         return false;
     }
     cursor.y - os_min_y < TITLEBAR_HEIGHT_PX
+}
+
+/// Classifies a press into header (titlebar band or blank toolbar
+/// chrome) versus content.
+///
+/// Geometry first (no AX cost for obvious titlebar/content presses);
+/// the AX hit-test (`Window::toolbar_blank_hit`) runs only in the
+/// ambiguous band below the titlebar, where unified toolbars live.
+/// Toolbar controls (buttons, text fields, tabs) and all content stay
+/// native — only blank draggable chrome joins the titlebar pipeline.
+fn press_kind(point: &CGPoint, window: &Window) -> PressKind {
+    if press_is_on_titlebar(point, window) {
+        return PressKind::Titlebar;
+    }
+    if window.toolbar_blank_hit(point) {
+        return PressKind::ToolbarBlank;
+    }
+    PressKind::Content
 }
 
 /// Direct-drives one header scroll-drag delta into the owner strip's
@@ -447,11 +473,14 @@ fn mouse_down_trigger(
         // mid-click. The Timeout auto-despawns if mouse-up is lost.
         let timeout = Timeout::new(Duration::from_secs(5), None, &mut commands);
         let mut holder = commands.spawn((MouseHeldMarker(entity), timeout));
-        // Record titlebar grabs on the holder: only those scroll the
-        // columns and swallow the native drag (see `TitlebarGrab`). One
-        // AX child-role read per press, reused by the scroll arming below.
-        let titlebar = press_is_on_titlebar(point, window);
-        if titlebar {
+        // Record header grabs on the holder: only those scroll the
+        // columns and swallow the native drag (see `TitlebarGrab`). The
+        // titlebar band is pure geometry; blank toolbar chrome below it
+        // is resolved by one AX hit-test per press, reused by the scroll
+        // arming below. Content and toolbar controls stay native.
+        let press = press_kind(point, window);
+        let header = matches!(press, PressKind::Titlebar | PressKind::ToolbarBlank);
+        if header {
             holder.try_insert(TitlebarGrab);
         }
         // Seed the paint-only drag tracker: a native-owned drag keeps its
@@ -482,14 +511,16 @@ fn mouse_down_trigger(
             );
         }
         // Scroll-drag arming: same grab-time philosophy, but for the
-        // titlebar only. A tiled, unmodified titlebar grab scrolls the
-        // columns and swallows the native drag; content grabs (and anything
-        // armed, floating or fullscreen) keep fully native behavior. The
-        // tap pre-suppresses broadly and this corrects it a frame later.
+        // header only (titlebar band or blank toolbar chrome). A tiled,
+        // unmodified header grab scrolls the columns and swallows the
+        // native drag; content grabs — including buttons, text fields
+        // and tab drags inside the toolbar — and anything armed,
+        // floating or fullscreen keep fully native behavior. The tap
+        // pre-suppresses broadly and this corrects it a frame later.
         let tiled = windows
             .get_managed(entity)
             .is_some_and(|(_, _, unmanaged)| unmanaged.is_none());
-        let scroll_armed = config.left_drag_scrolls_strip() && tiled && !armed && titlebar;
+        let scroll_armed = config.left_drag_scrolls_strip() && tiled && !armed && header;
         if scroll_armed {
             debug!(
                 "mouse drag scroll-armed on window {} header at {point:?}",
@@ -732,9 +763,15 @@ fn mouse_up_trigger(
                 // session that slipped through before suppression still ends
                 // with an echo that must not rewrite the slot (see the
                 // adoption grace in `window_moved_update_frame`), and any
-                // residue gets one settle check (see below).
+                // residue gets one settle check (see below). Seat verifying
+                // legs as the backstop past the grace, like the homed path.
                 let members = release_column_members(entity, &strips);
-                arm_release_grace(members, &mut scroll_state, &mut commands);
+                arm_release_grace(members.clone(), &mut scroll_state, &mut commands);
+                for member in &members {
+                    if in_flight.get(*member).is_err() {
+                        commands.ensure_verifying(*member);
+                    }
+                }
                 seed_release_inertia(
                     entity,
                     release_ema_px_s,
@@ -1085,7 +1122,7 @@ pub(crate) fn arm_release_grace(
 /// `Timeout`, not every frame.
 fn scroll_settle_check(
     mut scroll_state: ResMut<DragScrollState>,
-    mut windows: Query<(&mut Window, &Position)>,
+    mut windows: Query<(Entity, &mut Window, &Position)>,
     writer: Option<Res<crate::ax_writer::AxWriterQueue>>,
     mut write_state: ResMut<crate::ax_writer::AxWriteState>,
     config: Res<Config>,
@@ -1099,17 +1136,25 @@ fn scroll_settle_check(
         .settle_deadline
         .is_some_and(|deadline| Instant::now() >= deadline)
     {
+        // Hand off to the verifier instead of dropping the residue: a
+        // slow-applying app (Electron) can still be converging past the
+        // grace, and silently clearing here is what lets a later echo
+        // adopt the displaced frame as layout (the permanent-detach
+        // path). Verifying legs are throttled and self-clear on landing.
+        let members = std::mem::take(&mut scroll_state.members);
         warn!(
-            "scroll release: {} window(s) still displaced after settle, giving up",
-            scroll_state.members.len()
+            "scroll release: {} window(s) still displaced after settle, verifying",
+            members.len()
         );
-        scroll_state.members.clear();
+        for member in members {
+            commands.ensure_verifying(member);
+        }
         scroll_state.settle_deadline = None;
         return;
     }
     let mut pending = Vec::with_capacity(scroll_state.members.len());
     for member in std::mem::take(&mut scroll_state.members) {
-        let Ok((mut window, position)) = windows.get_mut(member) else {
+        let Ok((_, mut window, position)) = windows.get_mut(member) else {
             continue;
         };
         let Ok(live) = window.update_frame().inspect_err(|err| {
