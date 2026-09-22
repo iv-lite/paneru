@@ -2269,6 +2269,189 @@ fn test_under_threshold_move_animates_without_snap_strip_marker() {
     );
 }
 
+/// A pure strip translation must ride every member rigidly: no per-window
+/// `RepositionMarker` at any point, identical per-tick deltas across
+/// siblings, and a shared landing tick. Regression: the old
+/// `LayoutPosition`-dirtying fan-out animated each sibling independently
+/// toward a recomputed target, so columns drifted apart mid-flight and
+/// landed on different ticks.
+#[test]
+fn test_strip_translation_rides_members_together() {
+    let config: Config = (
+        MainOptions {
+            animation_speed: Some(12.0),
+            ..Default::default()
+        },
+        vec![],
+    )
+        .into();
+
+    let mut h = TestHarness::new().with_config(config).with_windows(3);
+    // One frame: update, then report whether the mock still has echoes to
+    // deliver. Quiescence needs everything quiet — markers settled, no
+    // pending mock events (a stale focus echo would legitimately supersede
+    // the manual strip marker below via `autocenter_window_on_focus`), and
+    // no live `SnapStripMarker` guards (the startup restore guard forces
+    // direct placement for its first 500ms, like the old heuristic did).
+    let step = |h: &mut TestHarness| {
+        h.app.update();
+        let mut drained = false;
+        for e in h.mock_state.drain_events() {
+            drained = true;
+            h.app.world_mut().write_message::<Event>(e);
+        }
+        drained
+    };
+    // Settle the spawn layout so the baseline below is true rest.
+    for _ in 0..300 {
+        let drained = step(&mut h);
+        let world = h.app.world_mut();
+        let mut markers = world.query_filtered::<(), With<RepositionMarker>>();
+        let mut guards = world.query_filtered::<(), With<crate::ecs::workspace::SnapStripMarker>>();
+        if !drained && markers.iter(world).next().is_none() && guards.iter(world).next().is_none() {
+            break;
+        }
+    }
+
+    let members: Vec<Entity> = [0, 1, 2]
+        .into_iter()
+        .map(|id| find_window_entity(id, h.app.world_mut()))
+        .collect();
+    let strip = {
+        let world = h.app.world_mut();
+        let mut q = world.query_filtered::<Entity, With<ActiveWorkspaceMarker>>();
+        q.single(world).expect("exactly one active strip")
+    };
+    let read_pos = |world: &mut World, e: Entity| world.get::<Position>(e).expect("position").0;
+    let base_strip = read_pos(h.app.world_mut(), strip);
+    let base: Vec<Origin> = members
+        .iter()
+        .map(|e| read_pos(h.app.world_mut(), *e))
+        .collect();
+
+    // Pure strip translation: no slot changes, so every member must ride.
+    // -200 keeps all three columns clear of the offscreen-sliver park logic.
+    h.app
+        .world_mut()
+        .entity_mut(strip)
+        .insert(RepositionMarker(base_strip + Origin::new(-200, 0)));
+
+    let mut prev = base.clone();
+    let mut saw_flight = false;
+    for tick in 0..30 {
+        step(&mut h);
+        let world = h.app.world_mut();
+        if world.get::<RepositionMarker>(strip).is_some() {
+            saw_flight = true;
+        }
+        for member in &members {
+            assert!(
+                world.get::<RepositionMarker>(*member).is_none(),
+                "tick {tick}: strip members must ride, never animate independently"
+            );
+        }
+        let current: Vec<Origin> = members.iter().map(|e| read_pos(world, *e)).collect();
+        let step_deltas: Vec<(i32, i32)> = current
+            .iter()
+            .zip(prev.iter())
+            .map(|(c, p)| (c.x - p.x, c.y - p.y))
+            .collect();
+        assert!(
+            step_deltas.windows(2).all(|w| w[0] == w[1]),
+            "tick {tick}: siblings must move by identical deltas, got {step_deltas:?}"
+        );
+        prev = current;
+    }
+    assert!(
+        saw_flight,
+        "the strip must actually have animated for the test to mean anything"
+    );
+    // Shared landing: the strip settled and every member sits exactly one
+    // strip displacement from its baseline slot.
+    let world = h.app.world_mut();
+    assert!(
+        world.get::<RepositionMarker>(strip).is_none(),
+        "the strip must have landed within the step budget"
+    );
+    for (member, start) in members.iter().zip(base.iter()) {
+        assert_eq!(
+            read_pos(world, *member),
+            *start + Origin::new(-200, 0),
+            "member {member:?} must land exactly on its rigid slot"
+        );
+    }
+}
+
+/// A genuine slot change with a static strip must still animate each window
+/// independently: rigid riding is for strip translation only, never for
+/// topology. Guards against over-correcting the ride into teleports.
+#[test]
+fn test_slot_change_still_animates_independently() {
+    let config: Config = (
+        MainOptions {
+            animation_speed: Some(12.0),
+            ..Default::default()
+        },
+        vec![],
+    )
+        .into();
+
+    let mut h = TestHarness::new().with_config(config).with_windows(3);
+    // Quiescence needs everything quiet — see the ride test above.
+    let step = |h: &mut TestHarness| {
+        h.app.update();
+        let mut drained = false;
+        for e in h.mock_state.drain_events() {
+            drained = true;
+            h.app.world_mut().write_message::<Event>(e);
+        }
+        drained
+    };
+    for _ in 0..300 {
+        let drained = step(&mut h);
+        let world = h.app.world_mut();
+        let mut markers = world.query_filtered::<(), With<RepositionMarker>>();
+        let mut guards = world.query_filtered::<(), With<crate::ecs::workspace::SnapStripMarker>>();
+        if !drained && markers.iter(world).next().is_none() && guards.iter(world).next().is_none() {
+            break;
+        }
+    }
+
+    let strip = {
+        let world = h.app.world_mut();
+        let mut q = world.query_filtered::<Entity, With<ActiveWorkspaceMarker>>();
+        q.single(world).expect("exactly one active strip")
+    };
+    // Pure topology: swap the first two columns without touching the strip.
+    h.app
+        .world_mut()
+        .get_mut::<LayoutStrip>(strip)
+        .expect("strip")
+        .swap(0, 1);
+    step(&mut h);
+
+    let world = h.app.world_mut();
+    assert!(
+        world.get::<RepositionMarker>(strip).is_none(),
+        "a pure slot change must not translate the strip"
+    );
+    let first = find_window_entity(0, world);
+    let second = find_window_entity(1, world);
+    let third = find_window_entity(2, world);
+    assert!(
+        world.get::<RepositionMarker>(first).is_some(),
+        "the swapped-out window must slide independently"
+    );
+    assert!(
+        world.get::<RepositionMarker>(second).is_some(),
+        "the swapped-in window must slide independently"
+    );
+    assert!(
+        world.get::<RepositionMarker>(third).is_none(),
+        "the untouched window must not move at all"
+    );
+}
+
 /// Switching virtual workspaces with `virtual_workspace_animations = false`
 /// must switch focus to the focused window of the destination workspace.
 #[test]

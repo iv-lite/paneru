@@ -158,6 +158,12 @@ fn run(queue: Receiver<AxWriteJob>, acks: Sender<AxWriteAck>) {
                 }
             }
         }
+        // Deterministic intra-batch order (by window id): every display's
+        // strips ride on the same tick, and the batch must paint in a stable
+        // order rather than `HashMap` iteration order so siblings converge
+        // together, reproducibly.
+        let mut batch: Vec<_> = batch.into_iter().collect();
+        batch.sort_by_key(|(win_id, _)| *win_id);
         for (win_id, job) in batch {
             ax_set_window_position(&job.element, job.origin, job.h_pad, job.v_pad);
             trace!("ax writer: wrote window {win_id} seq {}", job.seq);

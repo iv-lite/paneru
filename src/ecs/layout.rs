@@ -11,7 +11,7 @@ use bevy::ecs::schedule::common_conditions::{not, resource_exists};
 use bevy::ecs::system::{Commands, Local, ParamSet, Populated, Query, Res};
 use bevy::math::IRect;
 use bevy::time::common_conditions::on_timer;
-use std::collections::{HashSet, VecDeque};
+use std::collections::{HashMap, HashSet, VecDeque};
 use std::time::Duration;
 use stdext::function_name;
 use tracing::{Level, instrument, trace, warn};
@@ -22,7 +22,7 @@ use crate::ecs::workspace::SnapStripMarker;
 use crate::ecs::{
     ActiveWorkspaceMarker, Bounds, DockPosition, EnsureVisibleMarker, Initializing, LayoutPosition,
     ManualStripOffset, MouseHeldMarker, Position, RepositionMarker, ReshuffleAroundMarker,
-    ResizeMarker, Scrolling, SpawnCommandsExt, Unmanaged,
+    ResizeMarker, Scrolling, SpawnCommandsExt, Unmanaged, VerifyWindowPosition,
 };
 use crate::errors::{Error, Result};
 use crate::events::Event;
@@ -146,6 +146,38 @@ type RepositionedWindows<'w, 's> = Populated<
     (Changed<LayoutPosition>, With<Window>, Without<LayoutStrip>),
 >;
 
+/// Strips whose own offset moved this tick — the [`ride_strip_motion`] input.
+/// Covers animated lerps, direct scroll/drag writes and snap assigns alike:
+/// every strip translation rides its members, whatever issued it.
+type MovedStrips<'w, 's> = Populated<
+    'w,
+    's,
+    (
+        Entity,
+        &'static LayoutStrip,
+        &'static Position,
+        Has<Scrolling>,
+        &'static ChildOf,
+    ),
+    Changed<Position>,
+>;
+
+/// Strip members as [`ride_strip_motion`] sees them: identity, slot, live
+/// frame, and whether an independent slide is already in flight.
+type RideMembers<'w, 's> = Query<
+    'w,
+    's,
+    (
+        Entity,
+        &'static Window,
+        &'static LayoutPosition,
+        &'static mut Position,
+        &'static mut Bounds,
+        Has<RepositionMarker>,
+    ),
+    (With<Window>, Without<LayoutStrip>),
+>;
+
 /// Clamp a window origin to the range where it still touches both viewport
 /// edges. For an oversized window this range is reversed: from right-aligned
 /// to left-aligned, which lets the strip pan across the hidden content.
@@ -251,7 +283,7 @@ impl Plugin for LayoutEventsPlugin {
                     layout_strip_changed,
                     reshuffle_layout_strip,
                     ensure_visible_in_strip,
-                    position_layout_strips,
+                    ride_strip_motion,
                     position_layout_windows,
                 )
                     .chain()
@@ -1469,20 +1501,195 @@ fn ensure_visible_in_strip(
     }
 }
 
-/// Reacts to changes in the position of the `LayoutStrip` to Display, and if changed,
-/// marks all the windows in the strip as requiring re-positioning.
+/// Rigid strip-following pass: when a strip's own offset moves, its members
+/// move by the same delta on the same tick — columns ride the strip instead
+/// of each running an independent animation toward a recomputed target (same
+/// rate but different residuals, so siblings land on different ticks and read
+/// as moving slowly relative to each other).
+///
+/// This replaces the old "dirty every member's `LayoutPosition`" fan-out,
+/// which conflated strip motion with genuine slot changes and therefore
+/// animated every sibling independently. `Changed<LayoutPosition>` now means
+/// only a real slot change (topology/resize, written by
+/// `layout_strip_changed` and animated per-window by
+/// `position_layout_windows`); this system owns pure strip translation, on
+/// every display in the same tick.
+///
+/// Per member of each moved strip:
+/// * swiping / snap-settling strips ride directly and drop markers (as before).
+/// * members already carrying a `RepositionMarker` (an independent slot-change
+///   slide overlapping strip motion) get their target refreshed via
+///   `reposition_entity`, so the slide composes with the strip instead of
+///   chasing a stale target.
+/// * everyone else votes: the strip-motion delta is the majority residual
+///   (`position - frame`). Bearers ride rigidly (direct-assign + verify, no
+///   marker); outliers (a perturbed window, a fresh slot change) animate back
+///   via `reposition_entity`, preserving the old repair/slide behavior. The
+///   majority must be strict and at least a pair, so a lone window or an
+///   evenly split swap keeps animating exactly as before.
 #[instrument(level = Level::DEBUG, skip_all)]
-fn position_layout_strips(
-    moved_strips: Populated<&LayoutStrip, Changed<Position>>,
-    mut windows: Query<&mut LayoutPosition, (With<Window>, Without<LayoutStrip>)>,
+fn ride_strip_motion(
+    moved_strips: MovedStrips,
+    mut members: RideMembers,
+    snap_guards: Query<&SnapStripMarker>,
+    displays: DisplayViewports,
+    config: Res<Config>,
+    mut commands: Commands,
 ) {
-    for strip in moved_strips {
-        for entity in strip.all_windows() {
-            if let Ok(mut position) = windows.get_mut(entity) {
-                position.set_changed();
+    // Contexts only for moved strips: idle strips on every display skip the
+    // rebuild instead of rehashing every window every frame.
+    let mut strip_contexts: EntityHashMap<StripWindowContext> = EntityHashMap::new();
+    for (strip_entity, layout_strip, Position(strip_position), swiping, child_of) in &moved_strips {
+        let snap_settling = snap_guards.iter().any(|guard| guard.strip == strip_entity);
+        insert_strip_window_contexts(
+            &mut strip_contexts,
+            layout_strip,
+            *strip_position,
+            swiping,
+            child_of.parent(),
+            snap_settling,
+        );
+    }
+    if strip_contexts.is_empty() {
+        return;
+    }
+    let riders = collect_riders(&members, &strip_contexts);
+    let plans = plan_strip_rides(&riders, &displays, &config);
+    if plans.is_empty() {
+        return;
+    }
+    let ride_delta = elect_ride_delta(&plans);
+
+    for plan in &plans {
+        if plan.forced
+            || (!plan.in_flight && ride_delta.is_some_and(|delta| delta == plan.residual))
+        {
+            // Rigid ride: the strip moved under a settled window, so the
+            // window is already conceptually there — assign, don't animate.
+            // Carries verification like every driven move (see
+            // `reposition_entity`), minus the marker the animator would chase.
+            if let Ok((_, _, _, mut position, mut bounds, _)) = members.get_mut(plan.entity) {
+                position.0 = plan.frame.min;
+                if bounds.0 != plan.frame.size() {
+                    bounds.0 = plan.frame.size();
+                }
+                if let Ok(mut entity_commands) = commands.get_entity(plan.entity) {
+                    entity_commands.try_remove::<RepositionMarker>();
+                    entity_commands.try_insert(VerifyWindowPosition::default());
+                }
+            }
+        } else {
+            // Outlier or overlapping independent slide: animate toward the
+            // fresh frame (refreshing an in-flight target, repairing a
+            // perturbation, or sliding into a new slot).
+            commands.reposition_entity(plan.entity, plan.frame.min);
+            if let Ok((_, _, _, _, mut bounds, _)) = members.get_mut(plan.entity)
+                && bounds.0 != plan.frame.size()
+            {
+                bounds.0 = plan.frame.size();
             }
         }
     }
+}
+
+/// Owned per-member snapshot: voting needs the whole strip's residuals
+/// before any member is moved, so the query borrow is released first.
+struct Rider {
+    entity: Entity,
+    layout: Origin,
+    size: Size,
+    pos: Origin,
+    h_pad: i32,
+    in_flight: bool,
+    context: StripWindowContext,
+}
+
+fn collect_riders(
+    members: &RideMembers,
+    strip_contexts: &EntityHashMap<StripWindowContext>,
+) -> Vec<Rider> {
+    let mut riders = Vec::new();
+    for (entity, window, layout_position, position, bounds, in_flight) in members {
+        let Some(context) = strip_contexts.get(&entity).copied() else {
+            continue;
+        };
+        riders.push(Rider {
+            entity,
+            layout: layout_position.0,
+            size: bounds.0,
+            pos: position.0,
+            h_pad: window.horizontal_padding(),
+            in_flight,
+            context,
+        });
+    }
+    riders
+}
+
+/// Desired frame + residual per rider; members already home are skipped so
+/// a resting strip costs no writes, no commits, no AX traffic.
+struct RidePlan {
+    entity: Entity,
+    frame: IRect,
+    in_flight: bool,
+    forced: bool,
+    residual: (i32, i32),
+}
+
+fn plan_strip_rides(
+    riders: &[Rider],
+    displays: &DisplayViewports,
+    config: &Config,
+) -> Vec<RidePlan> {
+    let mut plans = Vec::with_capacity(riders.len());
+    for rider in riders {
+        let Ok((display, dock)) = displays.get(rider.context.display_entity) else {
+            continue;
+        };
+        let viewport = display.actual_display_bounds(dock, config);
+        let frame = desired_window_frame(
+            rider.layout,
+            rider.size,
+            rider.context.strip_position,
+            rider.context.stacked,
+            rider.context.swiping,
+            viewport,
+            rider.h_pad,
+            config,
+        );
+        if rider.pos == frame.min && rider.size == frame.size() {
+            continue;
+        }
+        plans.push(RidePlan {
+            entity: rider.entity,
+            frame,
+            in_flight: rider.in_flight,
+            forced: rider.context.swiping || rider.context.snap_settling,
+            residual: (rider.pos.x - frame.min.x, rider.pos.y - frame.min.y),
+        });
+    }
+    plans
+}
+
+/// The strip-motion delta: the strict-majority residual among voters
+/// (neither forced nor in flight), carried by at least a pair. A lone window
+/// or an evenly split swap has no "together" to keep and animates exactly as
+/// before, so those elect nothing.
+fn elect_ride_delta(plans: &[RidePlan]) -> Option<(i32, i32)> {
+    let mut tally: HashMap<(i32, i32), usize> = HashMap::new();
+    let mut cast = 0usize;
+    for plan in plans {
+        if plan.forced || plan.in_flight {
+            continue;
+        }
+        cast += 1;
+        *tally.entry(plan.residual).or_insert(0) += 1;
+    }
+    tally
+        .into_iter()
+        .max_by_key(|(_, count)| *count)
+        .filter(|(_, count)| *count >= 2 && *count * 2 > cast)
+        .map(|(delta, _)| delta)
 }
 
 #[derive(Clone, Copy)]
