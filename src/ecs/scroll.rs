@@ -1,9 +1,9 @@
 use bevy::app::{App, Plugin, Update};
 use bevy::ecs::entity::Entity;
 use bevy::ecs::message::MessageReader;
-use bevy::ecs::query::{Has, With, Without};
+use bevy::ecs::query::{Added, Has, With, Without};
 use bevy::ecs::schedule::IntoScheduleConfigs as _;
-use bevy::ecs::system::{Commands, Local, Populated, Res, Single};
+use bevy::ecs::system::{Commands, Local, Populated, Query, Res, Single};
 use bevy::math::IRect;
 use bevy::time::Time;
 use std::time::{Duration, Instant};
@@ -16,7 +16,7 @@ use crate::ecs::layout::{Column, LayoutStrip};
 use crate::ecs::params::{ActiveDisplay, Windows};
 use crate::ecs::{
     ActiveWorkspaceMarker, DragSettleMarker, ManualStripOffset, MissionControlActive, Position,
-    Scrolling, SendMessageTrigger,
+    RepositionMarker, Scrolling, SendMessageTrigger,
 };
 use crate::errors::Result;
 use bevy::ecs::schedule::common_conditions::on_message;
@@ -79,10 +79,11 @@ impl Plugin for ScrollEventsPlugin {
                 vertical_swipe_gesture
                     .run_if(mission_control_inactive)
                     .run_if(on_message::<InputEvent>),
+                swipe_gesture
+                    .run_if(mission_control_inactive)
+                    .run_if(on_message::<InputEvent>),
                 (
-                    swipe_gesture
-                        .run_if(mission_control_inactive)
-                        .run_if(on_message::<InputEvent>),
+                    cancel_driven_strip_glide,
                     apply_inertia,
                     apply_snap_force,
                     scrolling_integrator,
@@ -240,6 +241,37 @@ pub(super) fn swiping_timeout(
                     modifiers: Modifiers::empty(),
                 }));
             }
+        }
+    }
+}
+
+/// Strips with a freshly issued programmatic move plus live scroll state:
+/// the only strips whose glide can fight the animator.
+type DrivenGlideStrips<'w, 's> =
+    Query<'w, 's, Entity, (With<LayoutStrip>, Added<RepositionMarker>, With<Scrolling>)>;
+
+/// Cancels a live glide the moment a programmatic move takes over its
+/// strip: reshuffle, ensure-visible, restores and workspace switches all
+/// drive via `RepositionMarker`, which the scroll pipeline would otherwise
+/// overwrite every tick — the integrator from decaying velocity, and even
+/// at zero velocity the constraints from the stale `scroll.position` —
+/// stalling the strip mid-flight (focus animations stutter and stop).
+/// Latest explicit intent wins; glides yield. `Added` catches every
+/// issuer, present and future, with at most one frame of overlap.
+/// Removes (rather than zeroes) `Scrolling`: zeroing still leaves the
+/// constraints pinning the stale offset until the lift-timeout reaps it.
+/// Never touches live drags: drives write `Position` directly and never
+/// add strip markers. Every downstream reader takes `Option`/`Has`, is
+/// gated `Populated`, or re-inserts on demand — the same lifecycle as the
+/// lift-timeout reap.
+#[instrument(level = Level::TRACE, skip_all)]
+fn cancel_driven_strip_glide(strips: DrivenGlideStrips<'_, '_>, mut commands: Commands) {
+    for entity in &strips {
+        if let Ok(mut entity_commands) = commands.get_entity(entity) {
+            // The settle path steers through `scroll.position` too; a
+            // focus-driven move supersedes whatever it was revealing.
+            entity_commands.try_remove::<Scrolling>();
+            entity_commands.try_remove::<DragSettleMarker>();
         }
     }
 }
