@@ -2145,6 +2145,14 @@ pub(super) struct OverlayCaches {
     press_hit: PressHitCache,
 }
 
+/// Global clocks the overlay reacts to, bundled so `update_overlays` stays
+/// under Bevy's system-param limit.
+#[derive(bevy::ecs::system::SystemParam)]
+pub(super) struct OverlayClocks<'w> {
+    mission_control_active: Res<'w, MissionControlActive>,
+    display_gen: Res<'w, crate::ecs::DisplayGeneration>,
+}
+
 /// Windows as the overlay sees them for flight checks: whether paneru is
 /// currently driving or confirming each window.
 type FlightMarkers<'w, 's> = Query<
@@ -2346,7 +2354,7 @@ pub(super) fn update_overlays(
     paint: Res<DragPaintState>,
     time: Res<Time>,
     overlay_mgr: Option<NonSendMut<OverlayManager>>,
-    mission_control_active: Res<MissionControlActive>,
+    clocks: OverlayClocks<'_>,
     config: Res<Config>,
     mut caches: Local<OverlayCaches>,
     store: Option<Res<SnapshotStore>>,
@@ -2357,6 +2365,14 @@ pub(super) fn update_overlays(
     let Some(mut overlay_mgr) = overlay_mgr else {
         return;
     };
+
+    // Display-set reconciliation ran (wake, rescan, reconfigure): re-probe
+    // screen geometry even when the display count is unchanged — the cached
+    // CG↔Cocoa flip origin would otherwise paint every border off by the
+    // primary-height delta for up to a minute.
+    if clocks.display_gen.is_changed() {
+        overlay_mgr.refresh_screen_height();
+    }
 
     // Hex alpha composes multiplicatively; f32 precision is plenty for an
     // opacity in [0, 1].
@@ -2371,11 +2387,14 @@ pub(super) fn update_overlays(
     // whole gesture and reappearing at the release point reads as detached.
     // Touchpad swipes with no drag held keep the hide.
     let Some((swiping, active_strip)) = active_workspace.iter().next() else {
+        // No active workspace (orphaned strip after display removal): hide
+        // rather than holding the last rect until something dirties again.
+        overlay_mgr.hide_all();
         return;
     };
 
     let hide_for_swipe = overlay_hide_for_swipe(swiping, !drag_held.is_empty());
-    if hide_for_swipe || mission_control_active.0 || active_strip.is_fullscreen() {
+    if hide_for_swipe || clocks.mission_control_active.0 || active_strip.is_fullscreen() {
         overlay_mgr.hide_all();
         return;
     }

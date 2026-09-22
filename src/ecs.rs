@@ -4,6 +4,7 @@ use std::time::{Duration, Instant};
 use bevy::MinimalPlugins;
 use bevy::app::App as BevyApp;
 use bevy::app::{First, Last, PostUpdate, PreUpdate, Startup};
+use bevy::ecs::change_detection::DetectChanges;
 use bevy::ecs::hierarchy::ChildOf;
 use bevy::ecs::lifecycle::RemovedComponents;
 use bevy::ecs::message::MessageReader;
@@ -80,13 +81,10 @@ pub fn register_systems(app: &mut bevy::app::App) {
             .next()
             .is_none_or(|marker| !marker.is_user_swiping)
     };
-    let dimming_enabled = |config: Option<Res<Config>>| {
-        config.is_some_and(|config| {
-            config.has_dim_inactive_color()
-                || config.border_active_window()
-                || config.inactive_border_enabled()
-        })
-    };
+    // NOTE: no `dimming_enabled` gate on the overlay system by design — border
+    // pruning and removal must run even when every overlay is configured off,
+    // or disabling them live strands the existing windows. The system itself
+    // early-returns via `remove_all` when there is nothing to show.
     // The overlay must refresh not just when the active strip's layout changes,
     // but also whenever focus moves — including focus *loss* (e.g. switching to
     // an empty virtual workspace), which otherwise leaves a stale outline.
@@ -100,10 +98,12 @@ pub fn register_systems(app: &mut bevy::app::App) {
     let vw_indicator_dirty =
         |strip_changed: Query<(), (With<ActiveWorkspaceMarker>, Changed<LayoutStrip>)>,
          focus_gained: Query<(), Added<FocusedMarker>>,
+         mut focus_lost: RemovedComponents<FocusedMarker>,
          workspace_changed: Query<(), Added<ActiveWorkspaceMarker>>,
          focused_moved: Query<(), FocusedFrameChanged>| {
             !strip_changed.is_empty()
                 || !focus_gained.is_empty()
+                || focus_lost.read().next().is_some()
                 || !workspace_changed.is_empty()
                 || !focused_moved.is_empty()
         };
@@ -139,6 +139,18 @@ pub fn register_systems(app: &mut bevy::app::App) {
     // the next focus/strip/position change. Overlay-only, like above.
     let drag_ended =
         |mut released: RemovedComponents<MouseHeldMarker>| released.read().next().is_some();
+    // Mission Control enter/exit must re-run the overlay: borders are
+    // `CanJoinAllSpaces` and only hide via an explicit tick, so without
+    // this they stay visible through Mission Control (enter) or never
+    // repaint on return (exit) unless a coincidental term fires.
+    // Overlay-only, like above.
+    let mission_control_changed = |active: Res<MissionControlActive>| active.is_changed();
+    // Display-set reconciliation (wake, rescans, reconfiguration) must
+    // re-run the overlay and re-probe screen geometry even when nothing
+    // else dirtied it — same-count changes keep the display count (which
+    // the overlay manager watches) while moving everything else.
+    // Overlay-only, like above.
+    let display_set_changed = |generation: Res<DisplayGeneration>| generation.is_changed();
     // A fresh snapshot generation re-runs the overlay even when nothing else
     // dirtied it: border attachment reads snapshot frames, and the worker
     // wakes the pump on change precisely so native motion repaints promptly.
@@ -191,6 +203,7 @@ pub fn register_systems(app: &mut bevy::app::App) {
     app.add_message::<InputEvent>();
     app.init_resource::<systems::ParkedCommands>();
     app.init_resource::<crate::ecs::BurstClock>();
+    app.init_resource::<crate::ecs::DisplayGeneration>();
     app.init_resource::<crate::ax_writer::AxWriteState>();
     app.add_systems(
         PreUpdate,
@@ -276,13 +289,14 @@ pub fn register_systems(app: &mut bevy::app::App) {
                 systems::update_overlays
                     .after(systems::animate_entities)
                     .after(systems::animate_resize_entities)
-                    .run_if(dimming_enabled)
                     .run_if(
                         vw_indicator_dirty
                             .or_eager(overlay_tracking_motion)
                             .or_eager(bordered_set_changed)
                             .or_eager(any_window_animating)
                             .or_eager(drag_ended)
+                            .or_eager(mission_control_changed)
+                            .or_eager(display_set_changed)
                             .or_eager(snapshot_advanced),
                     ),
                 systems::update_flash_messages,
@@ -785,6 +799,14 @@ impl ColdStart {
         self.started.elapsed()
     }
 }
+
+/// Generation counter for the display set, bumped by `reconcile_displays`
+/// whenever it runs (wake, add/remove/move/resize/configure). The overlay
+/// watches it to re-probe the primary-screen height even when the display
+/// *count* is unchanged — same-count reconfigs (arrangement, primary,
+/// resolution) otherwise stay stale behind the overlay's height cache.
+#[derive(Resource, Debug, Default)]
+pub struct DisplayGeneration(pub u64);
 
 /// Bevy event trigger for spawning new windows.
 #[derive(BevyEvent)]

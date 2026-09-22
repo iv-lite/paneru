@@ -541,18 +541,6 @@ impl Config {
             .is_none_or(|vertical| vertical)
     }
 
-    pub fn has_dim_inactive_color(&self) -> bool {
-        let config = self.inner();
-        config
-            .decorations
-            .as_ref()
-            .and_then(|decorations| decorations.inactive.as_ref())
-            .and_then(|inactive| inactive.dim.as_ref())
-            .and_then(|dim| dim.color.as_ref())
-            .is_some()
-            || config.options.dim_inactive_color.is_some()
-    }
-
     pub fn dim_inactive_opacity(&self) -> f32 {
         let config = self.inner();
         let color = config

@@ -217,6 +217,7 @@ pub(crate) fn reconcile_displays(
     workspaces: Query<(&LayoutStrip, Entity, Option<&ChildOf>)>,
     mut displays: Query<(&mut Display, Entity)>,
     window_manager: Res<WindowManager>,
+    mut display_gen: ResMut<crate::ecs::DisplayGeneration>,
     mut retries: Local<u8>,
     mut commands: Commands,
 ) {
@@ -242,6 +243,11 @@ pub(crate) fn reconcile_displays(
     }
 
     debug!("Reconciling displays against OS after wake / resize / configure");
+    // The display set may have changed (count, order, primary, geometry):
+    // poke the overlay generation so borders re-probe the screen height even
+    // when the count is unchanged (same-count reconfigs otherwise stay stale
+    // behind the overlay's cache).
+    display_gen.0 += 1;
 
     let mut present_displays: HashMap<CGDirectDisplayID, _> = window_manager
         .0

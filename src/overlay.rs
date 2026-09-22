@@ -370,9 +370,17 @@ impl OverlayManager {
                 .screen_h
                 .is_none_or(|(at, _)| at.elapsed() >= SCREEN_HEIGHT_CACHE)
         {
-            self.screen_h = Some((Instant::now(), primary_screen_height(self.mtm)));
+            self.refresh_screen_height();
         }
         self.screen_h.map_or(0.0, |(_, h)| h)
+    }
+
+    /// Re-probes the primary-screen height immediately, bypassing the cache.
+    /// Called when the display generation advances (reconcile, rescan,
+    /// reconfiguration): same-count changes keep the surface count while
+    /// moving the origin the CG↔Cocoa flip is anchored to.
+    pub fn refresh_screen_height(&mut self) {
+        self.screen_h = Some((Instant::now(), primary_screen_height(self.mtm)));
     }
 
     /// Update the per-display dim surfaces.
@@ -517,6 +525,13 @@ impl OverlayManager {
             }
             keep
         });
+        // An emptied map resets the hidden flag outright: with nothing
+        // ordered in, "hidden" is meaningless, and a stale `true` would make
+        // the next `hide_borders` a no-op while a visibility race below
+        // could leave a window showing.
+        if self.borders.is_empty() {
+            self.borders_hidden = false;
+        }
         for (id, abs_cg, params) in desired {
             let cocoa = cg_abs_to_cocoa(border_window_rect(*abs_cg, params.width), screen_h);
             if let Some(border) = self.borders.get_mut(id) {
@@ -549,8 +564,6 @@ impl OverlayManager {
                 self.borders_hidden = false;
             }
         }
-        // An empty desired set with an empty map is steady state; anything
-        // dropped above was ordered out on the way out.
     }
 
     /// Show the drop-preview ghost: a filled, border-stroked outline of the
