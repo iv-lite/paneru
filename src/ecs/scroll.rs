@@ -12,7 +12,7 @@ use tracing::{Level, instrument};
 use crate::commands::{Command, Direction, Operation};
 use crate::config::Config;
 use crate::config::swipe::SwipeGestureDirection;
-use crate::ecs::layout::{Column, LayoutStrip};
+use crate::ecs::layout::{Column, LayoutStrip, clamp_strip_to_fill, strip_total_width};
 use crate::ecs::params::{ActiveDisplay, Windows};
 use crate::ecs::{
     ActiveWorkspaceMarker, DragSettleMarker, ManualStripOffset, MissionControlActive, Position,
@@ -431,6 +431,26 @@ fn apply_snap_force(
                     &viewport,
                     &config,
                 )
+            })
+            .map(|target| {
+                // With more than one window the settle must not strand the
+                // strip next to whitespace: fill the viewport past the
+                // nearest-window target (which on its own can leave the
+                // opposite edge empty, and the continuous-swipe clamp above
+                // allows out-of-fill offsets by design for the manual drive).
+                if layout_strip.len() >= 2
+                    && let Some(total) = strip_total_width(layout_strip, &windows)
+                {
+                    clamp_strip_to_fill(
+                        target,
+                        total,
+                        layout_strip.len(),
+                        &viewport,
+                        config.center_single_column(),
+                    )
+                } else {
+                    target
+                }
             })
         else {
             commands

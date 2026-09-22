@@ -473,16 +473,17 @@ fn test_strip_scroll_release_settles_and_cleans_up() {
         })
         // The settle converges instantly here (window 1 already revealed),
         // so only the converged end state is asserted; the fling test below
-        // observes the marker mid-flight. The continuous range keeps the
-        // -254 offset instead of clamping.
+        // observes the marker mid-flight. The fill clamp pulls the -254 drag
+        // offset back to -176 so the strip packs the viewport instead of
+        // leaving whitespace past window 2.
         .on_iteration(11, move |world, _state| {
             let (offset, settled, scrolling) = strip_scroll_state(world);
-            assert_eq!(offset, -254);
+            assert_eq!(offset, -176);
             assert!(!settled, "settle marker must be reaped");
             assert!(!scrolling, "scrolling must be reaped");
-            assert_window_at!(world, 0, -254, TEST_MENUBAR_HEIGHT);
-            assert_window_at!(world, 1, 146, TEST_MENUBAR_HEIGHT);
-            assert_window_at!(world, 2, 546, TEST_MENUBAR_HEIGHT);
+            assert_window_at!(world, 0, -176, TEST_MENUBAR_HEIGHT);
+            assert_window_at!(world, 1, 224, TEST_MENUBAR_HEIGHT);
+            assert_window_at!(world, 2, 624, TEST_MENUBAR_HEIGHT);
         })
         .run(commands);
 }
@@ -693,6 +694,81 @@ fn test_window_swap_keeps_strip_when_in_view() {
             assert_window_at!(world, 1, 0, TEST_MENUBAR_HEIGHT);
             assert_window_at!(world, 0, TEST_WINDOW_WIDTH, TEST_MENUBAR_HEIGHT);
             assert_focused!(world, 1);
+        })
+        .run(commands);
+}
+
+#[test]
+fn test_focus_east_fills_fitting_strip() {
+    // Two 400px windows fit the 1024px viewport. After Center the strip sits
+    // at +312 with window 1 hanging off the right edge; focusing east must
+    // not stop at the minimal shortfall (strip 224, 224px of whitespace on
+    // the left) but pin the strip left so both windows pack the viewport.
+    let commands = vec![
+        Event::MenuOpened { window_id: 0 },
+        Event::Command {
+            command: Command::Window(Operation::Center),
+        },
+        Event::Command {
+            command: Command::Window(Operation::Focus(Direction::East)),
+        },
+    ];
+
+    let config: Config = (
+        MainOptions {
+            animation_speed: Some(10000.0),
+            ..Default::default()
+        },
+        vec![],
+    )
+        .into();
+
+    let centered = (TEST_DISPLAY_WIDTH - TEST_WINDOW_WIDTH) / 2;
+    TestHarness::new()
+        .with_config(config)
+        .with_windows(2)
+        .on_iteration(1, move |world, _state| {
+            assert_window_at!(world, 0, centered, TEST_MENUBAR_HEIGHT);
+        })
+        .on_iteration(2, |world, _state| {
+            assert_window_at!(world, 0, 0, TEST_MENUBAR_HEIGHT);
+            assert_window_at!(world, 1, TEST_WINDOW_WIDTH, TEST_MENUBAR_HEIGHT);
+            assert_focused!(world, 1);
+        })
+        .run(commands);
+}
+
+#[test]
+fn test_swap_east_fills_fitting_strip() {
+    // Same setup through the swap path (`ensure_visible`, not reshuffle):
+    // after Center, Swap(East) moves window 0 to layout 400, whose minimal
+    // expose is strip 224 — the fill clamp must pin it left instead.
+    let commands = vec![
+        Event::MenuOpened { window_id: 0 },
+        Event::Command {
+            command: Command::Window(Operation::Center),
+        },
+        Event::Command {
+            command: Command::Window(Operation::Swap(Direction::East)),
+        },
+    ];
+
+    let config: Config = (
+        MainOptions {
+            animation_speed: Some(10000.0),
+            ..Default::default()
+        },
+        vec![],
+    )
+        .into();
+
+    TestHarness::new()
+        .with_config(config)
+        .with_windows(2)
+        .on_iteration(2, |world, _state| {
+            assert_window_at!(world, 1, 0, TEST_MENUBAR_HEIGHT);
+            assert_window_at!(world, 0, TEST_WINDOW_WIDTH, TEST_MENUBAR_HEIGHT);
+            assert_focused!(world, 0);
         })
         .run(commands);
 }

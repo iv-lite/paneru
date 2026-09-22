@@ -236,6 +236,50 @@ pub(crate) fn origin_exposing(
     clamp_origin_to_viewport(layout + origin, size, viewport) - layout
 }
 
+/// Clamps a strip's horizontal offset so the strip fills the viewport with
+/// no empty edge: for an overflowing strip the offset stays inside
+/// `[viewport.max.x - total, viewport.min.x]`; for a fitting strip it pins
+/// the leftmost window to the left edge (or centers a lone column when
+/// `center_single`). Pure over precomputed width so callers (`reshuffle`,
+/// `ensure_visible`, drag settle) share one invariant and it stays unit
+/// testable. Oversize windows are unaffected: their range already spans from
+/// right-aligned to left-aligned. Callers decide *whether* to apply (gates
+/// like `auto_center`, deliberate offsets, single-window strips live at the
+/// call site); this only computes *where* filled is.
+pub(crate) fn clamp_strip_to_fill(
+    offset_x: i32,
+    total_strip_width: i32,
+    strip_len: usize,
+    viewport: &IRect,
+    center_single: bool,
+) -> i32 {
+    if viewport.width() < total_strip_width {
+        offset_x.clamp(viewport.max.x - total_strip_width, viewport.min.x)
+    } else if center_single && strip_len == 1 {
+        viewport.min.x + (viewport.width() - total_strip_width) / 2
+    } else {
+        // Strip fits entirely: pin the leftmost window to the left edge.
+        viewport.min.x
+    }
+}
+
+/// The full width of `strip`'s packed columns (`last layout_x + width`),
+/// mirroring the edge-invariant math in `reshuffle_layout_strip`. `None`
+/// when the last column's slot or frame is unknown.
+pub(crate) fn strip_total_width(strip: &LayoutStrip, windows: &Windows) -> Option<i32> {
+    strip
+        .last()
+        .ok()
+        .and_then(|column| column.top())
+        .and_then(|last| {
+            windows
+                .layout_position(last)
+                .map(|position| position.0.x)
+                .zip(windows.moving_frame(last).map(|frame| frame.width()))
+        })
+        .map(|(last_x, last_width)| last_x + last_width)
+}
+
 /// The member holding the largest share of `viewport` right now, for
 /// post-release reveal: after a drop, the strip scrolls so this window is
 /// fully visible. Pure over precomputed frames so the selection is unit
@@ -1370,40 +1414,35 @@ fn reshuffle_layout_strip(
                 (frame.min - layout_position.0).with_y(display_bounds.min.y)
             };
 
-            // Enforce the edge invariant when auto-center is off: the leftmost
-            // window must touch the left edge and the rightmost the right edge
-            // if more than 1 windows in workspace. Always enforced when
-            // forced, so no trailing empty space survives a removal.
+            // Enforce the edge invariant: with more than one window in the
+            // strip the leftmost window must touch the left edge and the
+            // rightmost the right edge, so a focused/moved window never rests
+            // next to whitespace. Always enforced when forced, so no trailing
+            // empty space survives a removal. Magnetic centering still owns
+            // out-of-range offsets, so it gates the invariant — but
+            // `continuous_swipe` does not: it governs the manual swipe range
+            // only (see `clamp_viewport_offset`), not where programmatic
+            // focus/move parks the strip.
             // A lone column with `center_single_column` is centered instead
-            // of left-pinned, regardless of the swipe/center gates — it has
-            // no neighbour to anchor against, so there is nothing to fight.
-            if let Some(total_strip_width) = strip
-                .last()
-                .ok()
-                .and_then(|column| column.top())
-                .and_then(|last| {
-                    windows
-                        .layout_position(last)
-                        .map(|position| position.0.x)
-                        .zip(windows.moving_frame(last).map(|frame| frame.width()))
-                })
-                .map(|(last_x, last_width)| last_x + last_width)
-            {
-                let apply_invariant =
-                    force || (!config.auto_center() && !config.continuous_swipe());
-                if display_bounds.width() < total_strip_width {
-                    if apply_invariant {
-                        strip_position.x = strip_position.x.clamp(
-                            display_bounds.max.x - total_strip_width,
-                            display_bounds.min.x,
-                        );
-                    }
-                } else if config.center_single_column() && strip.len() == 1 {
-                    strip_position.x =
-                        display_bounds.min.x + (display_bounds.width() - total_strip_width) / 2;
-                } else if apply_invariant {
-                    // Strip fits entirely: pin the leftmost window to the left edge.
-                    strip_position.x = display_bounds.min.x;
+            // of left-pinned, regardless of the gates — it has no neighbour
+            // to anchor against, so there is nothing to fight.
+            if let Some(total_strip_width) = strip_total_width(strip, &windows) {
+                let apply_invariant = if strip.len() >= 2 {
+                    force || !config.auto_center()
+                } else {
+                    force || (!config.auto_center() && !config.continuous_swipe())
+                };
+                let centered_single = config.center_single_column()
+                    && strip.len() == 1
+                    && display_bounds.width() >= total_strip_width;
+                if apply_invariant || centered_single {
+                    strip_position.x = clamp_strip_to_fill(
+                        strip_position.x,
+                        total_strip_width,
+                        strip.len(),
+                        &display_bounds,
+                        config.center_single_column(),
+                    );
                 }
             }
 
@@ -1437,9 +1476,11 @@ fn reshuffle_layout_strip(
 /// Scrolls the strip the minimum amount needed to keep `EnsureVisibleMarker`
 /// entities on-screen at their new layout position. If the entity already fits
 /// inside the viewport with the strip where it is, the strip is left alone and
-/// the per-window animator slides the entity into its slot. Only when the new
-/// slot would fall past an edge does the strip translate, and only by the
-/// shortfall — never to anchor the entity to a particular position.
+/// the per-window animator slides the entity into its slot — unless the strip
+/// parks a gap next to a neighbour, in which case it fills the viewport (same
+/// edge invariant as `reshuffle_layout_strip`). Only when the new slot would
+/// fall past an edge does the strip translate, and only by the shortfall plus
+/// the fill clamp — never to anchor the entity to a particular position.
 #[allow(clippy::type_complexity)]
 #[instrument(level = Level::DEBUG, skip_all)]
 fn ensure_visible_in_strip(
@@ -1449,6 +1490,7 @@ fn ensure_visible_in_strip(
         Query<&mut Position, (With<LayoutStrip>, Without<Window>)>,
     )>,
     displays: DisplayViewports,
+    manual_offsets: Query<&ManualStripOffset>,
     windows: Windows,
     config: Res<Config>,
     mut commands: Commands,
@@ -1463,18 +1505,28 @@ fn ensure_visible_in_strip(
         // before the `&mut Position` query below is touched — Bevy treats
         // the two queries as conflicting system params even though they're
         // never live at the same time here.
-        let Some((strip_entity, display_entity, strip_target, is_new_activation)) = strip_params
+        let Some((
+            strip_entity,
+            display_entity,
+            strip_target,
+            is_new_activation,
+            strip_len,
+            strip_total,
+        )) = strip_params
             .p0()
             .into_iter()
             .find(|s| s.0.contains(entity))
             .map(
-                |(_, strip_entity, strip_position, child, active_marker, strip_reposition)| {
+                |(strip, strip_entity, strip_position, child, active_marker, strip_reposition)| {
                     let target = strip_reposition.map_or(strip_position.0, |r| r.0);
+                    let total = strip_total_width(strip, &windows);
                     (
                         strip_entity,
                         child.parent(),
                         target,
                         active_marker.is_some_and(|m| m.is_added()),
+                        strip.columns().count(),
+                        total,
                     )
                 },
             )
@@ -1494,21 +1546,55 @@ fn ensure_visible_in_strip(
         };
         let viewport = display.actual_display_bounds(dock, &config);
 
+        // Filling is about not stranding a neighbour next to whitespace, so
+        // single-window strips keep minimal-expose behavior byte for byte.
+        // Magnetic centering still owns out-of-range offsets.
+        let fill_x = |offset_x: i32| {
+            if strip_len >= 2
+                && !config.auto_center()
+                && let Some(total) = strip_total
+            {
+                clamp_strip_to_fill(
+                    offset_x,
+                    total,
+                    strip_len,
+                    &viewport,
+                    config.center_single_column(),
+                )
+            } else {
+                offset_x
+            }
+        };
+
         // Where the entity would appear once the strip settles. Mid-animation
         // the strip's current position is on its way somewhere else, so the
         // target offset is what the window's slot will actually be measured
         // against - the same projection `reshuffle_layout_strip` makes.
         let candidate_min = layout_position.0 + strip_target;
-        // Clamp into the viewport. If already on-screen, this is a no-op and
-        // the strip target equals its current position — no movement.
+        // Clamp into the viewport. If already on-screen, the shortfall is
+        // empty and only the fill clamp can still move the strip.
         let clamped_min = clamp_origin_to_viewport(candidate_min, size, viewport);
-        if clamped_min == candidate_min {
-            continue;
-        }
-        // Both axes come from the clamp: it is still the minimum shortfall, and
-        // keeping the strip's own y here would silently drop the vertical
-        // correction for a window sitting above the menu bar.
-        let scroll_to = clamped_min - layout_position.0;
+        let scroll_to = if clamped_min == candidate_min {
+            // No shortfall — but the strip may still park a gap next to a
+            // neighbour (e.g. after a centered placement or a drag). Fill it,
+            // unless the placement is deliberate (center, snap):
+            // `reshuffle_layout_strip` owns that staleness, and firing here
+            // would undo an explicit user placement on every refocus.
+            if manual_offsets.get(strip_entity).is_ok() {
+                continue;
+            }
+            let filled_x = fill_x(strip_target.x);
+            if filled_x == strip_target.x {
+                continue;
+            }
+            Origin::new(filled_x, strip_target.y)
+        } else {
+            // Both axes come from the clamp: it is still the minimum shortfall, and
+            // keeping the strip's own y here would silently drop the vertical
+            // correction for a window sitting above the menu bar.
+            let exposed = clamped_min - layout_position.0;
+            Origin::new(fill_x(exposed.x), exposed.y)
+        };
         trace!("ensure_visible_in_strip: entity {entity}, scroll strip to {scroll_to}");
         // Scrolling to expose a window overrides whatever the user placed here.
         if let Ok(mut cmd) = commands.get_entity(strip_entity) {
@@ -2622,6 +2708,37 @@ mod tests {
         assert_eq!(
             origin_exposing(Origin::new(100, 0), size, Origin::new(50, 0), viewport),
             Origin::new(50, 0)
+        );
+    }
+
+    #[test]
+    fn fill_clamps_overflowing_strip_into_viewport() {
+        let viewport = IRect::new(0, 0, 1024, 768);
+        // 5 columns of 400px: valid offsets are [-976, 0].
+        assert_eq!(clamp_strip_to_fill(312, 2000, 5, &viewport, false), 0);
+        assert_eq!(clamp_strip_to_fill(-2000, 2000, 5, &viewport, false), -976);
+        assert_eq!(clamp_strip_to_fill(-500, 2000, 5, &viewport, false), -500);
+    }
+
+    #[test]
+    fn fill_pins_fitting_strip_to_the_left_edge() {
+        let viewport = IRect::new(0, 0, 1024, 768);
+        // 2 columns of 400px fit: any offset packs left.
+        assert_eq!(clamp_strip_to_fill(224, 800, 2, &viewport, false), 0);
+        assert_eq!(clamp_strip_to_fill(-200, 800, 2, &viewport, false), 0);
+        assert_eq!(clamp_strip_to_fill(0, 800, 2, &viewport, false), 0);
+    }
+
+    #[test]
+    fn fill_leaves_single_window_strips_to_the_caller() {
+        // Single-window behavior (minimal expose, lone centering) is owned by
+        // the caller: with one column the fill helper still computes the
+        // pinned/centered slot, but `ensure_visible` never asks for it.
+        let viewport = IRect::new(0, 0, 1024, 768);
+        assert_eq!(clamp_strip_to_fill(200, 400, 1, &viewport, false), 0);
+        assert_eq!(
+            clamp_strip_to_fill(0, 400, 1, &viewport, true),
+            (1024 - 400) / 2
         );
     }
 
