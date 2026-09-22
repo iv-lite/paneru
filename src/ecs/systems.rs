@@ -140,6 +140,21 @@ type CommittedWindows<'w, 's> = Populated<
     Or<(Changed<Position>, With<ResendMarker>)>,
 >;
 
+/// Windows as the verifier sees them: every leg, driving or confirming.
+/// Marker-less strips (no OS window to confirm against) are completed
+/// without a read; windows go through the ack/snapshot/direct chain.
+type VerifiableWindows<'w, 's> = Populated<
+    'w,
+    's,
+    (
+        Entity,
+        Option<&'static mut Window>,
+        &'static Position,
+        &'static mut crate::ecs::PositionDrive,
+        Option<&'static RepositionMarker>,
+    ),
+>;
+
 /// Fixed-duration tweens land exactly on their deadline, so no settle band
 /// is needed: siblings converge on the same tick by construction.
 const LOOP_MAX_TIMEOUT_FRAME_ACTIVE_MS: u32 = 16;
@@ -1206,8 +1221,8 @@ pub(crate) fn animate_entities(
     mut commands: Commands,
 ) {
     use crate::ecs::animation::{
-        RETARGET_CARRY_PX, birth_phase, eased_factor, retarget_duration, tween_finished,
-        tween_ivec2,
+        FIRST_TICK_WINDOW, RETARGET_CARRY_PX, birth_phase, eased_factor, kick_start,
+        retarget_duration, tween_finished, tween_ivec2,
     };
 
     // Time-based tween on a shared burst phase: progress derives from the
@@ -1259,7 +1274,14 @@ pub(crate) fn animate_entities(
                 let duration = retarget_duration(remaining, total, base);
                 let drift = (origin.as_vec2() - drive.target.as_vec2()).length();
                 let elapsed = now.saturating_sub(drive.started);
-                let prior = if drift <= RETARGET_CARRY_PX {
+                // Carry phase only across a live leg: a finished (verifying)
+                // leg has no velocity to preserve — resuming at its stale
+                // progress would teleport to done — and neither does a leg
+                // older than its own duration (orphaned pre-settle, then
+                // re-driven). Genuine jumps restart too.
+                let live =
+                    drive.phase == crate::ecs::DrivePhase::Animating && elapsed < drive.duration;
+                let prior = if live && drift <= RETARGET_CARRY_PX {
                     (elapsed.as_secs_f32() / drive.duration.as_secs_f32().max(f32::EPSILON))
                         .clamp(0.0, 1.0)
                 } else {
@@ -1290,8 +1312,18 @@ pub(crate) fn animate_entities(
         };
         let elapsed = now.saturating_sub(started);
         let t = eased_factor(elapsed, duration);
-        let new_pos = tween_ivec2(start, *origin, t);
+        let mut new_pos = tween_ivec2(start, *origin, t);
         let finished = tween_finished(elapsed, duration);
+        if !finished
+            && new_pos == position.0
+            && position.0 != *origin
+            && elapsed <= FIRST_TICK_WINDOW
+        {
+            // Fresh leg rounding to a standstill: guarantee visible motion
+            // so the first animated tick always commits (no dead frames).
+            // Bounded to 2px per axis, one-directional, never overshoots.
+            new_pos = kick_start(position.0, *origin);
+        }
 
         trace!(
             "entity {entity} source {} dest {origin} t {t:.3} moving to {new_pos}",
@@ -1331,8 +1363,8 @@ pub(super) fn animate_resize_entities(
     mut commands: Commands,
 ) {
     use crate::ecs::animation::{
-        RETARGET_CARRY_PX, birth_phase, eased_factor, retarget_duration, tween_finished,
-        tween_ivec2,
+        FIRST_TICK_WINDOW, RETARGET_CARRY_PX, birth_phase, eased_factor, kick_start,
+        retarget_duration, tween_finished, tween_ivec2,
     };
 
     // Same shared burst phase as positions so size and origin stay in step.
@@ -1358,7 +1390,10 @@ pub(super) fn animate_resize_entities(
                 let duration = retarget_duration(remaining, total, base);
                 let drift = (size.as_vec2() - tween.target.as_vec2()).length();
                 let elapsed = now.saturating_sub(tween.started);
-                let prior = if drift <= RETARGET_CARRY_PX {
+                // Carry only across a live leg: a stale leg (older than its
+                // own duration, re-driven after settling) restarts fresh
+                // instead of teleporting to done — same rule as positions.
+                let prior = if elapsed < tween.duration && drift <= RETARGET_CARRY_PX {
                     (elapsed.as_secs_f32() / tween.duration.as_secs_f32().max(f32::EPSILON))
                         .clamp(0.0, 1.0)
                 } else {
@@ -1391,8 +1426,13 @@ pub(super) fn animate_resize_entities(
         };
         let elapsed = now.saturating_sub(started);
         let t = eased_factor(elapsed, duration);
-        let new_size = tween_ivec2(start, *size, t);
+        let mut new_size = tween_ivec2(start, *size, t);
         let finished = tween_finished(elapsed, duration);
+        if !finished && new_size == bounds.0 && bounds.0 != *size && elapsed <= FIRST_TICK_WINDOW {
+            // Fresh leg rounding to a standstill: guarantee visible motion
+            // so the first animated tick always commits (no dead frames).
+            new_size = kick_start(bounds.0, *size);
+        }
 
         trace!(
             "entity {entity} source {} dest {size} t {t:.3} resizing to {new_size}",
@@ -2761,13 +2801,7 @@ pub(super) fn drain_ax_acks(
 /// budget.
 #[instrument(level = Level::TRACE, skip_all)]
 pub(crate) fn verify_window_position(
-    mut windows: Populated<(
-        Entity,
-        &mut Window,
-        &Position,
-        &mut crate::ecs::PositionDrive,
-        Option<&RepositionMarker>,
-    )>,
+    mut windows: VerifiableWindows,
     store: Option<Res<SnapshotStore>>,
     mut write_state: ResMut<AxWriteState>,
     writer: Option<Res<AxWriterQueue>>,
@@ -2776,7 +2810,7 @@ pub(crate) fn verify_window_position(
 ) {
     // Cheap shared reads hoisted out of the per-window loop.
     let queue_active = config.ax_writer_enabled() && writer.is_some();
-    for (entity, mut window, position, mut drive, repositioning) in &mut windows {
+    for (entity, window, position, mut drive, repositioning) in &mut windows {
         if !drive.is_verifying() {
             continue;
         }
@@ -2785,6 +2819,14 @@ pub(crate) fn verify_window_position(
         if repositioning.is_some() {
             continue;
         }
+        // Strips and other non-windows have no OS counterpart to confirm
+        // against; the commit already pushed. Drop the leg.
+        let Some(mut window) = window else {
+            if let Ok(mut entity_commands) = commands.get_entity(entity) {
+                entity_commands.try_remove::<crate::ecs::PositionDrive>();
+            }
+            continue;
+        };
         // Async write still converging: the OS has not seen the latest
         // target yet, so a drift reading now would re-push a duplicate.
         // The ack, not this tick, owns the confirmation.

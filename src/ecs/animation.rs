@@ -78,6 +78,28 @@ pub fn tween_finished(elapsed: Duration, duration: Duration) -> bool {
     duration.is_zero() || elapsed >= duration
 }
 
+/// Window inside which a fresh leg is guaranteed visible motion even when
+/// the eased delta still rounds to zero (sub-pixel first steps read as dead
+/// time, and the commit then sends nothing).
+pub const FIRST_TICK_WINDOW: Duration = Duration::from_millis(25);
+
+/// Minimum first-step in px per axis. Bounded and one-directional.
+pub const FIRST_TICK_KICK_PX: i32 = 2;
+
+/// Steps from `start` toward `end` by at most [`FIRST_TICK_KICK_PX`] per
+/// axis, never overshooting and never moving when already there. Pure math.
+pub fn kick_start(start: IVec2, end: IVec2) -> IVec2 {
+    let step = |remaining: i32| {
+        if remaining == 0 {
+            0
+        } else {
+            remaining.signum() * remaining.abs().min(FIRST_TICK_KICK_PX)
+        }
+    };
+    let delta = end - start;
+    start + IVec2::new(step(delta.x), step(delta.y))
+}
+
 /// Interpolates `start -> end` at eased factor `t`, rounded to whole pixels
 /// (AX frames are integral; sub-pixel residuals caused 1px shimmer).
 pub fn tween_ivec2(start: IVec2, end: IVec2, t: f32) -> IVec2 {
@@ -175,6 +197,25 @@ mod tests {
         );
         // No burst yet: first birth opens.
         assert_eq!(birth_phase(opened, None), (opened, true));
+    }
+
+    #[test]
+    fn kick_start_bounds_first_motion() {
+        use super::FIRST_TICK_KICK_PX;
+        let start = IVec2::new(0, 20);
+        // Bounded step toward the target, per axis.
+        assert_eq!(
+            kick_start(start, IVec2::new(100, 60)),
+            IVec2::new(FIRST_TICK_KICK_PX, 20 + FIRST_TICK_KICK_PX)
+        );
+        // Never overshoots a sub-kick remainder.
+        assert_eq!(kick_start(start, IVec2::new(1, 20)), IVec2::new(1, 20));
+        // Backs up too, and rests when home.
+        assert_eq!(
+            kick_start(start, IVec2::new(-50, 0)),
+            IVec2::new(-FIRST_TICK_KICK_PX, 20 - FIRST_TICK_KICK_PX)
+        );
+        assert_eq!(kick_start(start, start), start);
     }
 
     #[test]

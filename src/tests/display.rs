@@ -3104,6 +3104,52 @@ fn test_next_display_closes_source_gap() {
         .run(commands);
 }
 
+/// Moving a window to the next display with Follow focuses it there: the
+/// moved window keeps focus, the target display becomes active, and the
+/// window lands on screen — not parked on the inactive strip.
+#[test]
+fn test_next_display_follow_focuses_and_reveals() {
+    let commands = vec![
+        Event::MenuOpened { window_id: 0 },
+        Event::Command {
+            command: Command::Window(Operation::ToNextDisplay(MoveFocus::Follow)),
+        },
+        Event::Command {
+            command: Command::PrintState,
+        },
+    ];
+
+    TestHarness::new()
+        .with_windows(3)
+        .with_display(
+            EXT_DISPLAY_ID,
+            IRect::new(0, -EXT_DISPLAY_HEIGHT, EXT_DISPLAY_WIDTH, 0),
+            vec![EXT_WORKSPACE_ID],
+        )
+        .on_iteration(2, move |world, _state| {
+            assert_on_workspace!(world, 0, EXT_WORKSPACE_ID);
+            assert_focused!(world, 0);
+            let active = world
+                .query_filtered::<&Display, With<ActiveDisplayMarker>>()
+                .single(world)
+                .expect("exactly one active display");
+            assert_eq!(
+                active.id(),
+                EXT_DISPLAY_ID,
+                "the target display must become active on Follow"
+            );
+            let entity = find_window_entity(0, world);
+            let position = world.get::<Position>(entity).expect("need position").0;
+            let size = world.get::<Bounds>(entity).expect("need bounds").0;
+            let frame = IRect::from_corners(position, position + size);
+            assert!(
+                frame.min.x >= 0 && frame.max.x <= EXT_DISPLAY_WIDTH,
+                "moved window must land on screen, got {frame:?}"
+            );
+        })
+        .run(commands);
+}
+
 /// Moving the last window away from a scrolled strip must re-clamp the
 /// scroll: no trailing empty space may remain on the source display.
 #[test]

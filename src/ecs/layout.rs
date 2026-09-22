@@ -458,6 +458,27 @@ impl Column {
             }
         }
     }
+
+    /// Whether [`Column::move_to_front`] would change anything. Callers that
+    /// must not dirty the strip on a no-op (change detection would re-run
+    /// the whole layout conformance pass) check this through an immutable
+    /// borrow first and only take `&mut` when it returns `false`.
+    pub fn move_to_front_is_noop(&self, entity: Entity) -> bool {
+        match self {
+            Column::Single(_) | Column::Fullscren(_) => true,
+            Column::Stack(stack) => !stack.iter().any(|item| match item {
+                StackItem::Tabs(tabs) => tabs
+                    .iter()
+                    .position(|&e| e == entity)
+                    .is_some_and(|pos| pos != 0),
+                StackItem::Single(_) => false,
+            }),
+            Column::Tabs(tabs) => tabs
+                .iter()
+                .position(|&e| e == entity)
+                .is_none_or(|pos| pos == 0),
+        }
+    }
 }
 
 pub enum ColumnWindowIter<'a> {
@@ -957,6 +978,10 @@ impl LayoutStrip {
 
     pub fn get_column_mut(&mut self, index: usize) -> Option<&mut Column> {
         self.columns.get_mut(index)
+    }
+
+    pub fn get_column(&self, index: usize) -> Option<&Column> {
+        self.columns.get(index)
     }
 
     pub fn all_columns(&self) -> Vec<Entity> {

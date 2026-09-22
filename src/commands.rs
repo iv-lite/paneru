@@ -1430,8 +1430,13 @@ fn move_focused_window_to_display(
         commands.focus_entity(neighbour, false);
     }
 
-    // Insert into the target display's selected strip.
-    attach_window_to_display(
+    // Insert into the target display's selected strip. On Follow, mirror
+    // the drag path: focus travels with the window, the target display
+    // becomes active, and the strip scrolls the arrival into view — without
+    // this the window parks wherever the inactive strip sits, unfocused and
+    // offscreen. Stay keeps focus on the source neighbour (above) and
+    // leaves the target strip untouched.
+    if let Some(target_display) = attach_window_to_display(
         entity,
         target_id,
         target_bounds,
@@ -1441,7 +1446,16 @@ fn move_focused_window_to_display(
         other_workspaces,
         window_manager,
         commands,
-    );
+    ) && matches!(move_focus, MoveFocus::Follow)
+    {
+        commands.focus_entity(entity, true);
+        // `try_insert` is idempotent; the marker observer clears the
+        // previous display, keeping the active display glued to focus.
+        if let Ok(mut display_commands) = commands.get_entity(target_display) {
+            display_commands.try_insert(ActiveDisplayMarker);
+        }
+        commands.ensure_visible(entity);
+    }
 }
 
 /// Removes `entity` from `strip`, reshuffling a neighbour into its place so
@@ -1500,6 +1514,12 @@ pub(crate) fn detach_column_from_strip(
 /// display has no selected strip, in which case nothing was done. Shared by
 /// the keyboard display-move and mouse-drag paths.
 #[allow(clippy::too_many_arguments)]
+/// Appends `entity` to the target display's selected strip (or inserts at
+/// `mid_slot`), clamping width and scheduling layout + delayed size refresh.
+/// Returns the target *display* entity on success so callers can follow it
+/// (focus, activation, reveal) — `None` when the target display has no
+/// selected strip. Counterpart notes live on
+/// [`attach_column_to_display`].
 pub(crate) fn attach_window_to_display(
     entity: Entity,
     target_id: CGDirectDisplayID,
@@ -1510,16 +1530,14 @@ pub(crate) fn attach_window_to_display(
     other_workspaces: &mut OffscreenStrips,
     window_manager: &WindowManager,
     commands: &mut Commands,
-) -> bool {
+) -> Option<Entity> {
     let Ok(target_space_id) = window_manager.active_display_space(target_id) else {
-        return false;
+        return None;
     };
-    let Some((mut target_strip, child)) = other_workspaces
+    let (mut target_strip, child) = other_workspaces
         .iter_mut()
-        .find(|(strip, _)| strip.id() == target_space_id)
-    else {
-        return false;
-    };
+        .find(|(strip, _)| strip.id() == target_space_id)?;
+    let display_entity = child.parent();
     match mid_slot {
         Some(slot) => target_strip.insert_at(slot, entity),
         None => target_strip.append(entity),
@@ -1530,7 +1548,6 @@ pub(crate) fn attach_window_to_display(
     commands.reshuffle_around(entity);
 
     // Add a delayed refresh of the window size - because the other display can have different bounds.
-    let display_entity = child.parent();
     let moved_window = entity;
     let refresh_size = move |windows: Query<&Bounds, With<Window>>,
                              displays: Query<(&Display, Option<&DockPosition>)>,
@@ -1560,7 +1577,7 @@ pub(crate) fn attach_window_to_display(
     };
     let system_id = commands.register_system(refresh_size);
     Timeout::callback(Duration::from_millis(150), system_id, commands);
-    true
+    Some(display_entity)
 }
 
 /// Appends a whole `column` (with `leader` as the focus/scroll anchor) to

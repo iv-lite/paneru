@@ -312,7 +312,18 @@ pub(super) fn window_focused_trigger(
                 active_workspace_id = Some(strip.id());
             }
             if owner.is_none() && strip.contains(entity) {
-                if let Ok(index) = strip.index_of(entity)
+                // Immutable check first: `get_column_mut` dirties the strip
+                // through change detection even when the reorder is a
+                // logical no-op (single column, already leader), and a
+                // dirtied strip re-runs the whole slot-conformance pass on
+                // every focus. Only take `&mut` when something will move.
+                let needs_move = strip
+                    .index_of(entity)
+                    .ok()
+                    .and_then(|index| strip.get_column(index))
+                    .is_some_and(|column| !column.move_to_front_is_noop(entity));
+                if needs_move
+                    && let Ok(index) = strip.index_of(entity)
                     && let Some(column) = strip.get_column_mut(index)
                 {
                     column.move_to_front(entity);

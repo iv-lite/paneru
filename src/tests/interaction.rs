@@ -3037,6 +3037,48 @@ fn test_ultrawide_focus_glide_holds_visible_formation() {
     }
 }
 
+/// The first animated tick of a fresh leg always commits visible motion:
+/// a gentle curve's eased delta can round to zero (sub-pixel), which reads
+/// as dead time before the window moves. The animator guarantees a bounded
+/// 2px kick instead.
+#[test]
+fn test_first_animated_tick_always_moves() {
+    let config: Config = (
+        MainOptions {
+            animation_speed: Some(12.0),
+            ..Default::default()
+        },
+        vec![],
+    )
+        .into();
+    let mut h = TestHarness::new().with_config(config).with_windows(1);
+    quiesce(&mut h);
+    let strip = {
+        let world = h.app.world_mut();
+        let mut q = world.query_filtered::<Entity, With<ActiveWorkspaceMarker>>();
+        q.single(world).expect("exactly one active strip")
+    };
+    let read_pos = |world: &mut World, e: Entity| world.get::<Position>(e).expect("position").0;
+    let base = read_pos(h.app.world_mut(), strip);
+    // A 10px nudge: the eased first step rounds to zero, so without the
+    // kick the commit would send nothing for a frame.
+    h.app
+        .world_mut()
+        .entity_mut(strip)
+        .insert(RepositionMarker(base + Origin::new(-10, 0)));
+    pump_frame(&mut h);
+    let world = h.app.world_mut();
+    assert_eq!(
+        read_pos(world, strip),
+        base + Origin::new(-2, 0),
+        "first tick must kick 2px toward the target"
+    );
+    assert!(
+        world.get::<RepositionMarker>(strip).is_some(),
+        "the leg must still be flying after the kick"
+    );
+}
+
 /// A genuine slot change with a static strip must still animate each window
 /// independently: rigid riding is for strip translation only, never for
 /// topology. Guards against over-correcting the ride into teleports.
