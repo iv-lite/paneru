@@ -95,17 +95,36 @@ type ResizableWindows<'w, 's> = Query<
     Without<LayoutStrip>,
 >;
 
-/// Settle band for the exponential animator: residuals inside it snap to the
-/// target and drop the marker. Kept tight (about one frame's tail travel at
-/// the default rate) so siblings land on the same tick instead of popping
-/// home one frame apart; the tail costs a few extra AX commits per landing.
-const ANIMATE_SNAP_THRESHOLD: f32 = 2.0;
+/// Windows as the tweened position animator sees them: the presented frame
+/// to advance, the intent to converge on, whether it paints, and the lazily
+/// seeded leg state (retargeted, never restarted, when the intent moves).
+type TweenedPositions<'w, 's> = Populated<
+    'w,
+    's,
+    (
+        &'static mut Position,
+        Entity,
+        &'static RepositionMarker,
+        Has<Window>,
+        Option<&'static mut crate::ecs::PositionTween>,
+    ),
+>;
 
-/// Cap for animation time steps. A main-thread stall (synchronous AX IPC)
-/// must shed time instead of teleporting: without the cap the next
-/// `ease_out_factor` evaluates near 1.0 and the window jumps. Matches the
-/// scroll integrator's step cap.
-const MAX_ANIMATION_DT_SECS: f64 = 1.0 / 30.0;
+/// Windows as the tweened resize animator sees them. Mirrors
+/// [`TweenedPositions`] for sizes.
+type TweenedSizes<'w, 's> = Populated<
+    'w,
+    's,
+    (
+        &'static mut Bounds,
+        Entity,
+        &'static ResizeMarker,
+        Option<&'static mut crate::ecs::SizeTween>,
+    ),
+>;
+
+/// Fixed-duration tweens land exactly on their deadline, so no settle band
+/// is needed: siblings converge on the same tick by construction.
 const LOOP_MAX_TIMEOUT_FRAME_ACTIVE_MS: u32 = 16;
 /// Active-frame sleep while a `ProMotion` (120Hz) display is present.
 /// Committing animation at 16ms judders against a 120Hz panel; halving the
@@ -1097,15 +1116,6 @@ pub(super) fn retry_front_switch(
 /// Animates window movement.
 /// Fraction of the remaining distance an exponential ease-out consumes in a
 /// frame, given a decay `rate` (per second) and the frame's `delta` in seconds.
-/// Shared by the reposition and resize animators so the two never drift out of step.
-#[allow(
-    clippy::cast_possible_truncation,
-    reason = "clamped to [0, 1], well within f32's range; only sub-pixel precision is lost"
-)]
-fn ease_out_factor(rate: f64, delta: f64) -> f32 {
-    (1.0 - (-rate * delta).exp()).clamp(0.0, 1.0) as f32
-}
-
 /// Jump-cuts instead of sliding whenever an animation would cross a display
 /// seam: sets the position straight to the target and drops the marker, so no
 /// intermediate frame ever paints onto a neighboring display. Points outside
@@ -1123,71 +1133,101 @@ fn seam_snap_target(current: Origin, target: Origin, displays: &[IRect]) -> Opti
     }
 }
 
-/// This is a Bevy system that runs on `Update`. It smoothly moves windows to their target
+/// This is a Bevy system that runs on `Update`. It tweens windows to their target
 /// positions, as indicated by the `RepositionMarker` component.
-/// Animation speed is controlled by the `animation_speed` in the `Config`.
+/// Animation length is controlled by `animation_duration_ms` in the `Config`.
 /// When a window reaches its target position, the `RepositionMarker` is removed.
 ///
 /// # Arguments
 ///
 /// * `windows` - A `Populated` query for `(&mut Window, Entity, &RepositionMarker)` components.
 /// * `displays` - A query for all `Display` entities, used to get display bounds and menubar height.
-/// * `time` - The Bevy `Time` resource for calculating delta time.
-/// * `config` - The `Config` resource, used for animation speed.
-/// * `commands` - Bevy commands to remove the `RepositionMarker` when animation is complete.
+/// * `time` - The Bevy `Time` resource for the tween clock (virtual elapsed).
+/// * `config` - The `Config` resource, used for animation duration.
+/// * `commands` - Bevy commands to manage tween state and remove the `RepositionMarker` on landing.
 #[instrument(level = Level::TRACE, skip_all)]
 pub(super) fn animate_entities(
-    animate: Populated<(&mut Position, Entity, &RepositionMarker, Has<Window>)>,
+    animate: TweenedPositions,
     displays: Query<&Display>,
     time: Res<Time>,
     config: Res<Config>,
     mut commands: Commands,
 ) {
-    // Frame-rate-independent exponential smoothing (ease-out).
-    // `animation_speed` is the decay rate (per second); higher = snappier.
-    let dt = time.delta_secs_f64().min(MAX_ANIMATION_DT_SECS);
-    let t = ease_out_factor(config.animation_speed(), dt);
+    use crate::ecs::animation::{eased_factor, retarget_duration, tween_finished, tween_ivec2};
+
+    // Time-based tween: progress derives from the virtual clock, so a stall
+    // simply advances progress (correct) instead of teleporting (the old
+    // uncapped-exponential failure mode). Same deadline for every window, so
+    // siblings land together and the border rides the presented frame.
+    let now = time.elapsed();
+    let base = config.animation_duration();
     let display_bounds: Vec<IRect> = displays.iter().map(Display::bounds).collect();
 
-    animate.into_iter().for_each(
-        |(mut position, entity, RepositionMarker(origin), is_window)| {
-            // Seam-snapping applies to windows, which paint: a strip
-            // scroll offset is not a frame, so strips always lerp (a
-            // negative scroll target is routine, not a seam crossing).
-            if is_window
-                && let Some(snapped) = seam_snap_target(position.0, *origin, &display_bounds)
-            {
-                trace!("entity {entity} seam-snapping to {snapped}");
-                position.0 = snapped;
-                if let Ok(mut entity_commands) = commands.get_entity(entity) {
-                    entity_commands.try_remove::<RepositionMarker>();
-                }
-                return;
-            }
-            let target = origin.as_vec2();
-            let current = position.0.as_vec2();
-            let lerped = current.lerp(target, t);
-
-            // Snap once the shortfall fits inside the settle band (or after
-            // one effectively-complete tick), so the marker is dropped
-            // promptly instead of creeping for seconds on a slow machine.
-            let finished = (target - lerped).length() <= ANIMATE_SNAP_THRESHOLD;
-            let new_pos = if finished {
-                *origin
-            } else {
-                lerped.round().as_ivec2()
-            };
-
-            trace!(
-                "entity {entity} source {} dest {origin} t {t:.3} moving to {new_pos}",
-                position.0,
-            );
-            position.0 = new_pos;
-            if finished && let Ok(mut entity_commands) = commands.get_entity(entity) {
+    for (mut position, entity, RepositionMarker(origin), is_window, tween) in animate {
+        // Seam-snapping applies to windows, which paint: a strip
+        // scroll offset is not a frame, so strips always tween (a
+        // negative scroll target is routine, not a seam crossing).
+        if is_window && let Some(snapped) = seam_snap_target(position.0, *origin, &display_bounds) {
+            trace!("entity {entity} seam-snapping to {snapped}");
+            position.0 = snapped;
+            if let Ok(mut entity_commands) = commands.get_entity(entity) {
                 entity_commands.try_remove::<RepositionMarker>();
+                entity_commands.try_remove::<crate::ecs::PositionTween>();
             }
-        },
-    );
+            continue;
+        }
+        if base.is_zero() {
+            position.0 = *origin;
+            if let Ok(mut entity_commands) = commands.get_entity(entity) {
+                entity_commands.try_remove::<RepositionMarker>();
+                entity_commands.try_remove::<crate::ecs::PositionTween>();
+            }
+            continue;
+        }
+        // Lazily seed the leg, or retarget when the intent moved under us:
+        // start from the current presented frame with a proportionally
+        // shortened duration instead of restarting the full glide.
+        let (start, started, duration) = match tween {
+            Some(tween) if tween.target == *origin => (tween.start, tween.started, tween.duration),
+            Some(mut tween) => {
+                let remaining = (origin.as_vec2() - position.0.as_vec2()).length();
+                let total = (origin.as_vec2() - tween.start.as_vec2())
+                    .length()
+                    .max(remaining);
+                let duration = retarget_duration(remaining, total, base);
+                tween.start = position.0;
+                tween.target = *origin;
+                tween.started = now;
+                tween.duration = duration;
+                (tween.start, tween.started, tween.duration)
+            }
+            None => {
+                if let Ok(mut entity_commands) = commands.get_entity(entity) {
+                    entity_commands.try_insert(crate::ecs::PositionTween {
+                        start: position.0,
+                        target: *origin,
+                        started: now,
+                        duration: base,
+                    });
+                }
+                (position.0, now, base)
+            }
+        };
+        let elapsed = now.saturating_sub(started);
+        let t = eased_factor(elapsed, duration);
+        let new_pos = tween_ivec2(start, *origin, t);
+        let finished = tween_finished(elapsed, duration);
+
+        trace!(
+            "entity {entity} source {} dest {origin} t {t:.3} moving to {new_pos}",
+            position.0,
+        );
+        position.0 = if finished { *origin } else { new_pos };
+        if finished && let Ok(mut entity_commands) = commands.get_entity(entity) {
+            entity_commands.try_remove::<RepositionMarker>();
+            entity_commands.try_remove::<crate::ecs::PositionTween>();
+        }
+    }
 }
 
 /// Animates window resizing.
@@ -1202,38 +1242,67 @@ pub(super) fn animate_entities(
 /// * `commands` - Bevy commands to remove the `ResizeMarker` when resizing is complete.
 #[instrument(level = Level::TRACE, skip_all)]
 pub(super) fn animate_resize_entities(
-    animate: Populated<(&mut Bounds, Entity, &ResizeMarker)>,
+    animate: TweenedSizes,
     time: Res<Time>,
     config: Res<Config>,
     mut commands: Commands,
 ) {
-    // Matches animate_entities: exponential ease-out, frame-rate independent.
-    let dt = time.delta_secs_f64().min(MAX_ANIMATION_DT_SECS);
-    let t = ease_out_factor(config.animation_speed(), dt);
+    use crate::ecs::animation::{eased_factor, retarget_duration, tween_finished, tween_ivec2};
 
-    animate
-        .into_iter()
-        .for_each(|(mut bounds, entity, ResizeMarker(size))| {
-            let target = size.as_vec2();
-            let current = bounds.0.as_vec2();
-            let lerped = current.lerp(target, t);
+    // Same fixed-tween clock as positions so size and origin stay in step.
+    let now = time.elapsed();
+    let base = config.animation_duration();
 
-            let finished = (target - lerped).length() <= ANIMATE_SNAP_THRESHOLD;
-            let new_size = if finished {
-                *size
-            } else {
-                lerped.round().as_ivec2()
-            };
-
-            trace!(
-                "entity {entity} source {} dest {size} t {t:.3} resizing to {new_size}",
-                bounds.0,
-            );
-            bounds.0 = new_size;
-            if finished && let Ok(mut entity_commands) = commands.get_entity(entity) {
+    for (mut bounds, entity, ResizeMarker(size), tween) in animate {
+        if base.is_zero() {
+            bounds.0 = *size;
+            if let Ok(mut entity_commands) = commands.get_entity(entity) {
                 entity_commands.try_remove::<ResizeMarker>();
+                entity_commands.try_remove::<crate::ecs::SizeTween>();
             }
-        });
+            continue;
+        }
+        let (start, started, duration) = match tween {
+            Some(tween) if tween.target == *size => (tween.start, tween.started, tween.duration),
+            Some(mut tween) => {
+                let remaining = (size.as_vec2() - bounds.0.as_vec2()).length();
+                let total = (size.as_vec2() - tween.start.as_vec2())
+                    .length()
+                    .max(remaining);
+                let duration = retarget_duration(remaining, total, base);
+                tween.start = bounds.0;
+                tween.target = *size;
+                tween.started = now;
+                tween.duration = duration;
+                (tween.start, tween.started, tween.duration)
+            }
+            None => {
+                if let Ok(mut entity_commands) = commands.get_entity(entity) {
+                    entity_commands.try_insert(crate::ecs::SizeTween {
+                        start: bounds.0,
+                        target: *size,
+                        started: now,
+                        duration: base,
+                    });
+                }
+                (bounds.0, now, base)
+            }
+        };
+        let elapsed = now.saturating_sub(started);
+        let t = eased_factor(elapsed, duration);
+        let new_size = tween_ivec2(start, *size, t);
+        let finished = tween_finished(elapsed, duration);
+
+        trace!(
+            "entity {entity} source {} dest {size} t {t:.3} resizing to {new_size}",
+            bounds.0,
+        );
+        bounds.0 = if finished { *size } else { new_size };
+        if finished && let Ok(mut entity_commands) = commands.get_entity(entity) {
+            entity_commands.try_remove::<ResizeMarker>();
+            entity_commands.try_remove::<crate::ecs::SizeTween>();
+        }
+    }
 }
 
 /// Republishes the pointer and gesture events onto [`InputEvent`], so the input
@@ -2001,19 +2070,16 @@ fn pad_snapshot_frame(raw: IRect, window: &Window) -> IRect {
 /// 2. The current layout frame while paneru drives or confirms the window —
 ///    any of `RepositionMarker`, `ResizeMarker`, `VerifyWindowPosition`
 ///    present — or while the strip scrolls, a drag is held, or a release
-///    settles. This rides the lerped `Position` each frame instead of
+///    settles. This rides the tweened `Position` each frame instead of
 ///    jumping to the `RepositionMarker` target, so focus moves, reshuffles
-///    and release homing stay attached through the animation. The OS
+///    and release homing stay attached through the animation. The border and
+///    the AX commit read the same presented frame on the same tick, so no
+///    chase heuristic is needed: the fixed tween lands both together. The OS
 ///    position trails AX commits through all of these; the cached frame
 ///    would paint a detached border.
 /// 3. A fresh snapshot frame: native moves/resizes bypass ECS, and the
 ///    snapshot sees them without a synchronous round trip.
 /// 4. The cached OS frame, last.
-///
-/// `chase` is the fraction of the remaining distance to the layout target
-/// painted ahead (one animator step at the current rate over the frame
-/// lead), so the border lands where the window will be at present time
-/// instead of where it was at commit time. Zero disables the chase.
 #[allow(clippy::too_many_arguments)]
 fn border_frame_for(
     windows: &Windows,
@@ -2023,7 +2089,6 @@ fn border_frame_for(
     tracking_live: bool,
     native_held: bool,
     paint_frame: Option<IRect>,
-    chase: f32,
     store: Option<&SnapshotStore>,
 ) -> IRect {
     // Native-owned drag: layout never moved, so neither the slot nor the
@@ -2048,22 +2113,17 @@ fn border_frame_for(
                 repositioning || resizing || verifying
             });
     if driving {
-        // Ride the animation: `frame()` is the current lerped `Position`,
-        // while `moving_frame()` would substitute the final `Reposition` /
-        // `Resize` target and jump ahead of the window. The chase advances
-        // one lead-step toward that target, so at display rate the border
-        // meets the window instead of trailing a frame behind it.
+        // Ride the tween: `frame()` is the current presented `Position` —
+        // the exact rect just committed to AX on the same tick — while
+        // `moving_frame()` would substitute the final target and jump ahead
+        // of the window. One shared clock, one shared frame: border and
+        // window land together.
         if let Some(frame) = windows.frame(entity) {
             // Trace-only pin for drag-detach diagnosis: during motion each
             // overlay tick must log a live frame that advances; a frozen
             // rect here with a scrolling strip means the layout stopped
             // rewriting window positions (not an overlay gating miss).
             trace!("overlay live frame for {entity}: {frame:?}");
-            if chase > 0.0
-                && let Some(target) = windows.moving_frame(entity)
-            {
-                return chase_frame_toward(frame, target, chase);
-            }
             return frame;
         }
         trace!("overlay driving {entity} but no layout frame, falling back to OS frame");
@@ -2071,27 +2131,6 @@ fn border_frame_for(
         return pad_snapshot_frame(raw, window);
     }
     window.frame()
-}
-
-/// Advances `frame` toward `target` by one animator step (`chase`
-/// fraction of the remaining distance), so at display rate the border
-/// meets the window instead of trailing a frame behind it. Pure math —
-/// unit tested; no-op when already there or the chase is off.
-fn chase_frame_toward(frame: IRect, target: IRect, chase: f32) -> IRect {
-    if chase <= 0.0 {
-        return frame;
-    }
-    #[allow(
-        clippy::cast_possible_truncation,
-        reason = "one lead-step of a screen rect; sub-pixel precision is lost"
-    )]
-    let step = |remaining: i32| (f64::from(remaining) * f64::from(chase)).round() as i32;
-    let mut moved = frame;
-    moved.min.x += step(target.min.x - frame.min.x);
-    moved.min.y += step(target.min.y - frame.min.y);
-    moved.max.x += step(target.max.x - frame.max.x);
-    moved.max.y += step(target.max.y - frame.max.y);
-    moved
 }
 
 /// Absolute CG rect of a layout frame, corrected for window padding.
@@ -2307,12 +2346,10 @@ pub(super) fn update_overlays(
     // grab frame plus pointer EMA keeps the border on the cursor at display
     // rate instead of a frame behind the last event. Stale samples decay
     // to the plain offset inside the paint state, so holding still can
-    // never drift the rect. The same lead drives the animation chase in
-    // `border_frame_for` (one animator step ahead at the current rate),
-    // which under vsync pacing equals one retrace period.
+    // never drift the rect. Driven tweens need no lead: border and commit
+    // share the presented frame on the same tick.
     let paint_now = time.elapsed();
     let paint_lead = time.delta_secs_f64().clamp(0.0, 0.05);
-    let chase = ease_out_factor(config.animation_speed(), paint_lead);
     let frame = border_frame_for(
         &windows,
         &flight,
@@ -2321,7 +2358,6 @@ pub(super) fn update_overlays(
         tracking_live,
         is_native_held(entity),
         paint.predicted_frame_for(entity, paint_now, paint_lead),
-        chase,
         store.as_deref(),
     );
     let focused_abs_cg = abs_cg_rect(frame, window);
@@ -2409,7 +2445,6 @@ pub(super) fn update_overlays(
                 tracking_live,
                 is_native_held(entity),
                 paint.predicted_frame_for(entity, paint_now, paint_lead),
-                chase,
                 store.as_deref(),
             );
             // Parked-sliver guard, generalized per window across displays.
@@ -3152,7 +3187,6 @@ mod tests {
 #[cfg(test)]
 mod seam_tests {
     use super::CoalescedPointer;
-    use super::chase_frame_toward;
     use super::seam_snap_target;
     use super::{PARKED_COMMAND_CAP, ParkedCommands, WarmupStatus, warmup_ready};
     use crate::events::Event;
@@ -3370,24 +3404,19 @@ mod seam_tests {
     }
 
     #[test]
-    fn chase_frame_advances_one_step_toward_target() {
-        let frame = IRect::new(0, 20, 400, 768);
-        let target = IRect::new(100, 20, 500, 768);
-        // Zero chase disables: current frame paints as-is.
-        assert_eq!(chase_frame_toward(frame, target, 0.0), frame);
-        // Full chase lands on the target (instant-speed behavior).
-        assert_eq!(chase_frame_toward(frame, target, 1.0), target);
-        // Half chase advances half the remaining distance on every edge.
+    fn tween_presents_exact_landing_frame() {
+        use crate::ecs::animation::{eased_factor, tween_finished, tween_ivec2};
+        use std::time::Duration;
+        // The border reads the same presented frame the commit writes: at
+        // the deadline the tween sits exactly on target (no chase needed).
+        let start = IRect::new(0, 20, 400, 768).min;
+        let target = IRect::new(100, 20, 500, 768).min;
+        let duration = Duration::from_millis(150);
+        assert_eq!(tween_ivec2(start, target, 0.0), start);
         assert_eq!(
-            chase_frame_toward(frame, target, 0.5),
-            IRect::new(50, 20, 450, 768)
+            tween_ivec2(start, target, eased_factor(duration, duration)),
+            target
         );
-        // Already there never drifts, even at full chase.
-        assert_eq!(chase_frame_toward(target, target, 1.0), target);
-        // Works backing up too (negative remaining).
-        assert_eq!(
-            chase_frame_toward(target, frame, 0.5),
-            IRect::new(50, 20, 450, 768)
-        );
+        assert!(tween_finished(duration, duration));
     }
 }

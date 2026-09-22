@@ -206,6 +206,59 @@ fn apply_border_layer(window: &NSWindow, params: &BorderParams) {
     layer.setCornerRadius((params.radius + params.width / 2.0) as CGFloat);
 }
 
+/// Fill alpha of the drop-preview ghost. The border stroke uses full
+/// `BorderParams` opacity; the fill stays translucent so whatever is behind
+/// the future slot shows through.
+const DROP_PREVIEW_FILL_ALPHA: f64 = 0.25;
+
+/// Applies drop-preview styling to a (layer-backed) window's content view:
+/// translucent fill plus border stroke, all GPU-composited. Like
+/// `apply_border_layer` but with a fill so the landing slot reads as a
+/// ghost instead of an outline.
+fn apply_drop_preview_layer(window: &NSWindow, params: &BorderParams) {
+    let Some(view) = window.contentView() else {
+        return;
+    };
+    view.setWantsLayer(true);
+    let Some(layer) = view.layer() else {
+        return;
+    };
+    let fill = NSColor::colorWithSRGBRed_green_blue_alpha(
+        params.color.0 as CGFloat,
+        params.color.1 as CGFloat,
+        params.color.2 as CGFloat,
+        DROP_PREVIEW_FILL_ALPHA as CGFloat,
+    );
+    layer.setBackgroundColor(Some(fill.CGColor().as_ref()));
+    let stroke = NSColor::colorWithSRGBRed_green_blue_alpha(
+        params.color.0 as CGFloat,
+        params.color.1 as CGFloat,
+        params.color.2 as CGFloat,
+        params.opacity as CGFloat,
+    );
+    layer.setBorderWidth(params.width as CGFloat);
+    layer.setBorderColor(Some(stroke.CGColor().as_ref()));
+    layer.setCornerRadius(params.radius as CGFloat);
+}
+
+/// Builds a fresh drop-preview window: small overlay window + layer-backed
+/// content view with the ghost styling applied once at creation.
+fn make_drop_preview_window(
+    mtm: MainThreadMarker,
+    cocoa: NSRect,
+    params: &BorderParams,
+) -> Retained<NSWindow> {
+    let window = make_overlay_window(mtm, cocoa);
+    let view: Retained<NSView> = unsafe {
+        msg_send![NSView::alloc(mtm), initWithFrame: NSRect::new(NSPoint::new(0.0, 0.0), cocoa.size)]
+    };
+    view.setWantsLayer(true);
+    window.setContentView(Some(&view));
+    apply_drop_preview_layer(&window, params);
+    window.orderFront(None::<&AnyObject>);
+    window
+}
+
 /// A border-only overlay window: small (window-sized, not fullscreen),
 /// layer-backed, never repainted. Reused across moves; layer properties are
 /// only rewritten when the params actually change.
@@ -501,8 +554,10 @@ impl OverlayManager {
     }
 
     /// Show the drop-preview ghost: a filled, border-stroked outline of the
-    /// landing slot, `abs_cg` in absolute CG coords. Reuses its window across
-    /// ticks, redrawing only when the rect or params change.
+    /// landing slot, `abs_cg` in absolute CG coords. Layer-backed like the
+    /// borders (GPU-composited fill + stroke): moves never repaint and never
+    /// rebuild views; only genuine rect/param changes rewrite layer
+    /// properties. Reuses its window across ticks.
     pub fn show_drop_preview(&mut self, abs_cg: NSRect, border: &BorderParams) {
         let cocoa = cg_abs_to_cocoa(abs_cg, self.screen_height(false));
         if let Some((window, rect, params)) = &mut self.drop_preview {
@@ -510,26 +565,17 @@ impl OverlayManager {
                 window.orderFront(None::<&AnyObject>);
                 return;
             }
-            let view = DropPreviewView::new(
-                self.mtm,
-                NSRect::new(NSPoint::new(0.0, 0.0), cocoa.size),
-                border,
-            );
-            window.setContentView(Some(&view));
-            window.setFrame_display(cocoa, true);
+            if let Some(view) = window.contentView() {
+                view.setFrame(NSRect::new(NSPoint::new(0.0, 0.0), cocoa.size));
+            }
+            apply_drop_preview_layer(window, border);
+            window.setFrame_display(cocoa, false);
             window.orderFront(None::<&AnyObject>);
             *rect = cocoa;
             *params = border.clone();
             return;
         }
-        let window = make_overlay_window(self.mtm, cocoa);
-        let view = DropPreviewView::new(
-            self.mtm,
-            NSRect::new(NSPoint::new(0.0, 0.0), cocoa.size),
-            border,
-        );
-        window.setContentView(Some(&view));
-        window.orderFront(None::<&AnyObject>);
+        let window = make_drop_preview_window(self.mtm, cocoa, border);
         self.drop_preview = Some((window, cocoa, border.clone()));
     }
 
@@ -542,87 +588,17 @@ impl OverlayManager {
 }
 
 // ── DropPreview: filled ghost of the landing slot during armed drags ──
+// Layer-backed (see `apply_drop_preview_layer`); no custom `drawRect`.
 
-/// Fill alpha of the drop-preview ghost. The border stroke uses full
-/// `BorderParams` opacity; the fill stays translucent so whatever is behind
-/// the future slot shows through.
-const DROP_PREVIEW_FILL_ALPHA: f64 = 0.25;
-
-#[derive(Debug, Clone)]
-struct DropPreviewViewIvars {
-    fill_r: f64,
-    fill_g: f64,
-    fill_b: f64,
-    fill_opacity: f64,
-    border_r: f64,
-    border_g: f64,
-    border_b: f64,
-    border_opacity: f64,
-    border_width: f64,
-    border_radius: f64,
-}
-
-define_class!(
-    #[unsafe(super(NSView))]
-    #[thread_kind = MainThreadOnly]
-    #[name = "PaneruDropPreviewView"]
-    #[ivars = DropPreviewViewIvars]
-    #[derive(Debug)]
-    struct DropPreviewView;
-
-    impl DropPreviewView {
-        #[unsafe(method(drawRect:))]
-        fn draw_rect(&self, _dirty_rect: NSRect) {
-            let ivars = self.ivars();
-            let bounds = self.bounds();
-            let radius = ivars.border_radius as CGFloat;
-            let path = NSBezierPath::bezierPathWithRoundedRect_xRadius_yRadius(
-                bounds, radius, radius,
-            );
-            NSColor::colorWithSRGBRed_green_blue_alpha(
-                ivars.fill_r as CGFloat,
-                ivars.fill_g as CGFloat,
-                ivars.fill_b as CGFloat,
-                CGFloat::from(ivars.fill_opacity),
-            )
-            .setFill();
-            path.fill();
-            path.setLineWidth(ivars.border_width as CGFloat);
-            NSColor::colorWithSRGBRed_green_blue_alpha(
-                ivars.border_r as CGFloat,
-                ivars.border_g as CGFloat,
-                ivars.border_b as CGFloat,
-                CGFloat::from(ivars.border_opacity),
-            )
-            .setStroke();
-            path.stroke();
-        }
-    }
-);
-
-impl DropPreviewView {
-    fn new(mtm: MainThreadMarker, frame: NSRect, border: &BorderParams) -> Retained<Self> {
-        let this = Self::alloc(mtm).set_ivars(DropPreviewViewIvars {
-            fill_r: border.color.0,
-            fill_g: border.color.1,
-            fill_b: border.color.2,
-            fill_opacity: DROP_PREVIEW_FILL_ALPHA,
-            border_r: border.color.0,
-            border_g: border.color.1,
-            border_b: border.color.2,
-            border_opacity: border.opacity,
-            border_width: border.width,
-            border_radius: border.radius,
-        });
-        unsafe { msg_send![super(this), initWithFrame: frame] }
-    }
-}
-
+/// Sub-pixel jitter must not cost a `WindowServer` round trip per tick: the
+/// tween rounds to whole pixels, but snapshot/drag truth can still dither
+/// below a pixel. Treat <=0.5px deltas as equal so borders rest instead of
+/// shimmering.
 fn nsrect_eq(a: NSRect, b: NSRect) -> bool {
-    a.origin.x == b.origin.x
-        && a.origin.y == b.origin.y
-        && a.size.width == b.size.width
-        && a.size.height == b.size.height
+    (a.origin.x - b.origin.x).abs() <= 0.5
+        && (a.origin.y - b.origin.y).abs() <= 0.5
+        && (a.size.width - b.size.width).abs() <= 0.5
+        && (a.size.height - b.size.height).abs() <= 0.5
 }
 
 // ── FlashMessage ────────────────────────────────────────────────────────
@@ -759,6 +735,10 @@ pub struct FlashMessageManager {
     mtm: MainThreadMarker,
     window: Option<Retained<NSWindow>>,
     screen_h: Option<(Instant, f64)>,
+    /// Last painted OSD state: opacity is quantized to 0.1 steps so the
+    /// per-tick fade (~60fps) rebuilds the view ~6 times instead of every
+    /// tick. Same message + bucket + frame = no work beyond `orderFront`.
+    shown: Option<(String, u8, NSRect)>,
 }
 
 impl FlashMessageManager {
@@ -767,6 +747,7 @@ impl FlashMessageManager {
             mtm,
             window: None,
             screen_h: None,
+            shown: None,
         }
     }
 
@@ -809,6 +790,21 @@ impl FlashMessageManager {
 
         let frame = NSRect::new(NSPoint::new(cocoa_origin_x, cocoa_origin_y), size);
 
+        // Quantized fade: the view bakes opacity into its pixels, so only
+        // rebuild when the bucket moves, not on every fractional tick.
+        #[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
+        let bucket = (opacity.clamp(0.0, 1.0) * 10.0).round() as u8;
+        if let Some((shown_msg, shown_bucket, shown_frame)) = &self.shown
+            && shown_msg == message
+            && *shown_bucket == bucket
+            && nsrect_eq(*shown_frame, frame)
+            && let Some(window) = &self.window
+        {
+            window.orderFront(None::<&AnyObject>);
+            return;
+        }
+        self.shown = Some((message.to_string(), bucket, frame));
+
         if let Some(window) = &self.window {
             let view = FlashMessageView::new(
                 self.mtm,
@@ -840,6 +836,7 @@ impl FlashMessageManager {
         if let Some(window) = self.window.take() {
             window.orderOut(None::<&AnyObject>);
         }
+        self.shown = None;
     }
 }
 

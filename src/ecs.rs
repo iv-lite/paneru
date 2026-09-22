@@ -42,6 +42,7 @@ use crate::overlay::{FlashMessageManager, OverlayManager};
 use crate::platform::{Modifiers, PlatformCallbacks, WinID, WorkspaceId};
 use crate::snapshot::SnapshotStore;
 
+pub mod animation;
 pub mod display;
 pub mod focus;
 pub mod layout;
@@ -381,6 +382,30 @@ pub struct RepositionMarker(pub Origin);
 /// Component representing a request to resize a window.
 #[derive(Component, Debug, Deref, DerefMut)]
 pub struct ResizeMarker(pub Size);
+
+/// In-flight tween state for a driven move: `start` is the presented frame
+/// when the leg began, `target` the intent it converges on, `started` the
+/// virtual timestamp of the leg, `duration` its fixed length. Inserted lazily
+/// by the animator so the dozens of `reposition_entity` call sites stay
+/// untouched; removed together with [`RepositionMarker`] on landing.
+/// A changed target retargets (start = current presented frame) instead of
+/// restarting, so focus-spam stays fluid.
+#[derive(Component, Debug)]
+pub struct PositionTween {
+    pub start: Origin,
+    pub target: Origin,
+    pub started: Duration,
+    pub duration: Duration,
+}
+
+/// In-flight tween state for a driven resize. Mirrors [`PositionTween`].
+#[derive(Component, Debug)]
+pub struct SizeTween {
+    pub start: Size,
+    pub target: Size,
+    pub started: Duration,
+    pub duration: Duration,
+}
 
 /// Marker component indicating that windows around the marked entity need to be reshuffled.
 /// When `force` is set (window detach after a cross-display move), the

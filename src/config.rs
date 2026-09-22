@@ -384,10 +384,19 @@ impl Config {
         self.inner().options.clone()
     }
 
-    // Exponential ease-out decay rate (per second) consumed by the animation
-    // systems as `t = 1 - e^(-rate*dt)`. Higher values feel snappier; very large
-    // values collapse to an instant snap.
-    // Suggested range: 8..20 for a fluid feel. Unset = fluid default.
+    // Fixed tween length for driven moves (150ms default). `0` snaps
+    // instantly. New key; the legacy `animation_speed` rate below maps onto
+    // it when unset so old configs and the test harness keep working.
+    pub fn animation_duration(&self) -> std::time::Duration {
+        if let Some(ms) = self.options().animation_duration_ms {
+            return std::time::Duration::from_millis(ms.min(5000));
+        }
+        crate::ecs::animation::speed_to_duration(self.animation_speed())
+    }
+
+    // Legacy exponential ease-out decay rate (per second). Deprecated: prefer
+    // `animation_duration_ms`. Kept so existing configs keep their feel —
+    // 12 ≈ 150ms, very large values snap. Suggested range was 8..20.
     pub fn animation_speed(&self) -> f64 {
         self.options()
             .animation_speed
@@ -1324,7 +1333,12 @@ pub struct MainOptions {
     #[serde(default = "default_preset_stack_heights")]
     pub preset_stack_heights: Vec<f64>,
     /// The animation speed for window movements in pixels per second.
+    /// Deprecated: prefer `animation_duration_ms` (0 = snap). Honored when
+    /// the duration key is unset (12 ≈ 150ms, very large snaps).
     pub animation_speed: Option<f64>,
+    /// Fixed tween length in milliseconds for driven window moves.
+    /// Default 150. Set to 0 for an instant snap.
+    pub animation_duration_ms: Option<u64>,
     /// Automatically center the window when switching focus with keyboard.
     pub auto_center: Option<bool>,
     /// Automatically center a lone column: when a strip holds exactly one
