@@ -1,4 +1,5 @@
 use bevy::app::{App, Plugin, Update};
+use bevy::ecs::component::Component;
 use bevy::ecs::entity::Entity;
 use bevy::ecs::hierarchy::ChildOf;
 use bevy::ecs::message::{MessageReader, MessageWriter};
@@ -11,20 +12,18 @@ use bevy::time::Time;
 use std::time::{Duration, Instant};
 use tracing::{debug, info, trace, warn};
 
-use super::{
-    ActiveDisplayMarker, DragDisplayArmed, DragScrollArmed, DragSettleMarker, MouseHeldMarker,
-    Timeout,
-};
+use super::{ActiveDisplayMarker, DragSettleMarker, MouseHeldMarker, Timeout};
 use crate::commands::{OffscreenStrips, attach_column_to_display, detach_column_from_strip};
 use crate::config::swipe::SwipeGestureDirection;
 use crate::config::{Config, decorations::BorderRadiusOption};
 use crate::ecs::layout::{Column, LayoutStrip, desired_window_frame};
 use crate::ecs::params::{ActiveDisplayMut, GlobalState, Windows};
+use crate::ecs::sync::{Gesture, WindowSync, classify_gesture};
 use crate::ecs::workspace::mid_strip_slot;
 use crate::ecs::{
     ActiveWorkspaceMarker, ColdStart, DockPosition, LastPress, ManualStripOffset,
     MissionControlActive, Position, RepositionMarker, Scrolling, SelectedVirtualMarker,
-    SpawnCommandsExt, TitlebarGrab, Unmanaged,
+    SpawnCommandsExt, Unmanaged,
 };
 use crate::manager::{Display, Origin, Size, Window, WindowManager, origin_from};
 use crate::overlay::{BorderParams, OverlayManager};
@@ -220,7 +219,6 @@ impl Plugin for MouseEventsPlugin {
         // dragging. Ordered after adoption so the hit-test reads fresh frames,
         // and after the synthetic move so transfer sees this tick's motion.
         app.init_resource::<DragModifierState>();
-        app.init_resource::<DragPaintState>();
         app.init_resource::<DragScrollState>();
         app.init_resource::<DropPreviewState>();
         // Never during warmup: relocation needs converged strips.
@@ -389,8 +387,7 @@ fn mouse_down_trigger(
     window_manager: Res<WindowManager>,
     config: Res<Config>,
     mouse_held: Query<Entity, With<MouseHeldMarker>>,
-    mut scroll_state: ResMut<DragScrollState>,
-    mut paint: ResMut<DragPaintState>,
+    sync_states: Query<&crate::ecs::sync::WindowSync>,
     mut global_state: GlobalState,
     mut logged_config: Local<bool>,
     time: Res<Time>,
@@ -454,11 +451,16 @@ fn mouse_down_trigger(
             }
         }
 
-        // A fresh press takes over from any previous release: clear the
-        // stale settle grace either way, so an armed re-grab — or a native
-        // content drag — inside the grace window never inherits it.
-        scroll_state.members.clear();
-        scroll_state.settle_deadline = None;
+        // A fresh press takes over from any previous release: clear stale
+        // `Homing` either way, so an armed re-grab — or a native content
+        // drag — inside the grace window never inherits it.
+        if matches!(
+            sync_states.get(entity),
+            Ok(crate::ecs::sync::WindowSync::Homing { .. })
+        ) && let Ok(mut entity_commands) = commands.get_entity(entity)
+        {
+            entity_commands.try_remove::<crate::ecs::sync::WindowSync>();
+        }
 
         // The holder is always tracked: display-drag arming, the adoption
         // pin and drop homing all key off it. Only the click-reshuffle on
@@ -473,20 +475,19 @@ fn mouse_down_trigger(
         // mid-click. The Timeout auto-despawns if mouse-up is lost.
         let timeout = Timeout::new(Duration::from_secs(5), None, &mut commands);
         let mut holder = commands.spawn((MouseHeldMarker(entity), timeout));
-        // Record header grabs on the holder: only those scroll the
-        // columns and swallow the native drag (see `TitlebarGrab`). The
-        // titlebar band is pure geometry; blank toolbar chrome below it
-        // is resolved by one AX hit-test per press, reused by the scroll
-        // arming below. Content and toolbar controls stay native.
+        // Header classification for the scroll arming below: only header
+        // presses (titlebar band pure geometry; blank toolbar chrome via
+        // one AX hit-test per press) scroll the columns and swallow the
+        // native drag. Content and toolbar controls stay native.
         let press = press_kind(point, window);
         let header = matches!(press, PressKind::Titlebar | PressKind::ToolbarBlank);
-        if header {
-            holder.try_insert(TitlebarGrab);
-        }
-        // Seed the paint-only drag tracker: a native-owned drag keeps its
-        // layout slot pinned, so the border needs the grab frame plus the
-        // pointer deltas below to follow the cursor at input rate.
-        paint.begin(entity, window.frame());
+        // Seed the paint-only drag tracker on the holder: a native-owned
+        // drag keeps its layout slot pinned, so the border needs the grab
+        // frame plus the pointer deltas below to follow the cursor at
+        // input rate. Dies with the holder — no release cleanup needed.
+        let mut paint = DragPaint::default();
+        paint.begin(window.frame());
+        holder.try_insert(paint);
         // The holder (and the adoption lock on it) owns echo handling from
         // here — notably an armed re-grab inside the grace window, whose
         // transfer hit-test needs live adoption. (The grace itself was
@@ -503,7 +504,6 @@ fn mouse_down_trigger(
                 "mouse drag armed on window {} with modifiers {modifiers:?}",
                 window.id()
             );
-            holder.try_insert(DragDisplayArmed);
         } else {
             debug!(
                 "mouse down on window {}: held without arming (modifiers {modifiers:?} do not match drag shortcut)",
@@ -526,8 +526,20 @@ fn mouse_down_trigger(
                 "mouse drag scroll-armed on window {} header at {point:?}",
                 window.id()
             );
-            holder.try_insert(DragScrollArmed);
         }
+        // Classify-once descriptor for the whole gesture: downstream systems
+        // read this instead of re-deriving press context or re-checking live
+        // modifiers. Dual-write alongside the markers until they migrate.
+        let gesture = classify_gesture(
+            matches!(press, PressKind::Titlebar),
+            matches!(press, PressKind::ToolbarBlank),
+            armed,
+            config.left_drag_scrolls_strip() && tiled,
+        );
+        debug_assert_eq!(gesture.header, header);
+        debug_assert_eq!(gesture.display_armed, armed);
+        debug_assert_eq!(gesture.scroll_armed, scroll_armed);
+        holder.try_insert(gesture);
         set_scroll_drag_suppress(scroll_armed);
     }
 }
@@ -559,18 +571,11 @@ type ScrollDriveStrips<'w, 's> = Query<
     (With<LayoutStrip>, Without<Window>),
 >;
 
-/// Held-drag candidates: the holder marker plus every grab-time flag the
-/// drag paths branch on (display arming, scroll arming).
-type HeldDrag<'w, 's> = Query<
-    'w,
-    's,
-    (
-        Entity,
-        &'static MouseHeldMarker,
-        Has<DragDisplayArmed>,
-        Has<DragScrollArmed>,
-    ),
->;
+/// Held-drag candidates: the holder marker plus the grab-time gesture
+/// descriptor every drag path branches on (display arming, scroll arming).
+/// Test-spawned bare holders carry no gesture and read as unarmed content
+/// grabs — same as marker absence today.
+type HeldDrag<'w, 's> = Query<'w, 's, (Entity, &'static MouseHeldMarker, Option<&'static Gesture>)>;
 
 /// Home slot of a released window on its current strip, recomputed with the
 /// audit's exact math — or `None` when it already sits in its slot (or
@@ -697,21 +702,14 @@ fn try_reorder_column(entity: Entity, strips: &mut ReleaseStrips, windows: &Wind
 #[allow(clippy::too_many_arguments)]
 fn mouse_up_trigger(
     mut messages: MessageReader<InputEvent>,
-    mouse_held: Query<(
-        Entity,
-        &MouseHeldMarker,
-        Has<DragDisplayArmed>,
-        Has<DragScrollArmed>,
-    )>,
+    mouse_held: Query<(Entity, &MouseHeldMarker, Option<&Gesture>)>,
     windows: Windows,
     mut strips: ReleaseStrips,
     displays: PreviewDisplays,
     scrolling: Query<Entity, With<Scrolling>>,
     config: Res<Config>,
-    drag_modifiers: Res<DragModifierState>,
     time: Res<Time>,
     mut scroll_state: ResMut<DragScrollState>,
-    mut paint: ResMut<DragPaintState>,
     cold: Option<Res<ColdStart>>,
     in_flight: Query<(), With<RepositionMarker>>,
     mut commands: Commands,
@@ -721,19 +719,19 @@ fn mouse_up_trigger(
             continue;
         }
         // The grab is over either way: never let a lost press leave native
-        // drags swallowed.
+        // drags swallowed. Holder paint dies with the holder despawn below,
+        // so no paint cleanup exists.
         set_scroll_drag_suppress(false);
-        // The gesture is over: drop the paint-only drag offset so a later
-        // drag starts from its own grab frame.
-        paint.clear();
         let scroll_distance = std::mem::take(&mut scroll_state.distance_px);
         // Release velocity is per-gesture too: a stale EMA must never leak
         // into the next press (its MouseDown resets the sampler anyway).
         let release_ema_px_s = std::mem::take(&mut scroll_state.release_ema_px_s);
         scroll_state.last_sample_at = None;
 
-        for (held_entity, marker, armed, scroll_armed) in &mouse_held {
+        for (held_entity, marker, gesture) in &mouse_held {
             let entity = marker.0;
+            let (armed, scroll_armed) =
+                gesture.map_or((false, false), |g| (g.display_armed, g.scroll_armed));
             if cold.is_some() {
                 // Warmup: release bookkeeping only (despawn below) plus the
                 // echo shield — the OS window may have moved natively while
@@ -742,8 +740,8 @@ fn mouse_up_trigger(
                 // reshuffle, or inertia until the world converges.
                 arm_release_grace(
                     release_column_members(entity, &strips),
-                    &mut scroll_state,
                     &mut commands,
+                    time.elapsed(),
                 );
                 if let Ok(mut entity_commands) = commands.get_entity(held_entity) {
                     entity_commands.try_despawn();
@@ -766,7 +764,7 @@ fn mouse_up_trigger(
                 // residue gets one settle check (see below). Seat verifying
                 // legs as the backstop past the grace, like the homed path.
                 let members = release_column_members(entity, &strips);
-                arm_release_grace(members.clone(), &mut scroll_state, &mut commands);
+                arm_release_grace(members.clone(), &mut commands, time.elapsed());
                 for member in &members {
                     if in_flight.get(*member).is_err() {
                         commands.ensure_verifying(*member);
@@ -789,16 +787,10 @@ fn mouse_up_trigger(
             // Members of the dragged column (or the lone window).
             let members = release_column_members(entity, &strips);
 
-            // Armed same-display drop with the shortcut still held:
-            // relocate the column to the nearest slot; the layout chain
-            // animates members into place. A released shortcut cancels the
-            // move instead — the column glides home below like an unarmed
-            // drop.
-            let shortcut_held = config
-                .mouse_drag_display_modifier()
-                .is_some_and(|required| required.matches(drag_modifiers.current));
-            let reordered =
-                armed && shortcut_held && try_reorder_column(entity, &mut strips, &windows);
+            // Armed same-display drop (grab-time frozen): relocate the column
+            // to the nearest slot; the layout chain animates members into
+            // place. An unarmed drop glides home below.
+            let reordered = armed && try_reorder_column(entity, &mut strips, &windows);
             if reordered {
                 commands.reshuffle_around(entity);
             }
@@ -844,7 +836,7 @@ fn mouse_up_trigger(
                 // while the slot stayed pinned, and its lagging echo must
                 // not rewrite the slot. Transfers skip it — the hit-test
                 // needs live adoption on the new strip.
-                arm_release_grace(members, &mut scroll_state, &mut commands);
+                arm_release_grace(members, &mut commands, time.elapsed());
                 // Reveal the most-visible member: homing glides windows to
                 // slots but never moves the strip, so without this a drop
                 // can strand its window half-visible with nothing scheduled
@@ -874,19 +866,16 @@ impl Default for DragModifierState {
     }
 }
 
-/// Accumulated travel of the current unmodified left-drag, in pixels, plus
-/// the members of the last released held column and their settle deadline.
-/// Written on every mouse-up (scroll drags additionally feed the scroll
-/// pipeline mid-gesture); read on release to tell a scroll (keep the new
-/// scroll offset, no homing, no reshuffle) apart from a click (today's
-/// focus/reshuffle behavior). Members stay listed past release so a lagging
-/// native echo cannot rewrite their slots (see the adoption grace in
-/// `window_moved_update_frame`) until one settle check confirms them.
+/// Per-gesture scroll-drag telemetry: accumulated travel in pixels plus the
+/// release-velocity EMA. Written on every mouse-up (scroll drags
+/// additionally feed the scroll pipeline mid-gesture); read on release to
+/// tell a scroll (keep the new scroll offset, no homing, no reshuffle)
+/// apart from a click (today's focus/reshuffle behavior), and to seed
+/// release inertia. The post-release echo shield it used to carry now lives
+/// in per-window `WindowSync::Homing` (see `arm_release_grace`).
 #[derive(Debug, Resource, Default)]
 pub(crate) struct DragScrollState {
     pub(crate) distance_px: f64,
-    pub(crate) members: Vec<Entity>,
-    pub(crate) settle_deadline: Option<Instant>,
     /// EMA of the horizontal drag rate (strip px/s) and the virtual time of
     /// the last sample. The shared scroll pipeline zeroes velocity for
     /// pointer-driven `Scroll` events, so the drag tracks its own release
@@ -899,50 +888,26 @@ pub(crate) struct DragScrollState {
     pub(crate) last_sample_at: Option<Duration>,
 }
 
-impl DragScrollState {
-    /// Whether a post-release settle grace is currently active: members are
-    /// listed and the wall-clock deadline has not passed. While active, the
-    /// adoption path refuses lagging native echoes for members and the
-    /// overlay keeps reading the live layout frame, so neither can freeze a
-    /// stale OS rect into place.
-    pub(crate) fn settle_active(&self) -> bool {
-        self.settle_deadline
-            .is_some_and(|deadline| Instant::now() < deadline)
-            && !self.members.is_empty()
-    }
-}
-
-/// Paint-only drag tracker: grab frame plus accumulated pointer offset for
-/// the current held gesture, so the border can follow a native-owned drag
-/// at input rate while the layout slot stays pinned (adoption skips held
-/// windows by design) and the 250ms snapshot would otherwise step.
+/// Paint-only drag tracker on the holder: grab frame plus accumulated
+/// pointer offset for the held gesture, so the border can follow a
+/// native-owned drag at input rate while the layout slot stays pinned
+/// (adoption skips held windows by design) and the 250ms snapshot would
+/// otherwise step.
 ///
 /// Also tracks a per-axis velocity EMA so the border can extrapolate one
 /// vsync lead ahead of the last event instead of painting a frame behind.
 /// Written from the `MouseDragged` stream, read by the overlay's
 /// `native_held` branch. Never written back to `Position`: release homing
 /// still owns the glide home. Seeded at press time (when the OS frame is
-/// at-rest accurate); a missed press simply leaves no gesture and the
-/// border falls back to snapshot/cached frames as before.
-#[derive(Debug, Resource)]
-pub(crate) struct DragPaintState {
-    pub(crate) target: Option<Entity>,
+/// at-rest accurate); a missed press leaves no holder and the border falls
+/// back to snapshot/cached frames as before. Dies with the holder despawn,
+/// so no end-of-gesture cleanup exists by construction.
+#[derive(Component, Debug, Default)]
+pub(crate) struct DragPaint {
     pub(crate) grab_frame: Option<IRect>,
     pub(crate) offset: Origin,
     velocity_px_s: DVec2,
     last_sample_at: Option<Duration>,
-}
-
-impl Default for DragPaintState {
-    fn default() -> Self {
-        Self {
-            target: None,
-            grab_frame: None,
-            offset: Origin::ZERO,
-            velocity_px_s: DVec2::ZERO,
-            last_sample_at: None,
-        }
-    }
 }
 
 /// Gap past which a velocity sample resets: a pause mid-drag means holding
@@ -960,24 +925,17 @@ const PAINT_LEAD_CAP_PX: f64 = 64.0;
 /// frames can never drift the rect.
 const PAINT_VELOCITY_STALE_AFTER: Duration = Duration::from_millis(150);
 
-impl DragPaintState {
-    /// Seed a new gesture. Overwrites any stale state (e.g. a lost
-    /// mouse-up whose holder timed out).
-    pub(crate) fn begin(&mut self, target: Entity, grab_frame: IRect) {
-        self.target = Some(target);
+impl DragPaint {
+    /// Seed a new gesture with the at-rest OS frame.
+    pub(crate) fn begin(&mut self, grab_frame: IRect) {
         self.grab_frame = Some(grab_frame);
         self.offset = Origin::ZERO;
         self.velocity_px_s = DVec2::ZERO;
         self.last_sample_at = None;
     }
 
-    /// Accumulate one drag delta sampled at `now`. Ignores deltas for a
-    /// different target so a stale press can never steer another window's
-    /// border.
-    pub(crate) fn advance(&mut self, target: Entity, delta: Origin, now: Duration) {
-        if self.target != Some(target) {
-            return;
-        }
+    /// Accumulate one drag delta sampled at `now`.
+    pub(crate) fn advance(&mut self, delta: Origin, now: Duration) {
         self.offset += delta;
         if let Some(last) = self.last_sample_at {
             let gap = now.saturating_sub(last);
@@ -993,12 +951,8 @@ impl DragPaintState {
         self.last_sample_at = Some(now);
     }
 
-    /// Current painted frame for `entity`, or `None` when no gesture tracks
-    /// it (missed press, already released).
-    pub(crate) fn frame_for(&self, entity: Entity) -> Option<IRect> {
-        if self.target != Some(entity) {
-            return None;
-        }
+    /// Current painted frame, or `None` before the grab frame is seeded.
+    pub(crate) fn frame(&self) -> Option<IRect> {
         let grab = self.grab_frame?;
         Some(IRect::from_corners(
             grab.min + self.offset,
@@ -1008,16 +962,11 @@ impl DragPaintState {
 
     /// Painted frame extrapolated `lead_secs` ahead along the velocity EMA
     /// (one vsync period at the call site), or the plain accumulated frame
-    /// when the samples went stale, the lead is non-positive, or no gesture
-    /// tracks the entity. The lead is magnitude-capped so a wrong EMA can
-    /// cost at most one bounded overshoot, corrected next tick.
-    pub(crate) fn predicted_frame_for(
-        &self,
-        entity: Entity,
-        now: Duration,
-        lead_secs: f64,
-    ) -> Option<IRect> {
-        let base = self.frame_for(entity)?;
+    /// when the samples went stale or the lead is non-positive. The lead is
+    /// magnitude-capped so a wrong EMA can cost at most one bounded
+    /// overshoot, corrected next tick.
+    pub(crate) fn predicted(&self, now: Duration, lead_secs: f64) -> Option<IRect> {
+        let base = self.frame()?;
         let Some(last) = self.last_sample_at else {
             return Some(base);
         };
@@ -1037,16 +986,6 @@ impl DragPaintState {
             base.min + lead_origin,
             base.max + lead_origin,
         ))
-    }
-
-    /// End the gesture. Called on mouse-up; the holder despawn covers the
-    /// timeout path (a lingering offset is unread without a live holder).
-    pub(crate) fn clear(&mut self) {
-        self.target = None;
-        self.grab_frame = None;
-        self.offset = Origin::ZERO;
-        self.velocity_px_s = DVec2::ZERO;
-        self.last_sample_at = None;
     }
 }
 
@@ -1092,75 +1031,68 @@ fn release_column_members(entity: Entity, strips: &ReleaseStrips) -> Vec<Entity>
         .map_or_else(|| vec![entity], |column| column.window_iter().collect())
 }
 
-/// Arms the post-release echo shield for `members`: lists them with a
-/// deadline and schedules one settle check. A native-owned drag moved the
-/// OS window while the slot stayed pinned, and its lagging echo must not
-/// rewrite the slot (the permanent-detach path) — the adoption grace
-/// (`window_moved_update_frame`) refuses listed echoes inside the deadline,
-/// and the settle check repairs residue with no echo at all. Previously
-/// scroll-drags only; now every release, since plain content drags detach
-/// the same way.
-pub(crate) fn arm_release_grace(
-    members: Vec<Entity>,
-    scroll_state: &mut DragScrollState,
-    commands: &mut Commands,
-) {
-    scroll_state.members = members;
-    scroll_state.settle_deadline = Some(Instant::now() + SCROLL_SETTLE_GRACE);
+/// Arms the post-release echo shield for `members`: seats per-window
+/// `WindowSync::Homing` with a virtual-time deadline and schedules one
+/// settle check. A native-owned drag moved the OS window while the slot
+/// stayed pinned, and its lagging echo must not rewrite the slot (the
+/// permanent-detach path) — the adoption grace (`window_moved_update_frame`)
+/// refuses homing echoes inside the deadline, and the settle check repairs
+/// residue with no echo at all. Previously scroll-drags only; now every
+/// release, since plain content drags detach the same way.
+///
+/// `now` is virtual elapsed (`Time::elapsed`), never wall time, so the
+/// harness controls grace expiry.
+pub(crate) fn arm_release_grace(members: Vec<Entity>, commands: &mut Commands, now: Duration) {
+    let deadline = now + SCROLL_SETTLE_GRACE;
+    for member in members {
+        if let Ok(mut entity_commands) = commands.get_entity(member) {
+            entity_commands.try_insert(crate::ecs::sync::WindowSync::homing(deadline));
+        }
+    }
     let system_id = commands.register_system(scroll_settle_check);
     Timeout::callback(SCROLL_SETTLE_DELAY, system_id, commands);
 }
 
-/// Re-reads OS truth for scroll-released column members once they have had a
-/// moment to land, pushing any displaced window back into its slot.
+/// Re-reads OS truth for homing windows once they have had a moment to
+/// land, pushing any displaced window back into its slot.
 ///
 /// A native session that slipped through before suppression still ends with
 /// an echo the adoption grace refuses to legitimize — but if no echo ever
 /// arrives (a push the app ate with no notification), nothing would repair
 /// the OS side. This bounded check (first run +200ms, re-armed only while
-/// drift persists inside the deadline) closes that residue. Runs via
-/// `Timeout`, not every frame.
+/// `Homing` members persist) closes that residue. Runs via `Timeout`, not
+/// every frame. Expired members hand off to the verifier instead of being
+/// dropped: a slow-applying app (Electron) can still be converging past the
+/// grace, and silently clearing here is what lets a later echo adopt the
+/// displaced frame as layout (the permanent-detach path).
 fn scroll_settle_check(
-    mut scroll_state: ResMut<DragScrollState>,
-    mut windows: Query<(Entity, &mut Window, &Position)>,
+    mut windows: Query<(Entity, &mut Window, &Position, &WindowSync)>,
     writer: Option<Res<crate::ax_writer::AxWriterQueue>>,
     mut write_state: ResMut<crate::ax_writer::AxWriteState>,
     config: Res<Config>,
+    time: Res<Time>,
     mut commands: Commands,
 ) {
-    if scroll_state.members.is_empty() {
-        scroll_state.settle_deadline = None;
-        return;
-    }
-    if scroll_state
-        .settle_deadline
-        .is_some_and(|deadline| Instant::now() >= deadline)
-    {
-        // Hand off to the verifier instead of dropping the residue: a
-        // slow-applying app (Electron) can still be converging past the
-        // grace, and silently clearing here is what lets a later echo
-        // adopt the displaced frame as layout (the permanent-detach
-        // path). Verifying legs are throttled and self-clear on landing.
-        let members = std::mem::take(&mut scroll_state.members);
-        warn!(
-            "scroll release: {} window(s) still displaced after settle, verifying",
-            members.len()
-        );
-        for member in members {
-            commands.ensure_verifying(member);
-        }
-        scroll_state.settle_deadline = None;
-        return;
-    }
-    let mut pending = Vec::with_capacity(scroll_state.members.len());
-    for member in std::mem::take(&mut scroll_state.members) {
-        let Ok((_, mut window, position)) = windows.get_mut(member) else {
+    let now = time.elapsed();
+    let mut pending = 0;
+    for (member, mut window, position, sync) in &mut windows {
+        let WindowSync::Homing { .. } = sync else {
             continue;
         };
+        if !sync.homing_active(now) {
+            // Grace over with residue unconfirmed: verify owns it now.
+            // Verifying legs are throttled and self-clear on landing.
+            warn!("scroll release: window {member} still displaced after settle, verifying");
+            commands.ensure_verifying(member);
+            if let Ok(mut entity_commands) = commands.get_entity(member) {
+                entity_commands.try_remove::<WindowSync>();
+            }
+            continue;
+        }
         let Ok(live) = window.update_frame().inspect_err(|err| {
             debug!("scroll settle: re-reading OS frame for {member} failed: {err}");
         }) else {
-            pending.push(member);
+            pending += 1;
             continue;
         };
         let drift = (live.min - position.0).abs();
@@ -1172,6 +1104,10 @@ fn scroll_settle_check(
             // the single-writer discipline when the flag is on.
             info!("scroll settle: OS window {member} drifted {drift:?}, pushing slot");
             let epoch = write_state.current_epoch();
+            // Observed drift invalidates the dedup entry (see
+            // `AxWriteState::invalidate_sent`): the repair must send even
+            // when it matches the last intent.
+            write_state.invalidate_sent(window.id());
             crate::ax_writer::push_position(
                 &mut window,
                 position.0,
@@ -1181,13 +1117,10 @@ fn scroll_settle_check(
                 epoch,
                 false,
             );
-            pending.push(member);
+            pending += 1;
         }
     }
-    scroll_state.members = pending;
-    if scroll_state.members.is_empty() {
-        scroll_state.settle_deadline = None;
-    } else {
+    if pending > 0 {
         let system_id = commands.register_system(scroll_settle_check);
         Timeout::callback(SCROLL_SETTLE_STEP, system_id, &mut commands);
     }
@@ -1295,12 +1228,14 @@ fn held_drag_target(
     held: &HeldDrag<'_, '_>,
     windows: &Query<(&Window, Entity, Option<&Unmanaged>)>,
 ) -> Option<(Entity, WinID, bool, bool)> {
-    let (_, marker, armed, scroll_armed) = held.iter().next()?;
+    let (_, marker, gesture) = held.iter().next()?;
     let target = marker.0;
     let (window, _, unmanaged) = windows.iter().find(|(_, entity, _)| *entity == target)?;
     if unmanaged.is_some() {
         return None;
     }
+    let (armed, scroll_armed) =
+        gesture.map_or((false, false), |g| (g.display_armed, g.scroll_armed));
     Some((target, window.id(), armed, scroll_armed))
 }
 
@@ -1404,7 +1339,7 @@ fn seed_release_inertia(
 /// Floating/minimized/hidden windows are untouched (they keep native
 /// behavior plus the pin path).
 ///
-/// Exception: a header scroll-drag (grab-time [`DragScrollArmed`]) drives
+/// Exception: a header scroll-drag (grab-time scroll-armed `Gesture`) drives
 /// the owner strip's scroll offset directly, 1:1 with the pointer, when
 /// `left_drag_scrolls_strip` is enabled. The tap swallows the native drag
 /// for those grabs, so no `WindowMoved` echo and no adoption fight; armed
@@ -1421,7 +1356,7 @@ fn drag_move_held_column(
     config: Res<Config>,
     time: Res<Time>,
     mut scroll_state: ResMut<DragScrollState>,
-    mut paint: ResMut<DragPaintState>,
+    mut holder_paint: Query<&mut DragPaint>,
     cold: Option<Res<ColdStart>>,
     mut state: Local<DragMoveState>,
     mut commands: Commands,
@@ -1471,9 +1406,14 @@ fn drag_move_held_column(
                 // itself: the slot stays pinned, but the border needs every
                 // pointer delta at input rate. Advanced only for armed or
                 // scroll-driven holders — plain content grabs stay fully
-                // native and cost nothing per event.
-                if armed || scroll_armed {
-                    paint.advance(target, delta, time.elapsed());
+                // native and cost nothing per event. The paint rides the
+                // holder, resolved through the same grab that armed it.
+                if (armed || scroll_armed)
+                    && let Some((holder_entity, _, _)) =
+                        held.iter().find(|(_, marker, _)| marker.0 == target)
+                    && let Ok(mut paint) = holder_paint.get_mut(holder_entity)
+                {
+                    paint.advance(delta, time.elapsed());
                 }
                 if cold.is_some() {
                     // Warmup: track the cursor for paint only; the slot,
@@ -1583,17 +1523,16 @@ fn resolve_drag_target(
 /// Moves a mouse-dragged managed window across display boundaries.
 ///
 /// The transfer is armed at grab time: shortcut held while left-clicking a
-/// window (see `DragDisplayArmed`). While armed **and** the shortcut is still
-/// held, every `WindowMoved` for the held window hit-tests the freshly
-/// adopted frame's center: once it lands inside another display, the window
-/// is detached from the active strip and appended to the target display's
-/// selected strip — live, like the keyboard move — keeping focus while the
-/// active display follows it along. Dragging back transfers it home
-/// symmetrically.
+/// window (see `Gesture`). While armed, every `WindowMoved` for the held
+/// window hit-tests the freshly adopted frame's center: once it lands inside
+/// another display, the window is detached from the active strip and
+/// appended to the target display's selected strip — live, like the keyboard
+/// move — keeping focus while the active display follows it along. Dragging
+/// back transfers it home symmetrically.
 ///
-/// A held drag that is not armed (or whose shortcut was released) pins its
-/// window instead: each foreign move reshuffles it straight back to its
-/// slot, so tiled windows cannot be mouse-moved without the shortcut.
+/// A held drag that is not armed pins its window instead: each foreign move
+/// reshuffles it straight back to its slot, so tiled windows cannot be
+/// mouse-moved without the shortcut.
 ///
 /// The dragged window is expected in the active strip (a real drag focuses
 /// its window first); otherwise there is nothing to detach from and the move
@@ -1604,7 +1543,7 @@ fn resolve_drag_target(
 fn drag_window_across_display(
     mut messages: MessageReader<Event>,
     mut input: MessageReader<InputEvent>,
-    held: Populated<(Entity, &MouseHeldMarker, Has<DragDisplayArmed>)>,
+    held: Populated<(Entity, &MouseHeldMarker, Option<&Gesture>)>,
     windows: Windows,
     mut active_display: ActiveDisplayMut,
     mut offscreen: OffscreenStrips,
@@ -1635,10 +1574,12 @@ fn drag_window_across_display(
         let Some((_, entity)) = windows.find(*window_id) else {
             continue;
         };
-        // Only while the button is held down on this very window.
-        let armed = held
-            .iter()
-            .any(|(_, marker, armed)| marker.0 == entity && armed);
+        // Only while the button is held down on this very window. Arming is
+        // grab-time frozen (see `Gesture`): releasing the shortcut mid-drag
+        // no longer disarms transfer.
+        let armed = held.iter().any(|(_, marker, gesture)| {
+            marker.0 == entity && gesture.is_some_and(|g| g.display_armed)
+        });
         // Floating/minimized/hidden windows follow the cursor by themselves.
         let Some((_, _, unmanaged)) = windows.get_managed(entity) else {
             continue;
@@ -1646,15 +1587,11 @@ fn drag_window_across_display(
         if unmanaged.is_some() {
             continue;
         }
-        // Armed at grab time and shortcut still held: eligible for display
-        // transfer below. Anything else is left alone here: an unarmed or
-        // released drag glides home on mouse-up instead of being pinned
-        // mid-drag (the legacy pin path fought homing via strip chase).
-        let transfer = armed
-            && config
-                .mouse_drag_display_modifier()
-                .is_some_and(|required| required.matches(drag_modifiers.current));
-        if !transfer {
+        // Armed at grab time: eligible for display transfer below. Anything
+        // else is left alone here: an unarmed drag glides home on mouse-up
+        // instead of being pinned mid-drag (the legacy pin path fought
+        // homing via strip chase).
+        if !armed {
             if held.iter().any(|(_, marker, _)| marker.0 == entity) {
                 trace!(
                     "drag transfer: window (id {window_id}, {entity}) not eligible (armed={armed}), skipping"
@@ -1883,7 +1820,7 @@ fn preview_ghost(
 #[allow(clippy::too_many_arguments)]
 fn drag_drop_preview(
     mut input: MessageReader<InputEvent>,
-    held: Query<(Entity, &MouseHeldMarker, Has<DragDisplayArmed>)>,
+    held: Query<(Entity, &MouseHeldMarker, Option<&Gesture>)>,
     windows: Windows,
     strips: PreviewStrips,
     displays: PreviewDisplays,
@@ -1924,7 +1861,7 @@ fn drag_drop_preview(
     }
     let Some(armed_target) = held
         .iter()
-        .find(|(_, _, armed)| *armed)
+        .find(|(_, _, gesture)| gesture.is_some_and(|g| g.display_armed))
         .map(|(_, marker, _)| marker.0)
     else {
         hide("no armed drag in progress", &mut preview, &mut was_shown);
@@ -1968,7 +1905,7 @@ fn mouse_resize_trigger(
     mut messages: MessageReader<InputEvent>,
     windows: Windows,
     active_workspace: Single<(Entity, &LayoutStrip, &Position), With<ActiveWorkspaceMarker>>,
-    held: Query<(Entity, &MouseHeldMarker, Has<DragDisplayArmed>)>,
+    held: Query<(Entity, &MouseHeldMarker, Option<&Gesture>)>,
     window_manager: Res<WindowManager>,
     config: Res<Config>,
     mut state: Local<MouseResizeState>,
@@ -2016,10 +1953,9 @@ fn mouse_resize_trigger(
         // An armed display-drag owns the gesture: never resize the dragged
         // window out from under it when modifiers overlap. The latch resets
         // too, so no stale target resumes after the drag.
-        if held
-            .iter()
-            .any(|(_, marker, armed)| marker.0 == entity && armed)
-        {
+        if held.iter().any(|(_, marker, gesture)| {
+            marker.0 == entity && gesture.is_some_and(|g| g.display_armed)
+        }) {
             state.last_point = None;
             state.window_id = None;
             continue;
@@ -2189,7 +2125,7 @@ fn warp_landing(
 fn horizontal_warp_mouse_trigger(
     mut messages: MessageReader<InputEvent>,
     displays: Query<&Display>,
-    held: Query<(Entity, &MouseHeldMarker, Has<DragDisplayArmed>)>,
+    held: Query<(Entity, &MouseHeldMarker, Option<&Gesture>)>,
     window_manager: Res<WindowManager>,
     config: Res<Config>,
     mut state: Local<WarpVelocityState>,
@@ -2201,15 +2137,14 @@ fn horizontal_warp_mouse_trigger(
         // Edge-warp fires on plain moves (display traversal) and mid-drag
         // for shortcut-armed display drags; other drags (text selection,
         // resize handles, unarmed strip drags) keep native edge behavior.
-        // The grab-time arming is what distinguishes drags — see
-        // `DragDisplayArmed`. The ping-pong trap at shared corners is
-        // closed structurally in `warp_landing` (landings can never sit on
-        // a threshold), not by gating moves off.
-        let armed_drag = |modifiers: &Modifiers| {
-            held.iter().any(|(_, _, armed)| armed)
-                && config
-                    .mouse_drag_display_modifier()
-                    .is_some_and(|required| required.matches(*modifiers))
+        // Grab-time arming (see `Gesture`) is what distinguishes drags; the
+        // live shortcut state no longer gates mid-drag behavior. The
+        // ping-pong trap at shared corners is closed structurally in
+        // `warp_landing` (landings can never sit on a threshold), not by
+        // gating moves off.
+        let armed_drag = |_modifiers: &Modifiers| {
+            held.iter()
+                .any(|(_, _, gesture)| gesture.is_some_and(|g| g.display_armed))
         };
         let point = match event {
             Event::MouseMoved { point, .. } => point,
@@ -2265,27 +2200,31 @@ mod tests {
     }
 
     #[test]
-    fn settle_grace_tracks_members_and_deadline() {
-        use bevy::ecs::entity::Entity;
+    fn release_arming_seats_homing_with_virtual_deadline() {
+        use crate::ecs::sync::WindowSync;
+        use bevy::ecs::system::RunSystemOnce as _;
+        use bevy::ecs::world::World;
 
-        let mut state = DragScrollState::default();
-        assert!(!state.settle_active(), "empty list is never active");
-        state.members.push(Entity::PLACEHOLDER);
+        let mut world = World::new();
+        let member = world.spawn_empty().id();
+        let now = Duration::from_secs(100);
+        world
+            .run_system_once(move |mut commands: Commands| {
+                arm_release_grace(vec![member], &mut commands, now);
+            })
+            .expect("arming runs");
+        let sync = world
+            .get::<WindowSync>(member)
+            .expect("release seats Homing");
+        assert!(sync.homing_active(now), "grace is live right after arming");
         assert!(
-            !state.settle_active(),
-            "members without a deadline are stale, not active"
+            !sync.homing_active(now + SCROLL_SETTLE_GRACE),
+            "grace ends at its virtual deadline"
         );
-        state.settle_deadline = Some(Instant::now() + Duration::from_secs(1));
         assert!(
-            state.settle_active(),
-            "pending members inside the deadline are active"
+            !sync.homing_active(now + SCROLL_SETTLE_GRACE + Duration::from_secs(1)),
+            "grace stays over"
         );
-        state.settle_deadline = Some(
-            Instant::now()
-                .checked_sub(Duration::from_secs(1))
-                .expect("test clock runs forward"),
-        );
-        assert!(!state.settle_active(), "an expired deadline ends the grace");
     }
 
     #[test]
@@ -2314,57 +2253,33 @@ mod tests {
 
     #[test]
     fn drag_paint_tracks_grab_frame_plus_pointer_offset() {
-        use bevy::ecs::entity::Entity;
-
-        let mut paint = DragPaintState::default();
-        let target = Entity::PLACEHOLDER;
-        assert_eq!(paint.frame_for(target), None, "no gesture, no frame");
+        let mut paint = DragPaint::default();
+        assert_eq!(paint.frame(), None, "no gesture, no frame");
 
         let grab = IRect::new(0, 20, 400, 1020);
-        paint.begin(target, grab);
+        paint.begin(grab);
+        assert_eq!(paint.frame(), Some(grab), "zero offset paints grab");
+        paint.advance(Origin::new(50, 0), Duration::from_millis(100));
+        paint.advance(Origin::new(0, 30), Duration::from_millis(120));
         assert_eq!(
-            paint.frame_for(target),
-            Some(grab),
-            "zero offset paints grab"
-        );
-        paint.advance(target, Origin::new(50, 0), Duration::from_millis(100));
-        paint.advance(target, Origin::new(0, 30), Duration::from_millis(120));
-        assert_eq!(
-            paint.frame_for(target),
+            paint.frame(),
             Some(IRect::new(50, 50, 450, 1050)),
             "deltas accumulate 1:1 with the pointer"
         );
-
-        let other = Entity::from_raw_u32(9999).expect("test entity");
-        assert_eq!(paint.frame_for(other), None, "foreign entity reads nothing");
-        paint.advance(other, Origin::new(500, 500), Duration::from_millis(140));
-        assert_eq!(
-            paint.frame_for(target),
-            Some(IRect::new(50, 50, 450, 1050)),
-            "foreign deltas never steer the gesture"
-        );
-
-        paint.clear();
-        assert_eq!(paint.frame_for(target), None, "release ends the gesture");
     }
 
     #[test]
     fn drag_paint_predicts_one_lead_ahead_then_goes_stale() {
-        use bevy::ecs::entity::Entity;
-
-        let mut paint = DragPaintState::default();
-        let target = Entity::PLACEHOLDER;
+        let mut paint = DragPaint::default();
         let grab = IRect::new(0, 20, 400, 1020);
-        paint.begin(target, grab);
+        paint.begin(grab);
         // First sample stores its time; the second folds velocity:
         // 100px in 20ms → 5000px/s on x, EMA 0.3 → 1500px/s.
         let t0 = Duration::from_millis(100);
-        paint.advance(target, Origin::new(100, 0), t0);
-        paint.advance(target, Origin::new(100, 0), t0 + Duration::from_millis(20));
+        paint.advance(Origin::new(100, 0), t0);
+        paint.advance(Origin::new(100, 0), t0 + Duration::from_millis(20));
         let now = t0 + Duration::from_millis(40);
-        let predicted = paint
-            .predicted_frame_for(target, now, 0.016)
-            .expect("gesture paints");
+        let predicted = paint.predicted(now, 0.016).expect("gesture paints");
         // 1500*0.016 = 24px lead on top of the 200px offset, capped well
         // below 64.
         assert_eq!(predicted.min.x, 200 + 24);
@@ -2372,12 +2287,12 @@ mod tests {
         // Stale samples (held still) paint the accumulated offset, no lead.
         let late = t0 + Duration::from_millis(500);
         assert_eq!(
-            paint.predicted_frame_for(target, late, 0.016),
+            paint.predicted(late, 0.016),
             Some(IRect::new(200, 20, 600, 1020))
         );
         // Non-positive lead is the plain frame.
         assert_eq!(
-            paint.predicted_frame_for(target, now, 0.0),
+            paint.predicted(now, 0.0),
             Some(IRect::new(200, 20, 600, 1020))
         );
     }

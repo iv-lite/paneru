@@ -21,8 +21,8 @@ use std::time::{Duration, Instant};
 use tracing::{Level, debug, error, info, instrument, trace, warn};
 
 use super::{
-    ActiveDisplayMarker, BProcess, DragDisplayArmed, DragScrollArmed, ExistingMarker, FreshMarker,
-    MouseHeldMarker, RepositionMarker, ResizeMarker, RetryFrontSwitch, SpawnWindowTrigger, Timeout,
+    ActiveDisplayMarker, BProcess, ExistingMarker, FreshMarker, MouseHeldMarker, RepositionMarker,
+    ResizeMarker, RetryFrontSwitch, SpawnWindowTrigger, Timeout,
 };
 
 use crate::ax_writer::{AxWriteInbox, AxWriteState, AxWriterQueue, PushOutcome, push_position};
@@ -30,8 +30,12 @@ use crate::commands::{Command, Operation};
 use crate::config::{Config, decorations::BorderRadiusOption};
 use crate::ecs::display::FloatingLayer;
 use crate::ecs::layout::{Column, LayoutStrip};
-use crate::ecs::mouse::{DragModifierState, DragPaintState, DragScrollState, arm_release_grace};
+use crate::ecs::mouse::arm_release_grace;
 use crate::ecs::params::{ActiveDisplay, FrameActivity, Windows};
+use crate::ecs::sync::{
+    Gesture, ResizeEvent, SyncAction, SyncCounters, SyncEvent, WindowSync, reconcile,
+    reconcile_resize,
+};
 use crate::ecs::workspace::SnapStripMarker;
 use crate::ecs::{
     ActiveWorkspaceMarker, AnyWindowInFlight, Bounds, BruteforceWindows, ColdStart, FlashMessage,
@@ -64,8 +68,9 @@ type TimedOutSpawns<'w, 's> = Populated<
 
 /// Windows as [`window_moved_update_frame`] sees them: the element to re-read,
 /// the origin to update, the marker saying we are the ones moving it, and
-/// whether that move is still awaiting confirmation.
-type MovableWindows<'w, 's> = Query<
+/// whether that move is still awaiting confirmation. `Populated` so the
+/// reconciler never schedules when no windows exist at all.
+type MovableWindows<'w, 's> = Populated<
     'w,
     's,
     (
@@ -81,9 +86,9 @@ type MovableWindows<'w, 's> = Query<
 >;
 
 /// Windows as the resize handler rewrites them: the OS handle to re-read the
-/// frame from, the size to overwrite, and whether the window is ours to lay
-/// out at all.
-type ResizableWindows<'w, 's> = Query<
+/// frame from, the size to overwrite, whether the window is ours to lay out
+/// at all, and its own jitter history. `Populated`, like [`MovableWindows`].
+type ResizableWindows<'w, 's> = Populated<
     'w,
     's,
     (
@@ -93,6 +98,7 @@ type ResizableWindows<'w, 's> = Query<
         &'static mut Bounds,
         Option<&'static Unmanaged>,
         Has<ResizeMarker>,
+        &'static mut crate::ecs::sync::ResizeJitter,
     ),
     Without<LayoutStrip>,
 >;
@@ -703,7 +709,7 @@ pub(super) fn tick_cold_start(
 /// times a second with a constant.
 pub(super) fn publish_snapshot_cadence(
     cold: Option<Res<ColdStart>>,
-    held: Query<(), crate::ecs::DrivenDragHeld>,
+    held: Query<Option<&Gesture>, With<MouseHeldMarker>>,
     drives: Query<&crate::ecs::PositionDrive>,
     roster: Option<Res<SnapshotRoster>>,
     mut last: Local<bool>,
@@ -719,7 +725,9 @@ pub(super) fn publish_snapshot_cadence(
     // degrades to 250ms borders — the overlay paints those from throttled
     // direct reads, not the snapshot.
     let fast = cold.is_some()
-        || !held.is_empty()
+        || held
+            .iter()
+            .any(|gesture| gesture.is_some_and(|g| g.drives()))
         || drives.iter().any(crate::ecs::PositionDrive::is_verifying);
     if fast != *last {
         *last = fast;
@@ -1090,7 +1098,6 @@ pub(super) fn timeout_ticker(
     timers: Populated<(Entity, &mut Timeout)>,
     holders: Query<&MouseHeldMarker>,
     clock: Res<Time>,
-    mut scroll_state: ResMut<DragScrollState>,
     mut commands: Commands,
 ) {
     for (entity, mut timeout) in timers {
@@ -1105,7 +1112,7 @@ pub(super) fn timeout_ticker(
             // path armed the echo shield — do it here so the lagging echo
             // pushes the slot back instead of adopting the displaced frame.
             if let Ok(marker) = holders.get(entity) {
-                arm_release_grace(vec![marker.0], &mut scroll_state, &mut commands);
+                arm_release_grace(vec![marker.0], &mut commands, clock.elapsed());
             }
             trace!("Removing timer {entity}");
             if let Ok(mut entity_commands) = commands.get_entity(entity) {
@@ -1752,63 +1759,65 @@ fn sweep_input_tap(
     }
 }
 
-/// Clock + damping state for native-resize adoption, bundled so
-/// `window_resized_update_frame` stays under Bevy's system-param limit.
-#[derive(bevy::ecs::system::SystemParam)]
-pub(super) struct ResizeCalm<'w> {
-    time: Res<'w, Time>,
-    calm: ResMut<'w, crate::ecs::AdoptionCalm>,
-}
-
 #[instrument(level = Level::TRACE, skip_all)]
+#[allow(clippy::too_many_arguments)]
 pub(super) fn window_resized_update_frame(
     mut messages: MessageReader<Event>,
     mut windows: ResizableWindows,
-    mut workspaces: Query<(&LayoutStrip, &mut Position)>,
-    held: Query<(Entity, &MouseHeldMarker, Has<DragDisplayArmed>)>,
-    config: Res<Config>,
-    drag_modifiers: Res<DragModifierState>,
-    mut calm: ResizeCalm<'_>,
+    workspaces: Query<(&LayoutStrip, &Position)>,
+    held: Query<(Entity, &MouseHeldMarker, Option<&Gesture>)>,
+    sync_states: Query<&WindowSync>,
+    time: Res<Time>,
+    mut counters: ResMut<SyncCounters>,
+    mut commands: Commands,
 ) {
     for event in messages.read() {
         let Event::WindowResized { window_id } = event else {
             continue;
         };
+        counters.resize_echo_total += 1;
 
-        let Some((mut window, entity, position, mut bounds, unmanaged, resizing)) = windows
-            .iter_mut()
-            .find(|window| window.0.id() == *window_id)
+        let Some((mut window, entity, position, mut bounds, unmanaged, resizing, mut jitter_hist)) =
+            windows
+                .iter_mut()
+                .find(|window| window.0.id() == *window_id)
         else {
             continue;
         };
-        if matches!(unmanaged, Some(Unmanaged::Minimized | Unmanaged::Hidden)) {
-            continue;
-        }
+        // Single decision point like the move path: cheap facts first (no
+        // side effects), so the damping history below only records echoes
+        // that survive intent filtering, exactly as before.
+        let minimized = matches!(unmanaged, Some(Unmanaged::Minimized | Unmanaged::Hidden));
         // An armed display-drag owns the gesture: a simultaneous native
         // edge-resize must not reshape the window mid-move (mirrors the
         // move lock, which already ignores native moves for held windows).
-        if held
-            .iter()
-            .any(|(_, marker, armed)| marker.0 == entity && armed)
-            && config
-                .mouse_drag_display_modifier()
-                .is_some_and(|required| required.matches(drag_modifiers.current))
-        {
-            continue;
-        }
-        // Our own resize, echoed back: `commit_window_size` requested this size
-        // and `animate_resize_entities` is still stepping toward it, so reading
-        // the echo in here would fight the animation producing that difference.
-        // Only a resize we did not initiate is new information.
-        if resizing {
+        // Arming is grab-time frozen in the holder's `Gesture`.
+        let armed = held.iter().any(|(_, marker, gesture)| {
+            marker.0 == entity && gesture.is_some_and(|g| g.display_armed)
+        });
+        let state = sync_states.get(entity).copied().unwrap_or_default();
+        // Our own resize, echoed back: `commit_window_size` requested this
+        // size and `animate_resize_entities` is still stepping toward it, so
+        // reading the echo in here would fight the animation producing that
+        // difference. Only a resize we did not initiate is new information.
+        let pre = ResizeEvent {
+            minimized_or_hidden: minimized,
+            display_drag_armed: armed,
+            resizing,
+            jitter_damped: false,
+        };
+        if reconcile_resize(state, pre) == SyncAction::Ignore {
+            if armed {
+                counters.resize_ignore_armed += 1;
+            } else if resizing {
+                counters.resize_ignore_resizing += 1;
+            }
             continue;
         }
         let Ok(new_frame) = window.update_frame() else {
             continue;
         };
-        let active_strip = workspaces
-            .iter_mut()
-            .find(|(strip, _)| strip.contains(entity));
+        let active_strip = workspaces.iter().find(|(strip, _)| strip.contains(entity));
         let tabbed = active_strip
             .as_ref()
             .is_some_and(|strip| strip.0.tabbed(entity));
@@ -1823,7 +1832,13 @@ pub(super) fn window_resized_update_frame(
             // episode); a large resize resets the episode.
             let jitter = (new_frame.size() - old_frame.size()).abs();
             let jitter = jitter.x.max(jitter.y);
-            if !left_button_held() && calm.calm.damp(window.id(), calm.time.elapsed(), jitter) {
+            let damped = !left_button_held() && jitter_hist.damp(time.elapsed(), jitter);
+            let full = ResizeEvent {
+                jitter_damped: damped,
+                ..pre
+            };
+            if reconcile_resize(state, full) == SyncAction::Ignore {
+                counters.resize_ignore_jitter += 1;
                 continue;
             }
             if tabbed {
@@ -1831,34 +1846,10 @@ pub(super) fn window_resized_update_frame(
             } else {
                 bounds.0 = new_frame.size();
             }
-        }
-
-        // If the window was resized, shift LayoutStrip slightly to avoid moving right corner.
-        let Some((strip, mut strip_position)) = active_strip else {
-            // Floating window, don't nudge the strip.
-            continue;
-        };
-        if tabbed {
-            // Native tabs share a single layout slot. Keep the strip anchored
-            // and let the tab sync/layout systems propagate the new size.
-            continue;
-        }
-
-        if old_frame.min.x != new_frame.min.x {
-            let shift = (old_frame.size() - new_frame.size()).with_y(0);
-            // Search marke: reposition_entity - Updating position directly to reduce jitter.
-            strip_position.0.x += shift.x;
-        }
-
-        // When the user drags the top edge of a stacked window, we adjust the window above to
-        // accomodate.
-        let diff = old_frame.min.y - new_frame.min.y;
-        if diff.abs() > 0
-            && let Some(above_entity) = strip.above(entity)
-            && let Ok((_, _, _, mut above_bounds, _, _)) = windows.get_mut(above_entity)
-            && above_bounds.0.y - diff > 200
-        {
-            above_bounds.0.y -= diff;
+            counters.resize_adopt += 1;
+            if !matches!(state, WindowSync::Synced) {
+                commands.entity(entity).insert(WindowSync::Synced);
+            }
         }
     }
 }
@@ -1942,14 +1933,15 @@ const HELD_PAINT_REFRESH: Duration = Duration::from_millis(50);
 pub(crate) fn window_moved_update_frame(
     mut messages: MessageReader<Event>,
     mut windows: MovableWindows,
-    held: Query<(Entity, &MouseHeldMarker, Has<DragDisplayArmed>)>,
+    held: Query<(Entity, &MouseHeldMarker, Option<&Gesture>)>,
+    sync_states: Query<&WindowSync>,
     config: Res<Config>,
-    drag_modifiers: Res<DragModifierState>,
-    scroll_grace: Res<DragScrollState>,
     writer: Option<Res<AxWriterQueue>>,
     mut write_state: ResMut<AxWriteState>,
     mut paint_refresh: Local<HashMap<WinID, Instant>>,
     mut commands: Commands,
+    mut counters: ResMut<SyncCounters>,
+    time: Res<Time>,
 ) {
     // Adoption reads the echo directly, never the snapshot worker: the event
     // announces a move that just happened, and the 250ms poll may not have
@@ -1964,6 +1956,7 @@ pub(crate) fn window_moved_update_frame(
         let Event::WindowMoved { window_id } = event else {
             continue;
         };
+        counters.move_echo_total += 1;
 
         let Some((entity, mut window, mut position, bounds, unmanaged, repositioning, drive)) =
             windows
@@ -1972,139 +1965,200 @@ pub(crate) fn window_moved_update_frame(
         else {
             continue;
         };
+        // Single decision point: every fact the old five-way branch battery
+        // read is packed into one event and `reconcile` names the action.
+        // The arms below keep the exact side effects (paint refreshes,
+        // push-backs, adoption); only the decision moved.
         let verifying = drive.as_ref().is_some_and(|drive| drive.is_verifying());
-        if matches!(unmanaged, Some(Unmanaged::Minimized | Unmanaged::Hidden)) {
-            continue;
-        }
+        let minimized = matches!(unmanaged, Some(Unmanaged::Minimized | Unmanaged::Hidden));
+        let held_here = held.iter().any(|(_, marker, _)| marker.0 == entity);
+        // Only managed windows pin their slot while held: floating windows
+        // stay native and their echoes adopt as before.
+        let held_managed = held_here && unmanaged.is_none();
         // A managed window held without an armed display-drag keeps its
         // synthetic position: skip adoption so the column drive (which
         // already moved it) is never overwritten by a stale OS echo, and
-        // release homing — not a mid-drag pin — brings it home. Armed
-        // drags with the shortcut held adopt normally — the center
-        // hit-test needs fresh frames.
-        let draggable = held
-            .iter()
-            .any(|(_, marker, armed)| marker.0 == entity && armed)
-            && config
-                .mouse_drag_display_modifier()
-                .is_some_and(|required| required.matches(drag_modifiers.current));
-        if unmanaged.is_none() && held.iter().any(|(_, marker, _)| marker.0 == entity) && !draggable
-        {
-            // Native-owned held drag (content grab with strip scrolling):
-            // keep the synthetic slot pinned, but refresh the cached OS
-            // frame so the border's live-OS branch paints the cursor, not
-            // the grab point. Paint-only: `Position` stays untouched and
-            // release homing still owns the glide home. Throttled: each
-            // refresh is synchronous AX against the app being dragged, and
-            // at drag-event rates the read storm contends that app's own
-            // thread until text selection stutters.
-            let fresh = paint_refresh
-                .get(&window.id())
-                .is_none_or(|at| at.elapsed() >= HELD_PAINT_REFRESH);
-            if fresh {
-                paint_refresh.insert(window.id(), Instant::now());
-                if let Err(err) = window.update_frame() {
-                    debug!("refreshing held window {entity} frame: {err}");
-                }
-            }
-            continue;
-        }
-        // Our own move, echoed back: `animate_entities` lerps from the current
-        // `Position`, so overwriting it with the echoed frame mid-animation
-        // restarts each step from behind, and the two chase each other.
-        if repositioning {
-            continue;
-        }
-        // Async write still converging: the echo predates the queued write,
-        // so adopting it would regress `Position` and restart the lerp
-        // chase. The ack, not the echo, owns the truth until it lands.
-        if write_state.unacked(window.id()) {
-            continue;
-        }
-        // Driven move awaiting confirmation: the animator may have converged
-        // and the ack may be in, but a slow-applying app (or WindowServer)
-        // can still echo the pre-move frame — adopting it regresses
-        // `Position` and the audit re-homes every few seconds forever
-        // (observed as a window breathing around its slot). Paint-only
-        // refresh like the held path; verification owns the confirmation.
-        // Bounded: verify drops the marker after its retries regardless.
-        if verifying {
-            if let Err(err) = window.update_frame() {
-                debug!("refreshing unconfirmed window {entity} frame: {err}");
-            }
-            continue;
-        }
-        // A native session paneru never tracked (press-frame leak, stale
-        // suppress gate, tap-disabled gap): push the slot back instead of
-        // adopting, or the displaced echo becomes layout permanently and a
-        // later `commit` legitimizes it on the OS side. Direct push (not a
-        // marker: origin already equals the slot, so the chain would no-op).
-        if adoption_distrusted(
-            unmanaged.is_some(),
-            held.iter().any(|(_, marker, _)| marker.0 == entity),
-            repositioning,
-            left_button_held(),
-        ) {
-            let Ok(live) = window.update_frame() else {
-                continue;
-            };
-            let drift = (live.min - position.0).abs();
-            debug!("untracked native drag of window {entity}, drift {drift:?}: pushing slot back");
-            // Joins the in-flight commit frame: this push-back belongs to
-            // the motion already converging, not a new one. A dropped write
-            // reseats the resend marker (no echo will retry a settled push).
-            let epoch = write_state.current_epoch();
-            if push_position(
-                &mut window,
-                position.0,
-                writer.as_deref(),
-                &mut write_state,
-                config.ax_writer_enabled(),
-                epoch,
-                false,
-            ) == PushOutcome::DroppedFull
-                && let Ok(mut entity_commands) = commands.get_entity(entity)
-            {
-                entity_commands.try_insert(ResendMarker);
-            }
-            continue;
-        }
-        let Ok(new_frame) = window.update_frame() else {
-            continue;
-        };
-
+        // release homing — not a mid-drag pin — brings it home. Armed drags
+        // adopt normally — the center hit-test needs fresh frames. Arming is
+        // grab-time frozen in the holder's `Gesture`.
+        let draggable = held.iter().any(|(_, marker, gesture)| {
+            marker.0 == entity && gesture.is_some_and(|g| g.display_armed)
+        });
         // Post-release grace for scroll-dragged columns: a lagging echo from
         // a native session that slipped through before suppression must not
-        // rewrite the slot (the permanent-detach path). Push the slot back
-        // with the live frame in hand instead of adopting; the settle check
-        // owns any residue with no echo at all. Bounded by the deadline so
-        // a stuck list can never suppress adoption forever.
-        let in_grace = scroll_grace.settle_active() && scroll_grace.members.contains(&entity);
-        if in_grace {
-            let drift = (new_frame.min - position.0).abs();
-            if drift.x > 1 || drift.y > 1 {
-                debug!("scroll grace: echo for {entity} drifted {drift:?}, pushing slot back");
-                let epoch = write_state.current_epoch();
-                if crate::ax_writer::push_position(
-                    &mut window,
-                    position.0,
-                    writer.as_deref(),
-                    &mut write_state,
-                    config.ax_writer_enabled(),
-                    epoch,
-                    false,
-                ) == PushOutcome::DroppedFull
-                    && let Ok(mut entity_commands) = commands.get_entity(entity)
-                {
-                    entity_commands.try_insert(ResendMarker);
+        // rewrite the slot (the permanent-detach path). Owned by the
+        // `Homing` machine state now; the deadline bounds it so a stuck
+        // grace can never suppress adoption forever.
+        let machine_state = sync_states.get(entity).copied().unwrap_or_default();
+        let in_grace = machine_state.homing_active(time.elapsed());
+        // A native session paneru never tracked (press-frame leak, stale
+        // suppress gate, tap-disabled gap): an echo with no holder, no
+        // marker, *and* the button held is a session we missed, never
+        // intent. Atomic load, safe to evaluate eagerly per echo.
+        let distrust = adoption_distrusted(
+            unmanaged.is_some(),
+            held_here,
+            repositioning,
+            left_button_held(),
+        );
+        let echo = SyncEvent {
+            minimized_or_hidden: minimized,
+            held_native: held_managed,
+            display_drag_armed: draggable,
+            repositioning,
+            // Async write still converging: the echo predates the queued
+            // write, so the ack owns the truth until it lands.
+            unacked: write_state.unacked(window.id()),
+            verifying,
+            button_held_no_gesture: distrust,
+            in_grace,
+            drifted: false,
+        };
+        let state = machine_state;
+        // Expired homing reads as synced (and is cleaned up): the grace is
+        // bounded, never a permanent push-back trap.
+        let state =
+            if matches!(state, WindowSync::Homing { .. }) && !state.homing_active(time.elapsed()) {
+                commands.entity(entity).insert(WindowSync::Synced);
+                WindowSync::Synced
+            } else {
+                state
+            };
+        match reconcile(state, echo) {
+            SyncAction::Ignore => {
+                if minimized {
+                    counters.move_ignore_minimized += 1;
+                } else if held_managed && !draggable {
+                    // Native-owned held drag (content grab with strip
+                    // scrolling): keep the synthetic slot pinned, but refresh
+                    // the cached OS frame so the border's live-OS branch
+                    // paints the cursor, not the grab point. Paint-only:
+                    // `Position` stays untouched and release homing still
+                    // owns the glide home. Throttled: each refresh is
+                    // synchronous AX against the app being dragged.
+                    let fresh = paint_refresh
+                        .get(&window.id())
+                        .is_none_or(|at| at.elapsed() >= HELD_PAINT_REFRESH);
+                    if fresh {
+                        paint_refresh.insert(window.id(), Instant::now());
+                        if let Err(err) = window.update_frame() {
+                            debug!("refreshing held window {entity} frame: {err}");
+                        }
+                    }
+                    counters.move_ignore_held += 1;
+                    commands.entity(entity).insert(WindowSync::HeldNative);
+                } else if repositioning {
+                    // Our own move, echoed back: `animate_entities` lerps
+                    // from the current `Position`, so overwriting it
+                    // mid-animation restarts each step from behind.
+                    counters.move_ignore_reposition += 1;
+                } else if echo.unacked {
+                    counters.move_ignore_unacked += 1;
                 }
             }
-            continue;
-        }
-
-        let old_frame = IRect::from_corners(position.0, position.0 + bounds.0);
-        if old_frame.min != new_frame.min {
-            position.0 = new_frame.min;
+            SyncAction::SeatVerify => {
+                // Driven move awaiting confirmation: the animator may have
+                // converged and the ack may be in, but a slow-applying app
+                // (or WindowServer) can still echo the pre-move frame —
+                // adopting it regresses `Position` and the audit re-homes
+                // every few seconds forever (the breathing window).
+                // Paint-only refresh; verification owns the confirmation.
+                if let Err(err) = window.update_frame() {
+                    debug!("refreshing unconfirmed window {entity} frame: {err}");
+                }
+                counters.move_ignore_verifying += 1;
+                if !state.is_verifying() {
+                    commands.entity(entity).insert(WindowSync::Verifying {
+                        retries: WindowSync::VERIFY_RETRIES,
+                    });
+                }
+            }
+            SyncAction::PushBack => {
+                if distrust {
+                    // Untracked session: push the slot back instead of
+                    // adopting, or the displaced echo becomes layout
+                    // permanently and a later `commit` legitimizes it.
+                    let Ok(live) = window.update_frame() else {
+                        continue;
+                    };
+                    let drift = (live.min - position.0).abs();
+                    debug!(
+                        "untracked native drag of window {entity}, drift {drift:?}: pushing slot back"
+                    );
+                    // Joins the in-flight commit frame: this push-back belongs
+                    // to the motion already converging, not a new one. A
+                    // dropped write reseats the resend marker (no echo will
+                    // retry a settled push). Invalidates the dedup entry:
+                    // the drift proves the OS never converged to the last
+                    // intent, so re-sending it is the repair, not a dup.
+                    let epoch = write_state.current_epoch();
+                    write_state.invalidate_sent(window.id());
+                    match push_position(
+                        &mut window,
+                        position.0,
+                        writer.as_deref(),
+                        &mut write_state,
+                        config.ax_writer_enabled(),
+                        epoch,
+                        false,
+                    ) {
+                        PushOutcome::Deduped => counters.push_deduped += 1,
+                        PushOutcome::Sent => counters.push_sent += 1,
+                        PushOutcome::DroppedFull => {
+                            counters.push_dropped_full += 1;
+                            if let Ok(mut entity_commands) = commands.get_entity(entity) {
+                                entity_commands.try_insert(ResendMarker);
+                            }
+                        }
+                    }
+                    counters.move_pushback_distrust += 1;
+                    commands.entity(entity).insert(WindowSync::Drifted);
+                } else {
+                    let Ok(new_frame) = window.update_frame() else {
+                        continue;
+                    };
+                    let drift = (new_frame.min - position.0).abs();
+                    if drift.x > 1 || drift.y > 1 {
+                        debug!(
+                            "scroll grace: echo for {entity} drifted {drift:?}, pushing slot back"
+                        );
+                        let epoch = write_state.current_epoch();
+                        write_state.invalidate_sent(window.id());
+                        match crate::ax_writer::push_position(
+                            &mut window,
+                            position.0,
+                            writer.as_deref(),
+                            &mut write_state,
+                            config.ax_writer_enabled(),
+                            epoch,
+                            false,
+                        ) {
+                            PushOutcome::Deduped => counters.push_deduped += 1,
+                            PushOutcome::Sent => counters.push_sent += 1,
+                            PushOutcome::DroppedFull => {
+                                counters.push_dropped_full += 1;
+                                if let Ok(mut entity_commands) = commands.get_entity(entity) {
+                                    entity_commands.try_insert(ResendMarker);
+                                }
+                            }
+                        }
+                        counters.move_pushback_grace += 1;
+                    }
+                }
+            }
+            SyncAction::Adopt => {
+                let Ok(new_frame) = window.update_frame() else {
+                    continue;
+                };
+                let old_frame = IRect::from_corners(position.0, position.0 + bounds.0);
+                if old_frame.min != new_frame.min {
+                    position.0 = new_frame.min;
+                    counters.move_adopt += 1;
+                }
+                if !matches!(state, WindowSync::Synced) {
+                    commands.entity(entity).insert(WindowSync::Synced);
+                }
+            }
         }
     }
 }
@@ -2412,12 +2466,11 @@ pub(super) fn update_overlays(
     strips: Query<(&LayoutStrip, &ChildOf)>,
     drag_held: Query<(
         &MouseHeldMarker,
-        Has<DragDisplayArmed>,
-        Has<DragScrollArmed>,
+        Option<&Gesture>,
+        Option<&crate::ecs::mouse::DragPaint>,
     )>,
     flight: FlightMarkers<'_, '_>,
-    scroll_grace: Res<DragScrollState>,
-    paint: Res<DragPaintState>,
+    settle: crate::ecs::sync::SettleGate<'_, '_>,
     time: Res<Time>,
     overlay_mgr: Option<NonSendMut<OverlayManager>>,
     clocks: OverlayClocks<'_>,
@@ -2479,13 +2532,15 @@ pub(super) fn update_overlays(
     // Dim surfaces stay frozen (never hidden — no flash) and the
     // drop-preview ghost keeps painting on its own window.
     let holder_held = !drag_held.is_empty();
-    if !holder_held && paint.target.is_none() && left_button_held() {
-        // Button held with no drag tracking (a content press by design):
-        // nothing to hide for and no hit-test worth its IPC — borders
-        // stay glued and native behavior is fully untouched.
-        // `paint.begin` runs for every tracked grab, so an empty target
-        // exactly marks the untracked ones. Without a held button this
-        // must not fire: ordinary dirty ticks still need their repaint.
+    if !holder_held && left_button_held() {
+        // Button held with no drag tracking (a press the tap never
+        // delivered): no holder means no gesture owns the drag, so there is
+        // nothing to hide for and no hit-test worth its IPC — borders stay
+        // glued and native behavior is fully untouched. Without a held
+        // button this must not fire: ordinary dirty ticks still need their
+        // repaint. (Paint used to linger past holder timeouts and force a
+        // hit-test here; holder-owned paint dies with the holder, so the
+        // linger case reads as untracked now.)
         return;
     }
     // Two SLS round trips per tick while any button is held with no holder
@@ -2545,15 +2600,16 @@ pub(super) fn update_overlays(
     // fresh snapshot frame for other native motion that bypassed ECS, the
     // cached OS frame last. The grace arm matters most on the release tick
     // itself: without it the border snaps backward to the stale cache for
-    // one tick and then freezes there until the next dirty tick.
-    let tracking_live =
-        overlay_tracks_live(swiping, !drag_held.is_empty(), scroll_grace.settle_active());
+    // one tick and then freezes there until the next dirty tick. Settle
+    // reads through the bundled gate (live `Homing` states, legacy list
+    // fallback).
+    let settle = settle.active(time.elapsed());
+    let tracking_live = overlay_tracks_live(swiping, !drag_held.is_empty(), settle);
     if !drag_held.is_empty() {
         // Trace-only pin for drag-detach diagnosis (see `border_frame_for`):
         // proves the overlay ran during the drag and which truth it read.
         trace!(
-            "overlay drag tick: swiping={swiping} tracking_live={tracking_live} settle={}",
-            scroll_grace.settle_active(),
+            "overlay drag tick: swiping={swiping} tracking_live={tracking_live} settle={settle}",
         );
     }
     // A native-owned held drag (content grab with strip scrolling enabled:
@@ -2565,18 +2621,27 @@ pub(super) fn update_overlays(
     // both keep the layout frame.
     let is_native_held = |entity: Entity| {
         config.left_drag_scrolls_strip()
-            && drag_held
-                .iter()
-                .any(|(marker, armed, scroll_armed)| marker.0 == entity && !armed && !scroll_armed)
+            && drag_held.iter().any(|(marker, gesture, _)| {
+                marker.0 == entity && gesture.is_none_or(|g| !g.display_armed && !g.scroll_armed)
+            })
     };
     // One-frame velocity lead for the drag paint below: extrapolating the
     // grab frame plus pointer EMA keeps the border on the cursor at display
     // rate instead of a frame behind the last event. Stale samples decay
-    // to the plain offset inside the paint state, so holding still can
+    // to the plain offset inside the holder paint, so holding still can
     // never drift the rect. Driven tweens need no lead: border and commit
     // share the presented frame on the same tick.
     let paint_now = time.elapsed();
     let paint_lead = time.delta_secs_f64().clamp(0.0, 0.05);
+    // Paint-only frame for a native-held window, resolved through its
+    // holder's `DragPaint` (seeded at press, gone with the holder despawn).
+    let holder_paint = |entity: Entity| {
+        drag_held
+            .iter()
+            .find(|(marker, _, _)| marker.0 == entity)
+            .and_then(|(_, _, paint)| paint)
+            .and_then(|paint| paint.predicted(paint_now, paint_lead))
+    };
     let frame = border_frame_for(
         &windows,
         &flight,
@@ -2584,7 +2649,7 @@ pub(super) fn update_overlays(
         window,
         tracking_live,
         is_native_held(entity),
-        paint.predicted_frame_for(entity, paint_now, paint_lead),
+        holder_paint(entity),
         store.as_deref(),
     );
     let focused_abs_cg = abs_cg_rect(frame, window);
@@ -2671,7 +2736,7 @@ pub(super) fn update_overlays(
                 window,
                 tracking_live,
                 is_native_held(entity),
-                paint.predicted_frame_for(entity, paint_now, paint_lead),
+                holder_paint(entity),
                 store.as_deref(),
             );
             // Parked-sliver guard, generalized per window across displays.
@@ -2739,11 +2804,12 @@ pub(super) fn update_overlays(
 
 #[instrument(level = Level::TRACE, skip_all)]
 pub(super) fn commit_window_position(
-    mut moved_windows: CommittedWindows,
+    moved_windows: CommittedWindows,
     writer: Option<Res<AxWriterQueue>>,
     mut write_state: ResMut<AxWriteState>,
     config: Res<Config>,
     mut commands: Commands,
+    mut counters: ResMut<SyncCounters>,
 ) {
     use crate::ax_writer::{PushOutcome, push_position};
 
@@ -2751,30 +2817,32 @@ pub(super) fn commit_window_position(
     // joins one epoch, so whole-frame convergence stays observable even
     // though the worker drains latest-per-window.
     let epoch = write_state.begin_frame();
-    if !(config.ax_writer_enabled() && writer.is_some()) {
-        // Synchronous path: default, tests (no queue), dance apps, and
-        // shutdown. Unchanged behavior.
-        moved_windows
-            .par_iter_mut()
-            .for_each(|(mut window, position, _, _, _)| window.reposition(position.0));
-        return;
-    }
-    // Sequential: sends are ~100ns and sequence numbering needs `&mut`.
-    // Every position push (here, adoption/grace push-backs, settle, verify)
-    // routes through `push_position` so the queue stays the single writer.
-    // DroppedFull reseats the resend marker (a settled window's `Changed`
-    // will not refire); anything else clears it. Focused windows drain
-    // ahead of the batch on the worker.
+    // Single-writer discipline: every position push (here, adoption/grace
+    // push-backs, settle, verify) routes through `push_position`, queue or
+    // not. Without a queue (tests, dance apps, shutdown) it degrades to a
+    // synchronous write plus intent bookkeeping — same truth the async path
+    // records, so the dedup filter and the unacked gate never diverge
+    // between paths. Sequential: sends are ~100ns and sequence numbering
+    // needs `&mut`. DroppedFull reseats the resend marker (a settled
+    // window's `Changed` will not refire); anything else clears it. Focused
+    // windows drain ahead of the batch on the worker.
+    let queue = writer.as_deref();
+    let enabled = config.ax_writer_enabled() && queue.is_some();
     for (mut window, position, entity, focused, _) in moved_windows {
         let outcome = push_position(
             &mut window,
             position.0,
-            writer.as_deref(),
+            queue,
             &mut write_state,
-            true,
+            enabled,
             epoch,
             focused,
         );
+        match outcome {
+            PushOutcome::Deduped => counters.push_deduped += 1,
+            PushOutcome::Sent => counters.push_sent += 1,
+            PushOutcome::DroppedFull => counters.push_dropped_full += 1,
+        }
         if let Ok(mut entity_commands) = commands.get_entity(entity) {
             if outcome == PushOutcome::DroppedFull {
                 entity_commands.try_insert(ResendMarker);

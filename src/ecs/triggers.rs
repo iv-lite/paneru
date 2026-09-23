@@ -15,7 +15,7 @@ use tracing::{Level, debug, error, info, instrument, trace, warn};
 
 use super::{
     ActiveDisplayMarker, BProcess, FocusedMarker, FreshMarker, MissionControlActive,
-    MouseHeldMarker, PreviousManagedStrip, RetryFrontSwitch, SpawnWindowTrigger, StrayFocusEvent,
+    MouseHeldMarker, PreviousWorkspace, RetryFrontSwitch, SpawnWindowTrigger, StrayFocusEvent,
     SystemTheme, Timeout, Unmanaged,
 };
 use crate::config::Config;
@@ -23,6 +23,7 @@ use crate::ecs::focus::{FocusHistory, activate_owner_display};
 use crate::ecs::layout::LayoutStrip;
 use crate::ecs::params::{ActiveDisplay, GlobalState, WindowCtx, Windows};
 use crate::ecs::state::PaneruState;
+use crate::ecs::sync::{ResizeJitter, WindowSync};
 use crate::ecs::workspace::RestoreFocusMarker;
 use crate::ecs::{
     ActiveWorkspaceMarker, Bounds, DockPosition, Initializing, LayoutPosition, Position,
@@ -732,12 +733,14 @@ pub(super) fn window_unmanaged_trigger(
     }
 }
 
-fn remember_managed_strip(entity: Entity, strip: &LayoutStrip, commands: &mut Commands) {
+/// Remembers only the workspace home (strip identity) across minimize/hide.
+/// The slot index is intentionally forgotten: rejoin placement comes from
+/// config insertion or the overlapped column.
+fn remember_workspace_home(entity: Entity, strip: &LayoutStrip, commands: &mut Commands) {
     if let Ok(mut entity_commands) = commands.get_entity(entity) {
-        entity_commands.try_insert(PreviousManagedStrip {
+        entity_commands.try_insert(PreviousWorkspace {
             workspace_id: strip.id(),
             virtual_index: strip.virtual_index,
-            index: strip.index_of(entity).unwrap_or(strip.len()),
         });
     }
 }
@@ -770,7 +773,7 @@ pub(super) fn window_minimized_trigger(
                 );
             }
             if strip.contains(entity) {
-                remember_managed_strip(entity, &strip, &mut commands);
+                remember_workspace_home(entity, &strip, &mut commands);
                 strip.remove(entity);
             }
         }
@@ -791,7 +794,7 @@ pub(super) fn window_managed_trigger(
         ),
         Without<Window>,
     >,
-    previous_strips: Query<&PreviousManagedStrip>,
+    previous_homes: Query<&PreviousWorkspace>,
     initializing: Option<Res<Initializing>>,
     mut ctx: WindowCtx,
 ) {
@@ -813,10 +816,7 @@ pub(super) fn window_managed_trigger(
     debug!("Entity {entity} is managed again.");
     let (display, dock) = *active_display;
     let display_bounds = display.actual_display_bounds(dock, &ctx.config);
-    let mut insert_at = previous_strips
-        .get(entity)
-        .ok()
-        .map(|previous| previous.index);
+    let mut insert_at = None;
 
     if let Some(window) = ctx.windows.get(entity)
         && let Some((_, app)) = ctx
@@ -834,25 +834,34 @@ pub(super) fn window_managed_trigger(
             ctx.commands.resize_entity(entity, Size::new(width, height));
         }
 
-        insert_at = properties.insertion().or(insert_at);
+        insert_at = properties.insertion();
     }
 
-    let previous = previous_strips.get(entity).ok().copied();
     for (_, mut strip, _, _) in &mut workspaces {
         strip.remove(entity);
     }
 
     // The strip the window ended up in, and whether that strip is the one
-    // currently on screen.
+    // currently on screen. The remembered home routes back to the original
+    // virtual workspace; placement within it comes from config insertion or
+    // the overlapped column (the slot index is forgotten by design).
+    let home = previous_homes.get(entity).ok().copied();
     let mut landed_in = None;
-    if let Some(previous) = previous {
+    if let Some(home) = home {
         for (strip_entity, mut strip, _, active) in &mut workspaces {
-            if strip.id() == previous.workspace_id && strip.virtual_index == previous.virtual_index
-            {
-                strip.insert_at(insert_at.unwrap_or(previous.index), entity);
+            if strip.id() == home.workspace_id && strip.virtual_index == home.virtual_index {
+                if let Some(index) = insert_at {
+                    strip.insert_at(index, entity);
+                } else {
+                    let end = strip.len();
+                    strip.insert_at(end, entity);
+                }
                 landed_in = Some((strip_entity, active));
                 break;
             }
+        }
+        if let Ok(mut entity_commands) = ctx.commands.get_entity(entity) {
+            entity_commands.try_remove::<PreviousWorkspace>();
         }
     }
 
@@ -877,10 +886,6 @@ pub(super) fn window_managed_trigger(
             let insertion = insertion.unwrap_or(active_strip.len());
             active_strip.insert_at(insertion, entity);
         }
-    }
-
-    if let Ok(mut entity_commands) = ctx.commands.get_entity(entity) {
-        entity_commands.try_remove::<PreviousManagedStrip>();
     }
 
     if let Some((strip_entity, false)) = landed_in {
@@ -1159,6 +1164,8 @@ pub(super) fn spawn_window_trigger(
             width_ratio,
             window,
             layout_position,
+            WindowSync::default(),
+            ResizeJitter::default(),
             ChildOf(app_entity),
         ));
         commands.trigger(SendMessageTrigger(Event::WindowSpawned {

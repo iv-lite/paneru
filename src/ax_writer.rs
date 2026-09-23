@@ -292,6 +292,15 @@ impl AxWriteState {
     pub(crate) fn mark_sent(&mut self, win_id: WinID, target: Origin) {
         self.record_sent(win_id, target);
     }
+
+    /// Forgets the newest intent for `win_id`. Correction pushes (grace /
+    /// distrust / settle push-backs) must call this when they observe OS
+    /// drift: the dedup filter assumes the OS converged to the last intent,
+    /// but a natively displaced window proves it did not — re-sending the
+    /// same target is the repair, never a duplicate.
+    pub(crate) fn invalidate_sent(&mut self, win_id: WinID) {
+        self.last_sent.remove(&win_id);
+    }
 }
 
 /// Folds one drain batch to latest-per-window: intermediate lerp steps
@@ -637,5 +646,21 @@ mod tests {
         state.mark_sent(3, target);
         assert!(state.already_sent(3, target));
         assert!(!state.unacked(3));
+    }
+
+    #[test]
+    fn invalidation_forces_correction_repush() {
+        use crate::manager::Origin;
+        let mut state = AxWriteState::default();
+        let target = Origin::new(10, 20);
+        // A commit records the intent...
+        state.mark_sent(3, target);
+        assert!(state.already_sent(3, target));
+        // ...then native drift is observed: the correction must send even
+        // though it matches the last intent.
+        state.invalidate_sent(3);
+        assert!(!state.already_sent(3, target));
+        // Unknown windows invalidate cleanly.
+        state.invalidate_sent(99);
     }
 }

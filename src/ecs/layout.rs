@@ -1124,6 +1124,10 @@ impl LayoutStrip {
         })
     }
 
+    /// Stack neighbor directly above `entity`, if it sits in a stack. Pure
+    /// layout query, kept for stack-neighbor operations (the resize echo path
+    /// no longer auto-adjusts neighbors — layout owns sizes now).
+    #[allow(dead_code)]
     pub fn above(&self, entity: Entity) -> Option<Entity> {
         let index = self.index_of(entity).ok()?;
         let column = self.get(index).ok()?;

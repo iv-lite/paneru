@@ -1,10 +1,9 @@
-use std::collections::{HashMap, VecDeque};
 use std::sync::mpsc::Receiver;
 use std::time::{Duration, Instant};
 
 use bevy::MinimalPlugins;
 use bevy::app::App as BevyApp;
-use bevy::app::{First, Last, PostUpdate, PreUpdate, Startup};
+use bevy::app::{AppExit, First, Last, PostUpdate, PreUpdate, Startup};
 use bevy::ecs::change_detection::DetectChanges;
 use bevy::ecs::hierarchy::ChildOf;
 use bevy::ecs::lifecycle::RemovedComponents;
@@ -12,7 +11,7 @@ use bevy::ecs::message::MessageReader;
 use bevy::ecs::query::{Added, Changed, Or, With};
 use bevy::ecs::resource::Resource;
 use bevy::ecs::schedule::SystemCondition;
-use bevy::ecs::schedule::common_conditions::{not, resource_exists};
+use bevy::ecs::schedule::common_conditions::{not, on_message, resource_exists};
 use bevy::ecs::schedule::{ScheduleLabel as _, SingleThreadedExecutor, SystemSet};
 use bevy::ecs::system::{Commands, EntityCommands, Local, Query, Res, SystemId};
 use bevy::prelude::Event as BevyEvent;
@@ -59,6 +58,7 @@ pub(crate) mod restore;
 pub mod script_state;
 pub mod scroll;
 pub mod state;
+pub mod sync;
 pub(crate) mod systems;
 mod triggers;
 pub mod workspace;
@@ -119,8 +119,11 @@ pub fn register_systems(app: &mut bevy::app::App) {
     // `vw_indicator_dirty` gate.
     let overlay_tracking_motion =
         |strip_scrolled: Query<(), (With<ActiveWorkspaceMarker>, Changed<Position>)>,
-         drag_held: Query<(), DrivenDragHeld>| {
-            !strip_scrolled.is_empty() || !drag_held.is_empty()
+         drag_held: Query<Option<&crate::ecs::sync::Gesture>, With<MouseHeldMarker>>| {
+            !strip_scrolled.is_empty()
+                || drag_held
+                    .iter()
+                    .any(|gesture| gesture.is_some_and(|g| g.drives()))
         };
     // Windows appearing or disappearing change the per-window border set
     // (inactive borders), which no layout/focus tick necessarily accompanies.
@@ -192,6 +195,24 @@ pub fn register_systems(app: &mut bevy::app::App) {
     // New windows are when stray native tabs can appear; the timer is only
     // the backstop for tabs the OS assembles late.
     let window_added = |added: Query<(), Added<Window>>| !added.is_empty();
+    // OS-echo gating: the move/resize reconcilers only schedule on frames
+    // carrying a matching echo. Separate reader (like `window_closed_signals`
+    // above): consuming here must not starve the systems below.
+    let window_echo_signals = |mut messages: MessageReader<Event>| {
+        messages.read().any(|event| {
+            matches!(
+                event,
+                Event::WindowMoved { .. } | Event::WindowResized { .. }
+            )
+        })
+    };
+    // Focused-window discovery only needs to run when something claims
+    // focus; same separate-reader shape as the echo gate above.
+    let window_focused_signal = |mut messages: MessageReader<Event>| {
+        messages
+            .read()
+            .any(|event| matches!(event, Event::WindowFocused { .. }))
+    };
 
     app.add_systems(
         Startup,
@@ -207,12 +228,12 @@ pub fn register_systems(app: &mut bevy::app::App) {
     app.add_message::<InputEvent>();
     app.init_resource::<systems::ParkedCommands>();
     app.init_resource::<crate::ecs::PendingValidations>();
-    app.init_resource::<crate::ecs::AdoptionCalm>();
     app.init_resource::<crate::ecs::UserFocus>();
     app.init_resource::<crate::ecs::LastPress>();
     app.init_resource::<crate::ecs::BurstClock>();
     app.init_resource::<crate::ecs::DisplayGeneration>();
     app.init_resource::<crate::ax_writer::AxWriteState>();
+    app.init_resource::<crate::ecs::sync::SyncCounters>();
     app.add_systems(
         PreUpdate,
         (
@@ -253,11 +274,11 @@ pub fn register_systems(app: &mut bevy::app::App) {
                 .run_if(not(resource_exists::<Initializing>))
                 .run_if(not_swiping)
                 .run_if(on_timer(Duration::from_secs(5)).or_eager(window_added)),
-            systems::auto_discover_unmanaged_focused_windows,
+            systems::auto_discover_unmanaged_focused_windows.run_if(window_focused_signal),
             // Throttled: each attempt is AX round trips, and the 2s Timeout
             // bounds the total storm.
             systems::retry_front_switch.run_if(on_timer(Duration::from_millis(100))),
-            systems::tick_cold_start,
+            systems::tick_cold_start.run_if(resource_exists::<ColdStart>),
             systems::publish_snapshot_cadence,
             systems::update_low_power_state
                 .run_if(resource_exists::<LowPowerMode>)
@@ -267,13 +288,14 @@ pub fn register_systems(app: &mut bevy::app::App) {
                 systems::window_moved_update_frame,
             )
                 .chain()
-                .run_if(not_swiping),
-            systems::cleanup_on_exit,
-            restore::tick_restore_grace,
+                .run_if(not_swiping)
+                .run_if(window_echo_signals),
+            systems::cleanup_on_exit.run_if(on_message::<AppExit>),
+            restore::tick_restore_grace.run_if(resource_exists::<restore::SessionRestore>),
             state::periodic_state_save.run_if(on_timer(Duration::from_mins(5))),
-            state::cleanup_on_exit,
+            state::cleanup_on_exit.run_if(on_message::<AppExit>),
             script_state::periodic_script_state_save.run_if(on_timer(Duration::from_mins(5))),
-            script_state::script_state_cleanup_on_exit,
+            script_state::script_state_cleanup_on_exit.run_if(on_message::<AppExit>),
         ),
     );
     app.add_systems(
@@ -644,11 +666,15 @@ pub enum Unmanaged {
     Hidden,
 }
 
+/// Workspace home remembered across minimize/hide: the strip identity a
+/// window belonged to when it left the layout. Only routing survives — the
+/// slot index is deliberately forgotten (rejoin uses the configured
+/// insertion or the overlapped column). Strip identity is genuinely lost on
+/// `remove()`, so this single fact lives here until unhide consumes it.
 #[derive(Clone, Component, Copy, Debug)]
-pub struct PreviousManagedStrip {
+pub struct PreviousWorkspace {
     pub workspace_id: WorkspaceId,
     pub virtual_index: u32,
-    pub index: usize,
 }
 
 /// Wrapper component for a `ProcessApi` trait object, enabling dynamic dispatch for process-related operations within Bevy.
@@ -739,37 +765,6 @@ pub struct SkipReshuffle(pub bool);
 /// Spawned with a `Timeout` so it auto-despawns if the mouse-up event is lost.
 #[derive(Component)]
 pub struct MouseHeldMarker(pub Entity);
-
-/// Marker on a [`MouseHeldMarker`] holder arming display transfer for this
-/// drag: the grab happened with the configured drag shortcut held on a
-/// window. Without it, held drags pin their window to its slot instead of
-/// following the cursor across displays.
-#[derive(Component)]
-pub struct DragDisplayArmed;
-
-/// Marker on a [`MouseHeldMarker`] holder arming strip-scroll for this drag:
-/// the grab happened on the window's header (titlebar/toolbar, never content)
-/// with no drag shortcut held. Only such grabs scroll the columns and
-/// swallow the native drag; content grabs keep fully native behavior.
-#[derive(Component)]
-pub struct DragScrollArmed;
-
-/// Marker on a [`MouseHeldMarker`] holder recording a titlebar grab: the
-/// press landed on the window's titlebar. Drag, slide and friction math
-/// runs only for such holders — content grabs drive nothing and compute
-/// nothing, so the pointer path stays untouched.
-#[derive(Component)]
-pub struct TitlebarGrab;
-
-/// Query filter matching holders that actually drive something: armed or
-/// scroll-driven drags. Plain content holders (tracked for release
-/// bookkeeping only) must not key per-frame costs — overlay passes,
-/// snapshot fast-polling, active pacing — so every such gate filters on
-/// this instead of bare [`MouseHeldMarker`].
-pub(crate) type DrivenDragHeld = (
-    With<MouseHeldMarker>,
-    Or<(With<DragDisplayArmed>, With<DragScrollArmed>)>,
-);
 
 /// Resource indicating whether Mission Control is currently active.
 #[derive(Resource)]
@@ -885,98 +880,6 @@ impl PendingValidations {
         Duration::from_millis(
             500 * 2_u64.pow(u32::from(PENDING_VALIDATION_TRIES.saturating_sub(tries))),
         )
-    }
-}
-
-/// Damping for chronic native resizers (Electron breathing, progress-driven
-/// re-layout): windows that adopt small OS sizes over and over hold the tile
-/// instead of chasing app jitter. Button-held resizes (live user edge-drags)
-/// always adopt; large deltas reset the episode. See `damp`.
-#[derive(Resource, Debug, Default)]
-pub struct AdoptionCalm {
-    recent: HashMap<WinID, (VecDeque<Duration>, bool)>,
-}
-
-/// Small adoptions before damping engages, inside the trailing window.
-const ADOPTION_CALM_COUNT: usize = 5;
-/// Trailing window a burst of small adoptions must fit in to count as jitter.
-const ADOPTION_CALM_WINDOW: Duration = Duration::from_secs(60);
-/// Deltas at/above this are genuine resizes: adopted, and reset the episode.
-const ADOPTION_CALM_PX: i32 = 8;
-
-impl AdoptionCalm {
-    /// Records a small button-up size adoption for `win` at `now`; returns
-    /// `true` when the window is now breathing and this adoption should be
-    /// skipped (tile holds). Warns once per episode; large deltas and quiet
-    /// stretches reset it.
-    pub fn damp(&mut self, win: WinID, now: Duration, delta_px: i32) -> bool {
-        if delta_px >= ADOPTION_CALM_PX {
-            self.recent.remove(&win);
-            return false;
-        }
-        let (recent, warned) = self.recent.entry(win).or_default();
-        while recent
-            .front()
-            .is_some_and(|at| now.saturating_sub(*at) > ADOPTION_CALM_WINDOW)
-        {
-            recent.pop_front();
-        }
-        recent.push_back(now);
-        if recent.len() > ADOPTION_CALM_COUNT {
-            if !*warned {
-                *warned = true;
-                warn!(
-                    "adoption damping: window {win} resized itself repeatedly; holding tile size"
-                );
-            }
-            return true;
-        }
-        false
-    }
-}
-
-#[cfg(test)]
-mod adoption_calm_tests {
-    use super::*;
-
-    #[test]
-    fn chronic_jitter_damps_then_large_resets() {
-        let mut calm = AdoptionCalm::default();
-        let start = Duration::from_secs(100);
-        // Five small adoptions inside the window still adopt...
-        for i in 0..ADOPTION_CALM_COUNT {
-            let now = start + Duration::from_millis(i as u64 * 20);
-            assert!(!calm.damp(7, now, 2), "small adoption {i} adopts");
-        }
-        // ...the sixth is held.
-        assert!(
-            calm.damp(7, start + Duration::from_millis(120), 2),
-            "chronic jitter holds the tile"
-        );
-        // A large resize is genuine: adopts and resets the episode.
-        assert!(
-            !calm.damp(7, start + Duration::from_millis(140), 50),
-            "large resize resets"
-        );
-        assert!(
-            !calm.damp(7, start + Duration::from_millis(160), 2),
-            "fresh episode adopts again"
-        );
-        // Other windows are independent.
-        assert!(!calm.damp(9, start, 2));
-    }
-
-    #[test]
-    fn quiet_stretch_resets_the_episode() {
-        let mut calm = AdoptionCalm::default();
-        for i in 0..ADOPTION_CALM_COUNT {
-            assert!(!calm.damp(7, Duration::from_secs(i as u64), 2));
-        }
-        // Past the trailing window, history drains and adoption resumes.
-        assert!(
-            !calm.damp(7, Duration::from_secs(120), 2),
-            "quiet stretch resets"
-        );
     }
 }
 

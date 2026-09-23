@@ -6,12 +6,13 @@ use bevy::time::TimeUpdateStrategy;
 use crate::commands::{Command, Direction, MouseMove, MoveFocus, Operation};
 use crate::config::{Config, MainOptions, WindowParams};
 use crate::ecs::layout::{LayoutStrip, PARKED_STRIP_SLIVER};
-use crate::ecs::mouse::{DragModifierState, DragPaintState, DragScrollState, DropPreviewState};
+use crate::ecs::mouse::{DragModifierState, DragPaint, DragScrollState, DropPreviewState};
+use crate::ecs::sync::{Gesture, GestureKind, WindowSync};
 use crate::ecs::workspace::IgnoredMovedWindows;
 use crate::ecs::{
-    ActiveDisplayMarker, ActiveWorkspaceMarker, Bounds, DockPosition, DragDisplayArmed,
-    DragScrollArmed, DragSettleMarker, LayoutPosition, MouseHeldMarker, Position, RepositionMarker,
-    Scrolling, SpawnWindowTrigger, StaleAxMarker, Timeout, Unmanaged,
+    ActiveDisplayMarker, ActiveWorkspaceMarker, Bounds, DockPosition, DragSettleMarker,
+    LayoutPosition, MouseHeldMarker, Position, RepositionMarker, Scrolling, SpawnWindowTrigger,
+    StaleAxMarker, Timeout, Unmanaged,
 };
 use crate::events::Event;
 use crate::manager::{Application, Display, Origin, Size, Window};
@@ -1059,13 +1060,13 @@ fn test_native_drag_accumulates_paint_offset_with_slot_pinned() {
         .with_windows(1)
         .on_iteration(3, |world, _state| {
             let entity = find_window_entity(0, world);
-            let paint = world.resource::<DragPaintState>();
-            assert_eq!(paint.target, Some(entity));
-            // No per-event advance for content grabs: the offset stays at
-            // the grab frame while the slot stays pinned.
+            // Holder paint seeded at press: grab frame with no pointer
+            // offset for content grabs (they advance nothing per event).
+            let mut holders = world.query_filtered::<&DragPaint, With<MouseHeldMarker>>();
+            let paint = holders.iter(world).next().expect("holder paint");
             assert_eq!(paint.offset, Origin::ZERO);
             assert_eq!(
-                paint.frame_for(entity),
+                paint.frame(),
                 Some(IRect::from_corners(
                     Origin::new(0, TEST_MENUBAR_HEIGHT),
                     Origin::new(400, 768),
@@ -1077,8 +1078,12 @@ fn test_native_drag_accumulates_paint_offset_with_slot_pinned() {
             assert_eq!(position.0, Origin::new(0, TEST_MENUBAR_HEIGHT));
         })
         .on_iteration(4, |world, _state| {
-            let paint = world.resource::<DragPaintState>();
-            assert_eq!(paint.target, None, "release ends the paint gesture");
+            // Release despawns the holder, taking its paint with it.
+            let mut holders = world.query_filtered::<Entity, With<MouseHeldMarker>>();
+            assert!(
+                holders.iter(world).next().is_none(),
+                "release ends the paint gesture"
+            );
         })
         .run(commands);
 }
@@ -1089,8 +1094,6 @@ fn test_native_drag_accumulates_paint_offset_with_slot_pinned() {
 /// adopting the displaced frame.
 #[test]
 fn test_lost_release_still_arms_echo_shield() {
-    use crate::ecs::mouse::DragScrollState;
-
     let grab = CGPoint::new(200.0, 500.0);
     let mut h = TestHarness::new().with_windows(1);
     // Let init settle first so the press finds a real window.
@@ -1136,10 +1139,12 @@ fn test_lost_release_still_arms_echo_shield() {
                 .is_none(),
             "timed-out holder is gone"
         );
-        let shield = world.resource::<DragScrollState>();
+        let sync = world
+            .get::<WindowSync>(target)
+            .expect("window carries sync state");
         assert!(
-            shield.members.contains(&target),
-            "timeout arms the echo shield for the held target"
+            matches!(sync, WindowSync::Homing { .. }),
+            "timeout arms Homing for the held target, got {sync:?}"
         );
     }
     // The lagging echo of the native drag now arrives, still inside the
@@ -2879,21 +2884,17 @@ fn test_content_press_drives_nothing() {
     TestHarness::new()
         .with_windows(3)
         .on_iteration(3, |world, _state| {
-            // Mid-gesture: exactly one holder, but with neither arming
-            // marker — tracked for release bookkeeping, driving nothing.
-            let holders: Vec<(Entity, bool, bool)> = world
-                .query_filtered::<(
-                    Entity,
-                    Has<DragDisplayArmed>,
-                    Has<DragScrollArmed>,
-                ), With<MouseHeldMarker>>()
+            // Mid-gesture: exactly one holder, carrying a content gesture
+            // that drives nothing — tracked for release bookkeeping only.
+            let holders: Vec<(Entity, Option<Gesture>)> = world
+                .query_filtered::<(Entity, Option<&Gesture>), With<MouseHeldMarker>>()
                 .iter(world)
+                .map(|(entity, gesture)| (entity, gesture.copied()))
                 .collect();
             assert_eq!(holders.len(), 1, "content press holds its window");
-            assert!(
-                !holders[0].1 && !holders[0].2,
-                "content holder carries no arming markers"
-            );
+            let gesture = holders[0].1.expect("press edge classifies every grab");
+            assert_eq!(gesture.kind, GestureKind::Content);
+            assert!(!gesture.drives(), "content holder drives nothing");
             assert_window_at!(world, 0, 0, TEST_MENUBAR_HEIGHT);
             assert_window_at!(world, 1, 400, TEST_MENUBAR_HEIGHT);
             assert_window_at!(world, 2, 800, TEST_MENUBAR_HEIGHT);
@@ -2901,7 +2902,8 @@ fn test_content_press_drives_nothing() {
                 world.query::<&Scrolling>().iter(world).next().is_none(),
                 "content drags must not arm the scroll pipeline"
             );
-            let paint = world.resource::<DragPaintState>();
+            let mut paints = world.query_filtered::<&DragPaint, With<MouseHeldMarker>>();
+            let paint = paints.iter(world).next().expect("holder paint");
             assert_eq!(
                 paint.offset,
                 Origin::ZERO,

@@ -28,12 +28,13 @@ use crate::ecs::mouse::{DragModifierState, DropPreviewState};
 use crate::ecs::params::{
     ActiveDisplay, ActiveDisplayMut, GlobalState, Windows, ring_neighbour_of_cursor,
 };
+use crate::ecs::sync::Gesture;
 use crate::ecs::workspace::RestoreFocusMarker;
 use crate::ecs::{
-    ActiveDisplayMarker, ActiveWorkspaceMarker, Bounds, ColdStart, DockPosition, DragDisplayArmed,
-    FocusedMarker, FullWidthMarker, Initializing, ManualStripOffset, MissionControlActive,
-    MouseHeldMarker, NativeFullscreenMarker, RaiseWindow, SelectedVirtualMarker, SpawnCommandsExt,
-    Timeout, Unmanaged, UserFocus,
+    ActiveDisplayMarker, ActiveWorkspaceMarker, Bounds, ColdStart, DockPosition, FocusedMarker,
+    FullWidthMarker, Initializing, ManualStripOffset, MissionControlActive, MouseHeldMarker,
+    NativeFullscreenMarker, RaiseWindow, SelectedVirtualMarker, SpawnCommandsExt, Timeout,
+    Unmanaged, UserFocus,
 };
 use crate::events::Event;
 use crate::manager::{Application, Display, Origin, Size, Window, WindowManager, origin_from};
@@ -1957,7 +1958,7 @@ fn print_internal_state_handler(
     apps: Query<&Application>,
     workspaces: StripsWithVisibility,
     displays: Query<(&Display, Entity, Has<ActiveDisplayMarker>)>,
-    held: Query<(Entity, &MouseHeldMarker, Has<DragDisplayArmed>)>,
+    held: Query<(Entity, &MouseHeldMarker, Option<&Gesture>)>,
     drag_modifiers: Res<DragModifierState>,
     drop_preview: Res<DropPreviewState>,
     mission_control: Res<MissionControlActive>,
@@ -2047,7 +2048,7 @@ fn print_internal_state_handler(
     // drag did or did not transfer, without guessing.
     let holders = held
         .iter()
-        .map(|(holder, marker, armed)| format!("{holder}->{} armed={armed}", marker.0))
+        .map(|(holder, marker, gesture)| format!("{holder}->{} gesture={gesture:?}", marker.0))
         .collect::<Vec<_>>();
     info!(
         "Drag: holders=[{}], modifiers={:?}, preview={:?}, mission_control={}, drag_modifier={:?}, resize_modifier={:?}, warp={:?}, left_drag_scrolls_strip={}",
