@@ -121,6 +121,11 @@ pub(crate) struct AxWriteState {
     issued: HashMap<WinID, u64>,
     acked: HashMap<WinID, u64>,
     last_sent: HashMap<WinID, Origin>,
+    /// Commit epoch of the last issue per window. Backs
+    /// [`AxWriteState::unacked_timed_out`]: a dropped ack (the worker drops
+    /// completions when the main thread stops draining) must not gate
+    /// adoption/verify on a settled window forever.
+    issued_at: HashMap<WinID, u64>,
     /// Latest begun commit epoch (0 = no frame yet). Push sites outside the
     /// commit join this in-flight epoch via [`AxWriteState::current_epoch`].
     current: u64,
@@ -136,6 +141,10 @@ pub(crate) struct AxWriteState {
     /// Largest issued-behind-landed gap already warned about (watchdog
     /// edge-trigger, reset once the worker catches up).
     last_warned_gap: u64,
+    /// Circuit breaker set by the watchdog degrade ladder (see
+    /// `drain_ax_acks`): while set, new pushes route synchronously instead
+    /// of entering a queue the worker is not draining. Cleared on recovery.
+    fallback: bool,
 }
 
 /// Epochs retained past landing, bounding `epoch_members` when a window
@@ -145,7 +154,32 @@ const EPOCH_MEMBER_CAP: usize = 16;
 /// Issued-behind-landed gap (commit frames) past which the watchdog warns
 /// that the writer thread is stuck. At 60fps this is half a second of
 /// motion the OS never saw.
-const STUCK_WRITER_EPOCHS: u64 = 30;
+pub(crate) const STUCK_WRITER_EPOCHS: u64 = 30;
+
+/// Gap past which the watchdog degrades instead of only warning: repair is
+/// restricted to the focused window (see `verify_window_position`) so a
+/// wedged worker cannot stall the pump on every drifting window.
+pub(crate) const STUCK_DEGRADE_EPOCHS: u64 = 60;
+
+/// Gap past which new pushes fail open to the synchronous path until acks
+/// resume. Must stay above [`STUCK_DEGRADE_EPOCHS`].
+pub(crate) const STUCK_FALLBACK_EPOCHS: u64 = 120;
+
+/// How long a still-`unacked` window is given the benefit of the doubt
+/// (commit frames) before readers treat it as acked-for-reading and fall
+/// through to snapshot/direct verify. Matches the stuck-writer threshold:
+/// a genuinely traveling write lands well inside this; a dropped ack
+/// (best-effort `try_send` on a wedged pump) must not gate a settled
+/// window forever. Sequence counts are untouched — only the read gate
+/// relaxes.
+const UNACKED_TTL_EPOCHS: u64 = 30;
+
+/// Watchdog ladder ordering, checked at compile time: warn, then degrade
+/// repair, then fail open — each strictly after the previous.
+const _: () = {
+    assert!(STUCK_WRITER_EPOCHS < STUCK_DEGRADE_EPOCHS);
+    assert!(STUCK_DEGRADE_EPOCHS < STUCK_FALLBACK_EPOCHS);
+};
 
 impl AxWriteState {
     /// Opens a new commit frame. Called once per commit tick, whether or
@@ -165,6 +199,7 @@ impl AxWriteState {
     pub(crate) fn issue(&mut self, win_id: WinID, epoch: u64) -> u64 {
         let seq = self.issued.get(&win_id).copied().unwrap_or(0) + 1;
         self.issued.insert(win_id, seq);
+        self.issued_at.insert(win_id, self.current);
         self.epoch_members.entry(epoch).or_default().insert(win_id);
         self.prune_members();
         seq
@@ -178,6 +213,9 @@ impl AxWriteState {
         if epoch >= self.acked_epoch.get(&win_id).copied().unwrap_or(0) {
             self.acked_epoch.insert(win_id, epoch);
         }
+        if !self.unacked(win_id) {
+            self.issued_at.remove(&win_id);
+        }
         self.advance_landed();
     }
 
@@ -185,6 +223,53 @@ impl AxWriteState {
     pub(crate) fn unacked(&self, win_id: WinID) -> bool {
         self.issued.get(&win_id).copied().unwrap_or(0)
             > self.acked.get(&win_id).copied().unwrap_or(0)
+    }
+
+    /// Whether a still-`unacked` window has been waiting past
+    /// [`UNACKED_TTL_EPOCHS`] commit frames. Readers (adoption, verify) use
+    /// this to treat a lost ack as acked-for-reading and fall through to
+    /// snapshot/direct confirmation: the write either landed (snapshot
+    /// confirms, no duplicate) or truly never will (re-push repairs).
+    /// Sequence counts are untouched, so a late ack still converges.
+    pub(crate) fn unacked_timed_out(&self, win_id: WinID) -> bool {
+        if !self.unacked(win_id) {
+            return false;
+        }
+        self.issued_at
+            .get(&win_id)
+            .is_some_and(|at| self.current.saturating_sub(*at) > UNACKED_TTL_EPOCHS)
+    }
+
+    /// Whether an async write for `win_id` is still converging *and* within
+    /// its grace window. Adoption and verify gate on this instead of
+    /// [`AxWriteState::unacked`] so a dropped ack can delay but never
+    /// permanently block confirmation.
+    pub(crate) fn unacked_live(&self, win_id: WinID) -> bool {
+        self.unacked(win_id) && !self.unacked_timed_out(win_id)
+    }
+
+    /// Oldest still-traveling commit-frame gap, if any. Non-mutating
+    /// counterpart to [`AxWriteState::check_stall`] for readers (verify
+    /// degrade, snapshot cadence) that must not disturb the warn edge.
+    pub(crate) fn open_gap(&self) -> Option<u64> {
+        let oldest = self
+            .epoch_members
+            .keys()
+            .filter(|epoch| !self.landed(**epoch))
+            .min()
+            .copied()?;
+        Some(self.current.saturating_sub(oldest))
+    }
+
+    /// Whether new pushes currently fail open to the synchronous path (see
+    /// [`STUCK_FALLBACK_EPOCHS`]).
+    pub(crate) fn fallback_active(&self) -> bool {
+        self.fallback
+    }
+
+    /// Enters or leaves synchronous fallback. Callers bump diagnostics.
+    pub(crate) fn set_fallback(&mut self, fallback: bool) {
+        self.fallback = fallback;
     }
 
     /// Whether `epoch` has fully converged: every window pushed under it
@@ -471,6 +556,27 @@ pub(crate) fn push_position(
     }
 }
 
+/// Synchronous repair push through the single-writer discipline: performs
+/// the same dance-aware [`WindowApi::reposition`] the async fallback uses
+/// and records the same intent bookkeeping, without issuing a sequence —
+/// so no ack will (or must) arrive. Verify's confirmed-drift backstop uses
+/// this instead of a raw `reposition + mark_sent` pair so routing can never
+/// diverge between the two sites again.
+///
+/// Always sends: callers invoke this only on confirmed >1px OS drift, which
+/// proves the last intent never converged — re-sending the same target is
+/// the repair, never a duplicate (same reason correction pushes call
+/// `invalidate_sent` first).
+pub(crate) fn push_position_sync(
+    window: &mut Window,
+    target: Origin,
+    state: &mut AxWriteState,
+) -> PushOutcome {
+    window.reposition(target);
+    state.record_sent(window.id(), target);
+    PushOutcome::Sent
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -662,5 +768,59 @@ mod tests {
         assert!(!state.already_sent(3, target));
         // Unknown windows invalidate cleanly.
         state.invalidate_sent(99);
+    }
+
+    #[test]
+    fn lost_ack_ages_out_of_the_read_gate() {
+        let mut state = AxWriteState::default();
+        let e1 = state.begin_frame();
+        state.issue(7, e1);
+        assert!(state.unacked(7));
+        assert!(state.unacked_live(7), "fresh write gates readers");
+        assert!(!state.unacked_timed_out(7));
+        // A genuinely traveling write lands well inside the TTL...
+        for _ in 0..UNACKED_TTL_EPOCHS {
+            state.begin_frame();
+        }
+        assert!(state.unacked_live(7), "TTL boundary still gates");
+        // ...but a dropped ack (best-effort try_send on a wedged pump)
+        // must not gate a settled window forever.
+        state.begin_frame();
+        assert!(state.unacked(7), "sequence counts are untouched");
+        assert!(state.unacked_timed_out(7));
+        assert!(!state.unacked_live(7), "readers fall through to verify");
+        // A late ack still converges normally.
+        let seq = state.issued.get(&7).copied().unwrap_or(0);
+        state.acknowledge(7, seq, e1);
+        assert!(!state.unacked(7));
+        assert!(!state.unacked_timed_out(7));
+    }
+
+    #[test]
+    fn open_gap_reports_without_disturbing_the_edge() {
+        let mut state = AxWriteState::default();
+        assert_eq!(state.open_gap(), None, "idle has no gap");
+        let e1 = state.begin_frame();
+        state.issue(1, e1);
+        assert_eq!(state.open_gap(), Some(0));
+        for _ in 0..STUCK_WRITER_EPOCHS {
+            state.begin_frame();
+        }
+        let gap = state.open_gap().expect("stuck worker shows a gap");
+        assert!(gap >= STUCK_WRITER_EPOCHS);
+        assert!(gap < STUCK_DEGRADE_EPOCHS);
+        // Non-mutating: the warn edge is undisturbed by reads.
+        assert_eq!(state.last_warned_gap, 0);
+        assert!(state.check_stall().is_some());
+    }
+
+    #[test]
+    fn degrade_thresholds_order() {
+        assert!(!AxWriteState::default().fallback_active());
+        let mut state = AxWriteState::default();
+        state.set_fallback(true);
+        assert!(state.fallback_active());
+        state.set_fallback(false);
+        assert!(!state.fallback_active());
     }
 }

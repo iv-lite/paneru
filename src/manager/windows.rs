@@ -107,6 +107,16 @@ pub trait WindowApi: Send + Sync {
     fn is_full_screen(&self) -> bool;
     fn reposition(&mut self, origin: Origin);
     fn resize(&mut self, size: Size);
+    /// Single-shot size write without the staged offscreen retry: one
+    /// `kAXSize` write (plus the enhanced-UI pairing) and no reads. The
+    /// commit uses this while a resize tween is still driving (intermediate
+    /// frames converge at settle, where the full [`WindowApi::resize`]
+    /// confirmatory retry still runs); landed resizes keep the full path.
+    /// Default body is the full resize, so implementors without a fast
+    /// path (mocks) stay correct.
+    fn resize_fast(&mut self, size: Size) {
+        self.resize(size);
+    }
     fn update_frame(&mut self) -> Result<IRect>;
     /// Re-resolves the window's accessibility element from its app, matching
     /// by window id. Sleep invalidates cached element refs (observer
@@ -860,6 +870,23 @@ impl WindowApi for WindowOS {
         }
         self.disable_enhanced_ui();
         self.set_ax_position(origin);
+        self.reenable_enhanced_ui();
+    }
+
+    #[instrument(level = Level::TRACE)]
+    fn resize_fast(&mut self, size: Size) {
+        // Fast path for driven (still-tweening) resizes: a single size
+        // write, no confirmatory reads, no offscreen staging. Partially
+        // constrained apps may show a clamped intermediate frame, but the
+        // tween lands exactly and the settled commit runs the full staged
+        // retry — convergence is owned there, not here.
+        let drift = (self.frame.size() - size).abs();
+        if drift.x <= 1 && drift.y <= 1 {
+            trace!("already correct size.");
+            return;
+        }
+        self.disable_enhanced_ui();
+        self.set_ax_size(size);
         self.reenable_enhanced_ui();
     }
 

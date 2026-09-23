@@ -145,9 +145,11 @@ type CommittedWindows<'w, 's> = Populated<
     Or<(Changed<Position>, With<ResendMarker>)>,
 >;
 
-/// Windows as the verifier sees them: every leg, driving or confirming.
-/// Marker-less strips (no OS window to confirm against) are completed
-/// without a read; windows go through the ack/snapshot/direct chain.
+/// Windows as the verifier sees them: every leg, driving or confirming,
+/// plus whether the window is focused (degraded-writer repair is
+/// focused-only). Marker-less strips (no OS window to confirm against) are
+/// completed without a read; windows go through the ack/snapshot/direct
+/// chain.
 type VerifiableWindows<'w, 's> = Populated<
     'w,
     's,
@@ -157,6 +159,7 @@ type VerifiableWindows<'w, 's> = Populated<
         &'static Position,
         &'static mut crate::ecs::PositionDrive,
         Option<&'static RepositionMarker>,
+        Has<FocusedMarker>,
     ),
 >;
 
@@ -712,6 +715,8 @@ pub(super) fn publish_snapshot_cadence(
     cold: Option<Res<ColdStart>>,
     held: Query<Option<&Gesture>, With<MouseHeldMarker>>,
     drives: Query<&crate::ecs::PositionDrive>,
+    resends: Query<(), With<ResendMarker>>,
+    write_state: Res<AxWriteState>,
     roster: Option<Res<SnapshotRoster>>,
     mut last: Local<bool>,
 ) {
@@ -720,13 +725,15 @@ pub(super) fn publish_snapshot_cadence(
     };
     // Fast while warming up, while an armed or scroll-driven drag is held,
     // while any glide is animating (ultrawide multi-window traverses
-    // converge in ~1 fast tick instead of stepping at 4Hz), or while any
-    // landing awaits confirmation. Deliberately NOT while any mouse button
-    // is down, and not for plain content holders: content presses engage
-    // no tracking by design, so a text selection must not buy the 30ms AX
-    // storm. A genuinely missed press (no holder at all) degrades to 250ms
-    // borders — the overlay paints those from throttled direct reads, not
-    // the snapshot.
+    // converge in ~1 fast tick instead of stepping at 4Hz), while any
+    // landing awaits confirmation, while a dropped write awaits resend, or
+    // while writer frames are still traveling (stall recovery converges in
+    // ~1 fast tick instead of 250ms). Deliberately NOT while any mouse
+    // button is down, and not for plain content holders: content presses
+    // engage no tracking by design, so a text selection must not buy the
+    // 30ms AX storm. A genuinely missed press (no holder at all) degrades
+    // to 250ms borders — the overlay paints those from throttled direct
+    // reads, not the snapshot.
     let fast = cold.is_some()
         || held
             .iter()
@@ -734,7 +741,9 @@ pub(super) fn publish_snapshot_cadence(
         || drives.iter().any(|drive| {
             drive.phase == crate::ecs::DrivePhase::Animating
                 || crate::ecs::PositionDrive::is_verifying(drive)
-        });
+        })
+        || !resends.is_empty()
+        || write_state.open_gap().is_some();
     if fast != *last {
         *last = fast;
         let _ = roster
@@ -2016,8 +2025,9 @@ pub(crate) fn window_moved_update_frame(
             display_drag_armed: draggable,
             repositioning,
             // Async write still converging: the echo predates the queued
-            // write, so the ack owns the truth until it lands.
-            unacked: write_state.unacked(window.id()),
+            // write, so the ack owns the truth until it lands (or ages
+            // out — a lost ack must delay, never permanently block).
+            unacked: write_state.unacked_live(window.id()),
             verifying,
             button_held_no_gesture: distrust,
             in_grace,
@@ -2918,12 +2928,14 @@ pub(super) fn commit_window_position(
     // not. Without a queue (tests, dance apps, shutdown) it degrades to a
     // synchronous write plus intent bookkeeping — same truth the async path
     // records, so the dedup filter and the unacked gate never diverge
-    // between paths. Sequential: sends are ~100ns and sequence numbering
-    // needs `&mut`. DroppedFull reseats the resend marker (a settled
-    // window's `Changed` will not refire); anything else clears it. Focused
-    // windows drain ahead of the batch on the worker.
+    // between paths. While the watchdog fallback is active (worker not
+    // draining), new pushes likewise fail open to sync rather than pile
+    // onto a queue nobody reads. Sequential: sends are ~100ns and sequence
+    // numbering needs `&mut`. DroppedFull reseats the resend marker (a
+    // settled window's `Changed` will not refire); anything else clears it.
+    // Focused windows drain ahead of the batch on the worker.
     let queue = writer.as_deref();
-    let enabled = config.ax_writer_enabled() && queue.is_some();
+    let enabled = config.ax_writer_enabled() && queue.is_some() && !write_state.fallback_active();
     for (mut window, position, entity, focused, _) in moved_windows {
         let outcome = push_position(
             &mut window,
@@ -2951,11 +2963,17 @@ pub(super) fn commit_window_position(
 
 /// Drains writer completions into the ack map, ahead of the adoption and
 /// verify readers. No world access — never conflicts. Advances the landed
-/// frame frontier and runs the stuck-writer watchdog.
+/// frame frontier and runs the stuck-writer degrade ladder: warn at
+/// `STUCK_WRITER_EPOCHS`, restrict repair to focused at
+/// `STUCK_DEGRADE_EPOCHS` (enforced in verify), fail open to sync at
+/// `STUCK_FALLBACK_EPOCHS`, and recover automatically when acks resume.
 pub(super) fn drain_ax_acks(
     inbox: Option<Res<AxWriteInbox>>,
     mut write_state: ResMut<AxWriteState>,
+    mut counters: ResMut<SyncCounters>,
 ) {
+    use crate::ax_writer::{STUCK_FALLBACK_EPOCHS, STUCK_WRITER_EPOCHS};
+
     let Some(inbox) = inbox.as_deref() else {
         return;
     };
@@ -2968,6 +2986,19 @@ pub(super) fn drain_ax_acks(
         }
         write_state.acknowledge(ack.win_id, ack.seq, ack.epoch);
     }
+    // Recovery first: a fallback whose worker caught up returns to async.
+    // Idle (no open gap) counts as recovered — a quiet pump is not a stuck
+    // worker.
+    if write_state.fallback_active() {
+        let recovered = write_state
+            .open_gap()
+            .is_none_or(|gap| gap < STUCK_WRITER_EPOCHS);
+        if recovered {
+            write_state.set_fallback(false);
+            info!("ax writer: worker caught up; leaving synchronous fallback");
+        }
+        return;
+    }
     // Stuck-worker watchdog: whole commit frames keep issuing while none
     // land — the OS never sees the motion, so say so loudly instead of
     // letting siblings converge on stale frames forever.
@@ -2977,6 +3008,12 @@ pub(super) fn drain_ax_acks(
              the writer thread may be stuck (latest landed: {})",
             write_state.last_landed(),
         );
+        counters.writer_stall_warned += 1;
+        if gap >= STUCK_FALLBACK_EPOCHS {
+            write_state.set_fallback(true);
+            counters.writer_fallback_entries += 1;
+            warn!("ax writer: entering synchronous fallback until acks resume (gap {gap})");
+        }
     }
 }
 
@@ -2985,10 +3022,11 @@ pub(super) fn drain_ax_acks(
 /// moves like rigid rides), so this is the universal drift backstop between
 /// commits and the 5s audit — throttled to ~100ms per window instead of
 /// every frame, since each check can be a synchronous AX read. When the
-/// writer queue is active and the window has no unacked writes, the per-
-/// window ack state confirms immediately without a read; otherwise the
-/// snapshot (free) then a direct read (sync) decide, with a bounded re-push
-/// budget.
+/// writer queue is active and the window has no live unacked writes, the
+/// per-window ack state confirms immediately without a read; otherwise the
+/// snapshot (free, loaded once per tick) then a direct read (sync, budgeted
+/// per tick) decide, with a bounded re-push budget. While the writer is
+/// degraded, repair is restricted to the focused window.
 #[instrument(level = Level::TRACE, skip_all)]
 pub(crate) fn verify_window_position(
     mut windows: VerifiableWindows,
@@ -2997,10 +3035,29 @@ pub(crate) fn verify_window_position(
     writer: Option<Res<AxWriterQueue>>,
     config: Res<Config>,
     mut commands: Commands,
+    mut counters: ResMut<SyncCounters>,
 ) {
+    use crate::ax_writer::{STUCK_DEGRADE_EPOCHS, push_position_sync};
+
+    // One snapshot load per tick, not one per window: `ArcSwap::load` per
+    // window showed up hot with many verifying legs after wake/reconfig.
+    // Overlay passes already prefer `live_frame_from` for the same reason.
+    let snap_guard = store.as_deref().map(|s| s.0.load());
+    let snap = snap_guard.as_deref().map(|guard| &**guard);
+    // Degraded writer: a wedged worker must not stall the pump on every
+    // drifting window — the focused window (the one the user is looking
+    // at) still repairs, the rest wait for recovery.
+    let degraded = write_state
+        .open_gap()
+        .is_some_and(|gap| gap >= STUCK_DEGRADE_EPOCHS);
     // Cheap shared reads hoisted out of the per-window loop.
     let queue_active = config.ax_writer_enabled() && writer.is_some();
-    for (entity, window, position, mut drive, repositioning) in &mut windows {
+    // Bound synchronous AX reads per tick: the rest retry on the next
+    // 100ms pass instead of serializing the pump on a drift storm (wake,
+    // display reconfiguration, mass refuse). Legs persist across passes;
+    // the 3-tick drive budget bounds lifetime, not this cap.
+    let mut sync_reads: u8 = 0;
+    for (entity, window, position, mut drive, repositioning, focused) in &mut windows {
         if !drive.is_verifying() {
             continue;
         }
@@ -3017,10 +3074,14 @@ pub(crate) fn verify_window_position(
             }
             continue;
         };
-        // Async write still converging: the OS has not seen the latest
-        // target yet, so a drift reading now would re-push a duplicate.
-        // The ack, not this tick, owns the confirmation.
-        if write_state.unacked(window.id()) {
+        // Async write still converging and within grace: the OS has not
+        // seen the latest target yet, so a drift reading now would re-push
+        // a duplicate. The ack (or the TTL expiry into snapshot verify),
+        // not this tick, owns the confirmation.
+        if write_state.unacked_live(window.id()) {
+            continue;
+        }
+        if degraded && !focused {
             continue;
         }
         // Acked, per window: every write issued for this window has landed
@@ -3030,9 +3091,7 @@ pub(crate) fn verify_window_position(
         // fire-and-forget). No queue (tests, dance apps, sync path):
         // straight to the read below.
         if queue_active {
-            if let Some(raw) =
-                snapshot_live_frame(store.as_deref(), window.id(), SNAPSHOT_FRAME_MAX_AGE)
-            {
+            if let Some(raw) = live_frame_from(snap, window.id(), SNAPSHOT_FRAME_MAX_AGE) {
                 let drift = (pad_snapshot_frame(raw, &window).min - position.0).abs();
                 if drift.x > 1 || drift.y > 1 {
                     // Snapshot-confirmed drift: fall through to re-push.
@@ -3047,13 +3106,17 @@ pub(crate) fn verify_window_position(
         }
         // Prefer the snapshot worker's last read over a synchronous round
         // trip. Absent in tests (identical behavior there), stale, or
-        // missing this window: fall back to a direct read.
+        // missing this window: fall back to a direct read, budgeted.
         let window_id = window.id();
-        let live = snapshot_live_frame(store.as_deref(), window_id, SNAPSHOT_FRAME_MAX_AGE)
+        let live = live_frame_from(snap, window_id, SNAPSHOT_FRAME_MAX_AGE)
             .map(|raw| pad_snapshot_frame(raw, &window));
         let live = if let Some(frame) = live {
             frame
         } else {
+            if sync_reads >= VERIFY_SYNC_READS_PER_TICK {
+                continue;
+            }
+            sync_reads += 1;
             let Ok(frame) = window.update_frame() else {
                 // Unreadable window (beachballed app): retry next
                 // throttled pass instead of burning lifetime on failures.
@@ -3070,14 +3133,22 @@ pub(crate) fn verify_window_position(
             continue;
         }
 
-        window.reposition(position.0);
-        // NOTE: this push stays synchronous even with the writer flag on:
+        // NOTE: this repair stays synchronous even with the writer flag on:
         // it only fires on confirmed >1px drift (i.e. the queue already
         // failed this window), so it must not re-enter the failed queue.
-        // It is still accounted in `AxWriteState` so the dedup filter and
-        // the unacked gate see the same truth as queued writes.
-        // See `push_position` for the single-writer discipline.
-        write_state.mark_sent(window.id(), position.0);
+        // Routed through the single-writer discipline
+        // (`push_position_sync`, same dedup accounting as queued writes)
+        // so the dedup filter sees the same truth either way.
+        if degraded {
+            counters.writer_degraded_repairs += 1;
+        }
+        match push_position_sync(&mut window, position.0, &mut write_state) {
+            PushOutcome::Sent => counters.push_sent += 1,
+            PushOutcome::Deduped => counters.push_deduped += 1,
+            // Unreachable: the sync path never touches the queue. Matched
+            // so push accounting stays total if that ever changes.
+            PushOutcome::DroppedFull => counters.push_dropped_full += 1,
+        }
         if drive.tick()
             && let Ok(mut entity_commands) = commands.get_entity(entity)
         {
@@ -3086,18 +3157,49 @@ pub(crate) fn verify_window_position(
     }
 }
 
+/// Synchronous AX reads budgeted to one verify pass. Wake/reconfiguration
+/// drift storms would otherwise serialize the pump on per-window
+/// round-trips; the rest retry on the next 100ms pass.
+const VERIFY_SYNC_READS_PER_TICK: u8 = 8;
+
 #[instrument(level = Level::TRACE, skip_all)]
 pub(super) fn commit_window_size(
     active_display: ActiveDisplay,
-    mut resized_windows: Populated<(&mut Window, &Bounds, &mut WidthRatio), Changed<Bounds>>,
+    mut resized_windows: Populated<
+        (&mut Window, &Bounds, &mut WidthRatio, Has<ResizeMarker>),
+        Changed<Bounds>,
+    >,
+    mut write_state: ResMut<AxWriteState>,
 ) {
+    use std::sync::Mutex;
+
     let display_bounds = active_display.bounds();
+    // Post-resize OS truth collected from the parallel workers and recorded
+    // sequentially below, so a concurrent move's dedup filter sees the sync
+    // resize path's writes (same accounting as `push_position`).
+    let intents = Mutex::new(Vec::new());
     resized_windows
         .par_iter_mut()
-        .for_each(|(mut window, size, mut width_ratio)| {
+        .for_each(|(mut window, size, mut width_ratio, resizing)| {
             width_ratio.0 = f64::from(size.0.x) / f64::from(display_bounds.width());
-            window.resize(size.0);
+            // While the tween is still driving, a single size write per
+            // frame: the staged offscreen retry (up to ~6 AX round-trips)
+            // runs on the settled commit instead. Landed resizes keep the
+            // full confirmatory path.
+            if resizing {
+                window.resize_fast(size.0);
+            } else {
+                window.resize(size.0);
+            }
+            if let Ok(mut intents) = intents.lock() {
+                intents.push((window.id(), window.frame().min));
+            }
         });
+    if let Ok(intents) = intents.into_inner() {
+        for (id, origin) in intents {
+            write_state.mark_sent(id, origin);
+        }
+    }
 }
 
 /// Restores user-visible window state before Paneru shuts down: clears any

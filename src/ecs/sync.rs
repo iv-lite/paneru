@@ -40,6 +40,14 @@ pub struct SyncCounters {
     pub push_sent: u64,
     pub push_deduped: u64,
     pub push_dropped_full: u64,
+    /// Stuck-writer watchdog observations (each newly larger unlanded gap).
+    pub writer_stall_warned: u64,
+    /// Confirmed-drift repairs performed while the writer was degraded
+    /// (focused window only).
+    pub writer_degraded_repairs: u64,
+    /// Entries into synchronous fallback (plus one recovery each way is
+    /// visible in the log; the counter only counts entries).
+    pub writer_fallback_entries: u64,
 }
 
 /// Single sync truth per window.
