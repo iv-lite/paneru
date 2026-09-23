@@ -225,8 +225,10 @@ const LOOP_TIMEOUT_STEP: u32 = 1;
 /// app) never satisfies — the loop never exited and the window manager stopped
 /// responding until the burst let up. Nothing is dropped when a cap is hit:
 /// leftover events stay in the channel for the next frame to pick up.
+/// The event cap is sized for ultrawide HID bursts (high-rate drags across
+/// a 3440px+ traverse); the time budget still bounds the stay.
 const PUMP_BUDGET: Duration = Duration::from_millis(4);
-const PUMP_MAX_EVENTS: usize = 256;
+const PUMP_MAX_EVENTS: usize = 384;
 
 /// Gathers all present displays and spawns them as entities in the Bevy world.
 /// The currently active display (identified by `window_manager.active_display_id()`) is marked with `ActiveDisplayMarker`.
@@ -702,10 +704,10 @@ pub(super) fn tick_cold_start(
 }
 
 /// Publishes the snapshot worker's poll cadence: fast while warming up,
-/// holding a drag, confirming landings, or pressing the mouse (paint,
-/// prime, and verify converge in ~1 tick), slow idle. Sends on change
-/// only — the channel is unbounded but there is no reason to spam it 60
-/// times a second with a constant.
+/// holding a drag, gliding an animation, confirming landings, or pressing
+/// the mouse (paint, prime, and verify converge in ~1 tick), slow idle.
+/// Sends on change only — the channel is unbounded but there is no reason
+/// to spam it 60 times a second with a constant.
 pub(super) fn publish_snapshot_cadence(
     cold: Option<Res<ColdStart>>,
     held: Query<Option<&Gesture>, With<MouseHeldMarker>>,
@@ -717,17 +719,22 @@ pub(super) fn publish_snapshot_cadence(
         return;
     };
     // Fast while warming up, while an armed or scroll-driven drag is held,
-    // or while any landing awaits confirmation. Deliberately NOT while any
-    // mouse button is down, and not for plain content holders: content
-    // presses engage no tracking by design, so a text selection must not
-    // buy the 30ms AX storm. A genuinely missed press (no holder at all)
-    // degrades to 250ms borders — the overlay paints those from throttled
-    // direct reads, not the snapshot.
+    // while any glide is animating (ultrawide multi-window traverses
+    // converge in ~1 fast tick instead of stepping at 4Hz), or while any
+    // landing awaits confirmation. Deliberately NOT while any mouse button
+    // is down, and not for plain content holders: content presses engage
+    // no tracking by design, so a text selection must not buy the 30ms AX
+    // storm. A genuinely missed press (no holder at all) degrades to 250ms
+    // borders — the overlay paints those from throttled direct reads, not
+    // the snapshot.
     let fast = cold.is_some()
         || held
             .iter()
             .any(|gesture| gesture.is_some_and(|g| g.drives()))
-        || drives.iter().any(crate::ecs::PositionDrive::is_verifying);
+        || drives.iter().any(|drive| {
+            drive.phase == crate::ecs::DrivePhase::Animating
+                || crate::ecs::PositionDrive::is_verifying(drive)
+        });
     if fast != *last {
         *last = fast;
         let _ = roster
@@ -1229,8 +1236,8 @@ pub(crate) fn animate_entities(
     mut commands: Commands,
 ) {
     use crate::ecs::animation::{
-        FIRST_TICK_WINDOW, RETARGET_CARRY_PX, birth_phase, eased_factor, kick_start,
-        retarget_duration, tween_finished, tween_ivec2,
+        FIRST_TICK_WINDOW, birth_phase, eased_factor, kick_start, nudge_landing,
+        proportional_duration, retarget_duration, should_carry_phase, tween_finished, tween_ivec2,
     };
 
     // Time-based tween on a shared burst phase: progress derives from the
@@ -1238,7 +1245,10 @@ pub(crate) fn animate_entities(
     // `started` stamp — strips, windows and resizes move in lockstep even
     // when their markers land on adjacent ticks. A stall advances progress
     // (correct) instead of teleporting (the old uncapped-exponential
-    // failure mode), and the border rides the presented frame.
+    // failure mode), and the border rides the presented frame. The ease
+    // keeps a gentle attack (AX-sized first steps) with a decisive landing
+    // (non-zero end velocity + 1px landing nudge) so the tail commits
+    // instead of rounding to dead frames.
     let now = time.elapsed();
     let base = config.animation_duration();
     let display_bounds: Vec<IRect> = displays.iter().map(Display::bounds).collect();
@@ -1266,12 +1276,14 @@ pub(crate) fn animate_entities(
             continue;
         }
         // Lazily seed the leg, or retarget when the intent moved under us.
-        // Births join the burst phase while it is young (lockstep);
-        // retargets carry phase across small creeps (composed strip-plus-
-        // slot recomputes, ride-outlier refreshes) so easing bends instead
-        // of restarting at zero velocity every tick — and start over on
-        // genuine jumps, which deserve the full glide. Any retarget resumes
-        // driving, even if the old leg had already entered verifying.
+        // Births join the burst phase while it is young (lockstep) with a
+        // distance-proportional duration so ultrawide traverses get more
+        // time than short nudges without stretching into a slow pan;
+        // retargets carry phase only across a live leg with small drift
+        // (see `should_carry_phase`) so easing bends instead of restarting
+        // at zero velocity every tick — and start over on genuine jumps,
+        // which deserve the full glide. Any retarget resumes driving, even
+        // if the old leg had already entered verifying.
         let (start, started, duration) = match drive {
             Some(drive) if drive.target == *origin => (drive.start, drive.started, drive.duration),
             Some(mut drive) => {
@@ -1282,14 +1294,14 @@ pub(crate) fn animate_entities(
                 let duration = retarget_duration(remaining, total, base);
                 let drift = (origin.as_vec2() - drive.target.as_vec2()).length();
                 let elapsed = now.saturating_sub(drive.started);
-                // Carry phase only across a live leg: a finished (verifying)
-                // leg has no velocity to preserve — resuming at its stale
-                // progress would teleport to done — and neither does a leg
-                // older than its own duration (orphaned pre-settle, then
-                // re-driven). Genuine jumps restart too.
-                let live =
-                    drive.phase == crate::ecs::DrivePhase::Animating && elapsed < drive.duration;
-                let prior = if live && drift <= RETARGET_CARRY_PX {
+                let live = drive.phase == crate::ecs::DrivePhase::Animating;
+                let carry = live && should_carry_phase(elapsed, drive.duration, drift);
+                if carry {
+                    trace!("entity {entity} retarget carry drift {drift:.1}px");
+                } else {
+                    trace!("entity {entity} retarget restart drift {drift:.1}px");
+                }
+                let prior = if carry {
                     (elapsed.as_secs_f32() / drive.duration.as_secs_f32().max(f32::EPSILON))
                         .clamp(0.0, 1.0)
                 } else {
@@ -1310,27 +1322,31 @@ pub(crate) fn animate_entities(
                 if opened {
                     bursts.opened = Some(now);
                 }
+                let travel = (origin.as_vec2() - position.0.as_vec2()).length();
+                let duration = proportional_duration(travel, base);
                 if let Ok(mut entity_commands) = commands.get_entity(entity) {
                     entity_commands.try_insert(crate::ecs::PositionDrive::animating(
-                        position.0, *origin, started, base,
+                        position.0, *origin, started, duration,
                     ));
                 }
-                (position.0, started, base)
+                (position.0, started, duration)
             }
         };
         let elapsed = now.saturating_sub(started);
         let t = eased_factor(elapsed, duration);
         let mut new_pos = tween_ivec2(start, *origin, t);
         let finished = tween_finished(elapsed, duration);
-        if !finished
-            && new_pos == position.0
-            && position.0 != *origin
-            && elapsed <= FIRST_TICK_WINDOW
-        {
-            // Fresh leg rounding to a standstill: guarantee visible motion
-            // so the first animated tick always commits (no dead frames).
-            // Bounded to 2px per axis, one-directional, never overshoots.
-            new_pos = kick_start(position.0, *origin);
+        if !finished && new_pos == position.0 && position.0 != *origin {
+            if elapsed <= FIRST_TICK_WINDOW {
+                // Fresh leg rounding to a standstill: guarantee visible motion
+                // so the first animated tick always commits (no dead frames).
+                // Bounded to 2px per axis, one-directional, never overshoots.
+                new_pos = kick_start(position.0, *origin);
+            } else {
+                // Tail rounding to a standstill: nudge 1px toward the target
+                // so the landing commits instead of stalling on dead frames.
+                new_pos = nudge_landing(position.0, *origin);
+            }
         }
 
         trace!(
@@ -1371,8 +1387,8 @@ pub(super) fn animate_resize_entities(
     mut commands: Commands,
 ) {
     use crate::ecs::animation::{
-        FIRST_TICK_WINDOW, RETARGET_CARRY_PX, birth_phase, eased_factor, kick_start,
-        retarget_duration, tween_finished, tween_ivec2,
+        FIRST_TICK_WINDOW, birth_phase, eased_factor, kick_start, nudge_landing,
+        proportional_duration, retarget_duration, should_carry_phase, tween_finished, tween_ivec2,
     };
 
     // Same shared burst phase as positions so size and origin stay in step.
@@ -1401,7 +1417,8 @@ pub(super) fn animate_resize_entities(
                 // Carry only across a live leg: a stale leg (older than its
                 // own duration, re-driven after settling) restarts fresh
                 // instead of teleporting to done — same rule as positions.
-                let prior = if elapsed < tween.duration && drift <= RETARGET_CARRY_PX {
+                let carry = should_carry_phase(elapsed, tween.duration, drift);
+                let prior = if carry {
                     (elapsed.as_secs_f32() / tween.duration.as_secs_f32().max(f32::EPSILON))
                         .clamp(0.0, 1.0)
                 } else {
@@ -1421,25 +1438,31 @@ pub(super) fn animate_resize_entities(
                 if opened {
                     bursts.opened = Some(now);
                 }
+                let travel = (size.as_vec2() - bounds.0.as_vec2()).length();
+                let duration = proportional_duration(travel, base);
                 if let Ok(mut entity_commands) = commands.get_entity(entity) {
                     entity_commands.try_insert(crate::ecs::SizeDrive {
                         start: bounds.0,
                         target: *size,
                         started,
-                        duration: base,
+                        duration,
                     });
                 }
-                (bounds.0, started, base)
+                (bounds.0, started, duration)
             }
         };
         let elapsed = now.saturating_sub(started);
         let t = eased_factor(elapsed, duration);
         let mut new_size = tween_ivec2(start, *size, t);
         let finished = tween_finished(elapsed, duration);
-        if !finished && new_size == bounds.0 && bounds.0 != *size && elapsed <= FIRST_TICK_WINDOW {
-            // Fresh leg rounding to a standstill: guarantee visible motion
-            // so the first animated tick always commits (no dead frames).
-            new_size = kick_start(bounds.0, *size);
+        if !finished && new_size == bounds.0 && bounds.0 != *size {
+            if elapsed <= FIRST_TICK_WINDOW {
+                // Fresh leg rounding to a standstill: guarantee visible motion
+                // so the first animated tick always commits (no dead frames).
+                new_size = kick_start(bounds.0, *size);
+            } else {
+                new_size = nudge_landing(bounds.0, *size);
+            }
         }
 
         trace!(

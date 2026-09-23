@@ -1,11 +1,12 @@
 //! Fixed-duration tween math for window motion.
 //!
 //! A tween has a deadline: `progress = (now - started) / duration` through
-//! a gentle `smootherstep` curve, so siblings land on the same tick and the
-//! border can ride the exact presented frame. `smootherstep` — not a
-//! front-loaded ease-out — keeps every step AX-sized: a fast-attack curve
-//! spends ~35% of the distance on the first tick, which the coalesced AX
-//! writer turns into a visible jump-then-crawl.
+//! a snappy ease (gentle attack, decisive landing), so siblings land on the
+//! same tick and the border can ride the exact presented frame. The attack
+//! stays `smootherstep`-gentle — a fast-attack curve spends ~35% of the
+//! distance on the first tick, which the coalesced AX writer turns into a
+//! visible jump-then-crawl — while the tail blends toward linear so the last
+//! frames keep non-zero velocity instead of stalling at zero slope.
 //!
 //! Legs born into the same young burst share one phase stamp (see
 //! [`BURST_JOIN_WINDOW`]): strips, windows and resizes move in lockstep even
@@ -32,6 +33,16 @@ pub const DEFAULT_ANIMATION_DURATION_MS: u64 = 150;
 /// Shortest retargeted glide: interrupts stay fluid without popping.
 pub const MIN_ANIMATION_DURATION_MS: u64 = 40;
 
+/// Longest glide for very wide (ultrawide) moves: distance scaling in
+/// [`proportional_duration`] clamps here so a 3440px traverse stays snappy
+/// instead of stretching into a slow pan.
+pub const MAX_ANIMATION_DURATION_MS: u64 = 220;
+
+/// Reference travel (px) for [`proportional_duration`]: moves around this
+/// length use the base duration, shorter ones shrink toward the minimum,
+/// longer ones grow toward the maximum. Tuned for a 800px focus step.
+pub const REFERENCE_TRAVEL_PX: f32 = 800.0;
+
 /// Legs born within this long of a burst's opening adopt the burst's phase
 /// stamp instead of starting at zero progress, so a strip scroll plus the
 /// window slides issued on the next tick move in lockstep. Older than this,
@@ -55,6 +66,28 @@ pub fn smootherstep(p: f32) -> f32 {
     p * p * p * (p * (p * 6.0 - 15.0) + 10.0)
 }
 
+/// Snappy ease: `smootherstep` attack through `P = 0.7`, then a blend toward
+/// a linear tail so the landing keeps non-zero velocity. At `p = 0.7` both
+/// value and slope are continuous; at `p = 1` the slope is
+/// `(1 - smootherstep(0.7)) / 0.3 ≈ 0.54` instead of zero, so the last
+/// frames advance instead of rounding to a standstill.
+pub fn snappy_ease(p: f32) -> f32 {
+    /// Handoff point: attack below, linear-blend tail above.
+    const BLEND_START: f32 = 0.7;
+    let p = p.clamp(0.0, 1.0);
+    if p < BLEND_START {
+        return smootherstep(p);
+    }
+    let s = smootherstep(p);
+    let s70 = smootherstep(BLEND_START);
+    let t = (p - BLEND_START) / (1.0 - BLEND_START);
+    // Linear tail from (0.7, s70) to (1, 1), blended in with a smooth ramp
+    // so the handoff has no velocity kink.
+    let linear = s70 + (1.0 - s70) * t;
+    let blend = t * t * (3.0 - 2.0 * t);
+    s + (linear - s) * blend
+}
+
 /// Eased 0..1 factor for `elapsed` into `duration`.
 ///
 /// Returns `1.0` when `duration` is zero (snap) or `elapsed` covers it.
@@ -63,7 +96,7 @@ pub fn eased_factor(elapsed: Duration, duration: Duration) -> f32 {
         return 1.0;
     }
     let total = duration.as_secs_f32().max(f32::EPSILON);
-    smootherstep(elapsed.as_secs_f32() / total)
+    snappy_ease(elapsed.as_secs_f32() / total)
 }
 
 /// Birth phase for a fresh leg: legs born within [`BURST_JOIN_WINDOW`] of
@@ -119,6 +152,62 @@ pub fn tween_ivec2(start: IVec2, end: IVec2, t: f32) -> IVec2 {
     current.lerp(target, t).round().as_ivec2()
 }
 
+/// Minimum landing step (px per axis) when the eased delta rounds to a
+/// standstill while the leg still has travel left. Bounded and
+/// one-directional, never overshoots: guarantees the tail commits instead
+/// of emitting dead frames that read as an end-of-glide stall.
+pub const LANDING_NUDGE_PX: i32 = 1;
+
+/// Steps from `current` toward `target` by at most [`LANDING_NUDGE_PX`] per
+/// axis when `current != target`. Pure math; the tail counterpart to
+/// [`kick_start`] (which owns the first tick, this owns the last ones).
+pub fn nudge_landing(current: IVec2, target: IVec2) -> IVec2 {
+    let step = |remaining: i32| {
+        if remaining == 0 {
+            0
+        } else {
+            remaining.signum() * remaining.abs().min(LANDING_NUDGE_PX)
+        }
+    };
+    let delta = target - current;
+    current + IVec2::new(step(delta.x), step(delta.y))
+}
+
+/// Whether a retargeted leg keeps its phase (`true`) or restarts at zero
+/// progress (`false`). Carries only across a live `Animating` leg whose
+/// target drifted by at most [`RETARGET_CARRY_PX`]: a finished or expired
+/// leg has no velocity to preserve (resuming it would teleport to done),
+/// and a genuine jump deserves the full glide. Pure so the branch the
+/// animator takes is unit testable — the old inline logic sometimes carried
+/// and sometimes restarted on back-to-back focus moves, which read as an
+/// inconsistent end-of-animation slowdown.
+pub fn should_carry_phase(elapsed: Duration, duration: Duration, drift_px: f32) -> bool {
+    !duration.is_zero() && elapsed < duration && drift_px <= RETARGET_CARRY_PX
+}
+
+/// Distance-proportional glide for ultrawide travel: moves near
+/// [`REFERENCE_TRAVEL_PX`] use `base`, shorter ones shrink toward
+/// [`MIN_ANIMATION_DURATION_MS`], longer ones grow toward
+/// [`MAX_ANIMATION_DURATION_MS`]. Square-root scaling keeps a 3440px
+/// traverse from stretching into a slow pan while still giving it more
+/// time than a short nudge. Pure and unit testable.
+#[allow(
+    clippy::cast_precision_loss,
+    reason = "ms constant is tiny; f32 precision is plenty"
+)]
+pub fn proportional_duration(distance_px: f32, base: Duration) -> Duration {
+    if base.is_zero() || distance_px <= f32::EPSILON {
+        return base;
+    }
+    let scale = (distance_px / REFERENCE_TRAVEL_PX).sqrt().clamp(0.5, 1.5);
+    let scaled = base.as_secs_f32() * scale;
+    Duration::from_secs_f32(
+        scaled
+            .max(MIN_ANIMATION_DURATION_MS as f32 / 1000.0)
+            .min(MAX_ANIMATION_DURATION_MS as f32 / 1000.0),
+    )
+}
+
 /// Shortens the glide when retargeting mid-flight: the new leg covers only
 /// the remaining distance proportionally, floored at the minimum so a
 /// focus-spam stream stays fluid instead of popping.
@@ -157,6 +246,77 @@ mod tests {
         assert!(smootherstep(0.75) > 0.75, "gentle landing");
         // A 20ms tick of a 150ms glide covers ~4%, not ~35%.
         assert!(smootherstep(20.0 / 150.0) < 0.06);
+    }
+
+    #[test]
+    fn snappy_ease_pins_ends_and_stays_gentle_up_front() {
+        assert!(snappy_ease(0.0).abs() < 1e-6);
+        assert!((snappy_ease(1.0) - 1.0).abs() < 1e-6);
+        // Attack matches smootherstep (no first-tick jump).
+        assert!((snappy_ease(0.25) - smootherstep(0.25)).abs() < 1e-6);
+        assert!(snappy_ease(20.0 / 150.0) < 0.08);
+        // Decisive landing: the last 10% of time covers ~5x the distance of
+        // smootherstep (non-zero end velocity), so the tail commits instead
+        // of rounding to dead frames.
+        let snappy_tail = snappy_ease(1.0) - snappy_ease(0.9);
+        let smooth_tail = smootherstep(1.0) - smootherstep(0.9);
+        assert!(snappy_tail > smooth_tail * 2.0);
+        assert!(snappy_ease(0.9) < 1.0);
+    }
+
+    #[test]
+    fn landing_nudge_advances_without_overshoot() {
+        use super::LANDING_NUDGE_PX;
+        assert_eq!(
+            nudge_landing(IVec2::new(0, 0), IVec2::new(10, -5)),
+            IVec2::new(LANDING_NUDGE_PX, -LANDING_NUDGE_PX)
+        );
+        assert_eq!(
+            nudge_landing(IVec2::new(9, 0), IVec2::new(10, 0)),
+            IVec2::new(10, 0)
+        );
+        assert_eq!(
+            nudge_landing(IVec2::new(5, 5), IVec2::new(5, 5)),
+            IVec2::new(5, 5)
+        );
+    }
+
+    #[test]
+    fn carry_phase_rule_is_deterministic() {
+        let dur = Duration::from_millis(150);
+        assert!(should_carry_phase(
+            Duration::from_millis(50),
+            dur,
+            RETARGET_CARRY_PX
+        ));
+        assert!(!should_carry_phase(
+            Duration::from_millis(50),
+            dur,
+            RETARGET_CARRY_PX + 1.0
+        ));
+        assert!(!should_carry_phase(dur, dur, 0.0), "expired leg restarts");
+        assert!(!should_carry_phase(
+            dur.checked_add(Duration::from_millis(1))
+                .expect("150ms + 1ms"),
+            dur,
+            0.0
+        ));
+    }
+
+    #[test]
+    fn proportional_duration_scales_and_clamps() {
+        let base = Duration::from_millis(150);
+        // `Duration::from_secs_f32` round-trips through f32, so compare with
+        // a 1ms tolerance rather than exact equality.
+        let near = |a: Duration, b: Duration| a.abs_diff(b) <= Duration::from_millis(1);
+        assert!(near(proportional_duration(REFERENCE_TRAVEL_PX, base), base));
+        let short = proportional_duration(100.0, base);
+        assert!(short < base);
+        assert!(short >= Duration::from_millis(MIN_ANIMATION_DURATION_MS));
+        let wide = proportional_duration(3440.0, base);
+        assert!(wide > base);
+        assert!(wide <= Duration::from_millis(MAX_ANIMATION_DURATION_MS));
+        assert_eq!(proportional_duration(100.0, Duration::ZERO), Duration::ZERO);
     }
 
     #[test]

@@ -476,7 +476,7 @@ impl OverlayManager {
             };
 
             if let Some((window, stored, placed)) = self.overlays.get_mut(i) {
-                if *stored == params {
+                if dim_params_eq(stored, &params) {
                     // A `setFrame` is a WindowServer round trip even with
                     // `display: false`: skip it when neither geometry nor
                     // params moved since the last tick.
@@ -747,6 +747,26 @@ fn nsrect_eq(a: NSRect, b: NSRect) -> bool {
         && (a.origin.y - b.origin.y).abs() <= 0.5
         && (a.size.width - b.size.width).abs() <= 0.5
         && (a.size.height - b.size.height).abs() <= 0.5
+}
+
+/// Dim-parameter equality with the same 0.5px rest epsilon as borders plus a
+/// small opacity epsilon: sub-pixel cutout dither during a glide must not
+/// rebuild the `DimView` (a CPU `drawRect` + composite) every tick. Real
+/// integer moves still rebuild on the Rust path — the Swift `Dim` slice
+/// avoids even those via a GPU-composited `CAShapeLayer` mask, which is why
+/// finishing that slice is the larger ultrawide win.
+fn dim_params_eq(a: &DimParams, b: &DimParams) -> bool {
+    if (a.opacity - b.opacity).abs() > 0.01
+        || a.color != b.color
+        || (a.cutout_radius - b.cutout_radius).abs() > 0.5
+    {
+        return false;
+    }
+    match (a.cutout, b.cutout) {
+        (None, None) => true,
+        (Some(x), Some(y)) => nsrect_eq(x, y),
+        (None, Some(_)) | (Some(_), None) => false,
+    }
 }
 
 // ── FlashMessage ────────────────────────────────────────────────────────

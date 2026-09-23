@@ -1400,6 +1400,14 @@ fn drag_move_held_column(
     mut state: Local<DragMoveState>,
     mut commands: Commands,
 ) {
+    // HID bursts can deliver many `MouseDragged` per frame; driving the
+    // strip/column once per folded delta (instead of once per event) keeps
+    // a long header-drag at constant cost: one strip write, one paint
+    // advance, one commit push per frame. Velocity EMA still samples each
+    // raw delta so the release glide keeps its shape.
+    let mut folded_dx: i32 = 0;
+    let mut latest_modifiers = None;
+    let mut saw_drag = false;
     for InputEvent(event) in messages.read() {
         match event {
             Event::MouseDown { point, .. } => {
@@ -1431,103 +1439,105 @@ fn drag_move_held_column(
                 // column drive, paint, release EMA) only ever sees `dx`; a
                 // pure-vertical wiggle becomes a no-op that also keeps the
                 // press anchor fresh via `state.last` above.
-                let delta = Origin::new(delta.x, 0);
-                if delta == Origin::ZERO {
+                let dx = delta.x;
+                if dx == 0 {
                     continue;
                 }
-                let Some((target, window_id, armed, scroll_armed)) =
-                    held_drag_target(&held, &windows)
-                else {
-                    trace!("synthetic drag: no managed held target, skipping move");
-                    continue;
-                };
-                // Paint-only tracking for drags the layout doesn't drive
-                // itself: the slot stays pinned, but the border needs every
-                // pointer delta at input rate. Advanced only for armed or
-                // scroll-driven holders — plain content grabs stay fully
-                // native and cost nothing per event. The paint rides the
-                // holder, resolved through the same grab that armed it.
-                if (armed || scroll_armed)
-                    && let Some((holder_entity, _, _)) =
-                        held.iter().find(|(_, marker, _)| marker.0 == target)
-                    && let Ok(mut paint) = holder_paint.get_mut(holder_entity)
-                {
-                    paint.advance(delta, time.elapsed());
-                }
-                if cold.is_some() {
-                    // Warmup: track the cursor for paint only; the slot,
-                    // strip, and scroll pipeline must not move before the
-                    // world converges.
-                    continue;
-                }
-                // Header scroll-drag (grab-time armed): drive the owner
-                // strip directly, 1:1 with the pointer and same-tick as the
-                // column drive below — instead of emitting a `Scroll` event
-                // that trails a message hop plus an unordered plugin behind.
-                // Armed modifier drags and legacy (scroll-disabled) drags
-                // take the move path below; content grabs with scrolling
-                // enabled are ignored entirely — native owns them.
-                if scroll_armed {
-                    // Threshold and velocity track the hand (raw), and the
-                    // strip follows it 1:1: no friction while held — the
-                    // release glide owns all friction, and only then.
-                    scroll_state.distance_px += f64::from(delta.x.abs());
-                    // Horizontal columns only: `delta.y` is always zero after
-                    // the horizontal projection above; the `dx != 0` gate just
-                    // skips no-op events.
-                    if delta.x != 0 {
-                        let now = time.elapsed();
-                        sample_release_velocity(&mut scroll_state, f64::from(delta.x), now);
-                        drive_scroll_strip(
-                            target,
-                            delta.x,
-                            &strips,
-                            &mut scroll_strips,
-                            &time,
-                            &mut commands,
-                        );
-                    }
-                    continue;
-                }
-                // Drive the whole column so stacked/tabbed mates follow the
-                // grab instead of tearing off. Reached for armed drags and
-                // for legacy scroll-disabled drags; content grabs with
-                // scrolling enabled fall through with no motion at all.
-                if !armed && config.left_drag_scrolls_strip() {
-                    continue;
-                }
-                // Raw 1:1 while held, wherever the grab landed: friction
-                // applies only on release, never to the displacement itself.
-                let (delta, members) = column_drive(target, delta.x, &strips);
-                let mut moved_any = false;
-                for member in members {
-                    if let Ok(mut position) = positions.get_mut(member) {
-                        position.0 += delta;
-                        moved_any = true;
-                    }
-                    // Latest intent wins, as in `drive_scroll_strip`: a
-                    // stale slide marker would drag the member back toward
-                    // its old target behind the hand.
-                    if let Ok(mut entity_commands) = commands.get_entity(member) {
-                        entity_commands.try_remove::<RepositionMarker>();
-                    }
-                }
-                // Emit only when a transfer could follow (armed + shortcut
-                // held): the legacy pin path is gone — release homing owns
-                // snap-back — so unarmed motion must not wake it via a
-                // message that reads as foreign.
-                let eligible = armed
-                    && config
-                        .mouse_drag_display_modifier()
-                        .is_some_and(|required| required.matches(*modifiers));
-                if moved_any && eligible {
-                    // Feed the existing pipeline (adoption no-op, transfer
-                    // hit-test, preview) exactly as a native move would.
-                    moved.write(Event::WindowMoved { window_id });
-                }
+                // Fold for the single post-loop drive; EMA samples the raw
+                // per-event slice so release velocity still tracks the hand.
+                folded_dx = folded_dx.saturating_add(dx);
+                latest_modifiers = Some(*modifiers);
+                saw_drag = true;
+                scroll_state.distance_px += f64::from(dx.abs());
+                sample_release_velocity(&mut scroll_state, f64::from(dx), time.elapsed());
             }
             _ => {}
         }
+    }
+    if !saw_drag {
+        return;
+    }
+    // No-op guard: folded motion that nets to zero (jitter back and forth
+    // within one frame) keeps the anchor fresh above but must not touch
+    // `Position`/`Scrolling`/markers — otherwise every jitter frame pays a
+    // commit push plus an overlay pass for zero travel.
+    if folded_dx == 0 {
+        return;
+    }
+    let Some((target, window_id, armed, scroll_armed)) = held_drag_target(&held, &windows) else {
+        trace!("synthetic drag: no managed held target, skipping move");
+        return;
+    };
+    // Paint-only tracking for drags the layout doesn't drive itself: the
+    // slot stays pinned, but the border needs the pointer delta at input
+    // rate. Advanced once per frame for armed or scroll-driven holders —
+    // plain content grabs stay fully native and cost nothing per event.
+    if (armed || scroll_armed)
+        && let Some((holder_entity, _, _)) = held.iter().find(|(_, marker, _)| marker.0 == target)
+        && let Ok(mut paint) = holder_paint.get_mut(holder_entity)
+    {
+        paint.advance(Origin::new(folded_dx, 0), time.elapsed());
+    }
+    if cold.is_some() {
+        // Warmup: track the cursor for paint only; the slot, strip, and
+        // scroll pipeline must not move before the world converges.
+        return;
+    }
+    // Header scroll-drag (grab-time armed): drive the owner strip directly,
+    // 1:1 with the folded pointer travel and same-tick as the column drive
+    // below — instead of emitting a `Scroll` event that trails a message
+    // hop plus an unordered plugin behind. Armed modifier drags and legacy
+    // (scroll-disabled) drags take the move path below; content grabs with
+    // scrolling enabled are ignored entirely — native owns them.
+    if scroll_armed {
+        // Threshold and velocity already tracked per raw slice above; the
+        // strip follows the folded total 1:1 with no friction while held.
+        drive_scroll_strip(
+            target,
+            folded_dx,
+            &strips,
+            &mut scroll_strips,
+            &time,
+            &mut commands,
+        );
+        return;
+    }
+    // Drive the whole column so stacked/tabbed mates follow the grab
+    // instead of tearing off. Reached for armed drags and for legacy
+    // scroll-disabled drags; content grabs with scrolling enabled fall
+    // through with no motion at all.
+    if !armed && config.left_drag_scrolls_strip() {
+        return;
+    }
+    // Raw 1:1 while held, wherever the grab landed: friction applies only
+    // on release, never to the displacement itself.
+    let (delta, members) = column_drive(target, folded_dx, &strips);
+    let mut moved_any = false;
+    for member in members {
+        if let Ok(mut position) = positions.get_mut(member) {
+            position.0 += delta;
+            moved_any = true;
+        }
+        // Latest intent wins, as in `drive_scroll_strip`: a stale slide
+        // marker would drag the member back toward its old target behind
+        // the hand.
+        if let Ok(mut entity_commands) = commands.get_entity(member) {
+            entity_commands.try_remove::<RepositionMarker>();
+        }
+    }
+    // Emit only when a transfer could follow (armed + shortcut held): the
+    // legacy pin path is gone — release homing owns snap-back — so
+    // unarmed motion must not wake it via a message that reads as foreign.
+    let eligible = armed
+        && latest_modifiers.is_some_and(|modifiers| {
+            config
+                .mouse_drag_display_modifier()
+                .is_some_and(|required| required.matches(modifiers))
+        });
+    if moved_any && eligible {
+        // Feed the existing pipeline (adoption no-op, transfer hit-test,
+        // preview) exactly as a native move would.
+        moved.write(Event::WindowMoved { window_id });
     }
 }
 
