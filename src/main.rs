@@ -22,6 +22,8 @@ mod lua;
 mod manager;
 mod menubar;
 mod overlay;
+#[cfg(feature = "swift-overlay")]
+mod overlay_bridge;
 mod pasteboard;
 mod platform;
 mod reader;

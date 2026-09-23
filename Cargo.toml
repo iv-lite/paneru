@@ -57,6 +57,11 @@ pedantic = "warn"
 # cannot write to the copy.
 [features]
 default = ["lua", "vendored"]
+# Swift overlay strangler: load overlay-swift/ dylib at runtime via dlopen
+# and dispatch flash/ghost/borders/dim presentation to it, with automatic
+# fallback to the Rust implementation. Default off; PANERU_SWIFT_OVERLAY=0
+# forces the Rust path at runtime without rebuilding.
+swift-overlay = []
 vendored = ["mlua/vendored"]
 lua = [
   "lua-base",
