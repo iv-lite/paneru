@@ -12,14 +12,56 @@ use crate::util::exe_path;
 /// The bundle identifier for the `paneru` service.
 pub const ID: &str = "com.github.karinushka.paneru";
 
+/// Stable ad-hoc signing identifier stamped on the canonical binary, so
+/// re-granted TCC entries at least show a stable name. The hash still
+/// changes per build (ad-hoc), so every update needs one fresh grant —
+/// without a paid Developer ID there is no way around that.
+pub const SIGN_IDENTIFIER: &str = "com.github.karinushka.paneru";
+
+/// Location of the single canonical daemon binary, relative to `$HOME`.
+/// Every install vector converges here: `paneru install` copies the
+/// invoking binary over it, and the launchd plist plus the
+/// `Paneru.app` shim point at it once and never drift.
+pub const CANONICAL_BIN_REL: &str = ".local/bin/paneru";
+
+/// Absolute canonical daemon path for `home`.
+#[must_use]
+pub fn canonical_path(home: &Path) -> PathBuf {
+    home.join(CANONICAL_BIN_REL)
+}
+
+/// Extracts the `Program` entry from launchd plist text. Pure so the
+/// drift check is unit testable; returns `None` when absent/unparseable.
+#[must_use]
+pub fn parse_program(plist: &str) -> Option<String> {
+    let key = "<key>Program</key>";
+    let start = plist.find(key)? + key.len();
+    let rest = plist[start..].trim_start();
+    rest.strip_prefix("<string>")
+        .and_then(|s| s.find("</string>").map(|end| s[..end].to_string()))
+}
+
+/// Extracts the signing `Identifier=` from `codesign -d` output. Pure for
+/// tests; `None` when unsigned or unparseable.
+#[must_use]
+pub fn parse_identifier(codesign_output: &str) -> Option<String> {
+    codesign_output
+        .lines()
+        .find_map(|line| line.trim().strip_prefix("Identifier="))
+        .map(ToString::to_string)
+}
+
 /// `Service` manages the installation, uninstallation, starting, and stopping of the `paneru` application as a launchd service.
 /// It encapsulates the `launchctl::Service` and the path to the executable.
 #[derive(Debug)]
 pub struct Service {
     /// The underlying `launchctl::Service` instance.
     pub raw: launchctl::Service,
-    /// The absolute path to the `paneru` executable.
+    /// The absolute path to the invoking `paneru` executable (copy source).
     pub bin_path: PathBuf,
+    /// The absolute canonical daemon path (`~/.local/bin/paneru`) that the
+    /// plist and the app shim point at.
+    pub canonical: PathBuf,
     /// The user's home directory.
     home_dir: PathBuf,
 }
@@ -40,11 +82,12 @@ impl Service {
             ErrorKind::NotFound,
             "Cannot find home directory.",
         ))?;
+        let bin_path = exe_path().ok_or(Error::new(
+            ErrorKind::NotFound,
+            "Cannot find current executable path.",
+        ))?;
+        let canonical = canonical_path(&home_dir);
         Ok(Self {
-            bin_path: exe_path().ok_or(Error::new(
-                ErrorKind::NotFound,
-                "Cannot find current executable path.",
-            ))?,
             raw: launchctl::Service::builder()
                 .name(name)
                 .uid(unsafe { libc::getuid() }.to_string())
@@ -53,6 +96,8 @@ impl Service {
                     home = home_dir.display()
                 ))
                 .build(),
+            bin_path,
+            canonical,
             home_dir,
         })
     }
@@ -70,31 +115,130 @@ impl Service {
     }
 
     /// Installs the service as a launch agent by writing its plist file.
-    /// If the service is already installed, a warning is logged, and installation is skipped.
+    /// Doubles as the updater: converges the invoking binary onto the
+    /// canonical path (copy + ad-hoc re-stamp when the bytes differ) and
+    /// rewrites the plist whenever it is missing or its `Program=` drifted
+    /// from canonical. Never starts the service — follow with `paneru
+    /// restart` (which heals a bootstrapped stale definition).
     ///
     /// # Returns
     ///
-    /// `Ok(())` if the service is installed successfully or already exists, otherwise `Err(Error)` if a file system error occurs.
+    /// `Ok(())` if everything already converges, otherwise `Err(Error)` on
+    /// file system or signing errors.
     pub fn install(&self) -> Result<()> {
+        self.promote_to_canonical()?;
+        self.warn_if_not_on_path();
+        if self.is_installed() && !self.plist_drifted() {
+            warn!(
+                "launch agent at `{}` already points at the canonical binary, nothing to do",
+                self.plist_path().display()
+            );
+            return Ok(());
+        }
+        self.write_plist()?;
+        if self.is_bootstrapped().unwrap_or(false) {
+            warn!(
+                "service is loaded with a stale definition; run `paneru restart` to pick up {}",
+                self.canonical.display()
+            );
+        }
+        Ok(())
+    }
+
+    /// Reads the installed plist's `Program=` entry, if any.
+    #[must_use]
+    pub fn installed_program(&self) -> Option<String> {
+        fs::read_to_string(self.plist_path())
+            .ok()
+            .and_then(|text| parse_program(&text))
+    }
+
+    /// Whether the installed plist points somewhere other than canonical
+    /// (missing plist counts as drifted so callers converge it).
+    #[must_use]
+    pub fn plist_drifted(&self) -> bool {
+        self.installed_program()
+            .is_none_or(|program| program != self.canonical.display().to_string())
+    }
+
+    fn write_plist(&self) -> Result<()> {
         let plist_path = self.plist_path();
         let dir = plist_path.parent().ok_or(Error::last_os_error())?;
         if !dir.exists() {
             fs::create_dir_all(dir)?;
         }
-
-        if self.is_installed() {
-            warn!(
-                "existing launch agent detected at `{}`, skipping installation",
-                plist_path.display()
-            );
-            return Ok(());
-        }
-
         let mut plist = fs::File::create(plist_path)?;
         plist.write_all(self.launchd_plist().as_bytes())?;
-        info!("installed launch agent to `{}`", plist_path.display());
+        info!(
+            "installed launch agent at `{}` pointing at `{}`",
+            plist_path.display(),
+            self.canonical.display()
+        );
         info!("check logfile /tmp/com.github.karinushka.paneru*.log for potential error messages");
         Ok(())
+    }
+
+    /// Copies the invoking binary over the canonical path (atomic
+    /// temp+rename, safe while the old daemon runs) and re-stamps the
+    /// stable ad-hoc identifier when the bytes or the identifier differ.
+    /// Skips both when the canonical binary already matches, so a plain
+    /// `paneru install` never gratuitously invalidates a live TCC grant.
+    fn promote_to_canonical(&self) -> Result<()> {
+        let canonical = &self.canonical;
+        if let Some(parent) = canonical.parent()
+            && !parent.exists()
+        {
+            fs::create_dir_all(parent)?;
+        }
+        let current_bytes = fs::read(&self.bin_path)?;
+        let canonical_bytes = fs::read(canonical).unwrap_or_default();
+        if current_bytes != canonical_bytes {
+            let staging = canonical.with_extension("new");
+            fs::write(&staging, &current_bytes)?;
+            #[cfg(unix)]
+            {
+                use std::os::unix::fs::PermissionsExt;
+                let mut permissions = fs::metadata(&staging)?.permissions();
+                permissions.set_mode(0o755);
+                fs::set_permissions(&staging, permissions)?;
+            }
+            fs::rename(&staging, canonical)?;
+            info!("installed daemon binary to `{}`", canonical.display());
+        }
+        if Self::signature_identifier(canonical)? != SIGN_IDENTIFIER {
+            stamp_signature(canonical)?;
+        }
+        Ok(())
+    }
+
+    /// Signing identifier currently stamped on `path` (`None` when the
+    /// `codesign` probe itself fails).
+    fn signature_identifier(path: &Path) -> Result<String> {
+        let output = Command::new("/usr/bin/codesign")
+            .args(["-d", "--verbose=2"])
+            .arg(path)
+            .output()?;
+        let text = format!(
+            "{}{}",
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr)
+        );
+        Ok(parse_identifier(&text).unwrap_or_default())
+    }
+
+    /// Warns once when the canonical dir is not on `PATH`.
+    fn warn_if_not_on_path(&self) {
+        let Some(parent) = self.canonical.parent() else {
+            return;
+        };
+        let on_path =
+            env::var("PATH").is_ok_and(|path| env::split_paths(&path).any(|entry| entry == parent));
+        if !on_path {
+            warn!(
+                "canonical daemon `{}` is not on PATH; add `export PATH=\"$HOME/.local/bin:$PATH\"` to your shell profile",
+                self.canonical.display()
+            );
+        }
     }
 
     /// Uninstalls the service by removing its plist file.
@@ -137,14 +281,18 @@ impl Service {
     }
 
     /// Starts the service using `launchctl`.
-    /// If the service is not installed, it will be installed first.
+    /// Heals a drifted plist first (rewrite + bootout so the new `Program=`
+    /// takes effect), then enables/bootstraps or kickstarts as before.
     ///
     /// # Returns
     ///
     /// `Ok(())` if the service starts successfully, otherwise `Err(Error)` from `launchctl`.
     pub fn start(&self) -> Result<()> {
-        if !self.is_installed() {
-            self.install()?;
+        if !self.is_installed() || self.plist_drifted() {
+            if self.is_bootstrapped().unwrap_or(false) {
+                let _ = Self::launchctl(&["bootout", self.raw.service_target.as_str()]);
+            }
+            self.write_plist()?;
         }
         info!("starting service...");
         self.create_log_files()?;
@@ -227,7 +375,8 @@ impl Service {
     }
 
     /// Generates the content of the launchd plist file for this service.
-    /// This string is formatted with the service name, executable path, and log paths.
+    /// `Program` always points at the canonical daemon path, never at the
+    /// invoking binary's location (Cellar paths, tarball dirs, …).
     #[must_use]
     pub fn launchd_plist(&self) -> String {
         let xdg_config_home = env::var("XDG_CONFIG_HOME")
@@ -236,13 +385,31 @@ impl Service {
         format!(
             include_str!("../../assets/launchd.plist"),
             name = self.raw.name,
-            bin_path = self.bin_path.display(),
+            bin_path = self.canonical.display(),
             out_log_path = self.raw.out_log_path,
             error_log_path = self.raw.error_log_path,
             xdg_config_home = xdg_config_home,
             rust_log = rust_log,
         )
     }
+}
+
+/// Re-stamps the stable ad-hoc identifier on `path`. Required after every
+/// byte change (a copied signature never survives new bytes); without a
+/// paid Developer ID this is the closest macOS gets to a stable identity.
+fn stamp_signature(path: &Path) -> Result<()> {
+    let output = Command::new("/usr/bin/codesign")
+        .args(["--force", "--sign", "-", "--identifier", SIGN_IDENTIFIER])
+        .arg(path)
+        .output()?;
+    if output.status.success() {
+        return Ok(());
+    }
+    Err(Error::other(format!(
+        "codesign failed for {}: {}",
+        path.display(),
+        String::from_utf8_lossy(&output.stderr).trim()
+    )))
 }
 
 fn start_commands(service: &launchctl::Service, bootstrapped: bool) -> Vec<Vec<&str>> {
@@ -262,7 +429,8 @@ fn start_commands(service: &launchctl::Service, bootstrapped: bool) -> Vec<Vec<&
 
 #[cfg(test)]
 mod tests {
-    use super::start_commands;
+    use super::{parse_identifier, parse_program, start_commands};
+    use std::path::Path;
 
     fn service() -> launchctl::Service {
         launchctl::Service::builder()
@@ -292,6 +460,43 @@ mod tests {
                     "/Users/test/Library/LaunchAgents/com.github.karinushka.paneru.plist"
                 ]
             ]
+        );
+    }
+
+    #[test]
+    fn parse_program_reads_the_daemon_path() {
+        let plist = "\
+<?xml version=\"1.0\" encoding=\"UTF-8\"?>\n\
+<plist version=\"1.0\"><dict>\n\
+<key>Label</key><string>com.github.karinushka.paneru</string>\n\
+<key>Program</key>\n<string>/Users/test/.local/bin/paneru</string>\n\
+</dict></plist>\n";
+        assert_eq!(
+            parse_program(plist),
+            Some("/Users/test/.local/bin/paneru".to_string())
+        );
+        assert_eq!(parse_program("<plist></plist>"), None);
+        assert_eq!(parse_program("not xml at all"), None);
+    }
+
+    #[test]
+    fn parse_identifier_reads_codesign_output() {
+        let output = "Executable=/Users/test/.local/bin/paneru\n\
+            Identifier=com.github.karinushka.paneru\n\
+            Format=Mach-O thin (arm64)\n\
+            Signature=adhoc\n";
+        assert_eq!(
+            parse_identifier(output),
+            Some("com.github.karinushka.paneru".to_string())
+        );
+        assert_eq!(parse_identifier("garbage"), None);
+    }
+
+    #[test]
+    fn canonical_path_lives_under_home() {
+        assert_eq!(
+            super::canonical_path(Path::new("/Users/test")),
+            Path::new("/Users/test/.local/bin/paneru")
         );
     }
 }
