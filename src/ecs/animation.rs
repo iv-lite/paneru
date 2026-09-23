@@ -12,6 +12,14 @@
 //! when their markers land on adjacent ticks. Legs born later open a fresh
 //! burst with a full leg — never a rushed hop.
 //!
+//! On GPU vs CPU, honestly: window motion itself can never be GPU — other
+//! apps' windows move only through AX `WindowServer` round-trips (batched
+//! onto the single writer thread with per-window-latest coalescing). What
+//! is GPU-composited: the border/ghost overlay windows (layer-backed,
+//! `setFrame`-only moves) riding the presented frame. The tween math here
+//! exists to make that ride exact: small steps the writer tracks, shared
+//! phase so siblings converge together.
+//!
 //! Pure math only — no Bevy, no `AppKit` — so it stays unit testable.
 
 use std::time::Duration;
@@ -37,9 +45,6 @@ pub const BURST_JOIN_WINDOW: Duration = Duration::from_millis(50);
 /// starts over at zero progress (a genuine new move that deserves the full
 /// glide instead of inheriting a nearly-spent phase).
 pub const RETARGET_CARRY_PX: f32 = 32.0;
-
-/// Upper bound for migrated legacy speeds (e.g. `animation_speed = 0.5`).
-pub const MAX_ANIMATION_DURATION_MS: u64 = 4000;
 
 /// Smootherstep: gentle attack *and* landing, zero velocity at both ends.
 /// `p` is clamped 0..1. At 20ms into a 150ms glide this covers ~4% of the
@@ -112,27 +117,6 @@ pub fn tween_ivec2(start: IVec2, end: IVec2, t: f32) -> IVec2 {
     let current = start.as_vec2();
     let target = end.as_vec2();
     current.lerp(target, t).round().as_ivec2()
-}
-
-/// Converts a legacy exponential `animation_speed` rate to a tween duration.
-///
-/// `rate = 12` (the old fluid default) maps to ~150ms; very large rates
-/// (>= 1000, the harness snap convention) map to zero (instant).
-#[allow(
-    clippy::cast_possible_truncation,
-    clippy::cast_sign_loss,
-    clippy::cast_precision_loss,
-    reason = "clamped to 0..MAX ms, well within u64; sub-ms precision is lost"
-)]
-pub fn speed_to_duration(rate: f64) -> Duration {
-    if !rate.is_finite() || rate <= 0.0 {
-        return Duration::from_millis(DEFAULT_ANIMATION_DURATION_MS);
-    }
-    if rate >= 1000.0 {
-        return Duration::ZERO;
-    }
-    let ms = 1800.0 / rate;
-    Duration::from_millis(ms.round().clamp(0.0, MAX_ANIMATION_DURATION_MS as f64) as u64)
 }
 
 /// Shortens the glide when retargeting mid-flight: the new leg covers only
@@ -245,16 +229,6 @@ mod tests {
                 .expect("150ms - 1ms"),
             duration
         ));
-    }
-
-    #[test]
-    fn legacy_speed_maps_to_snappy_default() {
-        assert_eq!(speed_to_duration(12.0), Duration::from_millis(150));
-        assert_eq!(speed_to_duration(1_000_000.0), Duration::ZERO);
-        assert_eq!(speed_to_duration(10000.0), Duration::ZERO);
-        // Slower rates glide longer but stay bounded.
-        assert!(speed_to_duration(0.5) <= Duration::from_millis(MAX_ANIMATION_DURATION_MS));
-        assert!(speed_to_duration(30.0) < speed_to_duration(12.0));
     }
 
     #[test]

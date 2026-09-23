@@ -69,7 +69,7 @@ fn test_window_shuffle() {
             padding_right: Some(PADDING_RIGHT),
             padding_top: Some(PADDING_TOP),
             padding_bottom: Some(PADDING_BOTTOM),
-            animation_speed: Some(1_000_000.0),
+            animations: Some(false),
             ..Default::default()
         },
         vec![params],
@@ -186,7 +186,7 @@ fn test_window_resize_grow_and_shrink_cycle() {
     let config: Config = (
         MainOptions {
             preset_column_widths: vec![0.25, 0.5, 0.75],
-            animation_speed: Some(1_000_000.0),
+            animations: Some(false),
             ..Default::default()
         },
         vec![],
@@ -246,7 +246,7 @@ fn test_window_vertical_resize_grow_and_shrink_cycle() {
     let config: Config = (
         MainOptions {
             preset_stack_heights: vec![0.3, 0.5, 0.7],
-            animation_speed: Some(1_000_000.0),
+            animations: Some(false),
             ..Default::default()
         },
         vec![],
@@ -297,7 +297,7 @@ fn test_window_can_resize_to_two_display_widths_and_scroll() {
     let config: Config = (
         MainOptions {
             swipe_gesture_fingers: Some(3),
-            animation_speed: Some(10000.0),
+            animations: Some(false),
             ..Default::default()
         },
         vec![],

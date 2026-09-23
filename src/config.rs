@@ -384,26 +384,13 @@ impl Config {
         self.inner().options.clone()
     }
 
-    // Fixed tween length for driven moves (150ms default). `0` snaps
-    // instantly. New key; the legacy `animation_speed` rate below maps onto
-    // it when unset so old configs and the test harness keep working.
+    // Fixed tween length for driven moves (150ms default). `animations =
+    // false` snaps instantly (zero duration).
     pub fn animation_duration(&self) -> std::time::Duration {
-        if let Some(ms) = self.options().animation_duration_ms {
-            return std::time::Duration::from_millis(ms.min(5000));
+        if self.options().animations == Some(false) {
+            return std::time::Duration::ZERO;
         }
-        crate::ecs::animation::speed_to_duration(self.animation_speed())
-    }
-
-    // Legacy exponential ease-out decay rate (per second). Deprecated: prefer
-    // `animation_duration_ms`. Kept so existing configs keep their feel —
-    // 12 ≈ 150ms, very large values snap. Suggested range was 8..20.
-    pub fn animation_speed(&self) -> f64 {
-        self.options()
-            .animation_speed
-            // Fluid default: visible glide that still lands quickly. Set
-            // explicitly (or very high) for an instant snap.
-            .unwrap_or(12.0)
-            .max(0.0)
+        std::time::Duration::from_millis(crate::ecs::animation::DEFAULT_ANIMATION_DURATION_MS)
     }
 
     /// Finds a keybinding matching the given `keycode` and `modifier` mask.
@@ -1320,13 +1307,10 @@ pub struct MainOptions {
     /// a window vertically inside a stack.
     #[serde(default = "default_preset_stack_heights")]
     pub preset_stack_heights: Vec<f64>,
-    /// The animation speed for window movements in pixels per second.
-    /// Deprecated: prefer `animation_duration_ms` (0 = snap). Honored when
-    /// the duration key is unset (12 ≈ 150ms, very large snaps).
-    pub animation_speed: Option<f64>,
-    /// Fixed tween length in milliseconds for driven window moves.
-    /// Default 150. Set to 0 for an instant snap.
-    pub animation_duration_ms: Option<u64>,
+    /// Whether driven window moves glide (`true`, default) or snap
+    /// instantly (`false`). Replaces the old `animation_speed` /
+    /// `animation_duration_ms` knobs: one switch, one fixed 150ms tween.
+    pub animations: Option<bool>,
     /// Automatically center the window when switching focus with keyboard.
     pub auto_center: Option<bool>,
     /// Automatically center a lone column: when a strip holds exactly one

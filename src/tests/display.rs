@@ -370,7 +370,7 @@ fn test_vertical_drag_wiggle_moves_nothing() {
 fn test_sustained_scroll_drag_tracks_pointer_one_to_one() {
     let config: Config = (
         MainOptions {
-            animation_speed: Some(1_000_000.0),
+            animations: Some(false),
             ..Default::default()
         },
         vec![],
@@ -1066,7 +1066,7 @@ fn test_startup_snaps_scattered_windows_to_columns() {
     // guards must place everything instantly regardless.
     let config: Config = (
         MainOptions {
-            animation_speed: Some(0.5),
+            animations: Some(true),
             ..Default::default()
         },
         vec![],
@@ -2678,7 +2678,7 @@ fn test_unarmed_drag_with_scroll_disabled_moves_column_then_glides_home() {
                 MainOptions {
                     mouse_drag_display_modifier: Some(Modifiers::ALT),
                     left_drag_scrolls_strip: Some(false),
-                    animation_speed: Some(1_000_000.0),
+                    animations: Some(false),
                     ..Default::default()
                 },
                 vec![],

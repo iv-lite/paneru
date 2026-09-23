@@ -1208,7 +1208,8 @@ fn seam_snap_target(current: Origin, target: Origin, displays: &[IRect]) -> Opti
 
 /// This is a Bevy system that runs on `Update`. It tweens windows to their target
 /// positions, as indicated by the `RepositionMarker` component.
-/// Animation length is controlled by `animation_duration_ms` in the `Config`.
+/// Animation length is the fixed 150ms glide (`Config::animation_duration`;
+/// `animations = false` snaps).
 /// When a window reaches its target position, the `RepositionMarker` is removed.
 ///
 /// # Arguments

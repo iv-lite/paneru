@@ -267,7 +267,7 @@ fn setup_world() -> App {
     // friction by construction, so the suite pins exact pointer tracking
     // everywhere.
     let harness_options = MainOptions {
-        animation_speed: Some(1_000_000.0),
+        animations: Some(false),
         ..Default::default()
     };
     let harness_config: Config = (harness_options, Vec::new()).into();

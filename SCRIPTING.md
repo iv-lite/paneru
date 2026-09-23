@@ -40,7 +40,7 @@ paneru.setup {
   options = {
     focus_follows_mouse = true,
     sliver_width = 5,
-    animation_speed = 12.0,   -- write floats with a decimal point
+    animations = true,
     preset_stack_heights = { 0.25, 0.5, 0.75 },
   },
   padding = { top = 10, bottom = 10, left = 8, right = 8 },
@@ -79,7 +79,7 @@ An `init.lua` disables the TOML entirely, whether or not it calls `paneru.setup`
 Editing and saving `init.lua` hot-reloads the whole configuration (including menubar and passthrough updates), just like editing the TOML file.
 
 **Notes:**
-- Float-valued options (`animation_speed`, border `width`/`opacity`, window `width`, …) should be written with a decimal point (`12.0`, not `12`).
+- Float-valued options (border `width`/`opacity`, window `width`, …) should be written with a decimal point (`12.0`, not `12`).
 - A reload that *removes* a previous `paneru.setup` call keeps the last config it produced rather than reverting to TOML.
 - With Nix modules, set `services.paneru.config` to this `init.lua` (Lua source or a path). See [`nix/README.md`](nix/README.md).
 

@@ -277,7 +277,7 @@ fn test_sliver_smaller_than_edge_padding() {
     let config: Config = (
         MainOptions {
             sliver_width: Some(SLIVER),
-            animation_speed: Some(1_000_000.0),
+            animations: Some(false),
             padding_top: Some(PADDING),
             padding_bottom: Some(PADDING),
             padding_left: Some(PADDING),
@@ -504,7 +504,7 @@ fn test_window_hidden_ratio() {
     let config: Config = (
         MainOptions {
             window_hidden_ratio: Some(0.5),
-            animation_speed: Some(10000.0),
+            animations: Some(false),
             swipe_gesture_fingers: Some(3),
             ..Default::default()
         },
@@ -551,7 +551,7 @@ fn test_window_swap_brings_focused_into_view() {
 
     let config: Config = (
         MainOptions {
-            animation_speed: Some(10000.0),
+            animations: Some(false),
             ..Default::default()
         },
         vec![],
@@ -599,7 +599,7 @@ fn test_window_swap_keeps_strip_when_in_view() {
 
     let config: Config = (
         MainOptions {
-            animation_speed: Some(10000.0),
+            animations: Some(false),
             ..Default::default()
         },
         vec![],
@@ -635,7 +635,7 @@ fn test_focus_east_fills_fitting_strip() {
 
     let config: Config = (
         MainOptions {
-            animation_speed: Some(10000.0),
+            animations: Some(false),
             ..Default::default()
         },
         vec![],
@@ -674,7 +674,7 @@ fn test_swap_east_fills_fitting_strip() {
 
     let config: Config = (
         MainOptions {
-            animation_speed: Some(10000.0),
+            animations: Some(false),
             ..Default::default()
         },
         vec![],
@@ -1532,7 +1532,7 @@ fn test_follow_move_brings_appended_window_on_screen() {
     );
 }
 
-/// With `insert_windows_mid_strip` enabled and a smooth `animation_speed`, moving
+/// With `insert_windows_mid_strip` enabled and smooth animations, moving
 /// a window to another virtual workspace must not animate: every window snaps to
 /// its final spot. Checked per-update, since markers created and consumed
 /// mid-move would be invisible to a settle-then-check.
@@ -1541,7 +1541,7 @@ fn test_mid_strip_move_does_not_animate() {
     let config: Config = (
         MainOptions {
             insert_windows_mid_strip: Some(true),
-            animation_speed: Some(12.0),
+            animations: Some(true),
             virtual_workspace_animations: Some(false),
             swipe_gesture_fingers: Some(3),
             ..Default::default()
@@ -1628,7 +1628,7 @@ fn test_ensure_visible_snap_does_not_animate_with_animations_off() {
     let config: Config = (
         MainOptions {
             virtual_workspace_animations: Some(false),
-            animation_speed: Some(12.0),
+            animations: Some(true),
             ..Default::default()
         },
         vec![],
@@ -1686,7 +1686,7 @@ fn test_ensure_visible_without_snap_still_animates() {
     let config: Config = (
         MainOptions {
             virtual_workspace_animations: Some(false),
-            animation_speed: Some(0.5),
+            animations: Some(true),
             ..Default::default()
         },
         vec![],
@@ -1826,7 +1826,7 @@ fn test_focus_arrival_on_fresh_strip_defers_then_exposes() {
     let config: Config = (
         MainOptions {
             swipe_gesture_fingers: Some(3),
-            animation_speed: Some(1_000_000.0),
+            animations: Some(false),
             ..Default::default()
         },
         vec![],
@@ -2025,7 +2025,7 @@ fn test_snap_strip_marker_forces_snap_for_under_threshold_move() {
     let config: Config = (
         MainOptions {
             virtual_workspace_animations: Some(false),
-            animation_speed: Some(12.0),
+            animations: Some(true),
             ..Default::default()
         },
         vec![],
@@ -2118,7 +2118,7 @@ fn test_under_threshold_move_animates_without_snap_strip_marker() {
     let config: Config = (
         MainOptions {
             virtual_workspace_animations: Some(false),
-            animation_speed: Some(12.0),
+            animations: Some(true),
             ..Default::default()
         },
         vec![],
@@ -2239,7 +2239,7 @@ fn quiesce(h: &mut TestHarness) {
 fn test_strip_translation_rides_members_together() {
     let config: Config = (
         MainOptions {
-            animation_speed: Some(12.0),
+            animations: Some(true),
             ..Default::default()
         },
         vec![],
@@ -2403,7 +2403,7 @@ fn test_maximize_tiled_windows_disabled_keeps_native_size() {
 fn test_focus_glide_keeps_siblings_in_lockstep() {
     let config: Config = (
         MainOptions {
-            animation_speed: Some(12.0),
+            animations: Some(true),
             auto_center: Some(true),
             ..Default::default()
         },
@@ -2529,7 +2529,7 @@ fn test_focus_clamps_os_drift_back_to_tile() {
 fn test_os_echo_focus_reveals_without_rearranging() {
     let config: Config = (
         MainOptions {
-            animation_speed: Some(12.0),
+            animations: Some(true),
             auto_center: Some(true),
             ..Default::default()
         },
@@ -2569,7 +2569,7 @@ fn test_os_echo_focus_reveals_without_rearranging() {
 fn test_slot_change_still_animates_independently() {
     let config: Config = (
         MainOptions {
-            animation_speed: Some(12.0),
+            animations: Some(true),
             ..Default::default()
         },
         vec![],
@@ -2702,7 +2702,7 @@ fn test_virtual_workspace_switch_stops_in_flight_strip_animation() {
     let config: Config = (
         MainOptions {
             virtual_workspace_animations: Some(false),
-            animation_speed: Some(12.0),
+            animations: Some(true),
             swipe_gesture_fingers: Some(3),
             ..Default::default()
         },
@@ -2831,7 +2831,7 @@ fn test_reshuffle_leftmost_pins_strip_to_left_edge_with_stale_frame() {
     let config: Config = (
         MainOptions {
             auto_center: Some(false),
-            animation_speed: Some(30.0),
+            animations: Some(true),
             continuous_swipe: Some(false),
             ..Default::default()
         },
@@ -2909,7 +2909,7 @@ fn test_virtual_workspace_switch_preserves_scroll_with_animations() {
     let config: Config = (
         MainOptions {
             auto_center: Some(false),
-            animation_speed: Some(30.0),
+            animations: Some(true),
             swipe_gesture_fingers: Some(3),
             virtual_workspace_animations: Some(true),
             ..Default::default()
@@ -3059,7 +3059,7 @@ fn test_foreign_window_move_is_adopted() {
         MainOptions {
             // Snappy, so no `RepositionMarker` is still in flight when the
             // notification below arrives.
-            animation_speed: Some(10000.0),
+            animations: Some(false),
             ..Default::default()
         },
         vec![],
@@ -3288,7 +3288,7 @@ fn manual_offset_config() -> Config {
         MainOptions {
             auto_center: Some(false),
             continuous_swipe: Some(false),
-            animation_speed: Some(10000.0),
+            animations: Some(false),
             swipe_gesture_fingers: Some(3),
             ..Default::default()
         },
@@ -3412,7 +3412,7 @@ fn test_focus_into_hidden_virtual_workspace_exposes_target_window() {
 
     let config: Config = (
         MainOptions {
-            animation_speed: Some(10000.0),
+            animations: Some(false),
             virtual_workspace_animations: Some(true),
             auto_center: Some(false),
             // A reshuffle may leave a window up to half hidden where it is,
