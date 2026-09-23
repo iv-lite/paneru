@@ -444,9 +444,21 @@ impl OverlayManager {
                         *placed = frame;
                     }
                 } else {
+                    // Cutout-only motion (the focused window gliding under a
+                    // static dim): same paint, new hole. Rebuild the view
+                    // but composite asynchronously — the synchronous redraw
+                    // is what skewed the dim a frame behind layer-moved
+                    // borders every glide tick.
+                    #[allow(
+                        clippy::float_cmp,
+                        reason = "exact match with the derived PartialEq compared one branch up; config values are bit-stable per tick"
+                    )]
+                    let same_paint = stored.opacity == params.opacity
+                        && stored.color == params.color
+                        && stored.cutout_radius == params.cutout_radius;
                     let view = DimView::new(self.mtm, frame, &params);
                     window.setContentView(Some(&view));
-                    window.setFrame_display(frame, true);
+                    window.setFrame_display(frame, !same_paint);
                     *stored = params;
                     *placed = frame;
                 }
@@ -511,13 +523,18 @@ impl OverlayManager {
     /// params): drops vanished windows, moves/reskins changed ones, orders
     /// everything in. Moves never repaint and never rebuild views; only
     /// genuine param changes rewrite layer properties. Cost is O(changed),
-    /// never O(all windows).
-    pub fn sync_borders(&mut self, desired: &[(WinID, NSRect, BorderParams)]) {
+    /// never O(all windows). `wanted` is caller-owned scratch (clear +
+    /// refill inside) so no set is allocated per tick.
+    pub fn sync_borders(
+        &mut self,
+        desired: &[(WinID, NSRect, BorderParams)],
+        wanted: &mut std::collections::HashSet<WinID>,
+    ) {
         let screen_h = self.screen_height(false);
         // Set lookup: the retain scan below runs per border per tick, and
         // with inactive borders on both sides grow with the window count.
-        let wanted: std::collections::HashSet<WinID> =
-            desired.iter().map(|(id, _, _)| *id).collect();
+        wanted.clear();
+        wanted.extend(desired.iter().map(|(id, _, _)| *id));
         self.borders.retain(|id, border| {
             let keep = wanted.contains(id);
             if !keep {

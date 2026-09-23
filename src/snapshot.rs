@@ -318,6 +318,17 @@ pub(crate) fn snapshot_on_screen_set(
     (guard.at.elapsed() < max_age).then(|| guard.on_screen.clone())
 }
 
+/// On-screen window ids from an already-loaded snapshot, if fresh.
+/// Borrowed (no clone): per-tick overlay passes prefer this over
+/// [`snapshot_on_screen_set`], which loads + clones per call.
+pub(crate) fn on_screen_from(
+    snap: Option<&AxSnapshot>,
+    max_age: Duration,
+) -> Option<&HashSet<WinID>> {
+    let snap = snap?;
+    (snap.at.elapsed() < max_age).then_some(&snap.on_screen)
+}
+
 /// On-screen window ids, preferring the snapshot worker's set and falling
 /// back to a direct walk when absent or stale (tests take the fallback
 /// exclusively). Shared by overlay borders, tab grouping and (later) query
@@ -369,25 +380,36 @@ pub(crate) fn snapshot_live_frame(
     win_id: WinID,
     max_age: Duration,
 ) -> Option<IRect> {
-    let guard = store?.0.load();
-    (guard.at.elapsed() < max_age)
-        .then(|| guard.windows.get(&win_id)?.frame)
+    let Some(store) = store else {
+        return live_frame_from(None, win_id, max_age);
+    };
+    let guard = store.0.load();
+    live_frame_from(Some(&**guard), win_id, max_age)
+}
+
+/// [`snapshot_live_frame`] over an already-loaded snapshot: one `load()` per
+/// tick, not one per window. Per-tick overlay passes prefer this.
+pub(crate) fn live_frame_from(
+    snap: Option<&AxSnapshot>,
+    win_id: WinID,
+    max_age: Duration,
+) -> Option<IRect> {
+    let snap = snap?;
+    (snap.at.elapsed() < max_age)
+        .then(|| snap.windows.get(&win_id)?.frame)
         .flatten()
 }
 
-/// Detected corner radius for `win_id` from the snapshot worker, if the
-/// store exists, holds the window, and is newer than `max_age`. Same
-/// freshness rules as [`snapshot_live_frame`]: stale or missing data falls
-/// back to the direct SLS read. Pure over the loaded snapshot, so it is
-/// unit testable like the frame matrix.
-pub(crate) fn snapshot_corner_radius(
-    store: Option<&SnapshotStore>,
+/// Corner radius over an already-loaded snapshot (the store-based wrapper
+/// is gone: every caller hoists its load).
+pub(crate) fn corner_radius_from(
+    snap: Option<&AxSnapshot>,
     win_id: WinID,
     max_age: Duration,
 ) -> Option<f64> {
-    let guard = store?.0.load();
-    (guard.at.elapsed() < max_age)
-        .then(|| guard.windows.get(&win_id)?.corner_radius)
+    let snap = snap?;
+    (snap.at.elapsed() < max_age)
+        .then(|| snap.windows.get(&win_id)?.corner_radius)
         .flatten()
 }
 
@@ -634,22 +656,23 @@ mod tests {
             },
         );
         let store = SnapshotStore(Arc::new(ArcSwap::new(Arc::new(snapshot))));
+        let guard = store.0.load();
         assert_eq!(
-            snapshot_corner_radius(Some(&store), 1, Duration::from_secs(1)),
+            corner_radius_from(Some(&**guard), 1, Duration::from_secs(1)),
             Some(12.0)
         );
         assert_eq!(
-            snapshot_corner_radius(Some(&store), 1, Duration::from_nanos(0)),
+            corner_radius_from(Some(&**guard), 1, Duration::from_nanos(0)),
             None,
             "expired snapshots fall back to the direct read"
         );
         assert_eq!(
-            snapshot_corner_radius(Some(&store), 2, Duration::from_secs(1)),
+            corner_radius_from(Some(&**guard), 2, Duration::from_secs(1)),
             None,
             "missing windows fall back to the direct read"
         );
         assert_eq!(
-            snapshot_corner_radius(None, 1, Duration::from_secs(1)),
+            corner_radius_from(None, 1, Duration::from_secs(1)),
             None,
             "absent store (tests) falls back to the direct read"
         );

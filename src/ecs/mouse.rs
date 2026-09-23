@@ -94,13 +94,24 @@ fn press_is_on_titlebar(point: &CGPoint, window: &Window) -> bool {
 /// Classifies a press into header (titlebar band or blank toolbar
 /// chrome) versus content.
 ///
-/// Geometry first (no AX cost for obvious titlebar/content presses);
-/// the AX hit-test (`Window::toolbar_blank_hit`) runs only in the
-/// ambiguous band below the titlebar, where unified toolbars live.
-/// Toolbar controls (buttons, text fields, tabs) and all content stay
-/// native — only blank draggable chrome joins the titlebar pipeline.
+/// Geometry first (no AX cost for obvious content presses below the
+/// titlebar); the AX hit-test (`Window::toolbar_blank_hit`) runs in the
+/// ambiguous band below the titlebar, where unified toolbars live, and a
+/// targeted interactive check (`Window::interactive_hit`) runs inside the
+/// titlebar band itself, where unified tab strips live. Toolbar controls
+/// (buttons, text fields, tabs) and all content stay native — only blank
+/// draggable chrome joins the titlebar pipeline. Any AX failure falls back
+/// to geometry (titlebar band drags), never blocks input.
 fn press_kind(point: &CGPoint, window: &Window) -> PressKind {
     if press_is_on_titlebar(point, window) {
+        // Tab strips and toolbar controls live inside the titlebar
+        // geometry band: an interactive element under the cursor keeps
+        // native behavior (tab switching, buttons) instead of scrolling
+        // the strip and swallowing the drag. Press-time cost only (one AX
+        // walk), never per-tick.
+        if window.interactive_hit(point) {
+            return PressKind::Content;
+        }
         return PressKind::Titlebar;
     }
     if window.toolbar_blank_hit(point) {

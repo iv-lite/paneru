@@ -183,14 +183,6 @@ impl TestHarness {
         self
     }
 
-    /// Overrides how much simulated time each command gets. Tests whose
-    /// assertions need long-settling animations to converge exactly keep the
-    /// legacy 500ms window; everything else runs on [`COMMAND_WINDOW`].
-    pub(crate) fn with_command_window(mut self, window: Duration) -> Self {
-        self.command_window = window;
-        self
-    }
-
     pub(crate) fn with_state(mut self, state: PaneruState) -> Self {
         self.app.world_mut().insert_resource(state);
         self

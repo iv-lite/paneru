@@ -48,12 +48,12 @@ use crate::manager::{
     Application, Display, Origin, Process, Window, WindowManager, WindowOS, bruteforce_windows,
     pid_of_element,
 };
-use crate::overlay::{FlashMessageManager, OverlayManager};
+use crate::overlay::{BorderParams, FlashMessageManager, OverlayManager};
 use crate::platform::input::{TapHealth, left_button_held};
 use crate::platform::{PlatformCallbacks, WinID};
 use crate::snapshot::{
-    ON_SCREEN_MAX_AGE, SNAPSHOT_FRAME_MAX_AGE, SnapshotRoster, SnapshotStore, on_screen_set,
-    snapshot_corner_radius, snapshot_live_frame,
+    AxSnapshot, ON_SCREEN_MAX_AGE, SNAPSHOT_FRAME_MAX_AGE, SnapshotRoster, SnapshotStore,
+    corner_radius_from, live_frame_from, on_screen_from, on_screen_set, snapshot_live_frame,
 };
 use crate::util::AXUIWrapper;
 
@@ -1883,19 +1883,10 @@ fn overlay_tracks_live(swiping: bool, drag_held: bool, settle_grace: bool) -> bo
     swiping || drag_held || settle_grace
 }
 
-/// Whether the overlay hides for an active swipe. Touchpad swipes hide, but
-/// a held header-drag drives the strip scroll by hand, so the border must
-/// keep tracking the dragged window instead of vanishing until release (the
-/// reappearance jump reads as detached). Pure and unit tested like
-/// [`overlay_tracks_live`].
-fn overlay_hide_for_swipe(swiping: bool, drag_held: bool) -> bool {
-    swiping && !drag_held
-}
-
 /// Throttle window for the holder-less press hit-test below: two SLS round
-/// trips, so at most ~20Hz while a button is held with no tracked grab.
-/// Mirrors the FFM hover throttle; the answer only gates border hiding.
-const PRESS_HIT_THROTTLE: Duration = Duration::from_millis(50);
+/// trips, so at most ~10Hz while a button is held with no tracked grab.
+/// The answer only gates border hiding, so 100ms staleness is invisible.
+const PRESS_HIT_THROTTLE: Duration = Duration::from_millis(100);
 
 #[derive(Default)]
 struct PressHitCache {
@@ -2258,11 +2249,15 @@ pub(super) struct OverlayWindowConfigCache {
 }
 
 /// Per-tick overlay scratch state, bundled in one `Local` so the system
-/// stays under Bevy's system-param limit.
+/// stays under Bevy's system-param limit. The `desired`/`wanted` buffers are
+/// reused across ticks (clear + refill, never reallocated) instead of fresh
+/// `Vec`/`HashSet` per overlay pass.
 #[derive(Default)]
 pub(super) struct OverlayCaches {
     config: OverlayWindowConfigCache,
     press_hit: PressHitCache,
+    desired: Vec<(WinID, NSRect, BorderParams)>,
+    wanted: HashSet<WinID>,
 }
 
 /// Global clocks the overlay reacts to, bundled so `update_overlays` stays
@@ -2290,6 +2285,31 @@ type FlightMarkers<'w, 's> = Query<
 fn flight_driving(row: &(bool, bool, Option<&crate::ecs::PositionDrive>)) -> bool {
     let (repositioning, resizing, drive) = row;
     *repositioning || *resizing || drive.as_ref().is_some_and(|drive| drive.is_verifying())
+}
+
+/// How much the driving rung trusts the presented layout frame.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum DriveTrust {
+    /// Animator or holder drive owns motion this tick: commits flow, so
+    /// convergence is causal — paint the presented frame exactly. Clamping
+    /// here froze the border at `stale cache + 24px` through every fast
+    /// glide (freeze-then-jump on refresh).
+    Full,
+    /// Merely awaiting confirmation (verifying tail, settle): the app may
+    /// still hold the old frame — clamp to last-known OS truth.
+    Clamped,
+}
+
+/// Pure rung policy for the driving branch of [`border_frame_for`]: trust
+/// while the animator (markers) or a driving holder gesture owns motion,
+/// clamp while only a verifying leg remains. Unit tested; the harness has
+/// no `OverlayManager`, so this is the seam that pins border behavior.
+fn drive_trust(animator_owns: bool, holder_driven: bool) -> DriveTrust {
+    if animator_owns || holder_driven {
+        DriveTrust::Full
+    } else {
+        DriveTrust::Clamped
+    }
 }
 
 /// Snapshot frames are raw CG-decoded rects: re-apply the window's padding
@@ -2336,8 +2356,9 @@ fn border_frame_for(
     window: &Window,
     tracking_live: bool,
     native_held: bool,
+    holder_driven: bool,
     paint_frame: Option<IRect>,
-    store: Option<&SnapshotStore>,
+    snap: Option<&AxSnapshot>,
 ) -> IRect {
     // Native-owned drag: layout never moved, so neither the slot nor the
     // flight target means anything. Prefer the paint-only drag offset
@@ -2349,31 +2370,37 @@ fn border_frame_for(
         if let Some(frame) = paint_frame {
             return frame;
         }
-        if let Some(raw) = snapshot_live_frame(store, window.id(), SNAPSHOT_FRAME_MAX_AGE) {
+        if let Some(raw) = live_frame_from(snap, window.id(), SNAPSHOT_FRAME_MAX_AGE) {
             return pad_snapshot_frame(raw, window);
         }
         return window.frame();
     }
-    let driving = tracking_live || flight.get(entity).is_ok_and(|row| flight_driving(&row));
+    let flight_row = flight.get(entity).ok();
+    let driving = tracking_live || flight_row.is_some_and(|row| flight_driving(&row));
     if driving {
         // Ride the tween: `frame()` is the current presented `Position` —
         // the exact rect just committed to AX on the same tick — while
         // `moving_frame()` would substitute the final target and jump ahead
         // of the window. One shared burst phase, one shared frame: border and
-        // window land together. The lead over last-known OS truth is clamped
-        // (see `clamp_lead_to_os`): async AX trails the presented frame by a
-        // tick or two, and during stalls the presented frame advances while
-        // no commit lands — unclamped, the border visibly outruns the glass.
+        // window land together. Trust is total while the animator (markers)
+        // or a driving holder gesture owns motion — commits flow, so the
+        // lead is real travel, not overshoot. A bare verifying tail keeps
+        // the clamp: async AX may have stalled while the app still holds
+        // the old frame.
         if let Some(frame) = windows.frame(entity) {
             // Trace-only pin for drag-detach diagnosis: during motion each
             // overlay tick must log a live frame that advances; a frozen
             // rect here with a scrolling strip means the layout stopped
             // rewriting window positions (not an overlay gating miss).
             trace!("overlay live frame for {entity}: {frame:?}");
-            return clamp_lead_to_os(frame, window.frame());
+            let animator_owns = flight_row.is_some_and(|(rp, rs, _)| rp || rs);
+            return match drive_trust(animator_owns, holder_driven) {
+                DriveTrust::Full => frame,
+                DriveTrust::Clamped => clamp_lead_to_os(frame, window.frame()),
+            };
         }
         trace!("overlay driving {entity} but no layout frame, falling back to OS frame");
-    } else if let Some(raw) = snapshot_live_frame(store, window.id(), SNAPSHOT_FRAME_MAX_AGE) {
+    } else if let Some(raw) = live_frame_from(snap, window.id(), SNAPSHOT_FRAME_MAX_AGE) {
         return pad_snapshot_frame(raw, window);
     }
     window.frame()
@@ -2432,7 +2459,7 @@ fn border_radius_for(
     applications: &Query<&Application>,
     config: &Config,
     cache: &mut HashMap<WinID, (Option<f64>, Option<f64>)>,
-    store: Option<&SnapshotStore>,
+    snap: Option<&AxSnapshot>,
 ) -> Option<f64> {
     /// Base radius from global config plus one window's detected corners.
     fn base(config: &Config, detected: Option<f64>) -> f64 {
@@ -2448,7 +2475,7 @@ fn border_radius_for(
     let app = applications.get(parent).ok()?;
     let properties = WindowProperties::new(app, window, config);
     let configured = properties.border_radius();
-    let detected = snapshot_corner_radius(store, window_id, SNAPSHOT_FRAME_MAX_AGE)
+    let detected = corner_radius_from(snap, window_id, SNAPSHOT_FRAME_MAX_AGE)
         .or_else(|| window.border_radius());
     cache.insert(window_id, (configured, detected));
     Some(configured.unwrap_or(base(config, detected)))
@@ -2479,11 +2506,15 @@ pub(super) fn update_overlays(
     store: Option<Res<SnapshotStore>>,
     window_manager: Res<WindowManager>,
 ) {
-    use crate::overlay::BorderParams;
-
     let Some(mut overlay_mgr) = overlay_mgr else {
         return;
     };
+
+    // One snapshot load per overlay tick: every truth read below (border
+    // frames, radii, on-screen set) shares this guard instead of loading +
+    // cloning per window.
+    let snap_guard = store.as_deref().map(|s| s.0.load());
+    let snap: Option<&AxSnapshot> = snap_guard.as_ref().map(|g| &***g);
 
     // Display-set reconciliation ran (wake, rescan, reconfigure): re-probe
     // screen geometry even when the display count is unchanged — the cached
@@ -2512,8 +2543,11 @@ pub(super) fn update_overlays(
         return;
     };
 
-    let hide_for_swipe = overlay_hide_for_swipe(swiping, !drag_held.is_empty());
-    if hide_for_swipe || clocks.mission_control_active.0 || active_strip.is_fullscreen() {
+    // Touchpad swipes ride the live layout frame like any other motion
+    // (see `overlay_tracks_live`): hiding blinked the border every swipe.
+    // Only Mission Control and native fullscreen spaces hide — their windows
+    // leave tiled layout entirely.
+    if clocks.mission_control_active.0 || active_strip.is_fullscreen() {
         overlay_mgr.hide_all();
         return;
     }
@@ -2523,15 +2557,19 @@ pub(super) fn update_overlays(
         return;
     }
 
-    // No borders while a left-drag is held: a live outline tracking the
-    // gesture reads as detached next to the moving window, so the border
-    // hides for the gesture and reappears at the release point (the
-    // `drag_ended` gate guarantees the repaint). Holder covers every
-    // tracked grab; the button-state arm covers missed-press native drags
-    // with no holder, where the slot stays pinned while the OS moves.
-    // Dim surfaces stay frozen (never hidden — no flash) and the
-    // drop-preview ghost keeps painting on its own window.
+    // Borders during a held drag: a gesture the layout drives (armed column
+    // or scroll drag) keeps its border riding the live frame — truth is
+    // produced 1:1 with the pointer, so hiding would blink a glued outline
+    // for no reason. Anything else held (plain content grabs, bare test
+    // holders) hides for the gesture and reappears at the release point
+    // (the `drag_ended` gate guarantees the repaint). The button-state arm
+    // covers missed-press native drags with no holder, where the slot stays
+    // pinned while the OS moves. Dim surfaces stay frozen (never hidden —
+    // no flash) and the drop-preview ghost keeps painting on its own window.
     let holder_held = !drag_held.is_empty();
+    let driven_held = drag_held
+        .iter()
+        .any(|(_, gesture, _)| gesture.is_some_and(|g| g.drives()));
     if !holder_held && left_button_held() {
         // Button held with no drag tracking (a press the tap never
         // delivered): no holder means no gesture owns the drag, so there is
@@ -2544,15 +2582,26 @@ pub(super) fn update_overlays(
         return;
     }
     // Two SLS round trips per tick while any button is held with no holder
-    // (missed-press native drags). Throttled like the FFM hover hit-test:
-    // the answer only gates border hiding, so 50ms staleness is invisible.
+    // (missed-press native drags). Throttled: the answer only gates border
+    // hiding, so staleness is invisible.
+    // Split the tick scratch into disjoint fields once: `desired`/`wanted`
+    // reuse across ticks (clear + refill, never reallocated) while the
+    // radii cache borrows separately.
+    let OverlayCaches {
+        config: radii_cache,
+        press_hit,
+        desired,
+        wanted,
+    } = &mut *caches;
     let pressed_without_holder = !holder_held
         && left_button_held()
-        && press_hit_cached(&window_manager, &windows, &mut caches.press_hit);
-    if holder_held || pressed_without_holder {
+        && press_hit_cached(&window_manager, &windows, press_hit);
+    if pressed_without_holder || (holder_held && !driven_held) {
         overlay_mgr.hide_borders();
         return;
     }
+    // Driven holder from here on: the border below rides the live layout
+    // frame (or the holder paint for native-owned drags) every tick.
 
     let Some((window, entity)) = windows.focused() else {
         // Distinguish a truly focusless world from the transient two-marker
@@ -2605,6 +2654,12 @@ pub(super) fn update_overlays(
     // fallback).
     let settle = settle.active(time.elapsed());
     let tracking_live = overlay_tracks_live(swiping, !drag_held.is_empty(), settle);
+    // One rung per tick: when any window rides the driving rung (layout
+    // truth), every visible sibling rides it too instead of mixing layout
+    // frames with stale snapshot rungs (shear). Static siblings are
+    // unaffected — their layout frame is their slot — and when nothing
+    // drives, everyone shares the snapshot rung as before.
+    let tracking_live = tracking_live || flight.iter().any(|row| flight_driving(&row));
     if !drag_held.is_empty() {
         // Trace-only pin for drag-detach diagnosis (see `border_frame_for`):
         // proves the overlay ran during the drag and which truth it read.
@@ -2624,6 +2679,14 @@ pub(super) fn update_overlays(
             && drag_held.iter().any(|(marker, gesture, _)| {
                 marker.0 == entity && gesture.is_none_or(|g| !g.display_armed && !g.scroll_armed)
             })
+    };
+    // Grab-time driving gesture on this window (armed column or scroll
+    // drag): the layout moves with the pointer, so the border trusts the
+    // presented frame exactly (see `drive_trust`).
+    let is_holder_driven = |entity: Entity| {
+        drag_held
+            .iter()
+            .any(|(marker, gesture, _)| marker.0 == entity && gesture.is_some_and(|g| g.drives()))
     };
     // One-frame velocity lead for the drag paint below: extrapolating the
     // grab frame plus pointer EMA keeps the border on the cursor at display
@@ -2649,8 +2712,9 @@ pub(super) fn update_overlays(
         window,
         tracking_live,
         is_native_held(entity),
+        is_holder_driven(entity),
         holder_paint(entity),
-        store.as_deref(),
+        snap,
     );
     let focused_abs_cg = abs_cg_rect(frame, window);
 
@@ -2676,22 +2740,23 @@ pub(super) fn update_overlays(
     // The corner radius feeds every bordered window plus the dim cutout
     // hole, so a config change invalidates the whole cache at once.
     if config.is_changed() {
-        caches.config.radii.clear();
+        radii_cache.radii.clear();
     }
 
     // Desired borders: the focused window with active styling, plus — when
     // inactive borders are enabled — every on-screen tiled window with
-    // inactive styling. Computed fresh every overlay tick; the manager turns
-    // the diff into moves, reskins and removals (O(changed), never O(all)).
-    let mut desired: Vec<(WinID, NSRect, BorderParams)> = Vec::new();
+    // inactive styling. Reuses the tick scratch buffers (clear + refill, no
+    // per-tick allocation); the manager turns the diff into moves, reskins
+    // and removals (O(changed), never O(all)).
+    desired.clear();
     if want_border {
         let Some(radius) = border_radius_for(
             focused_window_id,
             &windows,
             &applications,
             &config,
-            &mut caches.config.radii,
-            store.as_deref(),
+            &mut radii_cache.radii,
+            snap,
         ) else {
             // Parent gone mid-focus: hide rather than freezing the old
             // rect until the next dirty tick.
@@ -2711,12 +2776,23 @@ pub(super) fn update_overlays(
     }
     // Inactive borders (opt-in) need the on-screen set; without it only the
     // focused entry above applies — dim below still updates either way.
-    // Snapshot first (250ms cadence, shared), direct walk as fallback.
-    let on_screen: Option<HashSet<WinID>> = if config.inactive_border_enabled() {
-        on_screen_set(store.as_deref(), &window_manager, ON_SCREEN_MAX_AGE)
-    } else {
-        None
-    };
+    // Snapshot set borrowed, never cloned; direct walk only when no worker
+    // exists (tests) — a present-but-stale worker skips the SLS walk and
+    // inactive borders wait a tick rather than paying CGWindowList.
+    let on_screen: Option<std::borrow::Cow<'_, HashSet<WinID>>> =
+        if config.inactive_border_enabled() {
+            match on_screen_from(snap, ON_SCREEN_MAX_AGE) {
+                Some(set) => Some(std::borrow::Cow::Borrowed(set)),
+                // No worker (tests): direct walk. A present-but-stale
+                // worker skips the SLS walk — inactive borders wait a tick
+                // rather than paying CGWindowList per frame.
+                None if store.is_none() => on_screen_set(None, &window_manager, ON_SCREEN_MAX_AGE)
+                    .map(std::borrow::Cow::Owned),
+                None => None,
+            }
+        } else {
+            None
+        };
     if let Some(on_screen) = &on_screen {
         for (window, entity, _) in windows.managed_iter() {
             let window_id = window.id();
@@ -2736,8 +2812,9 @@ pub(super) fn update_overlays(
                 window,
                 tracking_live,
                 is_native_held(entity),
+                is_holder_driven(entity),
                 holder_paint(entity),
-                store.as_deref(),
+                snap,
             );
             // Parked-sliver guard, generalized per window across displays.
             if !displays
@@ -2751,8 +2828,8 @@ pub(super) fn update_overlays(
                 &windows,
                 &applications,
                 &config,
-                &mut caches.config.radii,
-                store.as_deref(),
+                &mut radii_cache.radii,
+                snap,
             ) else {
                 continue;
             };
@@ -2768,7 +2845,7 @@ pub(super) fn update_overlays(
             ));
         }
     }
-    overlay_mgr.sync_borders(&desired);
+    overlay_mgr.sync_borders(desired, wanted);
 
     if dim_opacity > 0.0 {
         overlay_mgr.update(
@@ -2781,8 +2858,8 @@ pub(super) fn update_overlays(
                 &windows,
                 &applications,
                 &config,
-                &mut caches.config.radii,
-                store.as_deref(),
+                &mut radii_cache.radii,
+                snap,
             )
             .unwrap_or(10.0),
         );
@@ -2794,12 +2871,13 @@ pub(super) fn update_overlays(
     // Prune radii the desired set (plus the dim cutout lookup above) no
     // longer references. Runs last so a dim-only tick does not
     // evict-then-reread the focused entry (an AX call) every frame.
-    let wanted: HashSet<WinID> = desired
-        .iter()
-        .map(|(id, _, _)| *id)
-        .chain((dim_opacity > 0.0).then_some(focused_window_id))
-        .collect();
-    caches.config.radii.retain(|id, _| wanted.contains(id));
+    // Reuses the scratch set: clear + refill, no per-tick allocation.
+    wanted.clear();
+    wanted.extend(desired.iter().map(|(id, _, _)| *id));
+    if dim_opacity > 0.0 {
+        wanted.insert(focused_window_id);
+    }
+    radii_cache.radii.retain(|id, _| wanted.contains(id));
 }
 
 #[instrument(level = Level::TRACE, skip_all)]
@@ -3511,7 +3589,6 @@ mod tests {
     use super::active_timeout_limit;
     use super::adoption_distrusted;
     use super::gather_initial_processes;
-    use super::overlay_hide_for_swipe;
     use super::overlay_tracks_live;
     use super::vsync_timeout_ms;
     use super::{LOOP_MAX_TIMEOUT_FRAME_ACTIVE_MS, LOOP_MAX_TIMEOUT_PROMOTION_MS};
@@ -3590,15 +3667,17 @@ mod tests {
     }
 
     #[test]
-    fn overlay_hides_for_swipe_but_tracks_held_drags() {
-        // Touchpad swipe with no drag held: hide for the gesture.
-        assert!(overlay_hide_for_swipe(true, false));
-        // A held header-drag drives the scroll by hand: the border must keep
-        // tracking instead of vanishing until release.
-        assert!(!overlay_hide_for_swipe(true, true));
-        // No swipe: nothing to hide for.
-        assert!(!overlay_hide_for_swipe(false, false));
-        assert!(!overlay_hide_for_swipe(false, true));
+    fn drive_trust_follows_motion_ownership() {
+        use super::DriveTrust;
+        use super::drive_trust;
+        // Animator markers mean live commits: trust the presented frame so
+        // the border never freezes at stale-cache-plus-24 mid-glide.
+        assert_eq!(drive_trust(true, false), DriveTrust::Full);
+        assert_eq!(drive_trust(false, true), DriveTrust::Full);
+        assert_eq!(drive_trust(true, true), DriveTrust::Full);
+        // Bare verifying tail (no marker, no holder drive): the app may
+        // still hold the old frame — keep the clamp.
+        assert_eq!(drive_trust(false, false), DriveTrust::Clamped);
     }
 
     #[test]
