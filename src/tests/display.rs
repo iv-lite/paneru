@@ -1,3 +1,5 @@
+use std::cell::Cell;
+use std::rc::Rc;
 use std::time::Duration;
 
 use bevy::prelude::*;
@@ -1785,6 +1787,192 @@ fn test_armed_drag_at_edge_warps_cursor() {
             // landing x = left edge + inset (0 + 6), landing y = -1180 +
             // relative y (100 - 20).
             assert_eq!(state.cursor_position(), Origin::new(6, -1100));
+        })
+        .run(commands);
+}
+
+/// Warping mid-drag rebases the drag anchor: the first post-warp delta is
+/// measured from the landing point, not the pre-warp point — otherwise the
+/// inter-display span (1000+ px on ultrawide+laptop) folds into the column
+/// drive in one tick and ejects the strip, and a later focus arrival then
+/// "reveals" the displaced window by scrolling it out of the viewport.
+#[test]
+fn test_warp_back_rebases_drag_anchor() {
+    // Grab window 0's center while holding Alt (display-armed column drag).
+    let grab = CGPoint::new(200.0, 500.0);
+    // Right edge of the test display (bounds max.x 1024, threshold 3px).
+    let edge = CGPoint::new(1022.0, 100.0);
+    // Small continued drag on the external display after the warp.
+    let further = CGPoint::new(106.0, -1100.0);
+    let commands = vec![
+        Event::MenuOpened { window_id: 0 },
+        Event::MouseDown {
+            point: grab,
+            modifiers: Modifiers::ALT,
+        },
+        Event::MouseDragged {
+            point: CGPoint::new(600.0, 300.0),
+            modifiers: Modifiers::ALT,
+        },
+        Event::MouseDragged {
+            point: edge,
+            modifiers: Modifiers::ALT,
+        },
+        Event::MouseDragged {
+            point: further,
+            modifiers: Modifiers::ALT,
+        },
+        Event::MouseUp {
+            point: further,
+            modifiers: Modifiers::ALT,
+        },
+    ];
+
+    // The warp landing carries wall-clock velocity (up to +80px), so the
+    // exact post-warp delta is read back from the mock cursor (which the
+    // warp itself positions) rather than hardcoded.
+    let landing_x = Rc::new(Cell::new(0));
+    let stash_landing = landing_x.clone();
+    let expect_landing = landing_x.clone();
+    TestHarness::new()
+        .with_config(warp_drag_config())
+        .with_windows(1)
+        .with_display(
+            EXT_DISPLAY_ID,
+            IRect::new(0, -EXT_DISPLAY_HEIGHT, EXT_DISPLAY_WIDTH, 0),
+            vec![EXT_WORKSPACE_ID],
+        )
+        .on_iteration(2, |world, _state| {
+            // Pre-warp tracking is exact 1:1 (600 - 200).
+            assert_window_at!(world, 0, 400, TEST_MENUBAR_HEIGHT);
+        })
+        .on_iteration(3, move |world, state| {
+            // Edge tick drives its exact pre-warp segment (1022 - 600);
+            // the warp runs after the drive in the same tick.
+            assert_window_at!(world, 0, 822, TEST_MENUBAR_HEIGHT);
+            stash_landing.set(state.cursor_position().x);
+        })
+        .on_iteration(4, move |world, _state| {
+            // Post-warp delta measured from the landing (106 - landing),
+            // never the inter-display span (106 - 1022).
+            assert_window_at!(
+                world,
+                0,
+                822 + (106 - expect_landing.get()),
+                TEST_MENUBAR_HEIGHT
+            );
+        })
+        .run(commands);
+}
+
+/// Full repro: armed warp-drag, release, then FFM hover-focus. The drop
+/// relocates the dragged column to its nearest slot and the hover focuses
+/// without scrolling anything — the focused window must end fully inside
+/// its owner's viewport.
+#[test]
+fn test_warp_drag_release_then_hover_stays_in_viewport() {
+    let ffm_config: Config = (
+        MainOptions {
+            horizontal_mouse_warp: Some(1),
+            mouse_drag_display_modifier: Some(Modifiers::ALT),
+            focus_follows_mouse: Some(true),
+            mouse_follows_focus: Some(false),
+            auto_center: Some(false),
+            ..Default::default()
+        },
+        vec![],
+    )
+        .into();
+    let grab = CGPoint::new(200.0, 500.0);
+    let edge = CGPoint::new(1022.0, 100.0);
+    let further = CGPoint::new(106.0, -1100.0);
+    let commands = vec![
+        Event::MenuOpened { window_id: 0 },
+        Event::MouseDown {
+            point: grab,
+            modifiers: Modifiers::ALT,
+        },
+        Event::MouseDragged {
+            point: CGPoint::new(600.0, 300.0),
+            modifiers: Modifiers::ALT,
+        },
+        Event::MouseDragged {
+            point: edge,
+            modifiers: Modifiers::ALT,
+        },
+        Event::MouseDragged {
+            point: further,
+            modifiers: Modifiers::ALT,
+        },
+        Event::MouseUp {
+            point: further,
+            modifiers: Modifiers::ALT,
+        },
+        // Drop near the right edge relocates the column after window 1,
+        // retiling to window 1 at x 0 and window 0 at x 400. Hover each
+        // tile in turn: every hover focuses without moving the layout.
+        Event::MouseMoved {
+            point: CGPoint::new(200.0, 500.0),
+            modifiers: Modifiers::empty(),
+        },
+        Event::MouseMoved {
+            point: CGPoint::new(600.0, 500.0),
+            modifiers: Modifiers::empty(),
+        },
+        Event::Command {
+            command: Command::PrintState,
+        },
+    ];
+
+    TestHarness::new()
+        .with_config(ffm_config)
+        .with_windows(2)
+        .with_display(
+            EXT_DISPLAY_ID,
+            IRect::new(0, -EXT_DISPLAY_HEIGHT, EXT_DISPLAY_WIDTH, 0),
+            vec![EXT_WORKSPACE_ID],
+        )
+        .on_iteration(4, |world, _state| {
+            // Mid-gesture exactness, like the single-window case: the
+            // pre-warp segments (400 + 422) plus the post-landing travel
+            // (at most ~100px given the velocity-carry bound).
+            let window = world
+                .query::<&Window>()
+                .iter(world)
+                .find(|w| w.id() == 0)
+                .expect("window 0");
+            let x = window.frame().min.x;
+            assert!(
+                (842..=924).contains(&x),
+                "post-warp drag must track the landing, got x {x}"
+            );
+        })
+        .on_iteration(6, |world, _state| {
+            // Hover focused window 1 without moving the settled layout.
+            assert_focused!(world, 1);
+            assert_window_at!(world, 0, 400, TEST_MENUBAR_HEIGHT);
+            assert_window_at!(world, 1, 0, TEST_MENUBAR_HEIGHT);
+        })
+        .on_iteration(7, |world, _state| {
+            // Hover focused window 0, still without scrolling.
+            assert_focused!(world, 0);
+            assert_window_at!(world, 0, 400, TEST_MENUBAR_HEIGHT);
+            assert_window_at!(world, 1, 0, TEST_MENUBAR_HEIGHT);
+        })
+        .on_iteration(8, |world, _state| {
+            // Settle pin: nothing drifts after the hovers, and the focused
+            // window ends fully inside its viewport.
+            assert_focused!(world, 0);
+            assert_window_at!(world, 0, 400, TEST_MENUBAR_HEIGHT);
+            let window = world
+                .query::<&Window>()
+                .iter(world)
+                .find(|w| w.id() == 0)
+                .expect("window 0");
+            assert!(
+                window.frame().max.x <= TEST_DISPLAY_WIDTH,
+                "focused window must end fully inside its viewport"
+            );
         })
         .run(commands);
 }

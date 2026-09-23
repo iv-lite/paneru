@@ -21,6 +21,7 @@ use super::{
     PRESS_FOCUS_CAUSE_WINDOW, Position, PositionDrive, RepositionMarker, ReshuffleAroundMarker,
     SystemTheme, USER_FOCUS_CAUSE_WINDOW, Unmanaged, UserFocus,
 };
+use crate::ax_writer::AxWriteState;
 use crate::config::Config;
 use crate::ecs::layout::{LayoutStrip, clamp_origin_to_viewport};
 use crate::ecs::params::{ActiveDisplay, GlobalState, WindowCtx, Windows};
@@ -356,6 +357,8 @@ struct FocusArrivalGuards<'w, 's> {
     restored: Query<'w, 's, &'static RestoreFocusMarker>,
     reshuffling: Query<'w, 's, Entity, With<ReshuffleAroundMarker>>,
     strip_motion: StripMotion<'w, 's>,
+    strip_parents: Query<'w, 's, &'static ChildOf, With<LayoutStrip>>,
+    display_viewports: Query<'w, 's, (&'static Display, Option<&'static DockPosition>)>,
 }
 
 /// Strip offset plus pending glide target, for the already-placed check.
@@ -423,12 +426,23 @@ fn autocenter_window_on_focus(
     // it (or glides there) and the window projects inside the viewport. A
     // redundant marker would restart the glide, jogging an already-correct
     // strip on lagged Electron frames — the click-then-focus-echo sequence
-    // lands exactly here. Same 1px quantum as `drop_home`.
+    // lands exactly here. Same 1px quantum as `drop_home`. Measured
+    // against the OWNER viewport, not the active display: the
+    // `ActiveDisplayMarker` can lag a cross-display focus arrival (wrap,
+    // transfer, delayed echo), and clamping one display's sizes against
+    // another's bounds false-negatives into a redundant reshuffle that
+    // scrolls the focused window out of view.
     if let Some(size) = ctx.windows.size(entity)
         && let Some(layout) = ctx.windows.layout_position(entity)
         && let Some((strip_entity, _)) = strips.iter().find(|(_, strip)| strip.contains(entity))
     {
-        let viewport = active_display.bounds();
+        let viewport = owner_viewport(
+            Some(strip_entity),
+            &guards.strip_parents,
+            &guards.display_viewports,
+            &active_display,
+            &ctx.config,
+        );
         let strip_target = Origin::new(
             viewport.center().x - size.x / 2 - layout.0.x,
             viewport.min.y,
@@ -459,7 +473,16 @@ fn autocenter_window_on_focus(
         && let Some(layout) = ctx.windows.layout_position(entity)
         && let Some((strip_entity, _)) = strips.iter().find(|(_, strip)| strip.contains(entity))
     {
-        let viewport = active_display.bounds();
+        // Owner viewport, matching the already-placed check above: the
+        // active marker can lag a cross-display arrival, and centering on
+        // a stale display's bounds scrolls the window out of its own view.
+        let viewport = owner_viewport(
+            Some(strip_entity),
+            &guards.strip_parents,
+            &guards.display_viewports,
+            &active_display,
+            &ctx.config,
+        );
         let center = viewport.center();
         // Deliberately unclamped, mirroring `reshuffle_layout_strip`: under
         // `auto_center` the edge invariant is unenforced (magnetic centering
@@ -471,14 +494,18 @@ fn autocenter_window_on_focus(
     }
     // A reshuffle already queued (typically the command's own arrival
     // reshuffle) is measured post-strip-move by the Update layout pass —
-    // stacking a second marker only re-measures the same arrival. Other
-    // focus paths (clicks, hover, OS echoes) arrive with no marker and
+    // stacking a second marker only re-measures the same arrival downstream.
+    // Other focus paths (clicks, hover, OS echoes) arrive with no marker and
     // reshuffle here as before. Skipped entirely once centering drove the
     // strip itself: a follow-up reshuffle would overwrite the centering
     // target with a mere expose offset. Plain (not forced): a forced
     // re-clamp would discard a deliberate `ManualStripOffset` centering on
     // every refocus — vacated-slot closing on detach paths is already
-    // forced at the detach site itself.
+    // forced at the detach site itself. Lagged Electron echoes are already
+    // absorbed by the already-placed check above (same 1px quantum), so
+    // this stays unconditional: gating it on window flight broke setup
+    // centering, where the initial placement glide is still in flight when
+    // focus arrives.
     if !centered && !guards.reshuffling.contains(entity) {
         ctx.commands.reshuffle_around(entity);
     }
@@ -568,6 +595,7 @@ fn ensure_focused_visible(
     active_display: ActiveDisplay,
     config: Res<Config>,
     time: Res<Time>,
+    write_state: Res<AxWriteState>,
     mut commands: Commands,
 ) {
     use crate::ecs::layout::clamp_origin_to_viewport;
@@ -612,6 +640,23 @@ fn ensure_focused_visible(
         |(_, strip, _, _, _, _)| strip.tabbed(entity),
     );
     if tabbed {
+        return;
+    }
+    // Transient presented frame: an async write is still converging, so the
+    // frame below is stale truth — exposing now scrolls the settled window
+    // out (wrap-back hover on a lagged Electron frame lands exactly here).
+    // Defer for the followup instead of dropping: `Added<FocusedMarker>`
+    // fires once, and the followup retries until the write lands or ages
+    // out into snapshot verify.
+    if windows
+        .get(entity)
+        .is_some_and(|window| write_state.unacked_live(window.id()))
+    {
+        if let Ok(mut entity_commands) = commands.get_entity(entity) {
+            entity_commands.try_insert(DeferredExposeMarker {
+                deadline: time.elapsed() + DEFER_EXPOSE_TIMEOUT,
+            });
+        }
         return;
     }
     let (Some(frame), Some(size)) = (windows.moving_frame(entity), windows.size(entity)) else {
@@ -690,6 +735,7 @@ fn deferred_expose_followup(
     active_display: ActiveDisplay,
     config: Res<Config>,
     time: Res<Time>,
+    write_state: Res<AxWriteState>,
     mut commands: Commands,
 ) {
     use crate::ecs::layout::clamp_origin_to_viewport;
@@ -735,6 +781,14 @@ fn deferred_expose_followup(
         if owner.is_some_and(|(strip_entity, _, strip_flight, strip_scrolling, _, _)| {
             strip_flight || strip_scrolling || fresh_strips.contains(strip_entity)
         }) {
+            continue;
+        }
+        // Async write still converging: the presented frame is transient —
+        // retry until it lands or ages out, like flight above.
+        if windows
+            .get(entity)
+            .is_some_and(|window| write_state.unacked_live(window.id()))
+        {
             continue;
         }
         let tabbed = owner.map_or_else(

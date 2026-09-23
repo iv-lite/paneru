@@ -229,7 +229,12 @@ impl Plugin for MouseEventsPlugin {
                 )
                     .run_if(mission_control_inactive),
                 mouse_up_trigger,
-                horizontal_warp_mouse_trigger,
+                // After the synthetic move in the same tick: the edge event
+                // must drive its pre-warp segment first (exact 1:1), and
+                // only then teleport — otherwise the drag would fold the
+                // warp span itself as a delta. The warp publishes the
+                // landing via `WarpAnchor` for the next tick's rebase.
+                horizontal_warp_mouse_trigger.after(drag_move_held_column),
                 // Outside the mission-control gate like `mouse_up_trigger`:
                 // it must still run to hide a stale ghost. Ordered after
                 // the move and the transfer so the ghost never trails the
@@ -247,6 +252,7 @@ impl Plugin for MouseEventsPlugin {
         app.init_resource::<DragModifierState>();
         app.init_resource::<DragScrollState>();
         app.init_resource::<DropPreviewState>();
+        app.init_resource::<WarpAnchor>();
         // Never during warmup: relocation needs converged strips.
         app.add_systems(
             Update,
@@ -905,6 +911,27 @@ impl Default for DragModifierState {
     }
 }
 
+/// Edge-warp teleport record, bridging `horizontal_warp_mouse_trigger` and
+/// `drag_move_held_column` (separate systems with separate `Local` state):
+/// the warp writes the landing point; the drag consumes it to rebase its
+/// press anchor instead of driving the inter-display span as a drag delta.
+/// Without this, the first post-warp `MouseDragged` folds
+/// `landing − pre-warp point` (1000+ px on ultrawide+laptop) into the
+/// strip/column drive plus the release-velocity EMA — one tick displaces
+/// the strip far off-slot, and a later focus arrival then "reveals" the
+/// displaced window by scrolling it out of the viewport.
+#[derive(Debug, Default, Resource)]
+pub(crate) struct WarpAnchor {
+    pub(crate) landing: Option<Origin>,
+}
+
+/// Backstop bound on one frame's folded drag travel: a hand cannot move
+/// 512px in a single frame (30k px/s at 60fps); an edge-warp teleport or a
+/// coalescing glitch can. The anchor rebase above is the real fix; this
+/// bounds any race to a survivable nudge instead of a viewport-ejecting
+/// jump.
+const MAX_FOLD_DX_PX_PER_FRAME: i32 = 512;
+
 /// Per-gesture scroll-drag telemetry: accumulated travel in pixels plus the
 /// release-velocity EMA. Written on every mouse-up (scroll drags
 /// additionally feed the scroll pipeline mid-gesture); read on release to
@@ -1398,6 +1425,7 @@ fn drag_move_held_column(
     mut holder_paint: Query<&mut DragPaint>,
     cold: Option<Res<ColdStart>>,
     mut state: Local<DragMoveState>,
+    mut warp_anchor: ResMut<WarpAnchor>,
     mut commands: Commands,
 ) {
     // HID bursts can deliver many `MouseDragged` per frame; driving the
@@ -1405,6 +1433,16 @@ fn drag_move_held_column(
     // a long header-drag at constant cost: one strip write, one paint
     // advance, one commit push per frame. Velocity EMA still samples each
     // raw delta so the release glide keeps its shape.
+    //
+    // Edge-warp rebase: a warp last tick teleported the cursor to another
+    // display. The press anchor still holds the pre-warp point, so adopt
+    // the landing before folding — otherwise the first post-warp delta is
+    // the inter-display span. The velocity sampler is also reset (a pause
+    // means holding still); only post-warp motion may seed a fling.
+    if let Some(landing) = warp_anchor.landing.take() {
+        state.last = Some(landing);
+        scroll_state.last_sample_at = None;
+    }
     let mut folded_dx: i32 = 0;
     let mut latest_modifiers = None;
     let mut saw_drag = false;
@@ -1464,6 +1502,9 @@ fn drag_move_held_column(
     if folded_dx == 0 {
         return;
     }
+    // Teleport backstop (see `MAX_FOLD_DX_PX_PER_FRAME`): the anchor rebase
+    // above is the real fix; this bounds any race to a nudge.
+    let folded_dx = folded_dx.clamp(-MAX_FOLD_DX_PX_PER_FRAME, MAX_FOLD_DX_PX_PER_FRAME);
     let Some((target, window_id, armed, scroll_armed)) = held_drag_target(&held, &windows) else {
         trace!("synthetic drag: no managed held target, skipping move");
         return;
@@ -2178,6 +2219,7 @@ fn horizontal_warp_mouse_trigger(
     window_manager: Res<WindowManager>,
     config: Res<Config>,
     mut state: Local<WarpVelocityState>,
+    mut warp_anchor: ResMut<WarpAnchor>,
 ) {
     /// Stale velocity samples (e.g. from a prior gesture) shouldn't carry.
     const VELOCITY_FRESHNESS: Duration = Duration::from_millis(80);
@@ -2233,6 +2275,10 @@ fn horizontal_warp_mouse_trigger(
         // Reset the velocity sample to the landing point so the next motion
         // event computes velocity from the new position, not the pre-warp one.
         state.last = Some((landing, now));
+        // Rebase the held-drag anchor too: the drag system owns its own
+        // `Local` press point and would otherwise drive the inter-display
+        // span as one giant drag delta next tick (see `WarpAnchor`).
+        warp_anchor.landing = Some(landing);
     }
 }
 
