@@ -8,8 +8,8 @@ use crate::commands::{Command, Direction, MoveFocus, Operation};
 use crate::config::{Config, MainOptions, WindowParams, parse_command};
 use crate::ecs::display::FloatingLayer;
 use crate::ecs::{
-    ActiveWorkspaceMarker, Bounds, DragSettleMarker, FocusedMarker, ManualStripOffset,
-    NativeFullscreenMarker, Position, Scrolling, Unmanaged, layout::LayoutStrip,
+    ActiveWorkspaceMarker, Bounds, DragSettleMarker, EnsureVisibleMarker, FocusedMarker,
+    ManualStripOffset, NativeFullscreenMarker, Position, Scrolling, Unmanaged, layout::LayoutStrip,
 };
 use crate::ecs::{RepositionMarker, SpawnWindowTrigger};
 use crate::events::Event;
@@ -1026,6 +1026,42 @@ fn test_focus_west_from_outside_strip_enters_at_last_column() {
                 focused, expected,
                 "West from outside the strip enters at the last (rightmost) column",
             );
+        })
+        .run(commands);
+}
+
+/// A repeat focus echo for the already-focused window on a settled, visible
+/// tile issues no reveal marker and moves nothing: it carries no new layout
+/// information. (Marker absence is timing-soft in-harness — layout consumes
+/// markers same-iteration — so the decision itself is pinned by unit test;
+/// this asserts the settled end-state.)
+#[test]
+fn test_repeat_focus_echo_leaves_settled_tile_quiet() {
+    let commands = vec![
+        Event::MenuOpened { window_id: 0 },
+        Event::WindowFocused { window_id: 0 },
+        Event::WindowFocused { window_id: 0 },
+        Event::Command {
+            command: Command::PrintState,
+        },
+    ];
+
+    TestHarness::new()
+        .with_windows(1)
+        .on_iteration(3, |world, _state| {
+            assert_focused!(world, 0);
+            let entity = find_window_entity(0, world);
+            assert!(
+                world.get::<EnsureVisibleMarker>(entity).is_none(),
+                "repeat echo on a visible tile needs no reveal"
+            );
+            let mut strips = world.query::<(&LayoutStrip, &Position)>();
+            let (_, position) = strips
+                .iter(world)
+                .find(|(strip, _)| strip.contains(entity))
+                .expect("owning strip");
+            assert_eq!(position.0.x, 0, "strip never moved");
+            assert_window_at!(world, 0, 0, TEST_MENUBAR_HEIGHT);
         })
         .run(commands);
 }

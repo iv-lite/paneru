@@ -183,6 +183,21 @@ fn drive_scroll_strip(
 /// [`drag_move_held_column`], read and reset by [`mouse_up_trigger`].
 const DRAG_SCROLL_CLICK_THRESHOLD_PX: f64 = 4.0;
 
+/// Pointer travel (px, per axis) below which a press-release pair counts as
+/// a click: no reorder, no homing, and — since clicks never move anything —
+/// no reshuffle. Compared release point against `LastPress.point`, so it
+/// holds for every grab kind, not just scroll-armed drags.
+const CLICK_RELEASE_MAX_TRAVEL_PX: i32 = 4;
+
+/// Whether a release at `release_point` after a press at `press_point`
+/// counts as a click (no travel). Pure so the release decision is unit
+/// testable; the harness cannot observe the skipped marker (layout consumes
+/// it same-iteration), only its end-state.
+fn is_click_release(release_point: Origin, press_point: Origin) -> bool {
+    let travel = (release_point - press_point).abs();
+    travel.x <= CLICK_RELEASE_MAX_TRAVEL_PX && travel.y <= CLICK_RELEASE_MAX_TRAVEL_PX
+}
+
 pub struct MouseEventsPlugin;
 
 impl Plugin for MouseEventsPlugin {
@@ -482,10 +497,12 @@ fn mouse_down_trigger(
                 window.id()
             );
         }
-        // Defer reshuffle until mouse-up so the window doesn't shift
-        // mid-click. The Timeout auto-despawns if mouse-up is lost.
-        let timeout = Timeout::new(Duration::from_secs(5), None, &mut commands);
-        let mut holder = commands.spawn((MouseHeldMarker(entity), timeout));
+        // The holder lives until mouse-up (or the next press sweeping
+        // stale holders): no timeout fuse — a fuse would murder long
+        // drags mid-gesture, stalling the drive until homing glides home.
+        // A truly lost release strands the pin until the next press, which
+        // is the release the user actually made.
+        let mut holder = commands.spawn(MouseHeldMarker(entity));
         // Header classification for the scroll arming below: only header
         // presses (titlebar band pure geometry; blank toolbar chrome via
         // one AX hit-test per press) scroll the columns and swallow the
@@ -723,16 +740,21 @@ fn mouse_up_trigger(
     mut scroll_state: ResMut<DragScrollState>,
     cold: Option<Res<ColdStart>>,
     in_flight: Query<(), With<RepositionMarker>>,
+    last_press: Res<LastPress>,
     mut commands: Commands,
 ) {
     for InputEvent(event) in messages.read() {
-        if !matches!(event, Event::MouseUp { .. }) {
+        let Event::MouseUp { point, .. } = event else {
             continue;
-        }
+        };
         // The grab is over either way: never let a lost press leave native
         // drags swallowed. Holder paint dies with the holder despawn below,
         // so no paint cleanup exists.
         set_scroll_drag_suppress(false);
+        // A press-release pair with no pointer travel is a click: it moved
+        // nothing, so release issues no reorder, no homing, and no
+        // reshuffle — only the echo shield and reveal below still run.
+        let click = is_click_release(origin_from(*point), last_press.point);
         let scroll_distance = std::mem::take(&mut scroll_state.distance_px);
         // Release velocity is per-gesture too: a stale EMA must never leak
         // into the next press (its MouseDown resets the sampler anyway).
@@ -837,8 +859,14 @@ fn mouse_up_trigger(
                         debug!(
                             "mouse up: click release on {entity}, reshuffle suppressed (hidden ratio >= 1.0)"
                         );
+                    } else if click {
+                        // Pure click: the pointer never traveled, so nothing
+                        // moved and there is nothing to reshuffle. Skipping
+                        // the marker keeps lagged Electron frames from
+                        // jogging an already-correct strip on release.
+                        debug!("mouse up: click release on {entity}, no travel — no reshuffle");
                     } else {
-                        debug!("mouse up: click release on {entity}, reshuffling");
+                        debug!("mouse up: drop release on {entity}, reshuffling");
                         commands.reshuffle_around(entity);
                     }
                 }
@@ -2208,6 +2236,24 @@ mod tests {
 
     fn test_viewport() -> IRect {
         IRect::new(0, 20, 1024, 768)
+    }
+
+    #[test]
+    fn click_release_needs_zero_travel() {
+        let press = Origin::new(200, 500);
+        assert!(is_click_release(press, press));
+        assert!(
+            is_click_release(Origin::new(204, 503), press),
+            "4px per-axis still counts"
+        );
+        assert!(
+            !is_click_release(Origin::new(205, 500), press),
+            "5px horizontal is a drag"
+        );
+        assert!(
+            !is_click_release(Origin::new(200, 505), press),
+            "5px vertical is a drag"
+        );
     }
 
     #[test]

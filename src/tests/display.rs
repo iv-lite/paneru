@@ -554,12 +554,12 @@ fn test_native_drag_accumulates_paint_offset_with_slot_pinned() {
         .run(commands);
 }
 
-/// A lost release (mouse-up never arrives, holder times out) still arms
-/// the echo shield: the OS window may have moved natively while the slot
-/// stayed pinned, and its later echo must push the slot back instead of
-/// adopting the displaced frame.
+/// A lost release (mouse-up never arrives) holds the pin instead of timing
+/// out: holders carry no fuse, so the lagging echo of the native drag meets
+/// the held-ignore path and the slot stays pinned — no Homing is seated
+/// without a release.
 #[test]
-fn test_lost_release_still_arms_echo_shield() {
+fn test_lost_release_holds_pin_without_timeout() {
     let grab = CGPoint::new(200.0, 500.0);
     let mut h = TestHarness::new().with_windows(1);
     // Let init settle first so the press finds a real window.
@@ -591,10 +591,9 @@ fn test_lost_release_still_arms_echo_shield() {
             "setup: press holds the window"
         );
     }
-    // Just past the 5s holder timeout with no mouse-up ever arriving: the
-    // ticker despawns the holder and must arm the shield for its target.
-    // (Checked before the +200ms settle check, which clears a clean shield.)
-    h.advance(Duration::from_millis(5100));
+    // Six seconds with no mouse-up ever arriving: no fuse fires, the
+    // holder persists and seats nothing.
+    h.advance(Duration::from_millis(6000));
     {
         let world = h.app.world_mut();
         assert!(
@@ -602,25 +601,87 @@ fn test_lost_release_still_arms_echo_shield() {
                 .query_filtered::<Entity, With<MouseHeldMarker>>()
                 .iter(world)
                 .next()
-                .is_none(),
-            "timed-out holder is gone"
+                .is_some(),
+            "holder survives without release"
         );
         let sync = world
             .get::<WindowSync>(target)
             .expect("window carries sync state");
         assert!(
-            matches!(sync, WindowSync::Homing { .. }),
-            "timeout arms Homing for the held target, got {sync:?}"
+            matches!(sync, WindowSync::Synced),
+            "no release means no Homing, got {sync:?}"
         );
     }
-    // The lagging echo of the native drag now arrives, still inside the
-    // shield window: slot must hold.
+    // The lagging echo of the native drag now arrives: the held-ignore
+    // path pins the slot.
     h.mock_state
         .os_move_window(0, Origin::new(100, TEST_MENUBAR_HEIGHT));
     h.advance(Duration::from_millis(100));
     let world = h.app.world_mut();
     let position = world.entity(target).get::<Position>().expect("position");
     assert_eq!(position.0, Origin::new(0, TEST_MENUBAR_HEIGHT));
+}
+
+/// A continuous header drag past the old 5s fuse keeps driving: the holder
+/// lives until mouse-up, the strip follows the pointer 1:1 the whole way,
+/// and no Homing is seated mid-gesture.
+#[test]
+fn test_long_drag_keeps_driving_past_five_seconds() {
+    // Titlebar band: scroll-armed header grab drives the strip.
+    let grab = CGPoint::new(200.0, 30.0);
+    let mut h = TestHarness::new().with_windows(1);
+    h.run(vec![
+        Event::MenuOpened { window_id: 0 },
+        Event::Command {
+            command: Command::PrintState,
+        },
+    ]);
+    h.app.world_mut().write_message::<Event>(Event::MouseDown {
+        point: grab,
+        modifiers: Modifiers::empty(),
+    });
+    for _ in 0..5 {
+        h.app.update();
+        for event in h.mock_state.drain_events() {
+            h.app.world_mut().write_message::<Event>(event);
+        }
+    }
+    // Six one-second drag legs, +50px each, without ever releasing.
+    for step in 1..=6 {
+        h.app
+            .world_mut()
+            .write_message::<Event>(Event::MouseDragged {
+                point: CGPoint::new(200.0 + 50.0 * f64::from(step), 30.0),
+                modifiers: Modifiers::empty(),
+            });
+        h.advance(Duration::from_millis(1000));
+    }
+    let world = h.app.world_mut();
+    let target = find_window_entity(0, world);
+    assert!(
+        world
+            .query_filtered::<Entity, With<MouseHeldMarker>>()
+            .iter(world)
+            .next()
+            .is_some(),
+        "holder survives a 6s drag"
+    );
+    let sync = world
+        .get::<WindowSync>(target)
+        .expect("window carries sync state");
+    assert!(
+        matches!(sync, WindowSync::Synced),
+        "no mid-drag Homing while the gesture lives, got {sync:?}"
+    );
+    let mut strips = world.query::<(&LayoutStrip, &Position)>();
+    let (_, position) = strips
+        .iter(world)
+        .find(|(strip, _)| strip.contains(target))
+        .expect("owning strip");
+    assert_eq!(
+        position.0.x, 300,
+        "strip follows the pointer 1:1 across the whole drag"
+    );
 }
 
 /// A plain left-click drag must not detach the window: the OS really moves
@@ -1791,6 +1852,49 @@ fn test_content_press_drives_nothing() {
         })
         .on_iteration(5, |world, _state| {
             // Released cleanly with the layout untouched.
+            assert_window_at!(world, 0, 0, TEST_MENUBAR_HEIGHT);
+        })
+        .run(commands);
+}
+
+/// A press-release pair with no pointer travel is a click: release issues
+/// no reorder, no homing, and no reshuffle — only the echo shield and
+/// reveal still run. Guards against lagged-frame strip jogs on click.
+#[test]
+fn test_click_release_issues_no_reshuffle() {
+    let point = CGPoint::new(200.0, 500.0);
+    let commands = vec![
+        Event::MenuOpened { window_id: 0 },
+        Event::MouseDown {
+            point,
+            modifiers: Modifiers::empty(),
+        },
+        Event::MouseUp {
+            point,
+            modifiers: Modifiers::empty(),
+        },
+        Event::Command {
+            command: Command::PrintState,
+        },
+        Event::Command {
+            command: Command::PrintState,
+        },
+    ];
+
+    TestHarness::new()
+        .with_windows(1)
+        .on_iteration(4, |world, _state| {
+            // Nothing moved: strip offset holds, window sits in slot. (The
+            // skipped reshuffle marker itself is unobservable in-harness —
+            // layout consumes markers same-iteration — so the release
+            // decision is pinned by unit test instead.)
+            let entity = find_window_entity(0, world);
+            let mut strips = world.query::<(&LayoutStrip, &Position)>();
+            let (_, position) = strips
+                .iter(world)
+                .find(|(strip, _)| strip.contains(entity))
+                .expect("owning strip");
+            assert_eq!(position.0.x, 0);
             assert_window_at!(world, 0, 0, TEST_MENUBAR_HEIGHT);
         })
         .run(commands);

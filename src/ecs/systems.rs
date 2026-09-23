@@ -30,7 +30,6 @@ use crate::commands::{Command, Operation};
 use crate::config::{Config, decorations::BorderRadiusOption};
 use crate::ecs::display::FloatingLayer;
 use crate::ecs::layout::{Column, LayoutStrip};
-use crate::ecs::mouse::arm_release_grace;
 use crate::ecs::params::{ActiveDisplay, FrameActivity, Windows};
 use crate::ecs::sync::{
     Gesture, ResizeEvent, SyncAction, SyncCounters, SyncEvent, WindowSync, reconcile,
@@ -1096,7 +1095,6 @@ pub(super) fn fresh_marker_cleanup(cleanup: TimedOutSpawns, mut commands: Comman
 /// * `commands` - Bevy commands to despawn entities.
 pub(super) fn timeout_ticker(
     timers: Populated<(Entity, &mut Timeout)>,
-    holders: Query<&MouseHeldMarker>,
     clock: Res<Time>,
     mut commands: Commands,
 ) {
@@ -1107,13 +1105,9 @@ pub(super) fn timeout_ticker(
                 commands.run_system(system_id);
                 commands.unregister_system(system_id);
             }
-            // Lost release (mouse-up never arrived): the OS window may have
-            // moved natively while the slot stayed pinned, and no release
-            // path armed the echo shield — do it here so the lagging echo
-            // pushes the slot back instead of adopting the displaced frame.
-            if let Ok(marker) = holders.get(entity) {
-                arm_release_grace(vec![marker.0], &mut commands, clock.elapsed());
-            }
+            // Holders carry no fuse by design (a fuse would kill long
+            // drags mid-gesture): mouse-up or the next press owns holder
+            // lifetime, so nothing is armed or despawned here.
             trace!("Removing timer {entity}");
             if let Ok(mut entity_commands) = commands.get_entity(entity) {
                 entity_commands.try_despawn();

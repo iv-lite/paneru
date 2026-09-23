@@ -6,7 +6,7 @@ use bevy::ecs::entity::Entity;
 use bevy::ecs::hierarchy::ChildOf;
 use bevy::ecs::lifecycle::{Add, Remove};
 use bevy::ecs::observer::On;
-use bevy::ecs::query::{Added, Has, With};
+use bevy::ecs::query::{Added, Has, Or, With, Without};
 use bevy::ecs::resource::Resource;
 use bevy::ecs::schedule::IntoScheduleConfigs as _;
 use bevy::ecs::system::{Commands, Populated, Query, Res, ResMut, Single};
@@ -17,17 +17,17 @@ use bevy::time::common_conditions::on_timer;
 use tracing::{Level, debug, instrument, trace, warn};
 
 use super::{
-    DeferredExposeMarker, FocusedMarker, LastPress, MouseHeldMarker, PRESS_FOCUS_CAUSE_WINDOW,
-    PositionDrive, RepositionMarker, ReshuffleAroundMarker, SystemTheme, USER_FOCUS_CAUSE_WINDOW,
-    Unmanaged, UserFocus,
+    DeferredExposeMarker, EnsureVisibleMarker, FocusedMarker, LastPress, MouseHeldMarker,
+    PRESS_FOCUS_CAUSE_WINDOW, Position, PositionDrive, RepositionMarker, ReshuffleAroundMarker,
+    SystemTheme, USER_FOCUS_CAUSE_WINDOW, Unmanaged, UserFocus,
 };
 use crate::config::Config;
-use crate::ecs::layout::LayoutStrip;
+use crate::ecs::layout::{LayoutStrip, clamp_origin_to_viewport};
 use crate::ecs::params::{ActiveDisplay, GlobalState, WindowCtx, Windows};
 use crate::ecs::workspace::{PreviousStripPosition, RestoreFocusMarker, SnapStripMarker};
 use crate::ecs::{
-    ActiveDisplayMarker, ActiveWorkspaceMarker, Bounds, DockPosition, Position, RaiseWindow,
-    ResizeMarker, Scrolling, SendMessageTrigger, SpawnCommandsExt, StrayFocusEvent,
+    ActiveDisplayMarker, ActiveWorkspaceMarker, Bounds, DockPosition, RaiseWindow, ResizeMarker,
+    Scrolling, SendMessageTrigger, SpawnCommandsExt, StrayFocusEvent,
 };
 use crate::events::Event;
 use crate::manager::{Application, Display, Origin, Window, WindowManager, origin_from};
@@ -355,6 +355,28 @@ struct FocusArrivalGuards<'w, 's> {
     mouse_held: Query<'w, 's, &'static MouseHeldMarker>,
     restored: Query<'w, 's, &'static RestoreFocusMarker>,
     reshuffling: Query<'w, 's, Entity, With<ReshuffleAroundMarker>>,
+    strip_motion: StripMotion<'w, 's>,
+}
+
+/// Strip offset plus pending glide target, for the already-placed check.
+type StripMotion<'w, 's> = Query<
+    'w,
+    's,
+    (&'static Position, Option<&'static RepositionMarker>),
+    (With<LayoutStrip>, Without<Window>),
+>;
+
+/// Windows already carrying a reveal or reshuffle marker: stacking another
+/// only re-measures the same arrival downstream.
+pub(super) type RevealQueued<'w, 's> =
+    Query<'w, 's, Entity, Or<(With<EnsureVisibleMarker>, With<ReshuffleAroundMarker>)>>;
+
+/// Whether a strip offset already matches its target (1px quantum, same as
+/// `drop_home`) or glides toward it — in either case centering must not
+/// restart the glide. Pure so the already-placed decision is unit testable.
+fn strip_at_target(current: Origin, target: Origin, flying_to: Option<Origin>) -> bool {
+    let drift = (current - target).abs();
+    (drift.x <= 1 && drift.y <= 1) || flying_to.is_some_and(|to| to == target)
 }
 
 fn autocenter_window_on_focus(
@@ -396,6 +418,34 @@ fn autocenter_window_on_focus(
         )
     }) {
         return;
+    }
+    // Already placed: skip when the strip sits where centering would put
+    // it (or glides there) and the window projects inside the viewport. A
+    // redundant marker would restart the glide, jogging an already-correct
+    // strip on lagged Electron frames — the click-then-focus-echo sequence
+    // lands exactly here. Same 1px quantum as `drop_home`.
+    if let Some(size) = ctx.windows.size(entity)
+        && let Some(layout) = ctx.windows.layout_position(entity)
+        && let Some((strip_entity, _)) = strips.iter().find(|(_, strip)| strip.contains(entity))
+    {
+        let viewport = active_display.bounds();
+        let strip_target = Origin::new(
+            viewport.center().x - size.x / 2 - layout.0.x,
+            viewport.min.y,
+        );
+        let placed = guards
+            .strip_motion
+            .get(strip_entity)
+            .is_ok_and(|(position, marker)| {
+                strip_at_target(position.0, strip_target, marker.map(|m| m.0))
+            });
+        let visible = ctx
+            .windows
+            .frame(entity)
+            .is_some_and(|frame| clamp_origin_to_viewport(frame.min, size, viewport) == frame.min);
+        if placed && visible {
+            return;
+        }
     }
     // Center by moving the STRIP, never the window: the focused window keeps
     // no animation marker of its own, so it rides the strip rigidly with its
@@ -513,6 +563,7 @@ fn ensure_focused_visible(
     fresh_strips: Query<Entity, Added<ActiveWorkspaceMarker>>,
     strip_parents: Query<&ChildOf, With<LayoutStrip>>,
     display_viewports: Query<(&Display, Option<&DockPosition>)>,
+    reveal_queued: RevealQueued<'_, '_>,
     global_state: GlobalState,
     active_display: ActiveDisplay,
     config: Res<Config>,
@@ -574,6 +625,11 @@ fn ensure_focused_visible(
         &config,
     );
     if clamp_origin_to_viewport(frame.min, size, viewport) == frame.min {
+        return;
+    }
+    // Already queued: a reveal or reshuffle for this window is pending —
+    // stacking another only re-measures the same arrival downstream.
+    if reveal_queued.contains(entity) {
         return;
     }
     debug!("focus on {entity} outside viewport, exposing");
@@ -1022,6 +1078,19 @@ pub(super) fn stray_focus_observer(
 mod tests {
     use super::*;
     use bevy::ecs::world::World;
+
+    #[test]
+    fn strip_at_target_covers_settled_and_flying() {
+        let target = Origin::new(100, 20);
+        assert!(strip_at_target(target, target, None));
+        assert!(strip_at_target(Origin::new(101, 20), target, None));
+        assert!(strip_at_target(Origin::new(0, 20), target, Some(target)));
+        assert!(!strip_at_target(Origin::new(0, 20), target, None));
+        assert!(
+            !strip_at_target(Origin::new(0, 20), target, Some(Origin::new(50, 20))),
+            "glide toward elsewhere still needs centering"
+        );
+    }
 
     #[test]
     fn record_and_read_per_tier() {

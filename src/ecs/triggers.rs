@@ -215,6 +215,8 @@ pub(super) fn window_focused_trigger(
     mut workspaces: Query<(Entity, &mut LayoutStrip, Has<ActiveWorkspaceMarker>)>,
     strip_parents: Query<&ChildOf, With<LayoutStrip>>,
     strip_flight: Query<(Has<RepositionMarker>, Has<Scrolling>), With<LayoutStrip>>,
+    fresh_strips: Query<Entity, Added<ActiveWorkspaceMarker>>,
+    reveal_queued: crate::ecs::focus::RevealQueued<'_, '_>,
     displays: Query<(Entity, Has<ActiveDisplayMarker>), With<Display>>,
     held: Query<&MouseHeldMarker>,
     restore_guards: Query<(Entity, &RestoreFocusMarker)>,
@@ -394,13 +396,22 @@ pub(super) fn window_focused_trigger(
             // Standing down while the owner strip is mid-flight, too: the
             // echo of a command-driven raise lands here while the centering
             // glide is still converging, and re-deriving then would restart
-            // it with a mere expose offset.
+            // it with a mere expose offset. Fresh strips and already-queued
+            // reveals also stand down (see `repeat_reveal_needed`).
             let strip_in_flight = owner.is_some_and(|(strip_entity, _)| {
                 strip_flight
                     .get(strip_entity)
                     .is_ok_and(|(repositioning, scrolling)| repositioning || scrolling)
             });
-            if !strip_in_flight && !global_state.skip_reshuffle() && !global_state.initializing() {
+            let fresh_owner =
+                owner.is_some_and(|(strip_entity, _)| fresh_strips.contains(strip_entity));
+            if repeat_reveal_needed(
+                strip_in_flight,
+                fresh_owner,
+                reveal_queued.contains(entity),
+                global_state.skip_reshuffle(),
+                global_state.initializing(),
+            ) {
                 ctx.commands.ensure_visible(entity);
             }
             continue;
@@ -411,6 +422,22 @@ pub(super) fn window_focused_trigger(
             debug!("window {} ({entity}) focused.", window.id());
         }
     }
+}
+
+/// Whether a repeat focus echo earns an expose marker: only when the owner
+/// strip is settled and visible, nothing is already queued, and no
+/// fresh-strip deferral or global skip applies. Pure so the matrix is unit
+/// testable; visibility itself stays downstream, which reads layout — never
+/// lagged OS frames — so it cannot fake a shortfall.
+#[allow(clippy::fn_params_excessive_bools)]
+fn repeat_reveal_needed(
+    strip_in_flight: bool,
+    fresh_owner: bool,
+    reveal_queued: bool,
+    skip_reshuffle: bool,
+    initializing: bool,
+) -> bool {
+    !strip_in_flight && !fresh_owner && !reveal_queued && !skip_reshuffle && !initializing
 }
 
 /// Handles Mission Control events, updating the `MissionControlActive` resource.
@@ -1557,5 +1584,20 @@ where
         Ordering::Greater
     } else {
         Ordering::Equal
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::repeat_reveal_needed;
+
+    #[test]
+    fn repeat_reveal_needs_settled_unqueued_visible() {
+        assert!(repeat_reveal_needed(false, false, false, false, false));
+        assert!(!repeat_reveal_needed(true, false, false, false, false));
+        assert!(!repeat_reveal_needed(false, true, false, false, false));
+        assert!(!repeat_reveal_needed(false, false, true, false, false));
+        assert!(!repeat_reveal_needed(false, false, false, true, false));
+        assert!(!repeat_reveal_needed(false, false, false, false, true));
     }
 }
