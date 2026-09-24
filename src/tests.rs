@@ -7,6 +7,7 @@ mod session_restore;
 mod state;
 mod sync_invariant;
 mod tabs;
+mod termination;
 mod tiling;
 
 pub(crate) use harness::*;

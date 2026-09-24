@@ -11,7 +11,10 @@ use bevy::{
 use objc2_core_graphics::CGDirectDisplayID;
 use tracing::warn;
 
-use super::{ActiveDisplayMarker, ColdStart, FocusFollowsMouse, MouseHeldMarker, SkipReshuffle};
+use super::{
+    ActiveDisplayMarker, ColdStart, FocusFollowsMouse, MouseHeldMarker, PositionDrive,
+    ResendMarker, SkipReshuffle,
+};
 use crate::{
     config::Config,
     ecs::{
@@ -321,6 +324,8 @@ pub struct FrameActivity<'w, 's> {
     scrolling: Query<'w, 's, (), With<Scrolling>>,
     flash_messages: Query<'w, 's, (), With<FlashMessage>>,
     held: Query<'w, 's, (), With<MouseHeldMarker>>,
+    verifying: Query<'w, 's, &'static PositionDrive>,
+    resends: Query<'w, 's, (), With<ResendMarker>>,
     warming: Option<Res<'w, ColdStart>>,
 }
 
@@ -333,12 +338,19 @@ impl FrameActivity<'_, '_> {
     /// off to the idle cadence would starve the border repaint. Warmup
     /// counts so the first seconds converge at the active cadence instead of
     /// the 500ms idle ramp, when nothing above exists yet by construction.
+    /// Verifying drives and resends count too: a landed glide drops its
+    /// `RepositionMarker` before the verifier confirms the OS frame, and
+    /// without this the pump backs off to the 500ms idle sleep mid-tail —
+    /// the 100ms verify tick and the settle repaint then land a full idle
+    /// frame late, which reads as a slow snap-back.
     pub fn mid_frame(&self) -> bool {
         !self.repositioning.is_empty()
             || !self.resizing.is_empty()
             || !self.scrolling.is_empty()
             || !self.flash_messages.is_empty()
             || !self.held.is_empty()
+            || self.verifying.iter().any(PositionDrive::is_verifying)
+            || !self.resends.is_empty()
             || self.warming.is_some()
     }
 }

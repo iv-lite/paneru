@@ -511,12 +511,32 @@ pub(super) fn mission_control_trigger(
 ///
 /// # Arguments
 ///
-/// * `trigger` - The Bevy event trigger containing the application event.
+/// * `messages` - The Bevy event stream carrying the application event.
 /// * `processes` - A query for all processes.
-/// * `commands` - Bevy commands to spawn or despawn entities.
+/// * `applications` - A query for application entities and their children, used to
+///   cascade termination to owned windows.
+/// * `windows` - A query for all windows.
+/// * `strips` - The active workspace strip, for moving focus off dying windows.
+/// * `displays` - The active display, for focus distance.
+/// * `global_state` - Focus-follows-mouse and reshuffle flags.
+/// * `focus_history` - Per-workspace record of what was focused last.
+/// * `roster` - The AX snapshot roster, pruned per destroyed window.
+/// * `commands` - Bevy commands to despawn entities.
+#[allow(
+    clippy::too_many_arguments,
+    clippy::too_many_lines,
+    clippy::type_complexity
+)]
 pub(super) fn application_event_trigger(
     mut messages: MessageReader<Event>,
     processes: Query<(&BProcess, Entity)>,
+    applications: Query<(Entity, Option<&Children>, Option<&ChildOf>), With<Application>>,
+    windows: Windows,
+    strips: Query<&LayoutStrip, With<ActiveWorkspaceMarker>>,
+    displays: Query<(&Display, Option<&DockPosition>), With<ActiveDisplayMarker>>,
+    mut global_state: GlobalState,
+    mut focus_history: ResMut<FocusHistory>,
+    roster: Option<Res<SnapshotRoster>>,
     mut commands: Commands,
 ) {
     const PROCESS_READY_TIMEOUT_SEC: u64 = 5;
@@ -546,9 +566,91 @@ pub(super) fn application_event_trigger(
             }
 
             Event::ApplicationTerminated { psn } => {
-                if let Some((_, entity)) = find_process(*psn)
-                    && let Ok(mut entity_commands) = commands.get_entity(entity)
+                let Some((_, process_entity)) = find_process(*psn) else {
+                    continue;
+                };
+                // Cascade the quit to every owned window: despawning only the
+                // process entity orphans the app/window entities, leaving
+                // their strip slots occupied and their borders painted
+                // (per-window `Destroyed` notifications never arrive for a
+                // Cmd-Q-style quit, and the app observer teardown in `Drop`
+                // can swallow queued ones). Despawning each window fires the
+                // existing `On<Remove, Window>` cleanup (strip removal +
+                // forced reshuffle) and `RemovedComponents<Window>` (overlay
+                // prune), so borders vanish and survivors re-tile this tick.
+                let app_entities: Vec<Entity> = applications
+                    .iter()
+                    .filter(|(_, _, parent)| {
+                        parent
+                            .as_ref()
+                            .is_some_and(|c| c.parent() == process_entity)
+                    })
+                    .map(|(entity, _, _)| entity)
+                    .collect();
+                let mut dying: Vec<(WinID, Entity)> = Vec::new();
+                for app_entity in &app_entities {
+                    let Ok((_, children, _)) = applications.get(*app_entity) else {
+                        continue;
+                    };
+                    let Some(children) = children else {
+                        continue;
+                    };
+                    for child in children {
+                        if let Some(window) = windows.get(*child) {
+                            dying.push((window.id(), *child));
+                        }
+                    }
+                }
+                // Hand focus to a surviving neighbour before the despawns
+                // land: `give_away_focus` only excludes one entity, but a
+                // whole-app quit can strand several, so exclude the full
+                // dying set here instead of reusing it.
+                if let Some((_, focused_entity)) = windows.focused()
+                    && dying.iter().any(|(_, e)| *e == focused_entity)
+                    && let Some(strip) = strips.iter().next()
                 {
+                    let viewport = displays.iter().next().map(|(display, _)| display.bounds());
+                    let center_x = viewport.map(|v| v.center().x);
+                    let neighbour = strip
+                        .all_columns()
+                        .into_iter()
+                        .filter(|candidate| !dying.iter().any(|(_, e)| *e == *candidate))
+                        .filter_map(|candidate| {
+                            let center = windows.moving_frame(candidate)?.center().x;
+                            Some((candidate, center_x.map(|c| (center - c).abs())))
+                        })
+                        .min_by_key(|(_, dist)| *dist)
+                        .map(|(entity, _)| entity)
+                        .or_else(|| {
+                            strip
+                                .all_columns()
+                                .into_iter()
+                                .find(|candidate| !dying.iter().any(|(_, e)| *e == *candidate))
+                        });
+                    if let Some(neighbour) = neighbour
+                        && windows.get(neighbour).is_some()
+                    {
+                        global_state.set_ffm_flag(None);
+                        commands.focus_entity(neighbour, true);
+                    }
+                }
+                for (window_id, entity) in &dying {
+                    focus_history.forget(*entity);
+                    if let Some(roster) = roster.as_deref() {
+                        let _ = roster
+                            .0
+                            .try_send(crate::snapshot::RosterDelta::Remove(*window_id));
+                    }
+                    if let Ok(mut entity_commands) = commands.get_entity(*entity) {
+                        entity_commands.try_despawn();
+                    }
+                }
+                for app_entity in app_entities {
+                    if let Ok(mut entity_commands) = commands.get_entity(app_entity) {
+                        entity_commands.try_despawn();
+                    }
+                }
+                if let Ok(mut entity_commands) = commands.get_entity(process_entity) {
                     entity_commands.try_despawn();
                 }
             }

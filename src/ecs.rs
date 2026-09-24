@@ -182,13 +182,18 @@ pub fn register_systems(app: &mut bevy::app::App) {
     let native_tabs_enabled =
         |config: Option<Res<Config>>| config.is_none_or(|config| config.native_tabs_enabled());
     // Close/change signals that may strand windows without notification:
-    // a destroy to check siblings, a space/display change to re-verify.
+    // a destroy to check siblings, a space/display change to re-verify, an
+    // app termination to cascade window cleanup immediately instead of
+    // waiting out the 5s backstop (stale borders, delayed re-tiling).
     // Separate reader: consuming here must not starve the systems below.
     let window_closed_signals = |mut messages: MessageReader<Event>| {
         messages.read().any(|event| {
             matches!(
                 event,
-                Event::WindowDestroyed { .. } | Event::SpaceChanged | Event::DisplayChanged
+                Event::WindowDestroyed { .. }
+                    | Event::ApplicationTerminated { .. }
+                    | Event::SpaceChanged
+                    | Event::DisplayChanged
             )
         })
     };
