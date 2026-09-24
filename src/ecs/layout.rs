@@ -263,6 +263,14 @@ pub(crate) fn clamp_strip_to_fill(
     }
 }
 
+/// Clamps a managed window size to at most the usable viewport, per axis.
+/// Tiled windows must never exceed the display they live on: oversize tiles
+/// force the strip to pan (`clamp_origin_to_viewport` reverses for oversize)
+/// and widen their column, so one overshoot becomes permanent layout.
+pub(crate) fn clamp_size_to_viewport(size: Size, viewport: IRect) -> Size {
+    Size::new(size.x.min(viewport.width()), size.y.min(viewport.height()))
+}
+
 /// The full width of `strip`'s packed columns (`last layout_x + width`),
 /// mirroring the edge-invariant math in `reshuffle_layout_strip`. `None`
 /// when the last column's slot or frame is unknown.
@@ -328,6 +336,7 @@ impl Plugin for LayoutEventsPlugin {
                 (
                     layout_sizes_changed,
                     layout_strip_changed,
+                    clamp_managed_windows_to_viewport,
                     reshuffle_layout_strip,
                     ensure_visible_in_strip,
                     ride_strip_motion,
@@ -1302,38 +1311,81 @@ fn layout_strip_changed(
     displays: DisplayViewports,
     config: Res<Config>,
 ) {
-    let get_window_frame = |entity| {
-        windows
-            .get(entity)
-            .map(|(position, bounds, _)| IRect::from_corners(position.0, position.0 + bounds.0))
-            .ok()
+    let changed = {
+        let get_window_frame = |entity| {
+            windows
+                .get(entity)
+                .map(|(position, bounds, _)| IRect::from_corners(position.0, position.0 + bounds.0))
+                .ok()
+        };
+
+        changed_strips
+            .into_iter()
+            .filter_map(|(layout_strip, child_of)| {
+                displays
+                    .get(child_of.parent())
+                    .map(|(display, dock)| {
+                        let viewport = display.actual_display_bounds(dock, &config);
+                        let frames: Vec<(Entity, IRect)> = layout_strip
+                            .relative_positions(viewport.height(), &get_window_frame)
+                            .collect();
+                        (viewport, frames)
+                    })
+                    .ok()
+            })
+            .collect::<Vec<_>>()
     };
 
-    let changed = changed_strips
-        .into_iter()
-        .filter_map(|(layout_strip, child_of)| {
-            displays
-                .get(child_of.parent())
-                .map(|(display, dock)| {
-                    let height = display.actual_display_bounds(dock, &config).height();
-                    layout_strip.relative_positions(height, &get_window_frame)
-                })
-                .ok()
-        })
-        .flatten()
-        .collect::<Vec<_>>();
+    for (viewport, frames) in changed {
+        for (entity, frame) in frames {
+            if let Ok((_, mut bounds, mut layout_position)) = windows.get_mut(entity) {
+                if layout_position.0 != frame.min {
+                    layout_position.0 = frame.min;
+                }
+                // Slot-size conformance ("maximize into the tile") is optional:
+                // with `maximize_tiled_windows` off, members keep native sizes
+                // and slots keep deriving from them — positions stay managed.
+                // Height never exceeds the viewport (notch/menubar/dock would
+                // otherwise leave tiles taller than the display); width may
+                // overflow for the pannable wide-column feature (`SetWidth(2.0)`
+                // + swipe), so it follows the derived slot untouched.
+                if config.maximize_tiled_windows() && bounds.0 != frame.size() {
+                    let clamped = Size::new(frame.width(), frame.height().min(viewport.height()));
+                    if bounds.0 != clamped {
+                        bounds.0 = clamped;
+                    }
+                }
+            }
+        }
+    }
+}
 
-    for (entity, frame) in changed {
-        if let Ok((_, mut bounds, mut layout_position)) = windows.get_mut(entity) {
-            if layout_position.0 != frame.min {
-                layout_position.0 = frame.min;
-            }
-            // Slot-size conformance ("maximize into the tile") is optional:
-            // with `maximize_tiled_windows` off, members keep native sizes
-            // and slots keep deriving from them — positions stay managed.
-            if config.maximize_tiled_windows() && bounds.0 != frame.size() {
-                bounds.0 = frame.size();
-            }
+#[allow(clippy::type_complexity)]
+#[instrument(level = Level::DEBUG, skip_all)]
+fn clamp_managed_windows_to_viewport(
+    windows: Query<(Entity, &Bounds), (With<Window>, Without<Unmanaged>)>,
+    strips: Query<(&LayoutStrip, &ChildOf)>,
+    displays: DisplayViewports,
+    config: Res<Config>,
+    mut commands: Commands,
+) {
+    // Height backstop only, gated on `maximize_tiled_windows`: tiles taller
+    // than the viewport (stale dock/menubar/notch, wake drift, OS overshoot
+    // adoption) never fit, while width overflow is the intentional
+    // pannable wide-column feature and native-size mode keeps OS sizes.
+    if !config.maximize_tiled_windows() {
+        return;
+    }
+    for (entity, bounds) in &windows {
+        let Some((_, child)) = strips.iter().find(|(strip, _)| strip.contains(entity)) else {
+            continue;
+        };
+        let Ok((display, dock)) = displays.get(child.parent()) else {
+            continue;
+        };
+        let viewport = display.actual_display_bounds(dock, &config);
+        if bounds.0.y > viewport.height() {
+            commands.resize_entity(entity, Size::new(bounds.0.x, viewport.height()));
         }
     }
 }
@@ -2722,6 +2774,19 @@ mod tests {
         assert_eq!(clamp_strip_to_fill(312, 2000, 5, &viewport, false), 0);
         assert_eq!(clamp_strip_to_fill(-2000, 2000, 5, &viewport, false), -976);
         assert_eq!(clamp_strip_to_fill(-500, 2000, 5, &viewport, false), -500);
+    }
+
+    #[test]
+    fn size_clamps_to_at_most_the_viewport() {
+        let viewport = IRect::new(0, 30, 1024, 778);
+        assert_eq!(
+            clamp_size_to_viewport(Size::new(2000, 2000), viewport),
+            Size::new(1024, 748)
+        );
+        assert_eq!(
+            clamp_size_to_viewport(Size::new(400, 700), viewport),
+            Size::new(400, 700)
+        );
     }
 
     #[test]

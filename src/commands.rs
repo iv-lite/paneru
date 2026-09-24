@@ -22,7 +22,8 @@ use crate::config::snippet::{RuleSubject, SnippetDialect, window_rule_snippet};
 use crate::ecs::display::FloatingLayer;
 use crate::ecs::focus::FocusHistory;
 use crate::ecs::layout::{
-    Column, LayoutStrip, MIN_WINDOW_HEIGHT, StackItem, clamp_origin_to_viewport, strip_signature,
+    Column, LayoutStrip, MIN_WINDOW_HEIGHT, StackItem, clamp_origin_to_viewport,
+    clamp_size_to_viewport, strip_signature,
 };
 use crate::ecs::mouse::{DragModifierState, DropPreviewState};
 use crate::ecs::params::{
@@ -319,6 +320,7 @@ fn focus_arrival_center(
         &ChildOf,
     )>,
     active_display: &ActiveDisplay,
+    displays: &Query<(&Display, Option<&DockPosition>)>,
     config: &Config,
     mouse_held: &Query<Entity, With<MouseHeldMarker>>,
     restored: &Query<&RestoreFocusMarker>,
@@ -334,11 +336,22 @@ fn focus_arrival_center(
         && let Some((_, _, None)) = windows.get_managed(entity)
         && let Some(size) = windows.size(entity)
         && let Some(layout) = windows.layout_position(entity)
-        && let Some(strip_entity) = workspaces
-            .iter()
-            .find_map(|(strip, strip_entity, _, _)| strip.contains(entity).then_some(strip_entity))
+        && let Some((strip_entity, display_entity)) =
+            workspaces
+                .iter()
+                .find_map(|(strip, strip_entity, _, child)| {
+                    strip
+                        .contains(entity)
+                        .then_some((strip_entity, child.parent()))
+                })
     {
-        let viewport = active_display.bounds();
+        // Owner viewport, not the active display: the active marker can lag a
+        // cross-display arrival, and centering on a stale display's bounds
+        // scrolls the window out of its own view.
+        let viewport = displays.get(display_entity).map_or_else(
+            |_| active_display.actual_bounds(config),
+            |(display, dock)| display.actual_display_bounds(dock, config),
+        );
         let center = viewport.center();
         // Deliberately unclamped, mirroring `reshuffle_layout_strip` and
         // `autocenter_window_on_focus`: under `auto_center` the edge
@@ -415,6 +428,7 @@ fn command_move_focus(
     )>,
     layout_strips: Query<(&LayoutStrip, Entity)>,
     active_display: ActiveDisplay,
+    displays: Query<(&Display, Option<&DockPosition>)>,
     window_manager: Res<WindowManager>,
     config: Res<Config>,
     mouse_held: Query<Entity, With<MouseHeldMarker>>,
@@ -445,6 +459,7 @@ fn command_move_focus(
             &windows,
             &workspaces,
             &active_display,
+            &displays,
             &window_manager,
             &config,
             &mouse_held,
@@ -497,6 +512,7 @@ fn focus_move_step(
         &ChildOf,
     )>,
     active_display: &ActiveDisplay,
+    displays: &Query<(&Display, Option<&DockPosition>)>,
     window_manager: &WindowManager,
     config: &Config,
     mouse_held: &Query<Entity, With<MouseHeldMarker>>,
@@ -583,6 +599,7 @@ fn focus_move_step(
             windows,
             workspaces,
             active_display,
+            displays,
             config,
             mouse_held,
             restored,
@@ -796,6 +813,7 @@ fn command_toggle_floating_layer(
 /// # Returns
 ///
 /// `Some(Entity)` with the entity that was swapped with, otherwise `None`.
+#[allow(clippy::too_many_arguments)]
 #[instrument(level = Level::DEBUG, skip_all)]
 fn command_swap_focus(
     mut messages: MessageReader<Event>,
@@ -1323,6 +1341,7 @@ fn copy_window_rule(
 /// ring (`next == true` steps forward). The window is repositioned to the
 /// center of the new display. `MoveFocus::Follow` warps the mouse along,
 /// `MoveFocus::Stay` keeps focus on the source display's neighbour.
+#[allow(clippy::too_many_arguments)]
 fn to_adjacent_display(
     mut messages: MessageReader<Event>,
     windows: Windows,
@@ -1411,17 +1430,33 @@ fn move_focused_window_to_display(
         window.id(),
         target_bounds.width() / 2,
     );
-    let center = target_bounds.center().x;
 
     let Some(size) = windows.size(entity) else {
         return;
     };
     let width_ratio =
         (source_viewport_width > 0).then(|| f64::from(size.x) / f64::from(source_viewport_width));
-    // Clamp to the target width up front (maximum ratio 1.0) so the
-    // centering below and the attach use the landed size, not an overflow.
-    let size = Size::new(size.x.min(target_bounds.width()), size.y);
-    let dest = target_bounds.min.with_x(center - size.x / 2);
+    // Clamp to at most the target viewport: shrink the raw display bounds
+    // by edge padding so a window larger than its target display lands
+    // maximized, never overflowing. The dock-exact tighten happens in the
+    // delayed `refresh_size` inside `attach_window_to_display`, which reads
+    // the live target display.
+    let (pad_top, pad_right, pad_bottom, pad_left) = config.edge_padding();
+    let target_viewport = IRect::new(
+        target_bounds.min.x + pad_left,
+        target_bounds.min.y + pad_top,
+        target_bounds.max.x - pad_right,
+        target_bounds.max.y - pad_bottom,
+    );
+    let target_viewport = if target_viewport.width() > 0 && target_viewport.height() > 0 {
+        target_viewport
+    } else {
+        target_bounds
+    };
+    let size = clamp_size_to_viewport(size, target_viewport);
+    let dest = target_viewport
+        .min
+        .with_x(target_viewport.center().x - size.x / 2);
     commands.reposition_entity(entity, dest);
 
     if matches!(move_focus, MoveFocus::Follow) {
@@ -1550,8 +1585,8 @@ pub(crate) fn attach_window_to_display(
         Some(slot) => target_strip.insert_at(slot, entity),
         None => target_strip.append(entity),
     }
-    if current_size.x > target_bounds.width() {
-        commands.resize_entity(entity, Size::new(target_bounds.width(), current_size.y));
+    if current_size.x > target_bounds.width() || current_size.y > target_bounds.height() {
+        commands.resize_entity(entity, clamp_size_to_viewport(current_size, target_bounds));
     }
     commands.reshuffle_around(entity);
 
@@ -1578,7 +1613,11 @@ pub(crate) fn attach_window_to_display(
                     round_px(ratio * f64::from(viewport_bounds.width()))
                 })
                 .min(viewport_bounds.width());
-            let size = Size::new(width, viewport_bounds.height());
+            // Clamp, never force: arrival height stays as clamped on the move
+            // (or binpacked by layout), capped at the viewport so a taller
+            // source display never overflows a smaller target (notably the
+            // built-in display with notch/menubar/dock).
+            let size = Size::new(width, bounds.y.min(viewport_bounds.height()));
             commands.resize_entity(moved_window, size);
             commands.reshuffle_around(moved_window);
         }
@@ -1627,9 +1666,9 @@ pub(crate) fn attach_column_to_display(
     }
     for member in members {
         if let Some(size) = windows.size(member)
-            && size.x > target_bounds.width()
+            && (size.x > target_bounds.width() || size.y > target_bounds.height())
         {
-            commands.resize_entity(member, Size::new(target_bounds.width(), size.y));
+            commands.resize_entity(member, clamp_size_to_viewport(size, target_bounds));
         }
     }
     commands.reshuffle_around(leader);

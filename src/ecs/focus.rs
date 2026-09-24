@@ -374,12 +374,14 @@ type StripMotion<'w, 's> = Query<
 pub(super) type RevealQueued<'w, 's> =
     Query<'w, 's, Entity, Or<(With<EnsureVisibleMarker>, With<ReshuffleAroundMarker>)>>;
 
-/// Whether a strip offset already matches its target (1px quantum, same as
-/// `drop_home`) or glides toward it — in either case centering must not
-/// restart the glide. Pure so the already-placed decision is unit testable.
+/// Whether a strip offset already matches its target (2px quantum: OS
+/// rounding/Electron drift lands 1-2px off, and a redundant marker would
+/// restart the glide, jogging an already-correct strip) or glides toward
+/// it — in either case centering must not restart the glide. Pure so the
+/// already-placed decision is unit testable.
 fn strip_at_target(current: Origin, target: Origin, flying_to: Option<Origin>) -> bool {
     let drift = (current - target).abs();
-    (drift.x <= 1 && drift.y <= 1) || flying_to.is_some_and(|to| to == target)
+    (drift.x <= 2 && drift.y <= 2) || flying_to.is_some_and(|to| to == target)
 }
 
 fn autocenter_window_on_focus(

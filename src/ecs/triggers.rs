@@ -1376,6 +1376,15 @@ pub(super) fn apply_window_positions(
                 }
             } else {
                 debug!("Synthesizing WindowFocused for newly spawned window {entity}");
+                // Glide the strip to the arrival explicitly: the OS focus echo
+                // can arrive before strip insertion (no strip then, so arrival
+                // systems have nothing to center on and `Added<FocusedMarker>`
+                // will not refire). Deliberately no `UserFocus` stamp: spawn
+                // intent must not masquerade as keyboard intent, or later
+                // ambient echoes inherit it and `mouse_follows_focus` warps a
+                // cursor that is already inside.
+                ctx.commands.reshuffle_around(entity);
+                ctx.commands.ensure_visible(entity);
                 ctx.commands
                     .trigger(SendMessageTrigger(Event::WindowFocused {
                         window_id: window.id(),

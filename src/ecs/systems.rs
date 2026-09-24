@@ -3169,11 +3169,16 @@ pub(super) fn commit_window_size(
         (&mut Window, &Bounds, &mut WidthRatio, Has<ResizeMarker>),
         Changed<Bounds>,
     >,
+    config: Res<Config>,
     mut write_state: ResMut<AxWriteState>,
 ) {
     use std::sync::Mutex;
 
-    let display_bounds = active_display.bounds();
+    // Ratio denominator must be the usable viewport (dock/padding-adjusted),
+    // matching `resize_window` / `attach_window_to_display` pixel math.
+    // The raw display bounds include menubar/dock/padding, so ratios derived
+    // from them inflate on every move/resize cycle.
+    let viewport_width = active_display.actual_bounds(&config).width().max(1);
     // Post-resize OS truth collected from the parallel workers and recorded
     // sequentially below, so a concurrent move's dedup filter sees the sync
     // resize path's writes (same accounting as `push_position`).
@@ -3181,7 +3186,7 @@ pub(super) fn commit_window_size(
     resized_windows
         .par_iter_mut()
         .for_each(|(mut window, size, mut width_ratio, resizing)| {
-            width_ratio.0 = f64::from(size.0.x) / f64::from(display_bounds.width());
+            width_ratio.0 = f64::from(size.0.x) / f64::from(viewport_width);
             // While the tween is still driving, a single size write per
             // frame: the staged offscreen retry (up to ~6 AX round-trips)
             // runs on the settled commit instead. Landed resizes keep the
