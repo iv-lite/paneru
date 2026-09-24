@@ -36,6 +36,7 @@ use crate::{
 use crate::{platform::CFStringRef, util::AXUIWrapper};
 
 pub mod decorations;
+pub mod gaps;
 pub mod padding;
 pub mod snippet;
 pub mod swipe;
@@ -484,6 +485,23 @@ impl Config {
             i32::from(p.and_then(|p| p.right).or(o.padding_right).unwrap_or(0)),
             i32::from(p.and_then(|p| p.bottom).or(o.padding_bottom).unwrap_or(0)),
             i32::from(p.and_then(|p| p.left).or(o.padding_left).unwrap_or(0)),
+        )
+    }
+
+    /// Global between-window gaps (horizontal, vertical) in pixels: the
+    /// per-window inset every tiled window gets unless its rule sets its
+    /// own `horizontal/vertical_padding` (a rule value, including 0, wins).
+    /// Default 8/8 so inter-window gutters exist out of box; clamped
+    /// 0..=50 like the per-rule values.
+    pub fn window_gaps(&self) -> (i32, i32) {
+        const DEFAULT_GAP_PX: u16 = 8;
+        const MAX_GAP_PX: i32 = 50;
+        let config = self.inner();
+        let gaps = config.gaps.as_ref();
+        (
+            i32::from(gaps.and_then(|g| g.horizontal).unwrap_or(DEFAULT_GAP_PX))
+                .clamp(0, MAX_GAP_PX),
+            i32::from(gaps.and_then(|g| g.vertical).unwrap_or(DEFAULT_GAP_PX)).clamp(0, MAX_GAP_PX),
         )
     }
 
@@ -1184,6 +1202,7 @@ struct InnerConfig {
     default_workspaces: Option<u32>,
     swipe: Option<swipe::SwipeOptions>,
     padding: Option<padding::PaddingOptions>,
+    gaps: Option<gaps::GapsOptions>,
     restore: Option<RestoreOptions>,
 }
 
@@ -2340,6 +2359,23 @@ fn test_default_workspaces() {
     // Zero is clamped up to 1 (the physical space always exists).
     let config = Config::try_from(&*format!("default_workspaces = 0\n{base}")).unwrap();
     assert_eq!(config.default_workspaces(), 1);
+}
+
+#[test]
+fn test_window_gaps() {
+    let base = "[options]\n[bindings]\n";
+    // Absent table: 8px gutters out of box.
+    let config = Config::try_from(base).unwrap();
+    assert_eq!(config.window_gaps(), (8, 8));
+
+    // Explicit table wins per axis; unset axes keep the default.
+    let config =
+        Config::try_from(&*format!("[gaps]\nhorizontal = 0\nvertical = 12\n{base}")).unwrap();
+    assert_eq!(config.window_gaps(), (0, 12));
+
+    // Clamped 0..=50 like the per-rule values.
+    let config = Config::try_from(&*format!("[gaps]\nhorizontal = 500\n{base}")).unwrap();
+    assert_eq!(config.window_gaps(), (50, 8));
 }
 
 #[test]

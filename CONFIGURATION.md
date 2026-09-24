@@ -63,6 +63,30 @@ Sets the margins at the edges of the screen.
 
 ---
 
+## 2b. Gaps (`[gaps]`)
+
+Sets the between-window gaps: the per-window inset applied to every tiled
+window. The visual gap between neighbors is the sum of the adjacent insets
+(8 + 8 = 16px between columns by default).
+
+| Option | Type | Default | Description |
+| :--- | :--- | :--- | :--- |
+| `horizontal` | Integer (px) | `8` | Gaps to the left/right of each window. |
+| `vertical` | Integer (px) | `8` | Gaps to the top/bottom of each window. |
+
+Values are clamped to 0–50. A per-window rule `horizontal_padding` /
+`vertical_padding` (see §6) wins over these — including `0`, which opts
+that app out of the global gaps. Outer screen edges use `[padding]` above.
+
+**Example:**
+```toml
+[gaps]
+horizontal = 8
+vertical = 8
+```
+
+---
+
 ## 3. Swipe & Gestures (`[swipe]`)
 
 Configure trackpad gestures and scroll-wheel window sliding.
@@ -295,8 +319,8 @@ Define specific behaviors for applications based on their Title or Bundle ID.
 | `dont_focus` | Boolean | Prevent the window from taking focus when spawned. |
 | `width` | Positive Float | Initial width ratio for the window. Values above `1.0` create an oversized, horizontally scrollable window. |
 | `grid` | String | placement for floating windows: `"cols:rows:x:y:w:h"`. |
-| `horizontal_padding` | Integer | Gaps to the left/right of this window. |
-| `vertical_padding` | Integer | Gaps to the top/bottom of this window. |
+| `horizontal_padding` | Integer | Gaps to the left/right of this window (overrides `[gaps]`, including `0` to opt out). |
+| `vertical_padding` | Integer | Gaps to the top/bottom of this window (overrides `[gaps]`, including `0` to opt out). |
 | `bindings_passthrough`| Array (String)| Keys that should bypass Paneru and go directly to the app. |
 
 **Example:**

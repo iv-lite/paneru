@@ -1287,6 +1287,7 @@ pub fn setup_bevy_app(sender: EventSender, receiver: Receiver<Event>) -> Result<
 
 struct WindowProperties {
     params: Vec<WindowParams>,
+    gaps: (i32, i32),
 }
 
 impl WindowProperties {
@@ -1294,7 +1295,8 @@ impl WindowProperties {
         let bundle_id = app.bundle_id().unwrap_or_default();
         let title = window.title().unwrap_or_default();
         let params = config.find_window_properties(&title, &bundle_id);
-        Self { params }
+        let gaps = config.window_gaps();
+        Self { params, gaps }
     }
 
     pub fn floating(&self) -> bool {
@@ -1338,13 +1340,63 @@ impl WindowProperties {
         self.params
             .iter()
             .find_map(|props| props.vertical_padding)
-            .unwrap_or(0)
+            .unwrap_or(self.gaps.1)
     }
 
     pub fn horizontal_padding(&self) -> i32 {
         self.params
             .iter()
             .find_map(|props| props.horizontal_padding)
-            .unwrap_or(0)
+            .unwrap_or(self.gaps.0)
+    }
+}
+
+#[cfg(test)]
+mod properties_tests {
+    use super::*;
+    use crate::config::{MainOptions, WindowParams};
+    use crate::tests::{MockState, TEST_WORKSPACE_ID};
+
+    const TEST_PID: i32 = 7;
+
+    fn properties_with(params: Vec<WindowParams>, gaps_table: Option<&str>) -> (i32, i32) {
+        use crate::config::Config;
+
+        // Tuple path carries rules directly (like the harness); TOML path
+        // carries the `[gaps]` table. Either way `None` means inherit.
+        let config = match gaps_table {
+            Some(table) => Config::try_from(&*format!("{table}\n[options]\n[bindings]\n"))
+                .expect("gaps toml parses"),
+            None => Config::from((MainOptions::default(), params)),
+        };
+        let state = MockState::new();
+        state.spawn_app(TEST_PID, "com.test.app", "Test");
+        let app = state.create_application(TEST_PID);
+        let frame = bevy::math::IRect::new(0, 0, 400, 400);
+        let window = state.spawn_window(TEST_PID, TEST_WORKSPACE_ID, 0, frame);
+        let props = WindowProperties::new(&app, &window, &config);
+        (props.horizontal_padding(), props.vertical_padding())
+    }
+
+    #[test]
+    fn gaps_default_to_eight_without_rules() {
+        assert_eq!(properties_with(vec![], None), (8, 8));
+    }
+
+    #[test]
+    fn explicit_gaps_table_applies() {
+        assert_eq!(
+            properties_with(vec![], Some("[gaps]\nhorizontal = 0\nvertical = 12")),
+            (0, 12)
+        );
+    }
+
+    #[test]
+    fn rule_padding_wins_over_gaps_including_zero() {
+        let mut params = WindowParams::new(".*", None);
+        params.horizontal_padding = Some(0);
+        params.vertical_padding = Some(3);
+        // Global default would give 8/8; the rule opts out horizontally.
+        assert_eq!(properties_with(vec![params], None), (0, 3));
     }
 }
