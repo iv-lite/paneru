@@ -45,14 +45,6 @@ pub(crate) struct MockWindowData {
     pub(crate) horizontal_padding: i32,
     pub(crate) vertical_padding: i32,
     pub(crate) child_role: bool,
-    /// Whether an AX hit-test at the press point would land on blank
-    /// header-toolbar chrome (no interactive control in the way). Drives
-    /// the mocked `toolbar_blank_hit` for scroll-drag arming tests.
-    pub(crate) toolbar_blank: bool,
-    /// Whether an AX hit-test at the press point would land on an
-    /// interactive control (tab, button). Drives the mocked
-    /// `interactive_hit` for titlebar-band tab-press tests.
-    pub(crate) interactive_hit: bool,
 }
 
 impl Default for MockWindowData {
@@ -73,8 +65,6 @@ impl Default for MockWindowData {
             horizontal_padding: 0,
             vertical_padding: 0,
             child_role: false,
-            toolbar_blank: false,
-            interactive_hit: false,
         }
     }
 }
@@ -560,24 +550,6 @@ impl MockState {
                 .windows
                 .get(&id)
                 .is_some_and(|w| w.child_role))
-        });
-
-        let s = self.clone();
-        mw.expect_toolbar_blank_hit().returning(move |_| {
-            s.inner
-                .force_read()
-                .windows
-                .get(&id)
-                .is_some_and(|w| w.toolbar_blank)
-        });
-
-        let s = self.clone();
-        mw.expect_interactive_hit().returning(move |_| {
-            s.inner
-                .force_read()
-                .windows
-                .get(&id)
-                .is_some_and(|w| w.interactive_hit)
         });
 
         let s = self.clone();

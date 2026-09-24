@@ -16,8 +16,8 @@ use crate::config::swipe::SwipeGestureDirection;
 use crate::ecs::layout::{Column, LayoutStrip, clamp_strip_to_fill, strip_total_width};
 use crate::ecs::params::{ActiveDisplay, Windows};
 use crate::ecs::{
-    ActiveWorkspaceMarker, DragSettleMarker, ManualStripOffset, MissionControlActive, Position,
-    RepositionMarker, Scrolling, SendMessageTrigger,
+    ActiveWorkspaceMarker, DragSettleMarker, ManualStripOffset, MissionControlActive,
+    MouseHeldMarker, Position, RepositionMarker, Scrolling, SendMessageTrigger,
 };
 use crate::errors::Result;
 use bevy::ecs::schedule::common_conditions::on_message;
@@ -213,9 +213,11 @@ fn swipe_gesture(
 }
 
 #[instrument(level = Level::TRACE, skip_all)]
+#[allow(clippy::too_many_arguments)]
 pub(super) fn swiping_timeout(
     mut strips: Populated<(Entity, &mut Scrolling, &Position), With<LayoutStrip>>,
     manual_strips: Query<Has<ManualStripOffset>>,
+    held: Query<Entity, With<MouseHeldMarker>>,
     active_display: ActiveDisplay,
     time: Res<Time>,
     window_manager: Res<WindowManager>,
@@ -248,8 +250,11 @@ pub(super) fn swiping_timeout(
                 // snap never reaches on ultrawide viewports. Already-tidy
                 // strips no-op through the settle in one tick. Manually
                 // placed strips (Center/Snap) keep their offset: settling
-                // would override explicit user placement.
-                if manual_strips.get(entity).is_ok_and(|manual| !manual) {
+                // would override explicit user placement. Never while held:
+                // a live gesture owns the strip, and steering under it
+                // would fight the hand (the drive re-arms `Scrolling`
+                // itself on the next event).
+                if held.is_empty() && manual_strips.get(entity).is_ok_and(|manual| !manual) {
                     entity_commands.try_insert(DragSettleMarker);
                     scroll.velocity = 0.0;
                 } else {

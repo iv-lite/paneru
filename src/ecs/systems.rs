@@ -1335,7 +1335,14 @@ pub(crate) fn animate_entities(
                 let total = (origin.as_vec2() - drive.start.as_vec2())
                     .length()
                     .max(remaining);
-                let duration = retarget_duration(remaining, total, base);
+                // Rejoin the burst deadline like births: a retarget on its
+                // own shortened curve overtakes siblings still on the shared
+                // pace. Never shortens — the join only stretches.
+                let duration = join_duration(
+                    retarget_duration(remaining, total, base),
+                    now,
+                    bursts.deadline,
+                );
                 let drift = (origin.as_vec2() - drive.target.as_vec2()).length();
                 let elapsed = now.saturating_sub(drive.started);
                 let live = drive.phase == crate::ecs::DrivePhase::Animating;
@@ -1429,6 +1436,7 @@ pub(super) fn animate_resize_entities(
     animate: TweenedSizes,
     time: Res<Time>,
     config: Res<Config>,
+    phase: Option<Res<crate::ecs::VSyncPhase>>,
     mut bursts: ResMut<crate::ecs::BurstClock>,
     mut commands: Commands,
 ) {
@@ -1437,8 +1445,14 @@ pub(super) fn animate_resize_entities(
         proportional_duration, retarget_duration, should_carry_phase, tween_finished, tween_ivec2,
     };
 
-    // Same shared burst phase as positions so size and origin stay in step.
-    let now = time.elapsed();
+    // Same shared burst phase as positions so size and origin stay in step:
+    // identical `now` (including vsync prediction) plus the shared deadline,
+    // or co-born resize+move pairs run different easing curves and cross
+    // mid-flight — windows overlapping then converging on every resize.
+    let prediction = phase
+        .as_deref()
+        .map_or(Duration::ZERO, crate::ecs::VSyncPhase::prediction);
+    let now = time.elapsed() + prediction;
     let base = config.animation_duration();
 
     for (mut bounds, entity, ResizeMarker(size), tween) in animate {
@@ -1457,7 +1471,14 @@ pub(super) fn animate_resize_entities(
                 let total = (size.as_vec2() - tween.start.as_vec2())
                     .length()
                     .max(remaining);
-                let duration = retarget_duration(remaining, total, base);
+                // Rejoin the burst deadline like births: a retarget on its
+                // own shortened curve overtakes siblings still on the shared
+                // pace. Never shortens — the join only stretches.
+                let duration = join_duration(
+                    retarget_duration(remaining, total, base),
+                    now,
+                    bursts.deadline,
+                );
                 let drift = (size.as_vec2() - tween.target.as_vec2()).length();
                 let elapsed = now.saturating_sub(tween.started);
                 // Carry only across a live leg: a stale leg (older than its

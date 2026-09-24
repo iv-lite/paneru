@@ -9,7 +9,8 @@ use crate::config::{Config, MainOptions, WindowParams, parse_command};
 use crate::ecs::display::FloatingLayer;
 use crate::ecs::{
     ActiveWorkspaceMarker, Bounds, DragSettleMarker, EnsureVisibleMarker, FocusedMarker,
-    ManualStripOffset, NativeFullscreenMarker, Position, Scrolling, Unmanaged, layout::LayoutStrip,
+    ManualStripOffset, NativeFullscreenMarker, Position, RejectedFloatMarker, Scrolling, Unmanaged,
+    layout::LayoutStrip,
 };
 use crate::ecs::{RepositionMarker, SpawnWindowTrigger};
 use crate::events::Event;
@@ -450,47 +451,42 @@ fn strip_scroll_state(world: &mut World) -> (i32, bool, bool) {
     (x, settled, scrolling)
 }
 
-/// A strip-scroll header-drag release arms the drag-release settle, which
-/// then converges (nearest window revealed) and cleans itself up instead of
-/// stranding the strip at the kept offset with state left behind.
+/// A swipe release arms the drag-release settle, which then converges
+/// (nearest window revealed) and cleans itself up instead of stranding
+/// the strip at the kept offset with state left behind.
 #[test]
 fn test_strip_scroll_release_settles_and_cleans_up() {
-    // Window 0 sits at (0, 20); grab its header and drag left 254px to the
-    // clamp edge, ending slow so no fling-glide follows the release.
-    let grab = CGPoint::new(200.0, 30.0);
+    // 3 tiled windows: 1200px strip on a 1024px display. Swipe left past
+    // the fill edge; the swipe-end settle pulls back to -176 so the strip
+    // packs the viewport instead of leaving whitespace past window 2.
+    let config: Config = (
+        MainOptions {
+            swipe_gesture_fingers: Some(3),
+            ..Default::default()
+        },
+        vec![],
+    )
+        .into();
     let commands = vec![
         Event::MenuOpened { window_id: 0 },
-        Event::MouseDown {
-            point: grab,
-            modifiers: Modifiers::empty(),
+        Event::Swipe {
+            delta: 0.2,
+            fingers: 3,
         },
-        Event::MouseDragged {
-            point: CGPoint::new(150.0, 30.0),
-            modifiers: Modifiers::empty(),
+        Event::Command {
+            command: Command::PrintState,
         },
-        Event::MouseDragged {
-            point: CGPoint::new(100.0, 30.0),
-            modifiers: Modifiers::empty(),
+        Event::Command {
+            command: Command::PrintState,
         },
-        Event::MouseDragged {
-            point: CGPoint::new(50.0, 30.0),
-            modifiers: Modifiers::empty(),
+        Event::Command {
+            command: Command::PrintState,
         },
-        Event::MouseDragged {
-            point: CGPoint::new(0.0, 30.0),
-            modifiers: Modifiers::empty(),
+        Event::Command {
+            command: Command::PrintState,
         },
-        Event::MouseDragged {
-            point: CGPoint::new(-50.0, 30.0),
-            modifiers: Modifiers::empty(),
-        },
-        Event::MouseDragged {
-            point: CGPoint::new(-54.0, 30.0),
-            modifiers: Modifiers::empty(),
-        },
-        Event::MouseUp {
-            point: CGPoint::new(-54.0, 30.0),
-            modifiers: Modifiers::empty(),
+        Event::Command {
+            command: Command::PrintState,
         },
         Event::Command {
             command: Command::PrintState,
@@ -504,18 +500,29 @@ fn test_strip_scroll_release_settles_and_cleans_up() {
     ];
 
     TestHarness::new()
+        .with_config(config)
         .with_windows(3)
         .on_iteration(1, move |world, _state| {
-            assert_window_at!(world, 0, 0, TEST_MENUBAR_HEIGHT);
-            assert_window_at!(world, 1, 400, TEST_MENUBAR_HEIGHT);
-            assert_window_at!(world, 2, 800, TEST_MENUBAR_HEIGHT);
+            // The swipe is already carrying the strip with inertia.
+            let (offset, _, _) = strip_scroll_state(world);
+            assert!(
+                offset < 0,
+                "swipe must have displaced the strip, got {offset}"
+            );
         })
-        // The settle converges instantly here (window 1 already revealed),
-        // so only the converged end state is asserted; the fling test below
-        // observes the marker mid-flight. The fill clamp pulls the -254 drag
-        // offset back to -176 so the strip packs the viewport instead of
-        // leaving whitespace past window 2.
-        .on_iteration(11, move |world, _state| {
+        .on_iteration(2, move |world, _state| {
+            // The swipe moved the strip; inertia still carries it.
+            let (offset, _, _) = strip_scroll_state(world);
+            assert!(
+                offset < 0,
+                "swipe must have displaced the strip, got {offset}"
+            );
+        })
+        // The settle converges (window 1 revealed throughout, so it is
+        // quick): the fill clamp pulls the overshoot back to -176 so the
+        // strip packs the viewport instead of leaving whitespace past
+        // window 2, then reaps marker and scrolling.
+        .on_iteration(9, move |world, _state| {
             let (offset, settled, scrolling) = strip_scroll_state(world);
             assert_eq!(offset, -176);
             assert!(!settled, "settle marker must be reaped");
@@ -2685,6 +2692,79 @@ fn test_click_focus_never_grows_window() {
     assert_eq!(
         os_size, small,
         "click focus must not grow the OS window toward the tile"
+    );
+}
+
+/// A rejection float was never user intent: focusing the window heals it
+/// back into the layout instead of stranding it floating until restart.
+#[test]
+fn test_rejected_float_heals_on_refocus() {
+    let mut h = TestHarness::new().with_windows(2);
+    quiesce(&mut h);
+    // Simulate the rejection path's doing (float + marker, strip ejected).
+    let one = find_window_entity(1, h.app.world_mut());
+    h.app
+        .world_mut()
+        .entity_mut(one)
+        .insert(Unmanaged::Floating);
+    h.app
+        .world_mut()
+        .entity_mut(one)
+        .insert(RejectedFloatMarker);
+    for _ in 0..10 {
+        pump_frame(&mut h);
+    }
+    // Focusing it is the user asking for it back: the float drops and the
+    // managed path re-tiles it.
+    h.mock_state.focus_window(1);
+    for _ in 0..10 {
+        pump_frame(&mut h);
+    }
+    let world = h.app.world_mut();
+    assert!(
+        world.get::<Unmanaged>(one).is_none(),
+        "refocus must heal the rejection float"
+    );
+    let mut strips = world.query::<&LayoutStrip>();
+    assert!(
+        strips.iter(world).any(|strip| strip.contains(one)),
+        "healed window must rejoin a strip"
+    );
+}
+
+/// A minimize marker whose OS state disagrees heals: the one-shot
+/// `Deminimized` message lives two frames, so a dropped one strands the
+/// window strip-less with a return ticket forever. Two reconciler
+/// sightings (5s cadence) drop the marker and re-tile.
+#[test]
+fn test_stale_minimized_heals() {
+    let mut h = TestHarness::new().with_windows(1);
+    quiesce(&mut h);
+    // Minimized echo with no OS-side minimize behind it.
+    h.app
+        .world_mut()
+        .write_message::<Event>(Event::WindowMinimized { window_id: 0 });
+    for _ in 0..10 {
+        pump_frame(&mut h);
+    }
+    let zero = find_window_entity(0, h.app.world_mut());
+    assert!(
+        h.app
+            .world_mut()
+            .get::<Unmanaged>(zero)
+            .is_some_and(|unmanaged| matches!(unmanaged, Unmanaged::Minimized)),
+        "minimize echo must park the window"
+    );
+    h.advance(Duration::from_secs(11));
+    let world = h.app.world_mut();
+    assert!(
+        world.get::<Unmanaged>(zero).is_none(),
+        "stale minimize marker must heal"
+    );
+    let mut strips = world.query::<&LayoutStrip>();
+    assert!(
+        strips.iter(world).any(|strip| strip.contains(zero)),
+        "healed window must rejoin a strip"
     );
 }
 

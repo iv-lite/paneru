@@ -5,11 +5,12 @@ use bevy::ecs::lifecycle::{Add, Remove, RemovedComponents};
 use bevy::ecs::message::{MessageReader, MessageWriter};
 use bevy::ecs::observer::On;
 use bevy::ecs::query::{Added, Has, With, Without};
-use bevy::ecs::system::{Commands, NonSendMut, Populated, Query, Res, ResMut, Single};
+use bevy::ecs::system::{Commands, Local, NonSendMut, Populated, Query, Res, ResMut, Single};
 use bevy::math::IRect;
 use notify::event::{DataChange, MetadataKind, ModifyKind};
 use notify::{EventKind, Watcher};
 use std::cmp::Ordering;
+use std::collections::HashSet;
 use std::time::Duration;
 use tracing::{Level, debug, error, info, instrument, trace, warn};
 
@@ -872,6 +873,42 @@ fn remember_workspace_home(entity: Entity, strip: &LayoutStrip, commands: &mut C
             virtual_index: strip.virtual_index,
         });
     }
+}
+
+/// Heals stale minimize/hide markers: the `Deminimized`/`Visible` message
+/// lives only two frames, so a dropped one strands the window strip-less
+/// with a return ticket forever. Re-checks OS truth on a slow cadence and
+/// drops the marker when the OS disagrees — `window_managed_trigger` then
+/// re-tiles via the remembered home. Two consecutive sightings before
+/// healing, so a mid-animation sample never un-minimizes a live minimize.
+pub(super) fn reconcile_stale_unmanaged(
+    lingering: Populated<(Entity, &Window, &Unmanaged)>,
+    windows: Windows,
+    apps: Query<&Application>,
+    mut pending: Local<HashSet<Entity>>,
+    mut commands: Commands,
+) {
+    let mut seen = HashSet::new();
+    for (entity, window, unmanaged) in &lingering {
+        let stale = match unmanaged {
+            Unmanaged::Minimized => !window.is_minimized(),
+            Unmanaged::Hidden => windows
+                .find_parent(window.id())
+                .and_then(|(_, _, parent)| apps.get(parent).ok())
+                .is_some_and(|app| app.is_frontmost()),
+            Unmanaged::Floating => false,
+        };
+        if stale {
+            seen.insert(entity);
+            if pending.contains(&entity) {
+                debug!("stale {unmanaged:?} marker on {entity} disagrees with OS twice; re-tiling");
+                if let Ok(mut entity_commands) = commands.get_entity(entity) {
+                    entity_commands.try_remove::<Unmanaged>();
+                }
+            }
+        }
+    }
+    *pending = seen;
 }
 
 #[instrument(level = Level::DEBUG, skip_all, fields(trigger))]

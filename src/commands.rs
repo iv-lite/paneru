@@ -34,8 +34,8 @@ use crate::ecs::workspace::RestoreFocusMarker;
 use crate::ecs::{
     ActiveDisplayMarker, ActiveWorkspaceMarker, Bounds, ColdStart, DockPosition, FocusedMarker,
     FullWidthMarker, Initializing, ManualStripOffset, MissionControlActive, MouseHeldMarker,
-    NativeFullscreenMarker, RaiseWindow, SelectedVirtualMarker, SpawnCommandsExt, Timeout,
-    Unmanaged, UserFocus,
+    NativeFullscreenMarker, RaiseWindow, RejectedFloatMarker, SelectedVirtualMarker,
+    SpawnCommandsExt, Timeout, Unmanaged, UserFocus,
 };
 use crate::events::Event;
 use crate::manager::{Application, Display, Origin, Size, Window, WindowManager, origin_from};
@@ -1265,6 +1265,10 @@ fn manage_window(
         } else {
             entity_commands.try_insert(Unmanaged::Floating);
         }
+        // An explicit toggle owns the float state either way: a stale
+        // rejection marker must not heal a deliberate user float (or linger
+        // after a deliberate un-float).
+        entity_commands.try_remove::<RejectedFloatMarker>();
     }
 
     // Going floating -> managed only flips the component. Nothing else in

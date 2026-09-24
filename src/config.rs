@@ -385,13 +385,19 @@ impl Config {
         self.inner().options.clone()
     }
 
-    // Fixed tween length for driven moves (150ms default). `animations =
+    // Tween length for driven moves: `animation_duration_ms` when set
+    // (clamped to a sane range), else the 250ms default. `animations =
     // false` snaps instantly (zero duration).
     pub fn animation_duration(&self) -> std::time::Duration {
         if self.options().animations == Some(false) {
             return std::time::Duration::ZERO;
         }
-        std::time::Duration::from_millis(crate::ecs::animation::DEFAULT_ANIMATION_DURATION_MS)
+        let ms = self
+            .options()
+            .animation_duration_ms
+            .unwrap_or(crate::ecs::animation::DEFAULT_ANIMATION_DURATION_MS)
+            .clamp(0, 2000);
+        std::time::Duration::from_millis(ms)
     }
 
     /// Finds a keybinding matching the given `keycode` and `modifier` mask.
@@ -880,6 +886,23 @@ impl Config {
         self.options().focus_follows_mouse.is_none_or(|ffm| ffm)
     }
 
+    /// Drag travel, as a ratio of the working viewport width, above which
+    /// hover-focus sleeps after release — a hand that just flung the strip
+    /// across the monitor must not immediately refocus wherever the cursor
+    /// stopped. `<= 0.0` disables. Default `1.0` (a full viewport width).
+    pub fn ffm_drag_suppress_ratio(&self) -> f64 {
+        self.options()
+            .ffm_drag_suppress_ratio
+            .unwrap_or(1.0)
+            .clamp(0.0, 8.0)
+    }
+
+    /// How long hover-focus sleeps after a viewport-crossing drag.
+    /// `0` disables. Default 400ms.
+    pub fn ffm_drag_suppress_ms(&self) -> u64 {
+        self.options().ffm_drag_suppress_ms.unwrap_or(400)
+    }
+
     /// Returns `true` if the mouse cursor should follow the focused window based on the current configuration.
     /// If the configuration option is not set, it defaults to `true`.
     pub fn mouse_follows_focus(&self) -> bool {
@@ -1309,6 +1332,13 @@ pub struct RestoreOptions {
 pub struct MainOptions {
     /// Enables or disables focus follows mouse behavior.
     pub focus_follows_mouse: Option<bool>,
+    /// Drag travel, as a ratio of the working viewport width, above which
+    /// hover-focus sleeps after release. See
+    /// [`Config::ffm_drag_suppress_ratio`]. Default `1.0`; `<= 0` disables.
+    pub ffm_drag_suppress_ratio: Option<f64>,
+    /// Milliseconds hover-focus sleeps after a viewport-crossing drag. See
+    /// [`Config::ffm_drag_suppress_ms`]. Default `400`; `0` disables.
+    pub ffm_drag_suppress_ms: Option<u64>,
     /// Enables or disables mouse follows focus behavior.
     pub mouse_follows_focus: Option<bool>,
     /// Warps the mouse to the closest screen when at the edge.
@@ -1327,9 +1357,12 @@ pub struct MainOptions {
     #[serde(default = "default_preset_stack_heights")]
     pub preset_stack_heights: Vec<f64>,
     /// Whether driven window moves glide (`true`, default) or snap
-    /// instantly (`false`). Replaces the old `animation_speed` /
-    /// `animation_duration_ms` knobs: one switch, one fixed 150ms tween.
+    /// instantly (`false`). Glide length is `animation_duration_ms`.
     pub animations: Option<bool>,
+    /// Tween length for driven moves in milliseconds. See
+    /// [`Config::animation_duration`]: clamped 0–2000, default 250.
+    /// `animations = false` still snaps instantly regardless.
+    pub animation_duration_ms: Option<u64>,
     /// Automatically center the window when switching focus with keyboard.
     pub auto_center: Option<bool>,
     /// Automatically center a lone column: when a strip holds exactly one
@@ -2359,6 +2392,31 @@ fn test_default_workspaces() {
     // Zero is clamped up to 1 (the physical space always exists).
     let config = Config::try_from(&*format!("default_workspaces = 0\n{base}")).unwrap();
     assert_eq!(config.default_workspaces(), 1);
+}
+
+#[test]
+fn test_animation_duration_knob() {
+    use std::time::Duration;
+
+    let base = "[bindings]\n";
+    let with_options = |keys: &str| format!("{base}[options]\n{keys}");
+    // Unset: the visible default glide.
+    let config = Config::try_from(&*with_options("")).unwrap();
+    assert_eq!(
+        config.animation_duration(),
+        Duration::from_millis(crate::ecs::animation::DEFAULT_ANIMATION_DURATION_MS)
+    );
+    // Explicit value, clamped 0..=2000.
+    let config = Config::try_from(&*with_options("animation_duration_ms = 400\n")).unwrap();
+    assert_eq!(config.animation_duration(), Duration::from_millis(400));
+    let config = Config::try_from(&*with_options("animation_duration_ms = 5000\n")).unwrap();
+    assert_eq!(config.animation_duration(), Duration::from_millis(2000));
+    // Master switch still snaps.
+    let config = Config::try_from(&*with_options(
+        "animations = false\nanimation_duration_ms = 400\n",
+    ))
+    .unwrap();
+    assert_eq!(config.animation_duration(), Duration::ZERO);
 }
 
 #[test]

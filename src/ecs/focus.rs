@@ -103,7 +103,14 @@ pub struct FocusEventsPlugin;
 impl Plugin for FocusEventsPlugin {
     fn build(&self, app: &mut App) {
         app.init_resource::<FocusHistory>();
-        app.add_systems(Update, (detect_focus_rejection, clamp_window_size_on_focus));
+        app.add_systems(
+            Update,
+            (
+                detect_focus_rejection,
+                heal_rejected_float,
+                clamp_window_size_on_focus,
+            ),
+        );
         app.add_systems(
             PostUpdate,
             (
@@ -217,6 +224,7 @@ fn clamp_window_size_on_focus(
     user: Res<UserFocus>,
     press: Res<LastPress>,
     time: Res<Time>,
+    mut commands: Commands,
 ) {
     let Ok((mut window, bounds, resizing)) = windows.get_mut(*focused) else {
         return;
@@ -258,21 +266,44 @@ fn clamp_window_size_on_focus(
             frame.size(),
             bounds.0
         );
-        window.resize(grown);
+        commands.resize_entity(*focused, grown);
         return;
     }
     // Anything larger is never adopted: the tile is the truth, and adopting
     // OS drift here is what grew windows to viewport size over repeated
     // focuses (adopt -> strip dirty -> column master widens -> tile
-    // conformance writes it back -> commit pushes it to the OS). Pull the
-    // app back to its tile instead; `Window::resize` no-ops on <=1px.
+    // conformance writes it back -> commit pushes it to the OS). Glide back
+    // to the tile through the resize tween — a direct OS write would jump
+    // while `Position` still glides, overlapping siblings for a few ticks.
     warn!(
         "focus: clamping window {} from OS size {} back to tile size {}",
         window.id(),
         frame.size(),
         bounds.0
     );
-    window.resize(bounds.0);
+    commands.resize_entity(*focused, bounds.0);
+}
+
+#[instrument(level = Level::DEBUG, skip_all, fields(focused))]
+fn heal_rejected_float(
+    healed: Single<(Entity, Has<crate::ecs::RejectedFloatMarker>), Added<FocusedMarker>>,
+    mut commands: Commands,
+) {
+    // A rejection float was never user intent — only an app racing the
+    // request (explicit toggles clear the marker, so anything carrying it
+    // is still involuntary). Focusing the window is the user asking for it
+    // back: drop the float and let `window_managed_trigger` re-tile it
+    // instead of stranding it floating until restart. Runs on `Added`, so
+    // the heal itself never refires: no loop.
+    let (entity, rejected) = *healed;
+    if !rejected {
+        return;
+    }
+    debug!("healing rejection-floated window {entity} back into the layout");
+    if let Ok(mut entity_commands) = commands.get_entity(entity) {
+        entity_commands.try_remove::<Unmanaged>();
+        entity_commands.try_remove::<crate::ecs::RejectedFloatMarker>();
+    }
 }
 
 #[instrument(level = Level::DEBUG, skip_all, fields(focused))]
@@ -303,12 +334,13 @@ fn detect_focus_rejection(
         return;
     }
 
-    debug!(
-        "focus rejection detected: requested {target_entity}, got {}. Floating {target_entity}.",
+    warn!(
+        "focus rejection detected: requested {target_entity}, got {}. Floating {target_entity} (heals on refocus).",
         *focused
     );
     if let Ok(mut entity_commands) = commands.get_entity(target_entity) {
         entity_commands.try_insert(Unmanaged::Floating);
+        entity_commands.try_insert(crate::ecs::RejectedFloatMarker);
     }
     for (_, mut strip) in &mut workspaces {
         if strip.contains(target_entity) {

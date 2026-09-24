@@ -31,7 +31,6 @@ use crate::platform::input::set_scroll_drag_suppress;
 use crate::platform::{Modifiers, WinID, WorkspaceId};
 use crate::util::round_px;
 use bevy::ecs::schedule::common_conditions::{not, on_message, resource_exists};
-use objc2_core_foundation::CGPoint;
 use objc2_core_graphics::CGDirectDisplayID;
 
 use crate::events::{Event, InputEvent};
@@ -42,85 +41,114 @@ use crate::events::{Event, InputEvent};
 /// so the parked sliver of a hidden virtual workspace lives within this region.
 const CORNER_DEAD_ZONE_PX: i32 = 30;
 
-/// Height of the fallback header strip (px) used when the app exposes no
-/// `AXToolbar`: a representative macOS titlebar height.
-const TITLEBAR_HEIGHT_PX: i32 = 28;
-
-/// Presses within this distance of the window's left/right/top edges count as
-/// resize handles, never header grabs — the top edge sits inside the header
-/// strip and native edge resize must keep working.
-const RESIZE_MARGIN_PX: i32 = 6;
-
-/// Where a press landed: the draggable header (titlebar band or blank
-/// toolbar chrome) versus everything that must stay native (content,
-/// buttons, text fields, tab drags, ...). Only header presses scroll
-/// the strip and swallow the native drag.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum PressKind {
-    Titlebar,
-    ToolbarBlank,
-    Content,
-}
-
-/// Whether a press landed on the window's titlebar as opposed to its
-/// content. Only titlebar grabs scroll the columns and swallow the native
-/// drag; everything else keeps fully native behavior (text selection,
-/// sliders, tab drags, toolbar interaction, ...).
+/// Whether a press landed in the strip gutter (padding whitespace between
+/// windows, or trailing viewport whitespace past the last column) as
+/// opposed to on a window. Only gutter presses scroll the strip; presses
+/// on windows keep fully native behavior (text selection, sliders, tab
+/// drags, toolbar interaction, native window drags, ...) and glide home
+/// on release when tiled and non-floating.
 ///
-/// Pure geometry: the top `TITLEBAR_HEIGHT_PX` of the window, minus the
-/// resize margins. Fullscreen windows and sheets/drawers never count —
-/// they have no draggable header. Best-effort: any AX failure falls back
-/// to geometry and a press outside the window can never classify, so
-/// this never blocks input.
-fn press_is_on_titlebar(point: &CGPoint, window: &Window) -> bool {
-    if window.is_full_screen() || window.child_role().unwrap_or(false) {
+/// Pure geometry over the strip's column slots: a press is gutter when it
+/// sits inside some column's logical slot but outside every member's
+/// padding-inset OS rect, or past the last column inside the viewport.
+/// Single-column strips never arm (no between to grab). Unmanaged members
+/// contribute no intervals. Pure so the rule is unit testable; the caller
+/// supplies the strip, its viewport, and the window frames.
+fn press_in_strip_gutter(
+    point: Origin,
+    strip: &LayoutStrip,
+    strip_pos: Origin,
+    viewport: IRect,
+    windows: &Windows,
+) -> bool {
+    if !viewport.contains(point) || strip.len() < 2 {
         return false;
     }
-    let frame = window.frame();
-    let cursor = origin_from(*point);
-    // CG edges of the OS window: the logical frame is padded outward.
-    let os_min_x = frame.min.x + window.horizontal_padding();
-    let os_min_y = frame.min.y + window.vertical_padding();
-    let os_max_x = frame.max.x - window.horizontal_padding();
-    if cursor.x < os_min_x + RESIZE_MARGIN_PX
-        || cursor.x >= os_max_x - RESIZE_MARGIN_PX
-        || cursor.y < os_min_y + RESIZE_MARGIN_PX
-    {
-        return false;
-    }
-    cursor.y - os_min_y < TITLEBAR_HEIGHT_PX
-}
-
-/// Classifies a press into header (titlebar band or blank toolbar
-/// chrome) versus content.
-///
-/// Geometry first (no AX cost for obvious content presses below the
-/// titlebar); the AX hit-test (`Window::toolbar_blank_hit`) runs in the
-/// ambiguous band below the titlebar, where unified toolbars live, and a
-/// targeted interactive check (`Window::interactive_hit`) runs inside the
-/// titlebar band itself, where unified tab strips live. Toolbar controls
-/// (buttons, text fields, tabs) and all content stay native — only blank
-/// draggable chrome joins the titlebar pipeline. Any AX failure falls back
-/// to geometry (titlebar band drags), never blocks input.
-fn press_kind(point: &CGPoint, window: &Window) -> PressKind {
-    if press_is_on_titlebar(point, window) {
-        // Tab strips and toolbar controls live inside the titlebar
-        // geometry band: an interactive element under the cursor keeps
-        // native behavior (tab switching, buttons) instead of scrolling
-        // the strip and swallowing the drag. Press-time cost only (one AX
-        // walk), never per-tick.
-        if window.interactive_hit(point) {
-            return PressKind::Content;
+    let mut past_last_end = viewport.min.x;
+    for column in strip.all_columns() {
+        let (Some(layout_x), Some(frame)) = (
+            windows.layout_position(column).map(|p| p.0.x),
+            windows.moving_frame(column),
+        ) else {
+            continue;
+        };
+        // Unmanaged members are invisible to layout: no slot, no gutter.
+        if windows
+            .get_managed(column)
+            .is_some_and(|(_, _, unmanaged)| unmanaged.is_some())
+        {
+            continue;
         }
-        return PressKind::Titlebar;
+        let slot_min = layout_x + strip_pos.x;
+        let slot = IRect::from_corners(
+            Origin::new(slot_min, frame.min.y),
+            Origin::new(slot_min + frame.width(), frame.max.y),
+        );
+        if slot.contains(point) {
+            // Inside a column slot: gutter only in the padding inset the
+            // OS window leaves bare.
+            let window = windows.get(column);
+            let (h_pad, v_pad) =
+                window.map_or((0, 0), |w| (w.horizontal_padding(), w.vertical_padding()));
+            let os = IRect::from_corners(
+                Origin::new(slot.min.x + h_pad, slot.min.y + v_pad),
+                Origin::new(slot.max.x - h_pad, slot.max.y - v_pad),
+            );
+            // A degenerate inset (frame narrower than its padding) owns no
+            // gutter: treat the whole slot as window.
+            if os.min.x < os.max.x && os.min.y < os.max.y && !os.contains(point) {
+                return true;
+            }
+            return false;
+        }
+        past_last_end = past_last_end.max(slot.max.x);
     }
-    if window.toolbar_blank_hit(point) {
-        return PressKind::ToolbarBlank;
-    }
-    PressKind::Content
+    // Past every column but inside the viewport: trailing gutter.
+    point.x >= past_last_end
 }
 
-/// Direct-drives one header scroll-drag delta into the owner strip's
+/// Nearest managed strip member to a gutter press: gutter presses hit no
+/// window, but the scroll drive needs a holder target in a strip. Only
+/// multi-column strips qualify (a lone window has no between to grab);
+/// unmanaged members are skipped. Returns `None` when no strip claims
+/// the press as gutter.
+fn gutter_grab_target(
+    point: Origin,
+    strips: &Query<(Entity, &LayoutStrip, &Position, &ChildOf)>,
+    displays: &Query<(&Display, Option<&DockPosition>)>,
+    windows: &Windows,
+    config: &Config,
+) -> Option<Entity> {
+    let mut best: Option<(Entity, i32)> = None;
+    for (_, strip, strip_pos, child) in strips {
+        let Ok((display, dock)) = displays.get(child.parent()) else {
+            continue;
+        };
+        let viewport = display.actual_display_bounds(dock, config);
+        if !press_in_strip_gutter(point, strip, strip_pos.0, viewport, windows) {
+            continue;
+        }
+        for member in strip.all_windows() {
+            let Some(frame) = windows.moving_frame(member) else {
+                continue;
+            };
+            if windows
+                .get_managed(member)
+                .is_some_and(|(_, _, unmanaged)| unmanaged.is_some())
+            {
+                continue;
+            }
+            let travel = (frame.center() - point).abs();
+            let distance = travel.x + travel.y;
+            if best.is_none_or(|(_, known)| distance < known) {
+                best = Some((member, distance));
+            }
+        }
+    }
+    best.map(|(entity, _)| entity)
+}
+
+/// Direct-drives one gutter scroll-drag delta into the owner strip's
 /// scroll offset, same-tick as the column drive. The drive is raw 1:1 with
 /// the pointer: there is no friction while the strip moves — friction lives
 /// only on the release path (`seed_release_inertia` plus the scroll
@@ -252,6 +280,7 @@ impl Plugin for MouseEventsPlugin {
         app.init_resource::<DragModifierState>();
         app.init_resource::<DragScrollState>();
         app.init_resource::<DropPreviewState>();
+        app.init_resource::<FfmDragSuppress>();
         app.init_resource::<WarpAnchor>();
         // Never during warmup: relocation needs converged strips.
         app.add_systems(
@@ -297,12 +326,14 @@ fn mouse_moved_trigger(
     window_manager: Res<WindowManager>,
     config: Res<Config>,
     time: Res<Time>,
+    suppress: Res<FfmDragSuppress>,
     mut global_state: GlobalState,
     mut commands: Commands,
     mut last_find_query: Local<Option<Duration>>,
     held: Query<Entity, With<MouseHeldMarker>>,
 ) {
     const FIND_WINDOW_THROTTLE: Duration = Duration::from_millis(50);
+    let now = time.elapsed();
 
     for InputEvent(event) in messages.read() {
         let Event::MouseMoved { point, modifiers } = event else {
@@ -318,6 +349,15 @@ fn mouse_moved_trigger(
         // stale hover fires on release.
         if !held.is_empty() {
             trace!("mouse moved deferred: button held, hover focus waits for release");
+            continue;
+        }
+
+        // Post-drag sleep: a hand that just flung the strip across the
+        // viewport must not immediately refocus wherever the cursor
+        // stopped (covers real hovers and the synthetic settle hover).
+        // Click intent still lands via `LastPress`, only hover sleeps.
+        if suppress.0.is_some_and(|until| now < until) {
+            trace!("mouse moved suppressed: post-drag hover sleep");
             continue;
         }
 
@@ -362,7 +402,6 @@ fn mouse_moved_trigger(
             }
         }
 
-        let now = time.elapsed();
         if let Some(last_time) = *last_find_query
             && now.saturating_sub(last_time) < FIND_WINDOW_THROTTLE
         {
@@ -429,6 +468,8 @@ fn mouse_down_trigger(
     mut messages: MessageReader<InputEvent>,
     windows: Windows,
     active_workspace: Query<(Entity, Option<&Scrolling>), With<ActiveWorkspaceMarker>>,
+    strips: Query<(Entity, &LayoutStrip, &Position, &ChildOf)>,
+    displays: Query<(&Display, Option<&DockPosition>)>,
     window_manager: Res<WindowManager>,
     config: Res<Config>,
     mouse_held: Query<Entity, With<MouseHeldMarker>>,
@@ -465,10 +506,20 @@ fn mouse_down_trigger(
         last_press.at = time.elapsed();
         last_press.point = origin_from(*point);
 
-        let Some((window, entity)) = window_manager
+        // Resolve the grab: a window under the cursor, else a gutter grab
+        // on the nearest strip member (gutter presses hit no window —
+        // they land in padding whitespace). Window presses always stay
+        // native; only gutter grabs may scroll the strip.
+        let press_point = origin_from(*point);
+        let Some((window, entity, gutter)) = window_manager
             .find_window_at_point(point)
             .ok()
             .and_then(|window_id| windows.find(window_id))
+            .map(|(window, entity)| (window, entity, false))
+            .or_else(|| {
+                gutter_grab_target(press_point, &strips, &displays, &windows, &config)
+                    .and_then(|target| windows.get(target).map(|window| (window, target, true)))
+            })
         else {
             debug!("mouse down at {point:?}: no managed window under cursor, nothing held");
             // No grab, so no drag can follow: make sure a stale suppress
@@ -522,12 +573,6 @@ fn mouse_down_trigger(
         // A truly lost release strands the pin until the next press, which
         // is the release the user actually made.
         let mut holder = commands.spawn(MouseHeldMarker(entity));
-        // Header classification for the scroll arming below: only header
-        // presses (titlebar band pure geometry; blank toolbar chrome via
-        // one AX hit-test per press) scroll the columns and swallow the
-        // native drag. Content and toolbar controls stay native.
-        let press = press_kind(point, window);
-        let header = matches!(press, PressKind::Titlebar | PressKind::ToolbarBlank);
         // Seed the paint-only drag tracker on the holder: a native-owned
         // drag keeps its layout slot pinned, so the border needs the grab
         // frame plus the pointer deltas below to follow the cursor at
@@ -538,14 +583,16 @@ fn mouse_down_trigger(
         // The holder (and the adoption lock on it) owns echo handling from
         // here — notably an armed re-grab inside the grace window, whose
         // transfer hit-test needs live adoption. (The grace itself was
-        // already cleared above, for every press kind.)
+        // already cleared above, for gutter and window presses alike.)
         // Arm display transfer only for the grab-time conjunction the
         // user asked for: shortcut held while left-clicking a window.
         // This holder defines the drag target; pressing the shortcut
-        // later in the drag never arms.
-        let armed = config
-            .mouse_drag_display_modifier()
-            .is_some_and(|required| required.matches(*modifiers));
+        // later in the drag never arms. Gutter grabs never transfer —
+        // the gutter is a scroll-only surface.
+        let armed = !gutter
+            && config
+                .mouse_drag_display_modifier()
+                .is_some_and(|required| required.matches(*modifiers));
         if armed {
             debug!(
                 "mouse drag armed on window {} with modifiers {modifiers:?}",
@@ -557,33 +604,28 @@ fn mouse_down_trigger(
                 window.id()
             );
         }
-        // Scroll-drag arming: same grab-time philosophy, but for the
-        // header only (titlebar band or blank toolbar chrome). A tiled,
-        // unmodified header grab scrolls the columns and swallows the
-        // native drag; content grabs — including buttons, text fields
-        // and tab drags inside the toolbar — and anything armed,
-        // floating or fullscreen keep fully native behavior. The tap
-        // pre-suppresses broadly and this corrects it a frame later.
+        // Scroll-drag arming: gutter presses only (padding whitespace
+        // between windows, or trailing viewport whitespace). A tiled,
+        // unmodified gutter grab scrolls the columns; presses on windows —
+        // titlebar, toolbar, tabs, content — keep fully native behavior
+        // and glide home on release, as do armed, floating or fullscreen
+        // grabs. The tap pre-suppresses broadly and this corrects it a
+        // frame later.
         let tiled = windows
             .get_managed(entity)
             .is_some_and(|(_, _, unmanaged)| unmanaged.is_none());
-        let scroll_armed = config.left_drag_scrolls_strip() && tiled && !armed && header;
+        let scroll_armed = config.left_drag_scrolls_strip() && tiled && !armed && gutter;
         if scroll_armed {
             debug!(
-                "mouse drag scroll-armed on window {} header at {point:?}",
+                "mouse drag scroll-armed on window {} gutter at {point:?}",
                 window.id()
             );
         }
         // Classify-once descriptor for the whole gesture: downstream systems
         // read this instead of re-deriving press context or re-checking live
         // modifiers. Dual-write alongside the markers until they migrate.
-        let gesture = classify_gesture(
-            matches!(press, PressKind::Titlebar),
-            matches!(press, PressKind::ToolbarBlank),
-            armed,
-            config.left_drag_scrolls_strip() && tiled,
-        );
-        debug_assert_eq!(gesture.header, header);
+        let gesture = classify_gesture(gutter, armed, config.left_drag_scrolls_strip() && tiled);
+        debug_assert_eq!(gesture.gutter, gutter);
         debug_assert_eq!(gesture.display_armed, armed);
         debug_assert_eq!(gesture.scroll_armed, scroll_armed);
         holder.try_insert(gesture);
@@ -760,6 +802,7 @@ fn mouse_up_trigger(
     cold: Option<Res<ColdStart>>,
     in_flight: Query<(), With<RepositionMarker>>,
     last_press: Res<LastPress>,
+    mut suppress: ResMut<FfmDragSuppress>,
     mut commands: Commands,
 ) {
     for InputEvent(event) in messages.read() {
@@ -800,7 +843,7 @@ fn mouse_up_trigger(
                 }
                 continue;
             }
-            // A strip-scroll drag (header grab that actually moved through
+            // A strip-scroll drag (gutter grab that actually moved through
             // the shared scroll pipeline): the new scroll offset is the
             // intended result — no reorder, no homing, no click-reshuffle.
             // A press without travel falls through to today's click behavior
@@ -809,6 +852,20 @@ fn mouse_up_trigger(
                 debug!(
                     "mouse up: strip-scroll drag on {entity} traveled {scroll_distance:.0}px, keeping scroll offset"
                 );
+                // Viewport-crossing drags sleep hover-focus: the hand just
+                // flung the strip, so the cursor's landing window must not
+                // steal focus until the user really hovers. Click intent
+                // still lands via `LastPress`; only hover sleeps.
+                if drag_covers_viewport(
+                    scroll_distance,
+                    release_viewport_width(entity, &strips, &displays, &config),
+                    config.ffm_drag_suppress_ratio(),
+                ) {
+                    let ms = config.ffm_drag_suppress_ms();
+                    if ms > 0 {
+                        suppress.0 = Some(time.elapsed() + Duration::from_millis(ms));
+                    }
+                }
                 // Record the column for the post-release grace: a native
                 // session that slipped through before suppression still ends
                 // with an echo that must not rewrite the slot (see the
@@ -836,8 +893,24 @@ fn mouse_up_trigger(
                 }
                 continue;
             }
-            // Members of the dragged column (or the lone window).
-            let members = release_column_members(entity, &strips);
+            // Members of the dragged column (or the lone window),
+            // managed only: floating, minimized and hidden windows keep
+            // fully native behavior and never home, reveal or reshuffle —
+            // retile touches tiled windows alone.
+            let members: Vec<Entity> = release_column_members(entity, &strips)
+                .into_iter()
+                .filter(|member| {
+                    windows
+                        .get_managed(*member)
+                        .is_some_and(|(_, _, unmanaged)| unmanaged.is_none())
+                })
+                .collect();
+            if members.is_empty() {
+                if let Ok(mut entity_commands) = commands.get_entity(held_entity) {
+                    entity_commands.try_despawn();
+                }
+                continue;
+            }
 
             // Armed same-display drop (grab-time frozen): relocate the column
             // to the nearest slot; the layout chain animates members into
@@ -976,6 +1049,22 @@ pub(crate) struct DragScrollState {
     /// releases with ~zero velocity and stops dead.
     pub(crate) release_ema_px_s: f64,
     pub(crate) last_sample_at: Option<Duration>,
+}
+
+/// Hover-focus sleep after a viewport-crossing drag: a hand that just
+/// flung the strip across the monitor must not immediately refocus
+/// wherever the cursor stopped. Suppress-until timestamp in virtual time
+/// (harness-controlled expiry, like the release grace); `None` rests.
+/// Written in `mouse_up_trigger`, read in `mouse_moved_trigger` (which
+/// also covers the synthetic settle hover).
+#[derive(Debug, Resource, Default)]
+pub(crate) struct FfmDragSuppress(pub Option<Duration>);
+
+/// Whether a scroll-drag travel covers the configured share of the
+/// viewport width and should therefore sleep hover-focus. Pure so the
+/// rule is unit testable; the harness pins exact pointer tracking.
+fn drag_covers_viewport(distance_px: f64, viewport_width_px: f64, ratio: f64) -> bool {
+    ratio > 0.0 && viewport_width_px > 0.0 && distance_px > ratio * viewport_width_px
 }
 
 /// Paint-only drag tracker on the holder: grab frame plus accumulated
@@ -1119,6 +1208,25 @@ fn release_column_members(entity: Entity, strips: &ReleaseStrips) -> Vec<Entity>
                 .and_then(|index| strip.get(index).ok())
         })
         .map_or_else(|| vec![entity], |column| column.window_iter().collect())
+}
+
+/// Working viewport width of the display owning `entity`'s strip: the
+/// denominator for the post-drag hover sleep. Falls back to 0 (no sleep)
+/// when the strip or display is gone — an unmeasurable drag suppresses
+/// nothing.
+fn release_viewport_width(
+    entity: Entity,
+    strips: &ReleaseStrips,
+    displays: &PreviewDisplays,
+    config: &Config,
+) -> f64 {
+    strips
+        .iter()
+        .find(|(_, strip, _, _)| strip.contains(entity))
+        .and_then(|(_, _, _, child)| displays.get(child.parent()).ok())
+        .map_or(0.0, |(_, display, dock, _)| {
+            f64::from(display.actual_display_bounds(dock, config).width())
+        })
 }
 
 /// Arms the post-release echo shield for `members`: seats per-window
@@ -1443,7 +1551,7 @@ fn seed_release_inertia(
 /// Floating/minimized/hidden windows are untouched (they keep native
 /// behavior plus the pin path).
 ///
-/// Exception: a header scroll-drag (grab-time scroll-armed `Gesture`) drives
+/// Exception: a gutter scroll-drag (grab-time scroll-armed `Gesture`) drives
 /// the owner strip's scroll offset directly, 1:1 with the pointer, when
 /// `left_drag_scrolls_strip` is enabled. The tap swallows the native drag
 /// for those grabs, so no `WindowMoved` echo and no adoption fight; armed
@@ -1468,7 +1576,7 @@ fn drag_move_held_column(
 ) {
     // HID bursts can deliver many `MouseDragged` per frame; driving the
     // strip/column once per folded delta (instead of once per event) keeps
-    // a long header-drag at constant cost: one strip write, one paint
+    // a long gutter-drag at constant cost: one strip write, one paint
     // advance, one commit push per frame. Velocity EMA still samples each
     // raw delta so the release glide keeps its shape.
     //
@@ -1547,12 +1655,11 @@ fn drag_move_held_column(
         trace!("synthetic drag: no managed held target, skipping move");
         return;
     };
-    // Paint-only tracking for drags the layout doesn't drive itself: the
-    // slot stays pinned, but the border needs the pointer delta at input
-    // rate. Advanced once per frame for armed or scroll-driven holders —
-    // plain content grabs stay fully native and cost nothing per event.
-    if (armed || scroll_armed)
-        && let Some((holder_entity, _, _)) = held.iter().find(|(_, marker, _)| marker.0 == target)
+    // Paint-only tracking for every held drag: the slot stays pinned
+    // while a native-owned drag moves the OS window, so the border needs
+    // the pointer delta at input rate instead of stepping at snapshot
+    // cadence. Cheap per frame; dies with the holder.
+    if let Some((holder_entity, _, _)) = held.iter().find(|(_, marker, _)| marker.0 == target)
         && let Ok(mut paint) = holder_paint.get_mut(holder_entity)
     {
         paint.advance(Origin::new(folded_dx, 0), time.elapsed());
@@ -1562,22 +1669,21 @@ fn drag_move_held_column(
         // scroll pipeline must not move before the world converges.
         return;
     }
-    // Header scroll-drag (grab-time armed): drive the owner strip directly,
+    // Gutter scroll-drag (grab-time armed): drive the owner strip directly,
     // 1:1 with the folded pointer travel and same-tick as the column drive
     // below — instead of emitting a `Scroll` event that trails a message
     // hop plus an unordered plugin behind. Armed modifier drags and legacy
-    // (scroll-disabled) drags take the move path below; content grabs with
-    // scrolling enabled are ignored entirely — native owns them.
+    // (scroll-disabled) drags take the move path below; window grabs fall
+    // through with no motion at all — native owns them, release homing
+    // glides them back.
     if scroll_armed {
         // Dead-zone: a press that never travels reads as a click on
         // release, so driving the strip on sub-threshold pointer jitter
         // (trackpad tap wobble, HiDPI rounding) turns clicks into
-        // scrolls — e.g. VSCode tab clicks misclassified as titlebar
-        // grabs when the AX hit-test misses Electron chrome. Absorb
-        // motion below the click threshold; the press anchor already
-        // refreshed per slice above, so crossing the threshold later
-        // starts clean with no jump. Matches the release branch, which
-        // only keeps the offset past the same threshold.
+        // scrolls. Absorb motion below the click threshold; the press
+        // anchor already refreshed per slice above, so crossing the
+        // threshold later starts clean with no jump. Matches the release
+        // branch, which only keeps the offset past the same threshold.
         if scroll_state.distance_px <= DRAG_SCROLL_CLICK_THRESHOLD_PX {
             return;
         }
@@ -2355,6 +2461,20 @@ mod tests {
 
     fn test_viewport() -> IRect {
         IRect::new(0, 20, 1024, 768)
+    }
+
+    #[test]
+    fn viewport_crossing_drag_rule() {
+        // Strictly greater: exactly 100% still hovers.
+        assert!(drag_covers_viewport(1025.0, 1024.0, 1.0));
+        assert!(!drag_covers_viewport(1024.0, 1024.0, 1.0));
+        assert!(!drag_covers_viewport(500.0, 1024.0, 1.0));
+        // Disabled ratio or unmeasurable viewport suppresses nothing.
+        assert!(!drag_covers_viewport(5000.0, 1024.0, 0.0));
+        assert!(!drag_covers_viewport(5000.0, 0.0, 1.0));
+        // Custom ratios scale the bar.
+        assert!(drag_covers_viewport(600.0, 1024.0, 0.5));
+        assert!(!drag_covers_viewport(400.0, 1024.0, 0.5));
     }
 
     #[test]

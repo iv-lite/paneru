@@ -1,9 +1,8 @@
 use accessibility_sys::{
-    AXUIElementCopyElementAtPosition, AXUIElementCreateApplication, AXUIElementRef, AXValueCreate,
-    AXValueGetValue, kAXErrorSuccess, kAXFloatingWindowSubrole, kAXParentAttribute,
-    kAXPositionAttribute, kAXRaiseAction, kAXRoleAttribute, kAXSizeAttribute,
-    kAXStandardWindowSubrole, kAXToolbarRole, kAXUnknownSubrole, kAXValueTypeCGPoint,
-    kAXValueTypeCGSize, kAXWindowRole,
+    AXUIElementCreateApplication, AXUIElementRef, AXValueCreate, AXValueGetValue,
+    kAXFloatingWindowSubrole, kAXPositionAttribute, kAXRaiseAction, kAXSizeAttribute,
+    kAXStandardWindowSubrole, kAXUnknownSubrole, kAXValueTypeCGPoint, kAXValueTypeCGSize,
+    kAXWindowRole,
 };
 use bevy::ecs::component::Component;
 use bevy::math::IRect;
@@ -86,21 +85,6 @@ pub trait WindowApi: Send + Sync {
     fn invalidate_title(&self);
     fn identifier(&self) -> Result<String>;
     fn child_role(&self) -> Result<bool>;
-    /// Whether `point` (screen coordinates) lands on blank header-toolbar
-    /// chrome: inside the window's `AXToolbar` ancestry with no interactive
-    /// control between the cursor and the toolbar. Used to arm strip
-    /// scroll-drag from unified toolbars (`VSCode`, `Firefox`) while keeping
-    /// buttons, text fields, tab groups and content fully native. Main
-    /// thread only (synchronous cross-process AX reads); any failure
-    /// returns `false` so the press stays native.
-    fn toolbar_blank_hit(&self, point: &CGPoint) -> bool;
-    /// Whether `point` lands on an interactive control (tab group, radio
-    /// button, button, text field, ...) anywhere in its AX ancestry. Used
-    /// to keep titlebar-band presses on tabs and toolbar controls native:
-    /// unified tab strips live inside the titlebar geometry band, so
-    /// geometry alone cannot tell a tab from a header grab. Same
-    /// main-thread/fail-native contract as [`Self::toolbar_blank_hit`].
-    fn interactive_hit(&self, point: &CGPoint) -> bool;
     fn role(&self) -> Result<String>;
     fn subrole(&self) -> Result<String>;
     fn is_minimized(&self) -> bool;
@@ -305,90 +289,6 @@ pub struct WindowOS {
 }
 
 impl WindowOS {
-    /// Shared AX ancestry walk backing [`WindowApi::toolbar_blank_hit`]
-    /// and [`WindowApi::interactive_hit`]: deepest element at `point`, up
-    /// to 8 `AXParent` levels. Any failure reads as [`AncestryHit::Other`]
-    /// (press stays native). Inherent rather than a trait method so the
-    /// [`mockall`] mock need not stub it — the two trait methods delegate
-    /// to it, and tests stub those directly.
-    #[allow(clippy::cast_possible_truncation)]
-    fn ancestry_hit(&self, point: &CGPoint) -> AncestryHit {
-        const MAX_DEPTH: usize = 8;
-        // Roles that own the press: dragging from them must stay native
-        // (text selection, tab drags, button presses, URL edits, ...),
-        // even when they sit inside the toolbar rect.
-        const INTERACTIVE_ROLES: &[&str] = &[
-            "AXButton",
-            "AXRadioButton",
-            "AXCheckBox",
-            "AXPopUpButton",
-            "AXMenuButton",
-            "AXTabGroup",
-            "AXTextField",
-            "AXTextArea",
-            "AXComboBox",
-            "AXSlider",
-            "AXIncrementor",
-            "AXScrollArea",
-            "AXScrollBar",
-            "AXSplitter",
-            "AXTable",
-            "AXOutline",
-            "AXBrowser",
-            "AXList",
-            "AXGrid",
-            "AXMenu",
-            "AXMenuItem",
-            "AXMenuBarItem",
-            "AXLink",
-            "AXWebArea",
-        ];
-        const WINDOW_ROLES: &[&str] = &["AXWindow", "AXSheet", "AXDrawer"];
-
-        let Some(app_element) = self.app_reference() else {
-            return AncestryHit::Other;
-        };
-        let mut hit: AXUIElementRef = std::ptr::null_mut();
-        let status = unsafe {
-            AXUIElementCopyElementAtPosition(
-                app_element.as_ptr(),
-                point.x as f32,
-                point.y as f32,
-                &raw mut hit,
-            )
-        };
-        if status != kAXErrorSuccess {
-            return AncestryHit::Other;
-        }
-        let Ok(mut current) = AXUIWrapper::from_retained(hit.cast::<std::ffi::c_void>()) else {
-            return AncestryHit::Other;
-        };
-        let role_name = CFString::from_static_str(kAXRoleAttribute);
-        let parent_name = CFString::from_static_str(kAXParentAttribute);
-        for _ in 0..MAX_DEPTH {
-            let Ok(role) = current
-                .get_attribute::<CFString>(&role_name)
-                .map(|value| value.to_string())
-            else {
-                return AncestryHit::Other;
-            };
-            if INTERACTIVE_ROLES.iter().any(|item| item.eq(&role)) {
-                return AncestryHit::Interactive;
-            }
-            if role.eq(kAXToolbarRole) {
-                return AncestryHit::ToolbarBlank;
-            }
-            if WINDOW_ROLES.iter().any(|item| item.eq(&role)) {
-                return AncestryHit::Other;
-            }
-            let Ok(parent) = current.get_attribute::<AXUIWrapper>(&parent_name) else {
-                return AncestryHit::Other;
-            };
-            current = parent;
-        }
-        AncestryHit::Other
-    }
-
     /// Creates a new `Window` instance.
     ///
     /// # Arguments
@@ -724,17 +624,6 @@ pub(crate) fn snapshot_frame(element: &AXUIWrapper) -> Result<IRect> {
     Ok(irect_from(frame))
 }
 
-/// Outcome of one AX ancestry walk: what owns the press.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-enum AncestryHit {
-    /// An interactive control (tab, button, field) in the chain: native.
-    Interactive,
-    /// Blank toolbar chrome, nothing interactive: draggable header.
-    ToolbarBlank,
-    /// Anything else (content, failure, depth cap): native.
-    Other,
-}
-
 impl WindowApi for WindowOS {
     /// Returns the ID of the window.
     ///
@@ -806,28 +695,6 @@ impl WindowApi for WindowOS {
         Ok(["AXSheet", "AXDrawer"]
             .iter()
             .any(|axrole| axrole.eq(&role)))
-    }
-
-    /// Hit-tests `point` against the window's toolbar ancestry.
-    ///
-    /// Resolves the deepest AX element at the cursor and walks
-    /// `AXParent` up to the window (bounded: 8 levels). An interactive
-    /// role anywhere in the chain (button, text field, tab group, web
-    /// area, ...) means user intent belongs to the app → `false`. A
-    /// toolbar ancestor with nothing interactive below it means blank
-    /// draggable chrome → `true`. Reaching the window with no toolbar
-    /// ancestor (plain content, Electron custom chrome without an
-    /// `AXToolbar`) → `false`: classification must never arm scroll
-    /// from inside content.
-    #[allow(clippy::cast_possible_truncation)]
-    fn toolbar_blank_hit(&self, point: &CGPoint) -> bool {
-        self.ancestry_hit(point) == AncestryHit::ToolbarBlank
-    }
-
-    /// See [`Self::interactive_hit`]: same walk, answering the interactive
-    /// question instead of the blank-chrome one.
-    fn interactive_hit(&self, point: &CGPoint) -> bool {
-        self.ancestry_hit(point) == AncestryHit::Interactive
     }
 
     /// Retrieves the role of the window (e.g., "`AXWindow`").

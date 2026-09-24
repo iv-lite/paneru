@@ -5,7 +5,7 @@
 //! ride the exact presented frame. Ease-out cubic covers ground fast up
 //! front and decelerates into the landing: the first ticks are larger than
 //! the old `smootherstep` attack (which spent ~4% of the distance 20ms into
-//! a 150ms glide vs ~35% here), so very large glides may step wider than
+//! a glide vs ~22% here at the default pace), so very large glides may step
 //! the async AX writer tracks in one frame — `proportional_duration` and
 //! the coalesced writer absorb that; the tail keeps non-zero velocity
 //! instead of stalling at zero slope.
@@ -29,16 +29,18 @@ use std::time::Duration;
 
 use bevy::math::IVec2;
 
-/// Default glide for driven moves: visible but snappy.
-pub const DEFAULT_ANIMATION_DURATION_MS: u64 = 150;
+/// Default glide for driven moves: smooth and visible — long enough to
+/// read the strip motion, short enough to stay out of the way.
+pub const DEFAULT_ANIMATION_DURATION_MS: u64 = 250;
 
-/// Shortest retargeted glide: interrupts stay fluid without popping.
-pub const MIN_ANIMATION_DURATION_MS: u64 = 40;
+/// Shortest retargeted glide: interrupts stay fluid without popping, but
+/// no glide drops below perceptibility.
+pub const MIN_ANIMATION_DURATION_MS: u64 = 80;
 
 /// Longest glide for very wide (ultrawide) moves: distance scaling in
-/// [`proportional_duration`] clamps here so a 3440px traverse stays snappy
-/// instead of stretching into a slow pan.
-pub const MAX_ANIMATION_DURATION_MS: u64 = 220;
+/// [`proportional_duration`] clamps here so a 3440px traverse stays
+/// readable instead of stretching into a slow pan.
+pub const MAX_ANIMATION_DURATION_MS: u64 = 320;
 
 /// Reference travel (px) for [`proportional_duration`]: moves around this
 /// length use the base duration, shorter ones shrink toward the minimum,
@@ -60,10 +62,10 @@ pub const BURST_JOIN_WINDOW: Duration = Duration::from_millis(50);
 pub const RETARGET_CARRY_PX: f32 = 32.0;
 
 /// Ease-out cubic: fast attack, decelerating landing (`1 - (1-p)^3`).
-/// `p` is clamped 0..1. At 20ms into a 150ms glide this covers ~35% of the
-/// distance (vs ~4% for [`smootherstep`]), which reads as immediate,
-/// linear-like motion; the end velocity decays to zero smoothly instead of
-/// stalling, and [`nudge_landing`] still owns sub-pixel tails.
+/// `p` is clamped 0..1. At 20ms into a 250ms glide this covers ~22% of the
+/// distance — the motion reads immediately without teleporting — the end
+/// velocity decays to zero smoothly instead of stalling, and
+/// [`nudge_landing`] still owns sub-pixel tails.
 pub fn ease_out_cubic(p: f32) -> f32 {
     let p = p.clamp(0.0, 1.0);
     1.0 - (1.0 - p) * (1.0 - p) * (1.0 - p)
@@ -231,9 +233,10 @@ mod tests {
         // Fast attack: ahead of linear up front, decelerating into the end.
         assert!(ease_out_cubic(0.25) > 0.25, "fast attack");
         assert!(ease_out_cubic(0.75) > 0.75, "decelerating landing");
-        // A 20ms tick of a 150ms glide covers ~35%, not ~4%.
-        let early = ease_out_cubic(20.0 / 150.0);
-        assert!(early > 0.25 && early < 0.45);
+        // A 20ms tick of the default 250ms glide covers ~22%: quick to
+        // start, never a teleport.
+        let early = ease_out_cubic(20.0 / 250.0);
+        assert!(early > 0.15 && early < 0.35);
         assert!(ease_out_cubic(0.9) < 1.0);
         // Monotonic: never steps back.
         let mut prev = 0.0;
@@ -332,7 +335,10 @@ mod tests {
         assert!(near(proportional_duration(REFERENCE_TRAVEL_PX, base), base));
         let short = proportional_duration(100.0, base);
         assert!(short < base);
-        assert!(short >= Duration::from_millis(MIN_ANIMATION_DURATION_MS));
+        assert!(
+            near(short, Duration::from_millis(MIN_ANIMATION_DURATION_MS)),
+            "short moves floor at the minimum"
+        );
         let wide = proportional_duration(3440.0, base);
         assert!(wide > base);
         assert!(wide <= Duration::from_millis(MAX_ANIMATION_DURATION_MS));
@@ -417,7 +423,11 @@ mod tests {
         assert_eq!(retarget_duration(100.0, 100.0, base), base);
         let half = retarget_duration(50.0, 100.0, base);
         assert!(half < base);
-        assert!(half >= Duration::from_millis(MIN_ANIMATION_DURATION_MS));
+        // Floored at the minimum (`from_secs_f32` truncates sub-ms, so
+        // compare with tolerance like above).
+        assert!(
+            half + Duration::from_millis(1) >= Duration::from_millis(MIN_ANIMATION_DURATION_MS)
+        );
         // Zero base stays zero (snap).
         assert_eq!(
             retarget_duration(10.0, 100.0, Duration::ZERO),

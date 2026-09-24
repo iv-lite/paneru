@@ -11,7 +11,7 @@ use bevy::ecs::resource::Resource;
 use bevy::ecs::schedule::IntoScheduleConfigs as _;
 use bevy::ecs::schedule::SystemCondition as _;
 use bevy::ecs::schedule::common_conditions::{not, resource_exists};
-use bevy::ecs::system::{Commands, ParamSet, Populated, Query, Res, ResMut, Single};
+use bevy::ecs::system::{Commands, Local, ParamSet, Populated, Query, Res, ResMut, Single};
 use bevy::time::common_conditions::on_timer;
 use std::collections::HashSet;
 use std::time::Duration;
@@ -614,6 +614,7 @@ pub(crate) fn cleanup_unordered_windows(
     windows: Query<&Window>,
     workspaces: Query<&LayoutStrip>,
     window_manager: Res<WindowManager>,
+    mut pending: Local<HashSet<WinID>>,
     mut commands: Commands,
 ) {
     let windows = workspaces
@@ -626,16 +627,27 @@ pub(crate) fn cleanup_unordered_windows(
         })
         .filter_map(|entity| windows.get(entity).ok());
 
+    // Two consecutive sightings before destroying: a window transiently
+    // unordered during a space switch, Mission Control, or fullscreen
+    // animation — plus one flaky `role()` read — used to synthesize an
+    // unconfirmed destroy on the spot, permanently deleting a live window.
+    let mut seen = HashSet::new();
     for window in windows {
         let window_id = window.id();
         if window_manager.window_is_unordered(window_id) && window.role().is_err() {
-            debug!("Window {window_id} is unordered; removing it.");
-            commands.trigger(SendMessageTrigger(Event::WindowDestroyed {
-                window_id,
-                source: DestroySource::Accessibility,
-            }));
+            seen.insert(window_id);
+            if pending.contains(&window_id) {
+                debug!("Window {window_id} still unordered on second sighting; removing it.");
+                commands.trigger(SendMessageTrigger(Event::WindowDestroyed {
+                    window_id,
+                    source: DestroySource::Accessibility,
+                }));
+            } else {
+                debug!("Window {window_id} unordered on first sighting; watching.");
+            }
         }
     }
+    *pending = seen;
 }
 
 /// Removes previuos `ActiveWorkspaceMarker`'s when a new one is inserted.

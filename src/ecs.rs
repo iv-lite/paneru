@@ -304,6 +304,16 @@ pub fn register_systems(app: &mut bevy::app::App) {
             script_state::script_state_cleanup_on_exit.run_if(on_message::<AppExit>),
         ),
     );
+    // Heals stranded minimize/hide markers whose one-shot return message
+    // was dropped: cheap (only lingering windows are re-queried against the
+    // OS) and convergent (two sightings). Separate call: the Update tuple
+    // above is at the system-count limit.
+    app.add_systems(
+        Update,
+        triggers::reconcile_stale_unmanaged
+            .run_if(not(resource_exists::<Initializing>))
+            .run_if(on_timer(Duration::from_secs(5))),
+    );
     app.add_systems(
         PostUpdate,
         (
@@ -678,6 +688,13 @@ pub enum Unmanaged {
     /// The window is hidden.
     Hidden,
 }
+
+/// Marks a window floated by `detect_focus_rejection` (focus landed
+/// elsewhere than requested) as opposed to an explicit user float: the
+/// float was never user intent, so focusing the window heals it back into
+/// the layout instead of leaving it de-tiled until restart.
+#[derive(Component, Debug)]
+pub struct RejectedFloatMarker;
 
 /// Workspace home remembered across minimize/hide: the strip identity a
 /// window belonged to when it left the layout. Only routing survives — the

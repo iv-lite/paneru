@@ -12,8 +12,8 @@ use crate::ecs::mouse::{DragModifierState, DragPaint, DragScrollState, DropPrevi
 use crate::ecs::sync::{Gesture, GestureKind, WindowSync};
 use crate::ecs::workspace::IgnoredMovedWindows;
 use crate::ecs::{
-    ActiveDisplayMarker, Bounds, DockPosition, MouseHeldMarker, Position, RepositionMarker,
-    Scrolling, SpawnWindowTrigger, StaleAxMarker, Timeout, Unmanaged,
+    ActiveDisplayMarker, Bounds, DockPosition, FocusedMarker, MouseHeldMarker, Position,
+    RepositionMarker, Scrolling, SpawnWindowTrigger, StaleAxMarker, Timeout, Unmanaged,
 };
 use crate::events::Event;
 use crate::manager::{Application, Display, Origin, Size, Window};
@@ -363,46 +363,34 @@ fn test_vertical_drag_wiggle_moves_nothing() {
         .run(commands);
 }
 
-/// A sustained scroll-drag tracks the pointer 1:1: there is no friction
-/// while the strip moves — every step applies its full delta the same tick,
-/// so sustained fast motion never eases out. Friction lives only on the
-/// release path, once the drag had motion and the button comes up (the
-/// release glide owns it there).
+/// A gutter grab scroll-drives the strip 1:1 with the pointer: presses in
+/// padding whitespace between windows (or trailing viewport whitespace)
+/// arm on the nearest member, and the strip follows while windows keep
+/// their slots. Friction lives only on the release path.
 #[test]
-fn test_sustained_scroll_drag_tracks_pointer_one_to_one() {
-    let config: Config = (
-        MainOptions {
-            animations: Some(false),
-            ..Default::default()
-        },
-        vec![],
-    )
-        .into();
-    // Five windows give the strip room without a clamp wall: four -100px
-    // steps travel -400 raw, and the strip lands exactly there — window 1
-    // stays fully visible throughout, so no sliver parking or reveal
-    // corrects its offset (window 0 does park into its sliver at -400).
-    let grab = CGPoint::new(200.0, 30.0);
+fn test_gutter_drag_scrolls_strip_one_to_one() {
+    // Five windows: 2000px strip on a 1024px display. Park the strip at
+    // -1500 first (direct write; the ride recomputes member frames from
+    // it), exposing trailing whitespace past the last column at 500..1024.
+    // A press at (700, 40) hits no window and arms a gutter grab on the
+    // nearest member; dragging right +400 must move the strip to -1100. A
+    // settle command separates the park (iteration 0) from the press so
+    // committed OS frames converge before hit-testing.
     let commands = vec![
         Event::MenuOpened { window_id: 0 },
+        Event::Command {
+            command: Command::PrintState,
+        },
         Event::MouseDown {
-            point: grab,
+            point: CGPoint::new(700.0, 40.0),
             modifiers: Modifiers::empty(),
         },
         Event::MouseDragged {
-            point: CGPoint::new(100.0, 30.0),
+            point: CGPoint::new(1100.0, 40.0),
             modifiers: Modifiers::empty(),
         },
-        Event::MouseDragged {
-            point: CGPoint::new(0.0, 30.0),
-            modifiers: Modifiers::empty(),
-        },
-        Event::MouseDragged {
-            point: CGPoint::new(-100.0, 30.0),
-            modifiers: Modifiers::empty(),
-        },
-        Event::MouseDragged {
-            point: CGPoint::new(-200.0, 30.0),
+        Event::MouseUp {
+            point: CGPoint::new(1100.0, 40.0),
             modifiers: Modifiers::empty(),
         },
         Event::Command {
@@ -414,13 +402,35 @@ fn test_sustained_scroll_drag_tracks_pointer_one_to_one() {
     ];
 
     TestHarness::new()
-        .with_config(config)
         .with_windows(5)
+        .on_iteration(0, |world, _state| {
+            let mut strips = world.query::<(&LayoutStrip, &mut Position)>();
+            let (_, mut position) = strips.iter_mut(world).next().expect("need a strip to park");
+            position.0.x = -1500;
+        })
         .on_iteration(2, |world, _state| {
-            assert_window_at!(world, 0, -100, TEST_MENUBAR_HEIGHT);
+            // Mid-gesture: a Gutter holder driving the strip.
+            let holders: Vec<(Entity, Option<Gesture>)> = world
+                .query_filtered::<(Entity, Option<&Gesture>), With<MouseHeldMarker>>()
+                .iter(world)
+                .map(|(entity, gesture)| (entity, gesture.copied()))
+                .collect();
+            assert_eq!(holders.len(), 1, "gutter press holds the nearest window");
+            let gesture = holders[0].1.expect("press edge classifies every grab");
+            assert_eq!(gesture.kind, GestureKind::Gutter);
+            assert!(gesture.drives(), "gutter holder drives the strip");
+        })
+        .on_iteration(3, |world, _state| {
+            assert_eq!(
+                test_strip_offset(world),
+                -1100,
+                "gutter drag must track the pointer 1:1"
+            );
         })
         .on_iteration(5, |world, _state| {
-            assert_window_at!(world, 1, 0, TEST_MENUBAR_HEIGHT);
+            // Release kept the offset; the settle then pulled to the fill
+            // edge (-976) instead of stranding whitespace.
+            assert_eq!(test_strip_offset(world), -976);
         })
         .run(commands);
 }
@@ -528,18 +538,19 @@ fn test_native_drag_accumulates_paint_offset_with_slot_pinned() {
         .with_windows(1)
         .on_iteration(3, |world, _state| {
             let entity = find_window_entity(0, world);
-            // Holder paint seeded at press: grab frame with no pointer
-            // offset for content grabs (they advance nothing per event).
+            // Holder paint seeded at press plus pointer travel: the +50px
+            // horizontal drag tracks in paint (the +50px vertical leg is
+            // dropped by the horizontal-only drive).
             let mut holders = world.query_filtered::<&DragPaint, With<MouseHeldMarker>>();
             let paint = holders.iter(world).next().expect("holder paint");
-            assert_eq!(paint.offset, Origin::ZERO);
+            assert_eq!(paint.offset, Origin::new(50, 0));
             assert_eq!(
                 paint.frame(),
                 Some(IRect::from_corners(
-                    Origin::new(0, TEST_MENUBAR_HEIGHT),
-                    Origin::new(400, 768),
+                    Origin::new(50, TEST_MENUBAR_HEIGHT),
+                    Origin::new(450, 768),
                 )),
-                "grab frame with no pointer offset"
+                "painted frame is grab frame plus pointer offset"
             );
             // The slot never moved: layout truth is still the tiled origin.
             let position = world.entity(entity).get::<Position>().expect("position");
@@ -624,12 +635,12 @@ fn test_lost_release_holds_pin_without_timeout() {
     assert_eq!(position.0, Origin::new(0, TEST_MENUBAR_HEIGHT));
 }
 
-/// A continuous header drag past the old 5s fuse keeps driving: the holder
-/// lives until mouse-up, the strip follows the pointer 1:1 the whole way,
-/// and no Homing is seated mid-gesture.
+/// A continuous native drag past the old 5s fuse keeps its holder: the
+/// holder lives until mouse-up, and no Homing is seated mid-gesture.
+/// Window presses stay native, so the strip never follows the pointer.
 #[test]
 fn test_long_drag_keeps_driving_past_five_seconds() {
-    // Titlebar band: scroll-armed header grab drives the strip.
+    // Window press: always native, never scroll-armed.
     let grab = CGPoint::new(200.0, 30.0);
     let mut h = TestHarness::new().with_windows(1);
     h.run(vec![
@@ -680,10 +691,7 @@ fn test_long_drag_keeps_driving_past_five_seconds() {
         .iter(world)
         .find(|(strip, _)| strip.contains(target))
         .expect("owning strip");
-    assert_eq!(
-        position.0.x, 300,
-        "strip follows the pointer 1:1 across the whole drag"
-    );
+    assert_eq!(position.0.x, 0, "native drags never move the strip");
 }
 
 /// A plain left-click drag must not detach the window: the OS really moves
@@ -1978,10 +1986,10 @@ fn test_warp_drag_release_then_hover_stays_in_viewport() {
 }
 
 /// A content press tracks its holder but drives nothing: the holder
-/// carries neither arming marker, so no per-frame costs key off it (paint
-/// stays empty, overlay/snapshot/pump gates stay shut), the strip stays
-/// put, and no scroll state arms. The gesture reads pointer motion but
-/// never writes it.
+/// carries neither arming marker, so the strip stays put and no scroll
+/// state arms. Paint still tracks the pointer (so the border follows a
+/// native-owned drag at input rate) while the slot stays pinned. The
+/// gesture reads pointer motion but never writes it.
 #[test]
 fn test_content_press_drives_nothing() {
     // Deep inside window 0's content (tiles at (0, 20), 400 wide).
@@ -2034,8 +2042,8 @@ fn test_content_press_drives_nothing() {
             let paint = paints.iter(world).next().expect("holder paint");
             assert_eq!(
                 paint.offset,
-                Origin::ZERO,
-                "content drags advance no paint offset"
+                Origin::new(-100, 0),
+                "native drags track the pointer in paint (200 -> 400 -> 100) while the slot stays pinned"
             );
         })
         .on_iteration(5, |world, _state| {
@@ -2088,12 +2096,13 @@ fn test_click_release_issues_no_reshuffle() {
         .run(commands);
 }
 
-/// A press on a tab inside the titlebar band stays fully native: the AX
-/// ancestry check vetoes the header classification, so no scroll arm, no
-/// suppress, and a 100px drag moves neither the strip nor the window.
+/// A press on a window stays fully native — titlebar band included: window
+/// presses never arm the strip drive, so no scroll arm, no suppress, and a
+/// 100px drag moves neither the strip nor the window (it glides home).
 #[test]
-fn test_tab_press_in_titlebar_stays_native_and_moves_nothing() {
-    // Window 0 tiles at (0, 20); y=30 sits inside the 28px titlebar band.
+fn test_window_press_stays_native_and_moves_nothing() {
+    // Window 0 tiles at (0, 20); y=30 sits inside the old 28px titlebar
+    // band, which no longer arms anything.
     let grab = CGPoint::new(200.0, 30.0);
     let commands = vec![
         Event::MenuOpened { window_id: 0 },
@@ -2115,19 +2124,19 @@ fn test_tab_press_in_titlebar_stays_native_and_moves_nothing() {
     ];
 
     TestHarness::new()
-        .with_window(0, |w| w.interactive_hit = true)
+        .with_windows(1)
         .on_iteration(2, |world, _state| {
-            // Mid-gesture: tracked holder, but a Content gesture — the tab
-            // vetoed the header classification.
+            // Mid-gesture: tracked holder, but a Content gesture — window
+            // presses never drive.
             let holders: Vec<(Entity, Option<Gesture>)> = world
                 .query_filtered::<(Entity, Option<&Gesture>), With<MouseHeldMarker>>()
                 .iter(world)
                 .map(|(entity, gesture)| (entity, gesture.copied()))
                 .collect();
-            assert_eq!(holders.len(), 1, "tab press holds its window");
+            assert_eq!(holders.len(), 1, "window press holds its window");
             let gesture = holders[0].1.expect("press edge classifies every grab");
             assert_eq!(gesture.kind, GestureKind::Content);
-            assert!(!gesture.drives(), "tab holder drives nothing");
+            assert!(!gesture.drives(), "window holder drives nothing");
         })
         .on_iteration(4, |world, _state| {
             // A 100px pointer travel moved nothing: strip offset holds and
@@ -2138,7 +2147,7 @@ fn test_tab_press_in_titlebar_stays_native_and_moves_nothing() {
                 .iter(world)
                 .find(|(strip, _)| strip.contains(target))
                 .expect("owning strip");
-            assert_eq!(position.0.x, 0, "tab drag must not scroll the strip");
+            assert_eq!(position.0.x, 0, "window drag must not scroll the strip");
             assert_window_at!(world, 0, 0, TEST_MENUBAR_HEIGHT);
         })
         .run(commands);
@@ -2483,65 +2492,13 @@ fn test_armed_drag_follows_cursor_without_native_move() {
         .run(commands);
 }
 
-/// A grab below the 28px titlebar strip does NOT scroll-arm when the AX
-/// hit-test reports content or a toolbar control there: only the titlebar
-/// band and blank toolbar chrome drive, everything else stays native.
+/// A grab on toolbar chrome stays fully native like every other window
+/// press: only gutter presses scroll the strip. The window never leaves
+/// its slot and the strip never moves under the hand.
 #[test]
 fn test_toolbar_grab_stays_native() {
-    // Window 0 tiles at (0, 20); y=60 sits below the titlebar band, in
-    // what would be toolbar territory.
-    let grab = CGPoint::new(200.0, 60.0);
-    let commands = vec![
-        Event::MenuOpened { window_id: 0 },
-        Event::MouseDown {
-            point: grab,
-            modifiers: Modifiers::empty(),
-        },
-        Event::MouseDragged {
-            point: CGPoint::new(500.0, 60.0),
-            modifiers: Modifiers::empty(),
-        },
-        Event::Command {
-            command: Command::PrintState,
-        },
-        Event::MouseUp {
-            point: CGPoint::new(500.0, 60.0),
-            modifiers: Modifiers::empty(),
-        },
-        Event::Command {
-            command: Command::PrintState,
-        },
-    ];
-
-    TestHarness::new()
-        .with_windows(1)
-        .on_iteration(3, move |world, _state| {
-            // No scroll drive: the window never left its slot and the
-            // strip never moved, and no scroll state was armed.
-            assert_window_at!(world, 0, 0, TEST_MENUBAR_HEIGHT);
-            let entity = find_window_entity(0, world);
-            let mut strips = world.query::<(&LayoutStrip, &Position)>();
-            let (_, position) = strips
-                .iter(world)
-                .find(|(strip, _)| strip.contains(entity))
-                .expect("need owning strip");
-            assert_eq!(position.0.x, 0);
-            assert!(
-                world.query::<&Scrolling>().iter(world).next().is_none(),
-                "a toolbar grab must not arm the scroll pipeline"
-            );
-        })
-        .run(commands);
-}
-
-/// A grab on blank toolbar chrome (below the 28px titlebar band, with the
-/// AX hit-test reporting no interactive control in the way) scroll-drives
-/// the strip exactly like a titlebar grab: the window never leaves its
-/// slot — the strip glides under the hand instead.
-#[test]
-fn test_toolbar_blank_grab_scrolls_strip() {
     // 5 tiled windows: 2000px strip on a 1024px display. Grab window 0's
-    // toolbar at y=60 (below the titlebar band) and drag left.
+    // toolbar at y=60 and drag left: nothing may scroll.
     let commands = vec![
         Event::MenuOpened { window_id: 0 },
         Event::MouseDown {
@@ -2566,18 +2523,15 @@ fn test_toolbar_blank_grab_scrolls_strip() {
     ];
 
     TestHarness::new()
-        .with_window(0, |w| w.toolbar_blank = true)
-        .with_window(1, |_| {})
-        .with_window(2, |_| {})
-        .with_window(3, |_| {})
-        .with_window(4, |_| {})
+        .with_windows(5)
         .with_focused_window(0)
         .on_iteration(3, |world, _state| {
-            // Finger travel so far: -800 through the shared pipeline.
-            assert!(
-                strip_x_of_window_0(world) <= -785,
-                "toolbar drag segments must have scrolled the strip, got {}",
-                strip_x_of_window_0(world)
+            // Finger travel so far: -800, all of it native — the strip
+            // must not have moved.
+            assert_eq!(
+                strip_x_of_window_0(world),
+                0,
+                "toolbar drag must not scroll the strip"
             );
         })
         .on_iteration(4, |world, _state| {
@@ -2592,19 +2546,14 @@ fn test_toolbar_blank_grab_scrolls_strip() {
         .run(commands);
 }
 
-/// Sub-threshold pointer jitter on a scroll-armed titlebar grab must not
-/// move the strip: a press that never travels releases as a click, so
-/// driving earlier turns clicks (e.g. `VSCode` tab clicks misclassified
-/// when the AX hit-test misses Electron chrome) into scrolls plus
-/// release inertia. The dead-zone absorbs the wobble; release stays a
-/// no-reshuffle, no-inertia click.
+/// Sub-threshold pointer jitter on a window press must not move the
+/// strip: a press that never travels releases as a click, and window
+/// presses never drive — the release stays a no-reshuffle, no-inertia
+/// click.
 #[test]
 fn test_titlebar_jitter_click_does_not_scroll() {
-    // 5 tiled windows: 2000px strip on a 1024px display, so the strip can
-    // actually scroll. Window 0 tiles at (0, 20); y=40 sits inside the
-    // 28px titlebar band with the default mock reporting no interactive
-    // control, so the press arms the scroll drive exactly like the
-    // misclassified tab.
+    // 5 tiled windows: 2000px strip on a 1024px display, so the strip could
+    // scroll. Window 0 tiles at (0, 20); a 2px wobble on it is a click.
     let press = CGPoint::new(200.0, 40.0);
     let commands = vec![
         Event::MenuOpened { window_id: 0 },
@@ -2693,33 +2642,40 @@ fn test_strip_frames(world: &mut World) -> Vec<IRect> {
         .collect()
 }
 
-/// A flung header drag keeps gliding after release: the drag tracks its own
-/// release velocity (the shared pipeline zeroes it for pointer-driven
-/// Scrolls) and seeds `Scrolling` with it, so the existing inertia chain
-/// carries the strip past the finger's travel, then decays and cleans up —
-/// no homing, no reshuffle.
+/// A flung swipe keeps gliding after the gesture ends: the swipe tracks
+/// its own velocity and the inertia chain carries the strip past the
+/// finger's travel, then decays, settles to fill, and cleans up — no
+/// homing, no reshuffle.
 #[test]
 fn test_scroll_drag_release_glides_with_inertia() {
     // 5 tiled windows: 2000px strip on a 1024px display, clamp [-976, 0].
-    // Grab window 0's header and drag left in staged segments (200ms virtual
-    // time apart): -300, -200, then lift still moving -200.
+    // A +0.3 viewport swipe flings left; inertia must carry past the
+    // finger travel, then decay and settle at the fill edge.
+    let config: Config = (
+        MainOptions {
+            swipe_gesture_fingers: Some(3),
+            ..Default::default()
+        },
+        vec![],
+    )
+        .into();
     let commands = vec![
         Event::MenuOpened { window_id: 0 },
-        Event::MouseDown {
-            point: CGPoint::new(300.0, 30.0),
-            modifiers: Modifiers::empty(),
+        Event::Swipe {
+            delta: 0.2,
+            fingers: 3,
         },
-        Event::MouseDragged {
-            point: CGPoint::new(-100.0, 30.0),
-            modifiers: Modifiers::empty(),
+        Event::Command {
+            command: Command::PrintState,
         },
-        Event::MouseDragged {
-            point: CGPoint::new(-500.0, 30.0),
-            modifiers: Modifiers::empty(),
+        Event::Command {
+            command: Command::PrintState,
         },
-        Event::MouseUp {
-            point: CGPoint::new(-900.0, 30.0),
-            modifiers: Modifiers::empty(),
+        Event::Command {
+            command: Command::PrintState,
+        },
+        Event::Command {
+            command: Command::PrintState,
         },
         Event::Command {
             command: Command::PrintState,
@@ -2730,36 +2686,29 @@ fn test_scroll_drag_release_glides_with_inertia() {
     ];
 
     TestHarness::new()
+        .with_config(config)
         .with_windows(5)
         .with_focused_window(0)
-        .on_iteration(3, move |world, _state| {
-            // Finger travel so far: -800 through the shared pipeline.
+        .on_iteration(1, move |world, _state| {
+            // The swipe displaced the strip; inertia still carries it.
             assert!(
-                strip_x_of_window_0(world) <= -785,
-                "drag segments must have scrolled the strip, got {}",
+                strip_x_of_window_0(world) < 0,
+                "swipe must have displaced the strip, got {}",
                 strip_x_of_window_0(world)
             );
         })
-        .on_iteration(4, move |world, _state| {
-            // Release at -800 of finger travel, but the seeded glide carries
-            // the strip further left inside the same command window.
-            assert!(
-                strip_x_of_window_0(world) <= -810,
-                "release must glide past the finger travel, got {}",
-                strip_x_of_window_0(world)
-            );
-        })
-        .on_iteration(6, move |world, _state| {
-            // Settled: inertia decayed, `Scrolling` reaped, offset kept (no
-            // homing back toward 0).
+        .on_iteration(7, move |world, _state| {
+            // Settled: inertia decayed, `Scrolling` reaped, fill edge kept
+            // (no homing back toward 0).
             let mut scrolling = world.query_filtered::<&Scrolling, With<LayoutStrip>>();
             assert!(
                 scrolling.iter(world).next().is_none(),
                 "inertia must converge and reap Scrolling"
             );
-            assert!(
-                strip_x_of_window_0(world) <= -810,
-                "settled offset must keep the glide, got {}",
+            assert_eq!(
+                strip_x_of_window_0(world),
+                -976,
+                "settled offset must keep the fill edge, got {}",
                 strip_x_of_window_0(world)
             );
         })
@@ -2807,8 +2756,8 @@ fn test_focus_moves_never_seed_scrolling_friction() {
         .run(commands);
 }
 
-/// A grab inside the resize margin (here: 3px from the left edge, at header
-/// height) is a native resize, never a scroll: nothing moves.
+/// A press at the window edge stays native like every other window press:
+/// nothing moves.
 #[test]
 fn test_edge_margin_grab_keeps_native() {
     let grab = CGPoint::new(3.0, 30.0);
@@ -2843,12 +2792,12 @@ fn test_edge_margin_grab_keeps_native() {
         .run(commands);
 }
 
-/// A native echo landing after a scroll release (a session that slipped
+/// A native echo landing after a click release (a session that slipped
 /// through before suppression) must not rewrite the slot: the grace pushes
-/// the slot back and the strip keeps its scroll offset.
+/// the slot back and the window stays home.
 #[test]
 fn test_late_echo_heals_after_release() {
-    // Window 0 tiles at (0, 20); grab its titlebar and drag +100.
+    // Window 0 tiles at (0, 20); press and nudge it natively, then release.
     let grab = CGPoint::new(200.0, 30.0);
     let commands = vec![
         Event::MenuOpened { window_id: 0 },
@@ -2883,17 +2832,17 @@ fn test_late_echo_heals_after_release() {
             // The echo was refused: ECS still says slot...
             let entity = find_window_entity(0, world);
             let position = world.get::<Position>(entity).expect("need position").0;
-            assert_eq!(position, Origin::new(100, TEST_MENUBAR_HEIGHT));
+            assert_eq!(position, Origin::new(0, TEST_MENUBAR_HEIGHT));
             // ...and the OS window was pushed back into it...
             let window = world.get::<Window>(entity).expect("need window");
             assert_eq!(window.frame().min, position);
-            // ...while the strip kept its scroll offset.
+            // ...while the strip never moved.
             let mut strips = world.query::<(&LayoutStrip, &Position)>();
             let (_, position) = strips
                 .iter(world)
                 .find(|(strip, _)| strip.contains(entity))
                 .expect("need owning strip");
-            assert_eq!(position.0.x, 100);
+            assert_eq!(position.0.x, 0);
         })
         .run(commands);
 }
@@ -2941,16 +2890,16 @@ fn test_settle_repairs_silent_drift() {
             // The settle check (200ms virtual) pushed the slot back...
             let entity = find_window_entity(0, world);
             let position = world.get::<Position>(entity).expect("need position").0;
-            assert_eq!(position, Origin::new(100, TEST_MENUBAR_HEIGHT));
+            assert_eq!(position, Origin::new(0, TEST_MENUBAR_HEIGHT));
             let window = world.get::<Window>(entity).expect("need window");
             assert_eq!(window.frame().min, position);
-            // ...and the strip kept its scroll offset.
+            // ...and the strip never moved.
             let mut strips = world.query::<(&LayoutStrip, &Position)>();
             let (_, position) = strips
                 .iter(world)
                 .find(|(strip, _)| strip.contains(entity))
                 .expect("need owning strip");
-            assert_eq!(position.0.x, 100);
+            assert_eq!(position.0.x, 0);
         })
         .run(commands);
 }
@@ -3035,10 +2984,9 @@ fn test_unarmed_drag_with_scroll_disabled_moves_column_then_glides_home() {
         .run(commands);
 }
 
-/// A header scroll-glide drag must never detach across a display seam: when
-/// a native echo lands the held window's OS frame on another display
-/// mid-hold (suppression race, or a display change under the cursor), the
-/// strip keeps gliding and the window stays on its strip.
+/// A window drag must never detach across a display seam: when a native
+/// echo lands the held window's OS frame on another display mid-hold, the
+/// window stays on its strip.
 #[test]
 fn test_scroll_glide_drag_across_seam_never_detaches() {
     let grab = CGPoint::new(200.0, 30.0);
@@ -3136,6 +3084,75 @@ fn test_hover_focus_deferred_until_drag_release() {
             // After release the deferred hover takes effect: (500, 400) sits
             // inside window 1's tiled frame.
             assert_focused!(world, 1);
+        })
+        .run(commands);
+}
+
+/// Hover-focus sleeps after a viewport-crossing drag: flinging the strip
+/// 1200px on a 1024px viewport must not refocus wherever the cursor
+/// stopped. Once the sleep lapses, hovering follows again.
+#[test]
+fn test_hover_sleeps_after_viewport_crossing_drag() {
+    // Five windows: 2000px strip. Park at -1500 (iteration 0 + settle
+    // command), gutter-grab the trailing whitespace at (700, 40), and
+    // fling left 1200px to the clamp wall.
+    let commands = vec![
+        Event::MenuOpened { window_id: 0 },
+        Event::Command {
+            command: Command::PrintState,
+        },
+        Event::MouseDown {
+            point: CGPoint::new(700.0, 40.0),
+            modifiers: Modifiers::empty(),
+        },
+        Event::MouseDragged {
+            point: CGPoint::new(-500.0, 40.0),
+            modifiers: Modifiers::empty(),
+        },
+        Event::MouseUp {
+            point: CGPoint::new(-500.0, 40.0),
+            modifiers: Modifiers::empty(),
+        },
+        Event::MouseMoved {
+            point: CGPoint::new(200.0, 40.0),
+            modifiers: Modifiers::empty(),
+        },
+        Event::Command {
+            command: Command::PrintState,
+        },
+        Event::Command {
+            command: Command::PrintState,
+        },
+        Event::Command {
+            command: Command::PrintState,
+        },
+        Event::MouseMoved {
+            point: CGPoint::new(200.0, 40.0),
+            modifiers: Modifiers::empty(),
+        },
+        Event::Command {
+            command: Command::PrintState,
+        },
+    ];
+
+    TestHarness::new()
+        .with_windows(5)
+        .on_iteration(0, |world, _state| {
+            let mut strips = world.query::<(&LayoutStrip, &mut Position)>();
+            let (_, mut position) = strips.iter_mut(world).next().expect("need a strip to park");
+            position.0.x = -1500;
+        })
+        .on_iteration(5, |world, _state| {
+            // The strip flung under the cursor: (200, 40) now sits over
+            // another window, but hover-focus sleeps — still window 0.
+            assert_focused!(world, 0);
+        })
+        .on_iteration(10, |world, _state| {
+            // Sleep lapsed (600ms past the 400ms default): the same hover
+            // now follows to whichever window it sits over.
+            let mut focused = world.query_filtered::<&Window, With<FocusedMarker>>();
+            let id = focused.single(world).expect("a focused window").id();
+            assert_ne!(id, 0, "hover must follow again after the sleep lapses");
         })
         .run(commands);
 }

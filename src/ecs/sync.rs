@@ -300,12 +300,14 @@ pub fn reconcile_resize(state: WindowSync, event: ResizeEvent) -> SyncAction {
     SyncAction::Adopt
 }
 
-/// Where a press landed, classified once at the edge.
+/// Where a press landed, classified once at the edge: the strip gutter
+/// between windows (the only surface that scrolls the strip) versus
+/// everything that stays native (window content, tabs, buttons — presses
+/// on windows never drive anything).
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 #[allow(dead_code)]
 pub enum GestureKind {
-    Titlebar,
-    ToolbarBlank,
+    Gutter,
     Content,
     /// A press that never classified: always push back, explicitly.
     Unknown,
@@ -313,11 +315,11 @@ pub enum GestureKind {
 
 /// Full gesture descriptor stored on the holder; downstream systems read this
 /// instead of re-deriving press context (kills live-modifier re-checks and
-/// duplicate header/armed markers).
+/// duplicate gutter/armed markers).
 #[derive(Clone, Component, Copy, Debug, PartialEq, Eq)]
 pub struct Gesture {
     pub kind: GestureKind,
-    pub header: bool,
+    pub gutter: bool,
     pub display_armed: bool,
     pub scroll_armed: bool,
 }
@@ -338,25 +340,17 @@ impl Gesture {
     clippy::too_many_arguments,
     dead_code
 )]
-pub fn classify_gesture(
-    titlebar: bool,
-    toolbar_blank: bool,
-    display_armed: bool,
-    scroll_capable: bool,
-) -> Gesture {
-    let kind = if titlebar {
-        GestureKind::Titlebar
-    } else if toolbar_blank {
-        GestureKind::ToolbarBlank
+pub fn classify_gesture(gutter: bool, display_armed: bool, scroll_capable: bool) -> Gesture {
+    let kind = if gutter {
+        GestureKind::Gutter
     } else {
         GestureKind::Content
     };
-    let header = matches!(kind, GestureKind::Titlebar | GestureKind::ToolbarBlank);
     Gesture {
         kind,
-        header,
+        gutter,
         display_armed,
-        scroll_armed: scroll_capable && !display_armed && header,
+        scroll_armed: scroll_capable && !display_armed && gutter,
     }
 }
 
@@ -365,7 +359,7 @@ pub fn classify_gesture(
 pub fn unknown_gesture() -> Gesture {
     Gesture {
         kind: GestureKind::Unknown,
-        header: false,
+        gutter: false,
         display_armed: false,
         scroll_armed: false,
     }
@@ -552,26 +546,22 @@ mod tests {
 
     #[test]
     fn gesture_classification() {
-        let g = classify_gesture(true, false, false, true);
-        assert_eq!(g.kind, GestureKind::Titlebar);
-        assert!(g.header && g.scroll_armed);
-
-        let g = classify_gesture(false, true, false, true);
-        assert_eq!(g.kind, GestureKind::ToolbarBlank);
-        assert!(g.header && g.scroll_armed);
+        let g = classify_gesture(true, false, true);
+        assert_eq!(g.kind, GestureKind::Gutter);
+        assert!(g.gutter && g.scroll_armed);
 
         // Display-drag armed: scroll must stand down.
-        let g = classify_gesture(true, false, true, true);
+        let g = classify_gesture(true, true, true);
         assert!(!g.scroll_armed);
 
         // Content never scrolls.
-        let g = classify_gesture(false, false, false, true);
+        let g = classify_gesture(false, false, true);
         assert_eq!(g.kind, GestureKind::Content);
-        assert!(!g.header && !g.scroll_armed);
+        assert!(!g.gutter && !g.scroll_armed);
 
-        // Unknown is never header.
+        // Unknown is never gutter.
         let g = unknown_gesture();
         assert_eq!(g.kind, GestureKind::Unknown);
-        assert!(!g.header);
+        assert!(!g.gutter);
     }
 }

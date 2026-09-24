@@ -38,7 +38,7 @@ https://github.com/user-attachments/assets/793e7eaa-7909-4086-8380-1fb7861f8780
   A filled ghost spanning the dragged column marks the landing slot
   throughout the drag, and the edge
   warp carries the cursor across when `horizontal_mouse_warp` is set.
-  Without the shortcut, dragging a tiled window's titlebar scrolls the workspace strip
+  Without the shortcut, dragging in the strip gutter scrolls the workspace strip; window drags stay native and glide home
   instead of moving anything (content grabs stay native; disable with `left_drag_scrolls_strip = false`) —
   only armed drags reorder or transfer.
 - **Virtual Workspaces (Experimental):** Group your windows into tasks by
