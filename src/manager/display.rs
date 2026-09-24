@@ -18,6 +18,11 @@ use crate::{
 pub struct Display {
     /// The unique identifier for this display provided by Core Graphics.
     id: CGDirectDisplayID,
+    /// Stable EDID-derived UUID string (`CGDisplayCreateUUIDFromDisplayID`).
+    /// Unlike [`CGDirectDisplayID`], this survives plug order, reboot, and
+    /// driver reload — session restore keys off it. `None` when unresolved
+    /// (tests, transient enumeration failures).
+    uuid: Option<String>,
     /// The physical bounds (origin and size) of the display.
     bounds: IRect,
     /// The height of the menubar on this display (from the system).
@@ -43,6 +48,7 @@ impl Display {
     pub fn new(id: CGDirectDisplayID, bounds: IRect, menubar_height: i32) -> Self {
         Self {
             id,
+            uuid: None,
             bounds,
             menubar_height,
             menubar_height_override: None,
@@ -100,6 +106,17 @@ impl Display {
     /// The `CGDirectDisplayID` of the display.
     pub fn id(&self) -> CGDirectDisplayID {
         self.id
+    }
+
+    /// Stable UUID string for this display, if resolved at enumeration.
+    pub fn uuid(&self) -> Option<&str> {
+        self.uuid.as_deref()
+    }
+
+    /// Records the stable UUID string (resolved once at enumeration, so
+    /// save/restore paths never touch CoreGraphics themselves).
+    pub fn set_uuid(&mut self, uuid: String) {
+        self.uuid = Some(uuid);
     }
 
     pub fn locate_dock(&self, visible_frame: &IRect) -> DockPosition {

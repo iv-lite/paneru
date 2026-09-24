@@ -265,6 +265,41 @@ mod tests {
     }
 
     #[test]
+    fn glide_advances_every_tick_without_jumps() {
+        // Same 150ms, finer steps: an 800px glide sampled at 120Hz must
+        // never step back and must make pixel progress on every mid-glide
+        // tick (the kick/nudge own the first/last ticks, the curve owns
+        // the middle). A stalled mid-glide tick reads as judder; a huge
+        // one reads as a jump the AX writer turns into jump-then-crawl.
+        let start = IVec2::new(0, 0);
+        let end = IVec2::new(800, 0);
+        let duration = Duration::from_millis(DEFAULT_ANIMATION_DURATION_MS);
+        let mut previous = start;
+        let mut tick = Duration::ZERO;
+        while tick <= duration {
+            let t = eased_factor(tick, duration);
+            let current = tween_ivec2(start, end, t);
+            assert!(
+                current.x >= previous.x,
+                "glide must never step back at {tick:?}"
+            );
+            if tick >= Duration::from_millis(24) && tick <= Duration::from_millis(120) {
+                assert!(
+                    current.x > previous.x,
+                    "mid-glide tick at {tick:?} must advance"
+                );
+                assert!(
+                    current.x - previous.x <= 120,
+                    "mid-glide tick at {tick:?} must stay AX-sized"
+                );
+            }
+            previous = current;
+            tick += Duration::from_nanos(8_333_333);
+        }
+        assert_eq!(previous, end);
+    }
+
+    #[test]
     fn landing_nudge_advances_without_overshoot() {
         use super::LANDING_NUDGE_PX;
         assert_eq!(

@@ -232,6 +232,7 @@ pub fn register_systems(app: &mut bevy::app::App) {
     app.init_resource::<crate::ecs::LastPress>();
     app.init_resource::<crate::ecs::BurstClock>();
     app.init_resource::<crate::ecs::DisplayGeneration>();
+    app.init_resource::<crate::ecs::VSyncPhase>();
     app.init_resource::<crate::ax_writer::AxWriteState>();
     app.init_resource::<crate::ecs::sync::SyncCounters>();
     app.add_systems(
@@ -811,6 +812,30 @@ impl ColdStart {
 /// resolution) otherwise stay stale behind the overlay's height cache.
 #[derive(Resource, Debug, Default)]
 pub struct DisplayGeneration(pub u64);
+
+/// Fresh vsync phase published by the pump every quiet frame: how long
+/// until the next retrace (`lead`, falling back to the period estimate
+/// when the phase is unknown) plus the raw period. Animators commit the
+/// retrace-time pose by shifting `now` forward by `lead`, and the border
+/// predicts held drags over it — so frames start on the retrace and the
+/// glass the OS sees is the one due then, not one frame stale. `None`
+/// (headless, tests, pre-first-fire) means "no link": systems use their
+/// previous clocks unchanged.
+#[derive(Resource, Debug, Default, Clone, Copy)]
+pub struct VSyncPhase {
+    pub lead: Option<Duration>,
+    pub period: Option<Duration>,
+}
+
+impl VSyncPhase {
+    /// Prediction horizon for commits, bounded: never more than a couple
+    /// of retraces ahead, so a stale phase cannot teleport a glide.
+    pub fn prediction(&self) -> Duration {
+        const MAX_PREDICT_AHEAD: Duration = Duration::from_millis(50);
+        self.lead
+            .map_or(Duration::ZERO, |lead| lead.min(MAX_PREDICT_AHEAD))
+    }
+}
 
 /// A focus arrival the user asked for (keyboard command just now): set by
 /// command handlers alongside the focus they issue. OS echoes (app

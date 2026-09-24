@@ -38,20 +38,20 @@ pub struct DimParams {
 
 // ── DimView: fullscreen dark overlay with a transparent cutout + border ──
 
-#[derive(Debug, Clone)]
+#[derive(Debug)]
 struct DimViewIvars {
-    opacity: f32,
-    dim_r: f64,
-    dim_g: f64,
-    dim_b: f64,
+    opacity: std::cell::Cell<f32>,
+    dim_r: std::cell::Cell<f64>,
+    dim_g: std::cell::Cell<f64>,
+    dim_b: std::cell::Cell<f64>,
     // Cutout rect in the view's local coordinates.
-    cutout_x: f64,
-    cutout_y: f64,
-    cutout_w: f64,
-    cutout_h: f64,
-    has_cutout: bool,
+    cutout_x: std::cell::Cell<f64>,
+    cutout_y: std::cell::Cell<f64>,
+    cutout_w: std::cell::Cell<f64>,
+    cutout_h: std::cell::Cell<f64>,
+    has_cutout: std::cell::Cell<bool>,
     // Corner radius of the cutout hole (the window's own radius).
-    cutout_radius: f64,
+    cutout_radius: std::cell::Cell<f64>,
 }
 
 define_class!(
@@ -70,15 +70,15 @@ define_class!(
 
             // Fill the entire view with the dim color.
             let dim_color = NSColor::colorWithSRGBRed_green_blue_alpha(
-                ivars.dim_r as CGFloat,
-                ivars.dim_g as CGFloat,
-                ivars.dim_b as CGFloat,
-                CGFloat::from(ivars.opacity),
+                ivars.dim_r.get() as CGFloat,
+                ivars.dim_g.get() as CGFloat,
+                ivars.dim_b.get() as CGFloat,
+                CGFloat::from(ivars.opacity.get()),
             );
             dim_color.setFill();
             NSBezierPath::fillRect(bounds);
 
-            if ivars.has_cutout {
+            if ivars.has_cutout.get() {
                 // Punch a transparent hole using Clear compositing. Kept
                 // rounded to the window's corner radius so no dim bleeds in
                 // at the corners.
@@ -86,11 +86,11 @@ define_class!(
                     ctx.setCompositingOperation(NSCompositingOperation::Clear);
                     let hole = NSBezierPath::bezierPathWithRoundedRect_xRadius_yRadius(
                         NSRect::new(
-                            NSPoint::new(ivars.cutout_x, ivars.cutout_y),
-                            NSSize::new(ivars.cutout_w, ivars.cutout_h),
+                            NSPoint::new(ivars.cutout_x.get(), ivars.cutout_y.get()),
+                            NSSize::new(ivars.cutout_w.get(), ivars.cutout_h.get()),
                         ),
-                        ivars.cutout_radius as CGFloat,
-                        ivars.cutout_radius as CGFloat,
+                        ivars.cutout_radius.get() as CGFloat,
+                        ivars.cutout_radius.get() as CGFloat,
                     );
                     hole.fill();
                     ctx.setCompositingOperation(NSCompositingOperation::SourceOver);
@@ -107,22 +107,50 @@ define_class!(
 
 impl DimView {
     fn new(mtm: MainThreadMarker, frame: NSRect, params: &DimParams) -> Retained<Self> {
+        let this = Self::alloc(mtm).set_ivars(DimViewIvars::from_params(params));
+        unsafe { msg_send![super(this), initWithFrame: frame] }
+    }
+
+    /// Syncs new params into the live view in place (no alloc, no
+    /// `setContentView` swap) and marks it for repaint. Cutout glides hit
+    /// this every tick; rebuilding the view each time cost an allocation
+    /// plus a layer-tree swap the compositor had to pick up a frame late.
+    fn sync_params(&self, params: &DimParams) {
+        let ivars = self.ivars();
         let (has_cutout, cx, cy, cw, ch) = params.cutout.map_or((false, 0.0, 0.0, 0.0, 0.0), |r| {
             (true, r.origin.x, r.origin.y, r.size.width, r.size.height)
         });
-        let this = Self::alloc(mtm).set_ivars(DimViewIvars {
-            opacity: params.opacity,
-            dim_r: params.color.0,
-            dim_g: params.color.1,
-            dim_b: params.color.2,
-            cutout_x: cx,
-            cutout_y: cy,
-            cutout_w: cw,
-            cutout_h: ch,
-            has_cutout,
-            cutout_radius: params.cutout_radius,
+        ivars.opacity.set(params.opacity);
+        ivars.dim_r.set(params.color.0);
+        ivars.dim_g.set(params.color.1);
+        ivars.dim_b.set(params.color.2);
+        ivars.cutout_x.set(cx);
+        ivars.cutout_y.set(cy);
+        ivars.cutout_w.set(cw);
+        ivars.cutout_h.set(ch);
+        ivars.has_cutout.set(has_cutout);
+        ivars.cutout_radius.set(params.cutout_radius);
+        self.setNeedsDisplay(true);
+    }
+}
+
+impl DimViewIvars {
+    fn from_params(params: &DimParams) -> Self {
+        let (has_cutout, cx, cy, cw, ch) = params.cutout.map_or((false, 0.0, 0.0, 0.0, 0.0), |r| {
+            (true, r.origin.x, r.origin.y, r.size.width, r.size.height)
         });
-        unsafe { msg_send![super(this), initWithFrame: frame] }
+        Self {
+            opacity: std::cell::Cell::new(params.opacity),
+            dim_r: std::cell::Cell::new(params.color.0),
+            dim_g: std::cell::Cell::new(params.color.1),
+            dim_b: std::cell::Cell::new(params.color.2),
+            cutout_x: std::cell::Cell::new(cx),
+            cutout_y: std::cell::Cell::new(cy),
+            cutout_w: std::cell::Cell::new(cw),
+            cutout_h: std::cell::Cell::new(ch),
+            has_cutout: std::cell::Cell::new(has_cutout),
+            cutout_radius: std::cell::Cell::new(params.cutout_radius),
+        }
     }
 }
 
@@ -351,6 +379,11 @@ pub struct OverlayManager {
     /// running the Rust path below. Rust keeps all gating/dedup state.
     #[cfg(feature = "swift-overlay")]
     swift: Option<crate::overlay_bridge::SwiftOverlay>,
+    /// Scratch buffer for the Swift border sync: reused every tick so the
+    /// opt-in path stops allocating a `Vec` per frame like the Rust path
+    /// avoids doing (see `sync_borders`).
+    #[cfg(feature = "swift-overlay")]
+    swift_items: Vec<crate::overlay_bridge::SwiftBorderItem>,
 }
 
 impl OverlayManager {
@@ -366,6 +399,8 @@ impl OverlayManager {
             #[cfg(feature = "swift-overlay")]
             swift: crate::overlay_bridge::SwiftOverlay::try_load()
                 .filter(crate::overlay_bridge::SwiftOverlay::usable),
+            #[cfg(feature = "swift-overlay")]
+            swift_items: Vec::new(),
         }
     }
 
@@ -486,10 +521,11 @@ impl OverlayManager {
                     }
                 } else {
                     // Cutout-only motion (the focused window gliding under a
-                    // static dim): same paint, new hole. Rebuild the view
-                    // but composite asynchronously — the synchronous redraw
-                    // is what skewed the dim a frame behind layer-moved
-                    // borders every glide tick.
+                    // static dim): same paint, new hole. Sync the live view
+                    // in place and composite asynchronously — rebuilding the
+                    // view here cost an alloc plus a contentView swap every
+                    // tick, and the synchronous redraw is what skewed the
+                    // dim a frame behind layer-moved borders.
                     #[allow(
                         clippy::float_cmp,
                         reason = "exact match with the derived PartialEq compared one branch up; config values are bit-stable per tick"
@@ -497,8 +533,15 @@ impl OverlayManager {
                     let same_paint = stored.opacity == params.opacity
                         && stored.color == params.color
                         && stored.cutout_radius == params.cutout_radius;
-                    let view = DimView::new(self.mtm, frame, &params);
-                    window.setContentView(Some(&view));
+                    let synced = window
+                        .contentView()
+                        .and_then(|view| view.downcast::<DimView>().ok())
+                        .inspect(|view| view.sync_params(&params))
+                        .is_some();
+                    if !synced {
+                        let view = DimView::new(self.mtm, frame, &params);
+                        window.setContentView(Some(&view));
+                    }
                     window.setFrame_display(frame, !same_paint);
                     *stored = params;
                     *placed = frame;
@@ -605,12 +648,12 @@ impl OverlayManager {
         #[cfg(feature = "swift-overlay")]
         if let Some(f) = self.swift.as_ref().and_then(|s| s.borders_sync) {
             // Swift owns presentation; `wanted` is still filled for the
-            // caller's radii prune. Per-tick Vec here only (Swift path is
-            // opt-in experimental; the Rust path stays alloc-free).
+            // caller's radii prune. Items encode into the reused scratch
+            // buffer — no per-tick allocation on either side of the call.
             use crate::overlay_bridge::SwiftBorderItem;
-            let items: Vec<SwiftBorderItem> = desired
-                .iter()
-                .map(|(id, rect, params)| SwiftBorderItem {
+            self.swift_items.clear();
+            self.swift_items
+                .extend(desired.iter().map(|(id, rect, params)| SwiftBorderItem {
                     id: *id,
                     _pad: 0,
                     x: rect.origin.x,
@@ -623,9 +666,8 @@ impl OverlayManager {
                     opacity: params.opacity,
                     width: params.width,
                     radius: params.radius,
-                })
-                .collect();
-            unsafe { f(items.as_ptr(), items.len()) };
+                }));
+            unsafe { f(self.swift_items.as_ptr(), self.swift_items.len()) };
             self.borders_hidden = false;
             return;
         }

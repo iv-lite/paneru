@@ -3,19 +3,36 @@ import AppKit
 /// Shared screen geometry: CG (absolute, y-down) to Cocoa (y-up, anchored
 /// to the display at the global origin — NOT screens[0]).
 enum Screens {
+    /// Cached primary height: `NSScreen.screens` walks every screen on the
+    /// main thread, so only re-probe when the set changes (count, origins,
+    /// heights). Display add/remove invalidates implicitly next sync.
+    private static var cachedKey = ""
+    private static var cachedHeight: CGFloat = 0
+
     static func primaryHeight() -> CGFloat {
+        let screens = NSScreen.screens
+        let key = screens
+            .map { "\($0.frame.origin.x),\($0.frame.origin.y),\($0.frame.size.height)" }
+            .joined(separator: ";")
+        if key == cachedKey, cachedHeight > 0 {
+            return cachedHeight
+        }
         var fallback: CGFloat = 0
         var first = true
-        for screen in NSScreen.screens {
+        for screen in screens {
             let frame = screen.frame
             if first {
                 fallback = frame.height
                 first = false
             }
             if frame.origin.x == 0 && frame.origin.y == 0 {
+                cachedKey = key
+                cachedHeight = frame.height
                 return frame.height
             }
         }
+        cachedKey = key
+        cachedHeight = fallback
         return fallback
     }
 

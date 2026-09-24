@@ -37,6 +37,11 @@ struct VSyncShared {
     period_nanos: AtomicU64,
     /// Last fire timestamp, mach nanos for delta computation.
     last_fire_nanos: AtomicU64,
+    /// Estimated wall time of the NEXT retrace (last fire's
+    /// `targetTimestamp` carried into wall nanos). Zero means unknown.
+    /// Lets the pump sleep exactly to the retrace instead of a rounded
+    /// period guess, and phases commits to it (see `time_to_next`).
+    target_nanos: AtomicU64,
     /// Set by the pump when it sleeps wanting frames; consumed (cleared)
     /// by the callback when it wakes. Bounds wakes to one per retrace and
     /// silences the link while idle.
@@ -48,6 +53,14 @@ impl VSyncShared {
     fn period(&self) -> Option<Duration> {
         let nanos = self.period_nanos.load(Ordering::Relaxed);
         (nanos > 0).then(|| Duration::from_nanos(nanos))
+    }
+
+    /// Time from `now_nanos` (same clock as [`wall_nanos`]) to the next
+    /// retrace, if a target was ever recorded. Saturates at zero past the
+    /// mark instead of going negative — a stale target reads as "now".
+    fn time_to_next(&self, now_nanos: u64) -> Option<Duration> {
+        let target = self.target_nanos.load(Ordering::Relaxed);
+        (target > 0).then(|| Duration::from_nanos(target.saturating_sub(now_nanos)))
     }
 }
 
@@ -68,7 +81,7 @@ define_class!(
         /// Display-link fire: record the period estimate and wake the pump
         /// iff it armed us. Runs on the main runloop — no blocking, no ECS.
         #[unsafe(method(vsyncFired:))]
-        fn vsync_fired(&self, _link: &CADisplayLink) {
+        fn vsync_fired(&self, link: &CADisplayLink) {
             let now_nanos = wall_nanos();
             let ivars = self.ivars();
             let last = ivars.shared.last_fire_nanos.swap(now_nanos, Ordering::Relaxed);
@@ -80,6 +93,13 @@ define_class!(
                     last,
                     now_nanos,
                 ), Ordering::Relaxed);
+            // Phase, not just frequency: the link knows when the NEXT
+            // retrace lands (`targetTimestamp`). Carry it into wall nanos
+            // so the pump sleeps to the mark and commits phase to it.
+            ivars.shared.target_nanos.store(
+                next_target_nanos(now_nanos, link.timestamp(), link.targetTimestamp()),
+                Ordering::Relaxed,
+            );
             if ivars.shared.armed.swap(false, Ordering::Relaxed)
                 && let Some(waker) = ivars.shared.waker.as_ref()
             {
@@ -113,6 +133,25 @@ fn next_period_nanos(previous: u64, last_fire: u64, now: u64) -> u64 {
     } else {
         previous
     }
+}
+
+/// Pure phase helper: carries the link's `targetTimestamp` (seconds,
+/// same clock as `timestamp`) into wall nanos. Zero when the target is
+/// not ahead of the stamp (clock jump, first fire) — callers treat that
+/// as "phase unknown, use the period".
+#[allow(
+    clippy::cast_possible_truncation,
+    clippy::cast_sign_loss,
+    clippy::cast_precision_loss,
+    reason = "sub-second offset scaled to nanos; clamps instead of wrapping"
+)]
+fn next_target_nanos(now_nanos: u64, timestamp_s: f64, target_s: f64) -> u64 {
+    let offset_s = target_s - timestamp_s;
+    if offset_s.is_finite() && offset_s > 0.0 {
+        let offset_nanos = (offset_s * 1_000_000_000.0).clamp(0.0, u64::MAX as f64) as u64;
+        return now_nanos.saturating_add(offset_nanos);
+    }
+    0
 }
 
 /// A display link bound to one display, owned by [`super::PlatformCallbacks`]
@@ -186,13 +225,17 @@ impl VSyncLink {
         debug!("vsync: display link bound to display {display_id}");
     }
 
-    /// Arm a wake on the next retrace and report the current period
-    /// estimate, if any. The pump calls this when it sleeps wanting
-    /// frames; the callback consumes the arm exactly once.
-    pub(super) fn poll_period(&self) -> Option<Duration> {
-        self.link.as_ref()?;
+    /// Single-arm variant reporting `(lead, period)`: time to the next
+    /// retrace when the phase is known (else `None` — callers fall back
+    /// to the period) plus the raw period estimate for prediction and
+    /// logging. One arm, not two.
+    pub(super) fn poll_phase(&self) -> (Option<Duration>, Option<Duration>) {
+        if self.link.is_none() {
+            return (None, None);
+        }
         self.shared.armed.store(true, Ordering::Relaxed);
-        self.shared.period()
+        let now = wall_nanos();
+        (self.shared.time_to_next(now), self.shared.period())
     }
 
     fn teardown(&mut self) {
@@ -236,5 +279,28 @@ mod tests {
         assert!(shared.period().is_none());
         shared.period_nanos.store(8_333_333, Ordering::Relaxed);
         assert_eq!(shared.period(), Some(Duration::from_nanos(8_333_333)));
+    }
+
+    #[test]
+    fn target_phase_tracks_next_retrace() {
+        // One 60Hz period ahead lands ~16.6ms out (f64 round-trip through
+        // seconds, so compare with a 1µs tolerance).
+        let target =
+            next_target_nanos(1_000_000_000, 100.0, 100.0 + 16_666_667.0 / 1_000_000_000.0);
+        assert!(
+            target.abs_diff(1_000_000_000 + 16_666_667) <= 1_000,
+            "phase carries the link target into wall nanos, got {target}"
+        );
+        // Target behind the stamp (jump): unknown.
+        assert_eq!(next_target_nanos(1_000_000_000, 100.0, 99.0), 0);
+        let shared = VSyncShared::default();
+        assert!(shared.time_to_next(1_000_000_000).is_none());
+        shared.target_nanos.store(1_010_000_000, Ordering::Relaxed);
+        assert_eq!(
+            shared.time_to_next(1_000_000_000),
+            Some(Duration::from_nanos(10_000_000))
+        );
+        // Past the mark saturates at zero (stale reads as "now").
+        assert_eq!(shared.time_to_next(2_000_000_000), Some(Duration::ZERO));
     }
 }

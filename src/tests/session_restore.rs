@@ -28,6 +28,7 @@ fn test_startup_restore_rebuilds_virtual_workspace_layout() {
         active_display_id: Some(TEST_DISPLAY_ID),
         displays: vec![SavedDisplay {
             display_id: TEST_DISPLAY_ID,
+            uuid: None,
             bounds: SavedRect {
                 min_x: 0,
                 min_y: TEST_MENUBAR_HEIGHT,
@@ -40,6 +41,7 @@ fn test_startup_restore_rebuilds_virtual_workspace_layout() {
         workspaces: vec![SavedWorkspace {
             workspace_id: TEST_WORKSPACE_ID,
             display_id: Some(TEST_DISPLAY_ID),
+            display_uuid: None,
             active_virtual_index: Some(1),
             strips: vec![SavedStrip {
                 virtual_index: 1,
@@ -109,6 +111,7 @@ fn test_startup_restore_preserves_saved_display_when_present() {
         workspaces: vec![SavedWorkspace {
             workspace_id: EXT_WORKSPACE_ID,
             display_id: Some(EXT_DISPLAY_ID),
+            display_uuid: None,
             active_virtual_index: Some(0),
             strips: vec![SavedStrip {
                 virtual_index: 0,
@@ -179,6 +182,7 @@ fn test_startup_restore_keeps_current_native_workspace_active_across_multiple_wo
             SavedWorkspace {
                 workspace_id: TEST_WORKSPACE_ID,
                 display_id: Some(TEST_DISPLAY_ID),
+                display_uuid: None,
                 active_virtual_index: Some(0),
                 strips: vec![SavedStrip {
                     virtual_index: 0,
@@ -188,6 +192,7 @@ fn test_startup_restore_keeps_current_native_workspace_active_across_multiple_wo
             SavedWorkspace {
                 workspace_id: EXT_WORKSPACE_ID,
                 display_id: Some(EXT_DISPLAY_ID),
+                display_uuid: None,
                 active_virtual_index: Some(0),
                 strips: vec![SavedStrip {
                     virtual_index: 0,
@@ -393,6 +398,7 @@ fn test_startup_restore_keeps_emptied_baseline_row() {
         workspaces: vec![SavedWorkspace {
             workspace_id: TEST_WORKSPACE_ID,
             display_id: Some(TEST_DISPLAY_ID),
+            display_uuid: None,
             active_virtual_index: Some(1),
             strips: vec![SavedStrip {
                 virtual_index: 1,
@@ -427,6 +433,7 @@ fn test_startup_restore_keeps_emptied_baseline_row() {
 fn saved_display(display_id: u32, active: bool) -> SavedDisplay {
     SavedDisplay {
         display_id,
+        uuid: None,
         bounds: SavedRect {
             min_x: 0,
             min_y: TEST_MENUBAR_HEIGHT,
@@ -447,6 +454,7 @@ fn state_with_strips(strips: Vec<SavedStrip>) -> PaneruState {
         workspaces: vec![SavedWorkspace {
             workspace_id: TEST_WORKSPACE_ID,
             display_id: Some(TEST_DISPLAY_ID),
+            display_uuid: None,
             active_virtual_index: Some(0),
             strips,
         }],
@@ -489,4 +497,158 @@ fn saved_window(window_id: i32) -> SavedWindow {
         display_id: None,
         frame: None,
     }
+}
+
+/// With 3+ displays the OS reassigns numeric ids on reboot/replug while the
+/// EDID UUID stays put: restore must follow the UUID even when the saved
+/// numeric id still exists (pointing at the wrong monitor now).
+#[allow(clippy::too_many_lines)]
+#[test]
+fn test_startup_restore_prefers_uuid_over_rotated_display_ids() {
+    const THIRD_DISPLAY_ID: u32 = 3;
+    const THIRD_WORKSPACE_ID: WorkspaceId = 30;
+    const UUID_A: &str = "uuid-a";
+    const UUID_B: &str = "uuid-b";
+    const UUID_C: &str = "uuid-c";
+
+    let mut harness = TestHarness::new();
+    harness.mock_state.add_display(
+        EXT_DISPLAY_ID,
+        IRect::new(
+            TEST_DISPLAY_WIDTH,
+            0,
+            2 * TEST_DISPLAY_WIDTH,
+            TEST_DISPLAY_HEIGHT,
+        ),
+        vec![EXT_WORKSPACE_ID],
+    );
+    harness.mock_state.add_display(
+        THIRD_DISPLAY_ID,
+        IRect::new(
+            2 * TEST_DISPLAY_WIDTH,
+            0,
+            3 * TEST_DISPLAY_WIDTH,
+            TEST_DISPLAY_HEIGHT,
+        ),
+        vec![THIRD_WORKSPACE_ID],
+    );
+    // Numeric ids rotated relative to the save: uuid-b now answers as id 3,
+    // uuid-c as id 1, uuid-a as id 2.
+    harness.mock_state.set_display_uuid(TEST_DISPLAY_ID, UUID_C);
+    harness.mock_state.set_display_uuid(EXT_DISPLAY_ID, UUID_A);
+    harness
+        .mock_state
+        .set_display_uuid(THIRD_DISPLAY_ID, UUID_B);
+
+    for (workspace_id, window_id) in [
+        (TEST_WORKSPACE_ID, 100),
+        (EXT_WORKSPACE_ID, 300),
+        (THIRD_WORKSPACE_ID, 500),
+    ] {
+        let size = Size::new(TEST_WINDOW_WIDTH, TEST_WINDOW_HEIGHT);
+        let origin = Origin::new(0, TEST_MENUBAR_HEIGHT);
+        harness.mock_state.spawn_window(
+            TEST_PROCESS_ID,
+            workspace_id,
+            window_id,
+            IRect::from_corners(origin, origin + size),
+        );
+    }
+
+    let saved_workspace =
+        |workspace_id: WorkspaceId, display_id: u32, uuid: &str, window_id: i32| SavedWorkspace {
+            workspace_id,
+            display_id: Some(display_id),
+            display_uuid: Some(uuid.to_string()),
+            active_virtual_index: Some(0),
+            strips: vec![SavedStrip {
+                virtual_index: 0,
+                columns: vec![SavedColumn::Single(saved_window(window_id))],
+            }],
+        };
+    harness.world().insert_resource(PaneruState {
+        version: 4,
+        timestamp: 123_456_789,
+        active_display_id: Some(TEST_DISPLAY_ID),
+        displays: vec![
+            SavedDisplay {
+                display_id: 1,
+                uuid: Some(UUID_A.to_string()),
+                bounds: SavedRect {
+                    min_x: 0,
+                    min_y: TEST_MENUBAR_HEIGHT,
+                    max_x: TEST_DISPLAY_WIDTH,
+                    max_y: TEST_DISPLAY_HEIGHT,
+                },
+                active: true,
+                workspace_ids: vec![EXT_WORKSPACE_ID],
+            },
+            SavedDisplay {
+                display_id: 2,
+                uuid: Some(UUID_B.to_string()),
+                bounds: SavedRect {
+                    min_x: TEST_DISPLAY_WIDTH,
+                    min_y: TEST_MENUBAR_HEIGHT,
+                    max_x: 2 * TEST_DISPLAY_WIDTH,
+                    max_y: TEST_DISPLAY_HEIGHT,
+                },
+                active: false,
+                workspace_ids: vec![THIRD_WORKSPACE_ID],
+            },
+            SavedDisplay {
+                display_id: 3,
+                uuid: Some(UUID_C.to_string()),
+                bounds: SavedRect {
+                    min_x: 2 * TEST_DISPLAY_WIDTH,
+                    min_y: TEST_MENUBAR_HEIGHT,
+                    max_x: 3 * TEST_DISPLAY_WIDTH,
+                    max_y: TEST_DISPLAY_HEIGHT,
+                },
+                active: false,
+                workspace_ids: vec![TEST_WORKSPACE_ID],
+            },
+        ],
+        workspaces: vec![
+            // Saved numeric ids all still exist live — but rotated, so only
+            // the UUID points at the right monitor.
+            saved_workspace(TEST_WORKSPACE_ID, 3, UUID_B, 100),
+            saved_workspace(EXT_WORKSPACE_ID, 1, UUID_A, 300),
+            saved_workspace(THIRD_WORKSPACE_ID, 2, UUID_C, 500),
+        ],
+    });
+
+    let commands = vec![
+        Event::MenuOpened { window_id: 100 },
+        Event::Command {
+            command: Command::PrintState,
+        },
+    ];
+
+    harness
+        .on_iteration(1, |world, _state| {
+            // Live holders: uuid-a → id 2, uuid-b → id 3, uuid-c → id 1.
+            for (workspace_id, window_id, display_id, uuid) in [
+                (TEST_WORKSPACE_ID, 100, THIRD_DISPLAY_ID, UUID_B),
+                (EXT_WORKSPACE_ID, 300, EXT_DISPLAY_ID, UUID_A),
+                (THIRD_WORKSPACE_ID, 500, TEST_DISPLAY_ID, UUID_C),
+            ] {
+                let entity = crate::tests::harness::find_window_entity(window_id, world);
+                let parent = restored_strip_display_parent(world, workspace_id, 0, entity);
+                let display = world
+                    .entity(parent)
+                    .get::<Display>()
+                    .expect("parent should be a display");
+                assert_eq!(
+                    display.id(),
+                    display_id,
+                    "workspace {workspace_id} should follow its saved UUID to display {display_id}"
+                );
+                assert_eq!(
+                    display.uuid(),
+                    Some(uuid),
+                    "workspace {workspace_id} should sit on the display holding {uuid}"
+                );
+            }
+        })
+        .run(commands);
 }

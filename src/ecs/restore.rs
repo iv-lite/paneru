@@ -146,6 +146,9 @@ pub(crate) enum PlannedStackItem {
 pub(crate) struct PlannedStrip {
     pub workspace_id: WorkspaceId,
     pub display_id: Option<CGDirectDisplayID>,
+    /// Stable identity of the saved display (v4+). Preferred over
+    /// `display_id` when matching against live displays.
+    pub display_uuid: Option<String>,
     pub virtual_index: u32,
     pub columns: Vec<PlannedColumn>,
     /// First saved frame among the strip's windows, for geometric display
@@ -216,6 +219,7 @@ impl<'a> RestorePlanner<'a> {
         (!columns.is_empty()).then_some(PlannedStrip {
             workspace_id: workspace.workspace_id,
             display_id: workspace.display_id,
+            display_uuid: workspace.display_uuid.clone(),
             virtual_index: strip.virtual_index,
             columns,
             fallback_frame: first_saved_frame(strip),
@@ -512,11 +516,23 @@ pub(super) fn restore_window_state(
     }
 
     let mut restored_strips = 0;
+    // Saved display bounds by numeric id, for the geometric fallback when
+    // the saved display is gone and no window kept a frame.
+    let saved_bounds_by_display: HashMap<CGDirectDisplayID, SavedRect> = restoration
+        .displays
+        .iter()
+        .map(|display| (display.display_id, display.bounds))
+        .collect();
     for planned in &plan.strips {
+        let saved_bounds = planned
+            .display_id
+            .and_then(|id| saved_bounds_by_display.get(&id).copied());
         let Some((display_entity, display)) = select_display(
             planned.workspace_id,
             planned.display_id,
+            planned.display_uuid.as_deref(),
             planned.fallback_frame,
+            saved_bounds,
             &existing_workspace_parents,
             &displays,
         ) else {
@@ -677,69 +693,109 @@ fn hydrate_fallback_identities(
     }
 }
 
+/// Picks the live display a saved workspace belongs on.
+///
+/// Match order (stable identity first, live accidents last):
+/// 1. saved UUID (v4+) — survives numeric-id rotation on reboot/replug;
+/// 2. exact numeric display id (back-compat, v2/v3);
+/// 3. geometry: largest overlap with the strip's saved frame (or the saved
+///    display bounds), else the nearest display by center distance — so a
+///    shifted arrangement lands nearby instead of piling onto one display;
+/// 4. the workspace's live parent (native space already there);
+/// 5. the active display, else the lowest id.
+///
+/// The old code returned the live parent before trying geometry, cementing
+/// whatever `CGGetActiveDisplayList` order happened to parent at boot —
+/// with 3+ displays that mis-parents often enough to read as total loss.
+#[allow(clippy::too_many_arguments)]
 fn select_display<'a>(
     workspace_id: WorkspaceId,
     planned_display_id: Option<CGDirectDisplayID>,
+    planned_display_uuid: Option<&str>,
     fallback_frame: Option<SavedRect>,
+    saved_bounds: Option<SavedRect>,
     existing_workspace_parents: &HashMap<WorkspaceId, Entity>,
     displays: &'a Query<(Entity, &Display, Has<ActiveDisplayMarker>)>,
 ) -> Option<(Entity, &'a Display)> {
-    if let Some(display_entity) = existing_workspace_parents.get(&workspace_id)
-        && let Ok((entity, display, _)) = displays.get(*display_entity)
+    // 1. Stable identity first.
+    if let Some(uuid) = planned_display_uuid
+        && let Some(found) = displays
+            .iter()
+            .find(|(_, display, _)| display.uuid() == Some(uuid))
     {
-        let current_display_id = display.id();
-        if planned_display_id.is_some_and(|display_id| display_id != current_display_id) {
-            info!(
-                "Session restore remapping workspace {} from saved display {:?} to current display {}",
-                workspace_id, planned_display_id, current_display_id
-            );
-            return Some((entity, display));
-        }
+        return Some((found.0, found.1));
     }
 
-    if let Some(display_id) = planned_display_id {
-        if let Some((entity, display, _)) = displays
+    // 2. Exact numeric id (v2/v3 files, or ids that didn't rotate).
+    if let Some(display_id) = planned_display_id
+        && let Some(found) = displays
             .iter()
             .find(|(_, display, _)| display.id() == display_id)
-        {
-            return Some((entity, display));
-        }
+    {
+        return Some((found.0, found.1));
+    }
+
+    if planned_display_id.is_some() {
         info!(
-            "Session restore remapping workspace {} from missing display {}",
-            workspace_id, display_id
+            "Session restore remapping workspace {workspace_id} from missing display {:?}",
+            planned_display_id
         );
-        // Geometric fallback: the saved id is gone (undock/reorder), so
-        // place by largest overlap with the saved frame instead of piling
-        // onto the active display below.
-        if let Some(frame) = fallback_frame {
-            let frame = IRect::new(frame.min_x, frame.min_y, frame.max_x, frame.max_y);
-            if let Some(((target_entity, target_display, _), _)) = displays
-                .iter()
-                .map(|(entity, candidate, active)| {
-                    let overlap = frame.intersect(candidate.bounds());
-                    let area =
-                        i64::from(overlap.width().max(0)) * i64::from(overlap.height().max(0));
-                    ((entity, candidate, active), area)
-                })
-                .filter(|(_, area)| *area > 0)
-                .max_by_key(|(_, area)| *area)
-            {
-                info!(
-                    "Session restore placing workspace {} by saved-frame overlap on display {}",
-                    workspace_id,
-                    target_display.id()
-                );
-                return Some((target_entity, target_display));
+    }
+
+    // 3. Geometry: overlap first, then nearest center. The reference is the
+    // strip's first saved window frame, falling back to the saved display
+    // bounds (whole-display memory when no window kept a frame).
+    let reference = fallback_frame
+        .or(saved_bounds)
+        .map(|frame| IRect::new(frame.min_x, frame.min_y, frame.max_x, frame.max_y));
+    if let Some(frame) = reference {
+        let mut best: Option<((Entity, &'a Display, bool), i64)> = None;
+        for (entity, candidate, active) in displays.iter() {
+            let overlap = frame.intersect(candidate.bounds());
+            let area = i64::from(overlap.width().max(0)) * i64::from(overlap.height().max(0));
+            if area > best.map_or(0, |(_, best_area)| best_area) {
+                best = Some(((entity, candidate, active), area));
             }
+        }
+        if let Some(((target_entity, target_display, _), _)) = best {
+            let target_id = target_display.id();
+            info!(
+                "Session restore placing workspace {workspace_id} by saved-frame overlap on display {target_id}"
+            );
+            return Some((target_entity, target_display));
+        }
+        // No overlap (shifted arrangement, resolution change): nearest
+        // display center to the saved center, never a blind pile-on.
+        let saved_center = frame.center();
+        let nearest = displays.iter().min_by_key(|(_, candidate, _)| {
+            let center = candidate.bounds().center();
+            let dx = i64::from(center.x - saved_center.x);
+            let dy = i64::from(center.y - saved_center.y);
+            dx * dx + dy * dy
+        });
+        if let Some((target_entity, target_display, _)) = nearest {
+            let target_id = target_display.id();
+            info!(
+                "Session restore placing workspace {workspace_id} on nearest display {target_id} (no saved-frame overlap)"
+            );
+            return Some((target_entity, target_display));
         }
     }
 
+    // 4. Live parent: the native space is already there.
     if let Some(display_entity) = existing_workspace_parents.get(&workspace_id)
         && let Ok((entity, display, _)) = displays.get(*display_entity)
     {
+        let live_id = display.id();
+        if planned_display_id.is_some_and(|display_id| display_id != live_id) {
+            info!(
+                "Session restore remapping workspace {workspace_id} from saved display {planned_display_id:?} to current display {live_id}"
+            );
+        }
         return Some((entity, display));
     }
 
+    // 5. Last resort: active, else lowest id.
     displays
         .iter()
         .find(|(_, _, active)| *active)

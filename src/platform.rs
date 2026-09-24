@@ -382,12 +382,12 @@ impl PlatformCallbacks {
             .ensure(self.main_thread_marker, display_id, enabled);
     }
 
-    /// Arms a wake on the next retrace and reports the current period
-    /// estimate, if the link is bound. The pump calls this when it sleeps
-    /// wanting frames; the callback consumes the arm exactly once, so idle
-    /// sleeps (which never arm) pay nothing.
-    pub fn vsync_period(&mut self) -> Option<std::time::Duration> {
-        self.vsync_link.poll_period()
+    /// Arms a wake on the next retrace and reports `(lead, period)`: time
+    /// to the next retrace when the phase is known plus the raw period
+    /// estimate. Single arm; the pump publishes both to
+    /// [`crate::ecs::VSyncPhase`] for sleep phasing and commit prediction.
+    pub fn vsync_phase(&mut self) -> (Option<std::time::Duration>, Option<std::time::Duration>) {
+        self.vsync_link.poll_phase()
     }
 
     /// Returns `true` when at least one event was dispatched this pass.

@@ -183,23 +183,37 @@ fn active_timeout_limit(promotion_present: bool) -> u32 {
     }
 }
 
-/// Sleep ceiling for one pump pass. Vsync retrace period when bound (and
-/// the frame wants to move), else the fixed active/idle/low-power ladder.
-/// Pure over its inputs so the selection is unit testable; the arming
-/// side-effect lives in the `vsync_period` call feeding it.
+/// Sleep ceiling for one pump pass. Time to the next retrace when the
+/// phase is known, else the period estimate, else the fixed
+/// active/idle/low-power ladder. Pure over its inputs so the selection is
+/// unit testable; the arming side-effect lives in the `vsync_phase` call
+/// feeding it.
 fn pump_timeout_limit(
     frame_active: bool,
     low_power: bool,
+    vsync_lead: Option<Duration>,
     vsync_period: Option<Duration>,
     promotion: bool,
 ) -> u32 {
     if frame_active {
-        vsync_period.map_or_else(|| active_timeout_limit(promotion), vsync_timeout_ms)
+        vsync_lead.map_or_else(
+            || vsync_period.map_or_else(|| active_timeout_limit(promotion), vsync_timeout_ms),
+            vsync_lead_timeout_ms,
+        )
     } else if low_power {
         LOOP_MAX_TIMEOUT_LOWPOWER_MS
     } else {
         LOOP_MAX_TIMEOUT_MS
     }
+}
+
+/// Sleep mark for a vsync lead: ceil (not round) so the backstop never
+/// lands past the retrace it is pacing to — oversleeping wakes after the
+/// mark and the frame starts a full period late. The armed link's wake
+/// still ends the wait on time; this is only the ceiling.
+#[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
+fn vsync_lead_timeout_ms(lead: Duration) -> u32 {
+    (lead.as_secs_f64() * 1000.0).ceil() as u32
 }
 
 /// Retrace period as whole-millisecond sleep. Rounded (not truncated) so
@@ -1236,11 +1250,16 @@ fn seam_snap_target(current: Origin, target: Origin, displays: &[IRect]) -> Opti
 /// * `config` - The `Config` resource, used for animation duration.
 /// * `commands` - Bevy commands to manage tween state and remove the `RepositionMarker` on landing.
 #[instrument(level = Level::TRACE, skip_all)]
+#[allow(
+    clippy::too_many_lines,
+    reason = "tween state machine: birth/retarget/landing branches are one readable flow; splitting would scatter the leg lifecycle"
+)]
 pub(crate) fn animate_entities(
     animate: TweenedPositions,
     displays: Query<&Display>,
     time: Res<Time>,
     config: Res<Config>,
+    phase: Option<Res<crate::ecs::VSyncPhase>>,
     mut bursts: ResMut<crate::ecs::BurstClock>,
     mut commands: Commands,
 ) {
@@ -1258,23 +1277,40 @@ pub(crate) fn animate_entities(
     // keeps a gentle attack (AX-sized first steps) with a decisive landing
     // (non-zero end velocity + 1px landing nudge) so the tail commits
     // instead of rounding to dead frames.
-    let now = time.elapsed();
+    //
+    // Phase prediction: shift `now` forward by the pump's vsync lead so the
+    // committed frame is the retrace-time pose, not one frame stale. The
+    // AX write lands a frame late; without this the glass chases the
+    // tween and the border (painted now) leads it. Bounded to ~50ms by
+    // `VSyncPhase::prediction`; zero without a link, so headless/tests
+    // behave exactly as before.
+    let prediction = phase
+        .as_deref()
+        .map_or(Duration::ZERO, crate::ecs::VSyncPhase::prediction);
+    let now = time.elapsed() + prediction;
     let base = config.animation_duration();
-    let display_bounds: Vec<IRect> = displays.iter().map(Display::bounds).collect();
+    // Seam bounds only matter to windows (strip offsets routinely go
+    // negative without crossing a seam): collect lazily on the first
+    // window so strip-only ticks skip the per-tick allocation entirely.
+    let mut display_bounds: Option<Vec<IRect>> = None;
 
     for (mut position, entity, RepositionMarker(origin), is_window, drive) in animate {
         // Seam-snapping applies to windows, which paint: a strip
         // scroll offset is not a frame, so strips always tween (a
         // negative scroll target is routine, not a seam crossing).
         // Snapped jumps still verify: the OS must actually land there.
-        if is_window && let Some(snapped) = seam_snap_target(position.0, *origin, &display_bounds) {
-            trace!("entity {entity} seam-snapping to {snapped}");
-            position.0 = snapped;
-            if let Ok(mut entity_commands) = commands.get_entity(entity) {
-                entity_commands.try_remove::<RepositionMarker>();
-                entity_commands.try_insert(crate::ecs::PositionDrive::verifying());
+        if is_window {
+            let bounds = display_bounds
+                .get_or_insert_with(|| displays.iter().map(Display::bounds).collect());
+            if let Some(snapped) = seam_snap_target(position.0, *origin, bounds) {
+                trace!("entity {entity} seam-snapping to {snapped}");
+                position.0 = snapped;
+                if let Ok(mut entity_commands) = commands.get_entity(entity) {
+                    entity_commands.try_remove::<RepositionMarker>();
+                    entity_commands.try_insert(crate::ecs::PositionDrive::verifying());
+                }
+                continue;
             }
-            continue;
         }
         if base.is_zero() {
             position.0 = *origin;
@@ -1627,6 +1663,9 @@ pub(crate) fn pump_events(
     mut promotion: Local<(bool, Option<Instant>)>,
     // Last seen vsync-bind state, for transition-only logging below.
     mut vsync_bound: Local<bool>,
+    // Fresh retrace phase published for commit prediction downstream.
+    // Optional: headless/test apps never install it.
+    mut vsync_phase: Option<ResMut<crate::ecs::VSyncPhase>>,
 ) {
     let Some((ref mut platform, incoming_events)) = platform.zip(incoming_events) else {
         // No platform interface or incoming event pipe - probably executing in a unit test.
@@ -1722,25 +1761,31 @@ pub(crate) fn pump_events(
         if let Some(display) = active_display.iter().next() {
             platform.ensure_vsync_link(display.id(), true);
         }
-        // Vsync-paced when bound: sleep to the next retrace instead of
-        // the fixed active guess, and let the link's wake (armed below)
-        // end the wait on time. Falls back to the sleep ladder with no
-        // period yet or pre-macOS-14. Transitions log once (not per
-        // frame): a silently unbound link reads as ordinary judder.
-        let period = if frame_active {
-            platform.vsync_period()
+        // Vsync-phased when bound: sleep to the next retrace mark instead
+        // of the fixed active guess, and let the link's wake (armed below)
+        // end the wait on time. Phase unknown but period known: rounded
+        // period backstop. Neither: sleep ladder (pre-macOS-14, headless).
+        // Transitions log once (not per frame): a silently unbound link
+        // reads as ordinary judder.
+        let (lead, period) = if frame_active {
+            platform.vsync_phase()
         } else {
-            None
+            (None, None)
         };
-        if period.is_some() != *vsync_bound {
-            *vsync_bound = period.is_some();
-            if let Some(period) = period {
-                debug!("pump: vsync link bound, pacing active frames to {period:?}");
+        if let Some(phase) = vsync_phase.as_deref_mut() {
+            phase.lead = lead.or(period);
+            phase.period = period;
+        }
+        let bound = lead.or(period);
+        if bound.is_some() != *vsync_bound {
+            *vsync_bound = bound.is_some();
+            if let Some(mark) = bound {
+                debug!("pump: vsync link bound, pacing active frames to {mark:?}");
             } else if frame_active {
                 debug!("pump: vsync link unbound during active frame, on sleep ladder");
             }
         }
-        let timeout_limit = pump_timeout_limit(frame_active, low_power, period, promotion.0);
+        let timeout_limit = pump_timeout_limit(frame_active, low_power, lead, period, promotion.0);
         *timeout = timeout.min(timeout_limit) + LOOP_TIMEOUT_STEP;
     } else {
         // Still backed up: come straight back rather than sleeping on it.
@@ -2527,6 +2572,7 @@ pub(super) fn update_overlays(
     flight: FlightMarkers<'_, '_>,
     settle: crate::ecs::sync::SettleGate<'_, '_>,
     time: Res<Time>,
+    phase: Option<Res<crate::ecs::VSyncPhase>>,
     overlay_mgr: Option<NonSendMut<OverlayManager>>,
     clocks: OverlayClocks<'_>,
     config: Res<Config>,
@@ -2722,8 +2768,20 @@ pub(super) fn update_overlays(
     // to the plain offset inside the holder paint, so holding still can
     // never drift the rect. Driven tweens need no lead: border and commit
     // share the presented frame on the same tick.
+    //
+    // With a vsync link, the horizon is the retrace the commit will land
+    // on (phase lead), not the frame delta behind us: the OS window trails
+    // by a frame, so predicting to now+lead puts the border where the
+    // glass will be when the write lands. Falls back to the delta without
+    // a link; still clamped so a stalled frame cannot fling the rect.
     let paint_now = time.elapsed();
-    let paint_lead = time.delta_secs_f64().clamp(0.0, 0.05);
+    let vsync_horizon = phase
+        .as_deref()
+        .map(|phase| phase.prediction().as_secs_f64())
+        .filter(|horizon| *horizon > 0.0);
+    let paint_lead = vsync_horizon
+        .unwrap_or(time.delta_secs_f64())
+        .clamp(0.0, 0.05);
     // Paint-only frame for a native-held window, resolved through its
     // holder's `DragPaint` (seeded at press, gone with the holder despawn).
     let holder_paint = |entity: Entity| {
@@ -3715,6 +3773,8 @@ mod tests {
     use super::adoption_distrusted;
     use super::gather_initial_processes;
     use super::overlay_tracks_live;
+    use super::pump_timeout_limit;
+    use super::vsync_lead_timeout_ms;
     use super::vsync_timeout_ms;
     use super::{LOOP_MAX_TIMEOUT_FRAME_ACTIVE_MS, LOOP_MAX_TIMEOUT_PROMOTION_MS};
     use crate::config::Config;
@@ -3760,6 +3820,44 @@ mod tests {
             vsync_timeout_ms(Duration::from_nanos(8_333_333)),
             8,
             "120Hz backstop sits on the retrace"
+        );
+    }
+
+    #[test]
+    fn phased_sleep_prefers_lead_then_period_then_ladder() {
+        use std::time::Duration;
+        let period_60 = Duration::from_nanos(16_666_667);
+        // Known phase: ceil to the mark, never past it.
+        assert_eq!(
+            pump_timeout_limit(
+                true,
+                false,
+                Some(Duration::from_micros(8300)),
+                Some(period_60),
+                false
+            ),
+            9,
+            "mid-cycle lead sleeps to the mark, not the full period"
+        );
+        assert_eq!(
+            pump_timeout_limit(true, false, Some(Duration::ZERO), Some(period_60), false),
+            0,
+            "retrace-now polls instead of sleeping a period"
+        );
+        // Phase unknown, period known: rounded period backstop.
+        assert_eq!(
+            pump_timeout_limit(true, false, None, Some(period_60), false),
+            17
+        );
+        // Neither: the sleep ladder.
+        assert_eq!(
+            pump_timeout_limit(true, false, None, None, false),
+            LOOP_MAX_TIMEOUT_FRAME_ACTIVE_MS
+        );
+        assert_eq!(
+            vsync_lead_timeout_ms(Duration::from_nanos(16_666_667)),
+            17,
+            "lead backstop ceils onto the retrace"
         );
     }
 

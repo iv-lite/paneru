@@ -29,10 +29,11 @@ use crate::snapshot::{SnapshotStore, TitleInvalidations, snapshot_title};
 use paneru_shared_types::windowset::WindowSet;
 
 pub const STATE_FILE_NAME: &str = "state.json";
-const SUPPORTED_STATE_VERSION: u32 = 3;
+const SUPPORTED_STATE_VERSION: u32 = 4;
 /// Older files we still read: v2 lacks per-window display/frame (filled as
-/// `None`, restoring old behavior). Anything else is dropped.
-const BACKFILL_STATE_VERSION: u32 = 2;
+/// `None`, restoring old behavior), v3 lacks stable display UUIDs (geometry
+/// + numeric-id fallback, see `select_display`). Anything else is dropped.
+const BACKFILL_STATE_VERSIONS: [u32; 2] = [2, 3];
 
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Resource)]
 pub struct PaneruState {
@@ -47,6 +48,10 @@ pub struct PaneruState {
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq)]
 pub struct SavedDisplay {
     pub display_id: CGDirectDisplayID,
+    /// Stable EDID-derived identity. `None` on v2/v3 files (predates UUID
+    /// persistence) — restore falls back to numeric id + geometry.
+    #[serde(default)]
+    pub uuid: Option<String>,
     pub bounds: SavedRect,
     pub active: bool,
     pub workspace_ids: Vec<WorkspaceId>,
@@ -64,6 +69,10 @@ pub struct SavedRect {
 pub struct SavedWorkspace {
     pub workspace_id: WorkspaceId,
     pub display_id: Option<CGDirectDisplayID>,
+    /// Stable identity of the workspace's display (v4+). Preferred over
+    /// `display_id`, which the OS reassigns on plug order/reboot.
+    #[serde(default)]
+    pub display_uuid: Option<String>,
     pub active_virtual_index: Option<u32>,
     pub strips: Vec<SavedStrip>,
 }
@@ -189,6 +198,7 @@ impl PaneruState {
         apps: &Query<&Application>,
     ) -> Self {
         let mut display_entity_ids = HashMap::new();
+        let mut display_entity_uuids: HashMap<Entity, String> = HashMap::new();
         let mut display_workspace_ids: HashMap<Entity, Vec<WorkspaceId>> = HashMap::new();
         let mut workspace_map: HashMap<WorkspaceId, SavedWorkspaceBuilder> = HashMap::new();
         let active_display_id = displays
@@ -198,6 +208,9 @@ impl PaneruState {
 
         for (display, entity, _) in displays {
             display_entity_ids.insert(entity, display.id());
+            if let Some(uuid) = display.uuid() {
+                display_entity_uuids.insert(entity, uuid.to_string());
+            }
             display_workspace_ids.insert(entity, Vec::new());
         }
 
@@ -270,16 +283,22 @@ impl PaneruState {
                 }
             }
 
+            let display_uuid =
+                display_entity.and_then(|entity| display_entity_uuids.get(&entity).cloned());
             let workspace =
                 workspace_map
                     .entry(strip.id())
                     .or_insert_with(|| SavedWorkspaceBuilder {
                         display_id,
+                        display_uuid: display_uuid.clone(),
                         active_virtual_index: None,
                         strips: Vec::new(),
                     });
             if workspace.display_id.is_none() {
                 workspace.display_id = display_id;
+            }
+            if workspace.display_uuid.is_none() {
+                workspace.display_uuid = display_uuid;
             }
             if active_workspace {
                 workspace.active_virtual_index = Some(strip.virtual_index);
@@ -297,6 +316,7 @@ impl PaneruState {
                 SavedWorkspace {
                     workspace_id,
                     display_id: workspace.display_id,
+                    display_uuid: workspace.display_uuid,
                     active_virtual_index: workspace.active_virtual_index,
                     strips: workspace.strips,
                 }
@@ -306,6 +326,7 @@ impl PaneruState {
             .iter()
             .map(|(display, entity, active)| SavedDisplay {
                 display_id: display.id(),
+                uuid: display.uuid().map(str::to_string),
                 bounds: display.bounds().into(),
                 active,
                 workspace_ids: display_workspace_ids.remove(&entity).unwrap_or_default(),
@@ -338,8 +359,9 @@ impl PaneruState {
     pub fn load_from_file(path: &Path) -> Option<Self> {
         let data = fs::read_to_string(path).ok()?;
         let state: Self = serde_json::from_str(&data).ok()?;
-        (state.version == SUPPORTED_STATE_VERSION || state.version == BACKFILL_STATE_VERSION)
-            .then_some(state)
+        (state.version == SUPPORTED_STATE_VERSION
+            || BACKFILL_STATE_VERSIONS.contains(&state.version))
+        .then_some(state)
     }
 
     /// Drops saved windows whose application was never observed (bundle id
@@ -428,6 +450,7 @@ impl PaneruState {
 #[derive(Default)]
 struct SavedWorkspaceBuilder {
     display_id: Option<CGDirectDisplayID>,
+    display_uuid: Option<String>,
     active_virtual_index: Option<u32>,
     strips: Vec<SavedStrip>,
 }

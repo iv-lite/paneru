@@ -20,10 +20,12 @@ final class BorderPool {
     func sync(items: [(id: Int32, rect: NSRect, style: BorderStyle)]) {
         dispatchPrecondition(condition: .onQueue(.main))
         let wanted = Set(items.map(\.id))
-        for (id, entry) in entries where !wanted.contains(id) {
-            entry.window.orderOut(nil)
+        // In-place prune: the old `filter` rebuilt the whole dictionary
+        // every tick (O(n) alloc at display rate during glides).
+        for id in entries.keys where !wanted.contains(id) {
+            entries[id]?.window.orderOut(nil)
+            entries.removeValue(forKey: id)
         }
-        entries = entries.filter { wanted.contains($0.key) }
         if entries.isEmpty {
             hidden = false
         }

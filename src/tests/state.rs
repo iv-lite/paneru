@@ -75,6 +75,7 @@ fn test_state_serialization() {
         active_display_id: Some(TEST_DISPLAY_ID),
         displays: vec![SavedDisplay {
             display_id: TEST_DISPLAY_ID,
+            uuid: None,
             bounds: SavedRect {
                 min_x: 0,
                 min_y: TEST_MENUBAR_HEIGHT,
@@ -87,6 +88,7 @@ fn test_state_serialization() {
         workspaces: vec![SavedWorkspace {
             workspace_id: TEST_WORKSPACE_ID,
             display_id: Some(TEST_DISPLAY_ID),
+            display_uuid: None,
             active_virtual_index: Some(0),
             strips: vec![SavedStrip {
                 virtual_index: 0,
@@ -112,6 +114,7 @@ fn restore_plan_compacts_missing_windows_and_preserves_active_virtual_row() {
     let state = restore_state(vec![SavedWorkspace {
         workspace_id: TEST_WORKSPACE_ID,
         display_id: Some(TEST_DISPLAY_ID),
+        display_uuid: None,
         active_virtual_index: Some(1),
         strips: vec![
             SavedStrip {
@@ -193,6 +196,7 @@ fn restore_plan_skips_ambiguous_fallback_match() {
     let state = restore_state(vec![SavedWorkspace {
         workspace_id: TEST_WORKSPACE_ID,
         display_id: None,
+        display_uuid: None,
         active_virtual_index: Some(0),
         strips: vec![SavedStrip {
             virtual_index: 0,

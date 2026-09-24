@@ -84,6 +84,7 @@ struct MockDisplayData {
     id: u32,
     bounds: IRect,
     workspaces: Vec<WorkspaceId>,
+    uuid: Option<String>,
 }
 
 /// The internal state of our "Virtual macOS".
@@ -221,8 +222,18 @@ impl MockState {
                 id,
                 bounds,
                 workspaces,
+                uuid: None,
             },
         );
+    }
+
+    /// Assigns a stable UUID to a mocked display, modelling the EDID-derived
+    /// identity real hardware keeps across restarts (numeric ids rotate).
+    pub fn set_display_uuid(&self, id: u32, uuid: &str) {
+        let mut inner = self.inner.force_write();
+        if let Some(display) = inner.displays.get_mut(&id) {
+            display.uuid = Some(uuid.to_string());
+        }
     }
 
     #[allow(unused)]
@@ -766,10 +777,11 @@ impl MockState {
                 .displays
                 .values()
                 .map(|d| {
-                    (
-                        Display::new(d.id, d.bounds, TEST_MENUBAR_HEIGHT),
-                        d.workspaces.clone(),
-                    )
+                    let mut display = Display::new(d.id, d.bounds, TEST_MENUBAR_HEIGHT);
+                    if let Some(uuid) = d.uuid.clone() {
+                        display.set_uuid(uuid);
+                    }
+                    (display, d.workspaces.clone())
                 })
                 .collect()
         });
