@@ -271,12 +271,14 @@ impl PlatformCallbacks {
     /// # Returns
     ///
     /// `Ok(std::pin::Pin<Box<Self>>)` if the instance is created successfully, otherwise `Err(Error)`.
-    pub fn new(events: EventSender) -> Pin<Box<Self>> {
+    pub fn new(events: EventSender) -> Option<Pin<Box<Self>>> {
         // This is required to receive some Cocoa notifications into Carbon code, like
         // NSWorkspaceActiveSpaceDidChangeNotification and
         // NSWorkspaceActiveDisplayDidChangeNotification
         // Found on: https://stackoverflow.com/questions/68893386/unable-to-receive-nsworkspaceactivespacedidchangenotification-specifically-but
-        let main_thread_marker = MainThreadMarker::new().unwrap();
+        // Not on the main thread (e.g. a test harness calling setup): fail
+        // construction instead of panicking — callers degrade or exit.
+        let main_thread_marker = MainThreadMarker::new()?;
         let cocoa_app = NSApplication::sharedApplication(main_thread_marker);
         cocoa_app.setActivationPolicy(NSApplicationActivationPolicy::Accessory);
         cocoa_app.finishLaunching();
@@ -287,7 +289,7 @@ impl PlatformCallbacks {
 
         let workspace_observer = WorkspaceObserver::new(events.clone());
         let vsync_link = vsync::VSyncLink::new(events.waker().clone());
-        Box::pin(PlatformCallbacks {
+        let pinned = Box::pin(PlatformCallbacks {
             main_thread_marker,
             cocoa_app,
             process_handler: None,
@@ -298,7 +300,8 @@ impl PlatformCallbacks {
             vsync_link,
             notify_handler: None,
             events,
-        })
+        });
+        Some(pinned)
     }
 
     /// Sets up and starts all platform-specific handlers, including input, display, Mission Control, workspace, and process handlers.

@@ -34,7 +34,7 @@ use crate::config::snippet::SnippetDialect;
 use crate::config::{CONFIGURATION_FILE, Config, WindowParams};
 use crate::ecs::layout::LayoutStrip;
 use crate::ecs::state::PaneruState;
-use crate::errors::Result;
+use crate::errors::{Error, Result};
 use crate::events::{Event, EventSender, InputEvent};
 #[cfg(feature = "lua")]
 use crate::lua;
@@ -240,6 +240,13 @@ pub fn register_systems(app: &mut bevy::app::App) {
     app.init_resource::<crate::ecs::VSyncPhase>();
     app.init_resource::<crate::ax_writer::AxWriteState>();
     app.init_resource::<crate::ecs::sync::SyncCounters>();
+    app.init_resource::<systems::FrameClock>();
+    app.init_resource::<systems::FrameStats>();
+    app.add_systems(Last, systems::record_frame_time);
+    app.add_systems(
+        Update,
+        systems::report_frame_stats.run_if(on_timer(Duration::from_secs(60))),
+    );
     app.add_systems(
         PreUpdate,
         (
@@ -298,21 +305,26 @@ pub fn register_systems(app: &mut bevy::app::App) {
                 .run_if(window_echo_signals),
             systems::cleanup_on_exit.run_if(on_message::<AppExit>),
             restore::tick_restore_grace.run_if(resource_exists::<restore::SessionRestore>),
-            state::periodic_state_save.run_if(on_timer(Duration::from_mins(5))),
+            // 30s dirty-gated saves (not 5min): a crash must lose seconds
+            // of layout, not minutes. Both are no-ops when clean.
+            state::periodic_state_save.run_if(on_timer(Duration::from_secs(30))),
             state::cleanup_on_exit.run_if(on_message::<AppExit>),
-            script_state::periodic_script_state_save.run_if(on_timer(Duration::from_mins(5))),
+            script_state::periodic_script_state_save.run_if(on_timer(Duration::from_secs(30))),
             script_state::script_state_cleanup_on_exit.run_if(on_message::<AppExit>),
         ),
     );
     // Heals stranded minimize/hide markers whose one-shot return message
     // was dropped: cheap (only lingering windows are re-queried against the
     // OS) and convergent (two sightings). Separate call: the Update tuple
-    // above is at the system-count limit.
+    // above is at the system-count limit. Same for the snapshot watchdog.
     app.add_systems(
         Update,
-        triggers::reconcile_stale_unmanaged
-            .run_if(not(resource_exists::<Initializing>))
-            .run_if(on_timer(Duration::from_secs(5))),
+        (
+            triggers::reconcile_stale_unmanaged
+                .run_if(not(resource_exists::<Initializing>))
+                .run_if(on_timer(Duration::from_secs(5))),
+            systems::watch_snapshot_worker.run_if(on_timer(Duration::from_secs(5))),
+        ),
     );
     app.add_systems(
         PostUpdate,
@@ -1188,12 +1200,13 @@ pub fn setup_bevy_app(sender: EventSender, receiver: Receiver<Event>) -> Result<
     // enumeration so no main state crosses threads (only the constructor's
     // sender is shared).
     {
-        let (store, roster) = crate::snapshot::spawn_snapshot_thread(
+        if let Some((store, roster)) = crate::snapshot::spawn_snapshot_thread(
             crate::manager::WindowManagerOS::new(sender.clone()),
             sender.waker().clone(),
-        );
-        app.insert_resource(store);
-        app.insert_resource(roster);
+        ) {
+            app.insert_resource(store);
+            app.insert_resource(roster);
+        }
         app.insert_resource(crate::snapshot::TitleInvalidations::default());
     }
 
@@ -1204,9 +1217,19 @@ pub fn setup_bevy_app(sender: EventSender, receiver: Receiver<Event>) -> Result<
     // than lazy-start races on first animation. The ack map is inited by
     // `register_systems` so both paths share it.
     {
-        let (queue, inbox) = crate::ax_writer::spawn_ax_writer();
-        app.insert_resource(queue);
-        app.insert_resource(inbox);
+        if let Some((queue, inbox)) = crate::ax_writer::spawn_ax_writer() {
+            app.insert_resource(queue);
+            app.insert_resource(inbox);
+        }
+    }
+
+    // AX read pool: verify/adoption paths poll it instead of blocking the
+    // pump on cross-process IPC (harness keeps the synchronous path — no
+    // service resource there, so reads fall back to direct).
+    {
+        if let Some(reads) = crate::ax_reads::spawn_ax_reads() {
+            app.insert_resource(reads);
+        }
     }
 
     // Run every schedule inline rather than fanning systems out across the task
@@ -1230,7 +1253,11 @@ pub fn setup_bevy_app(sender: EventSender, receiver: Receiver<Event>) -> Result<
     }
 
     let menu_events = sender.clone();
-    let mut platform_callbacks = PlatformCallbacks::new(sender);
+    let Some(mut platform_callbacks) = PlatformCallbacks::new(sender) else {
+        return Err(Error::InvalidConfig(
+            "platform callbacks require the main thread".to_string(),
+        ));
+    };
     platform_callbacks.setup_handlers()?;
     let mtm = platform_callbacks.main_thread_marker;
     let overlay_manager = OverlayManager::new(mtm);
@@ -1286,17 +1313,20 @@ pub fn setup_bevy_app(sender: EventSender, receiver: Receiver<Event>) -> Result<
             .world()
             .resource::<script_state::ScriptStateStore>()
             .revision_handle();
-        let worker = lua::LuaWorker::spawn(lua::LuaSource::Path(path.clone()), revision);
-        // A script that called `paneru.setup{...}` is authoritative: insert its
-        // config now, before `app.run()`, so it exists ahead of the Startup
-        // schedule and wins over the TOML `InitialConfig` (see
-        // `gather_initial_processes`). Without `setup`, the TOML config is used.
-        if let Some(config) = worker.built_config() {
-            app.insert_resource(config);
+        // A failed load falls back to no-script behavior (TOML config,
+        // no plugin): startup never wedges on a broken script.
+        if let Some(worker) = lua::LuaWorker::spawn(lua::LuaSource::Path(path.clone()), revision) {
+            // A script that called `paneru.setup{...}` is authoritative: insert its
+            // config now, before `app.run()`, so it exists ahead of the Startup
+            // schedule and wins over the TOML `InitialConfig` (see
+            // `gather_initial_processes`). Without `setup`, the TOML config is used.
+            if let Some(config) = worker.built_config() {
+                app.insert_resource(config);
+            }
+            app.insert_resource(worker);
+            app.insert_resource(lua::LuaScriptPath(path));
+            app.add_plugins(lua::LuaPlugin {});
         }
-        app.insert_resource(worker);
-        app.insert_resource(lua::LuaScriptPath(path));
-        app.add_plugins(lua::LuaPlugin {});
     }
 
     Ok(app)

@@ -672,7 +672,7 @@ fn command_focus_managed(
     let target = focus_history
         .last_managed(workspace_id)
         .filter(|entity| active_strip.contains(*entity))
-        .or_else(|| active_strip.all_columns().into_iter().next());
+        .or_else(|| active_strip.first_top());
 
     if let Some(entity) = target {
         commands.focus_entity(entity, true);
@@ -777,7 +777,7 @@ fn command_toggle_floating_layer(
         focus_history
             .last_managed(workspace_id)
             .filter(|entity| active_strip.contains(*entity))
-            .or_else(|| active_strip.all_columns().into_iter().next())
+            .or_else(|| active_strip.first_top())
     };
 
     if floating_front {
@@ -1781,7 +1781,7 @@ fn warp_mouse_to_display(
 /// Distributes heights equally among all windows in the currently focused stack.
 fn equalize_column(
     mut messages: MessageReader<Event>,
-    current_focus: Single<(&Window, Entity), With<FocusedMarker>>,
+    current_focus: Option<Single<(&Window, Entity), With<FocusedMarker>>>,
     windows: Windows,
     active_display: ActiveDisplay,
     config: Res<Config>,
@@ -1794,6 +1794,12 @@ fn equalize_column(
         return;
     }
 
+    // Focusless world (all minimized, post-quit cascade): nothing to
+    // equalize — skip instead of panicking.
+    let Some(current_focus) = current_focus else {
+        debug!("Equalize with no focused window; skipping");
+        return;
+    };
     let (_, entity) = *current_focus;
     let active_strip = active_display.active_strip();
     let Ok(column) = active_strip
@@ -1804,9 +1810,16 @@ fn equalize_column(
     };
 
     if let Column::Stack(stack) = column {
+        // Empty stacks cannot happen (columns always hold a window), but a
+        // degenerate one must skip, never divide by zero or panic.
+        let Ok(count) = i32::try_from(stack.len()) else {
+            return;
+        };
+        if count <= 0 {
+            return;
+        }
         #[allow(clippy::cast_precision_loss)]
-        let equal_height =
-            active_display.actual_bounds(&config).height() / i32::try_from(stack.len()).unwrap();
+        let equal_height = active_display.actual_bounds(&config).height() / count;
 
         for item in &stack {
             for entity in item.window_iter() {

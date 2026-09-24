@@ -241,7 +241,7 @@ fn workspace_change_handler(
         Has<ActiveWorkspaceMarker>,
         Has<SelectedVirtualMarker>,
     )>,
-    active_display: Single<(&Display, Entity), With<ActiveDisplayMarker>>,
+    active_display: Option<Single<(&Display, Entity), With<ActiveDisplayMarker>>>,
     window_manager: Res<WindowManager>,
     mut commands: Commands,
 ) {
@@ -251,6 +251,13 @@ fn workspace_change_handler(
     {
         return;
     }
+    // No active display (mid-reconfigure): space changes need display
+    // geometry — skip this tick instead of panicking; the change is
+    // re-observed on the next display event.
+    let Some(active_display) = active_display else {
+        debug!("workspace change with no active display; skipping");
+        return;
+    };
     let (active_display, display_entity) = *active_display;
 
     let Ok(workspace_id) = window_manager.active_display_space(active_display.id()) else {
@@ -322,102 +329,107 @@ fn workspace_change_handler(
 
 #[instrument(level = Level::DEBUG, skip_all, fields(trigger))]
 fn detect_moved_windows(
-    activated_workspace: Single<Entity, Added<ActiveWorkspaceMarker>>,
+    activated: Populated<Entity, Added<ActiveWorkspaceMarker>>,
     mut workspaces: Query<(&mut LayoutStrip, Entity, Has<NativeFullscreenMarker>)>,
     apps: Query<&mut Application>,
     window_manager: Res<WindowManager>,
     mut ignored_windows: ResMut<IgnoredMovedWindows>,
     mut ctx: WindowCtx,
 ) {
-    let Ok(workspace_id) = workspaces
-        .get(*activated_workspace)
-        .map(|strip| strip.0.id())
-    else {
-        return;
-    };
-    debug!("workspace {workspace_id}");
-
-    let strips = workspaces
-        .iter()
-        .filter_map(|strip| (strip.0.id() == workspace_id).then_some(strip.0))
-        .collect::<Vec<_>>();
-    let find_window = |window_id| {
-        ctx.windows
-            .find_managed(window_id)
-            .map(|(_, entity)| entity)
-    };
-    let Ok((moved_windows, mut unresolved)) =
-        windows_not_in_strips(workspace_id, find_window, &strips, &window_manager).inspect_err(
-            |err| {
-                warn!("unable to get windows in the current workspace: {err}");
-            },
-        )
-    else {
-        return;
-    };
-    // Skip known, but unmanaged windows.
-    unresolved.retain(|window_id| {
-        !ignored_windows.0.contains(window_id) && ctx.windows.find(*window_id).is_none()
-    });
-
-    if !unresolved.is_empty() {
-        let unresolved_ids = unresolved.iter().copied().collect::<HashSet<_>>();
-        // Retry unresolved window IDs: during startup bruteforce, windows on
-        // inactive workspaces may have stale AX attributes (e.g. AXGroup instead
-        // of AXWindow).  Now that this workspace is active, re-query each app's
-        // window list — the AX data should be correct.
-        let retry_windows = apps
-            .into_iter()
-            .flat_map(|app| {
-                app.window_list(&ctx.config)
-                    .into_iter()
-                    .filter(|window| unresolved_ids.contains(&window.id()))
-            })
-            .collect::<Vec<_>>();
-        if retry_windows.is_empty() {
-            // Bound the set: a pathological app must not grow it without
-            // limit. Clearing loses nothing — genuinely missing windows are
-            // simply re-probed (and re-ignored) on the next activation.
-            if ignored_windows.0.len() > 4096 {
-                ignored_windows.0.clear();
-            }
-            for id in unresolved_ids {
-                ignored_windows.0.insert(id);
-            }
-        } else {
-            debug!(
-                "retrying unresolved windows: {}",
-                retry_windows
-                    .iter()
-                    .map(|window| format!("{}", window.id()))
-                    .collect::<Vec<_>>()
-                    .join(" ")
-            );
-            ctx.commands.trigger(SpawnWindowTrigger(retry_windows));
-        }
-    }
-
-    for entity in moved_windows {
-        if workspaces
-            .iter()
-            .any(|(strip, _, fullscreen)| fullscreen && strip.contains(entity))
-        {
-            // Do not relocate fullscreen windows, this will happen
-            // during the destructino of their workspace.
+    // Every activation is handled: a `Single` would silently skip the whole
+    // system when two strips activate in one tick.
+    let arrivals: Vec<Entity> = activated.iter().collect();
+    for activated_workspace in arrivals {
+        let Ok(workspace_id) = workspaces
+            .get(activated_workspace)
+            .map(|strip| strip.0.id())
+        else {
             continue;
+        };
+        debug!("workspace {workspace_id}");
+
+        let strips = workspaces
+            .iter()
+            .filter_map(|strip| (strip.0.id() == workspace_id).then_some(strip.0))
+            .collect::<Vec<_>>();
+        let find_window = |window_id| {
+            ctx.windows
+                .find_managed(window_id)
+                .map(|(_, entity)| entity)
+        };
+        let Ok((moved_windows, mut unresolved)) =
+            windows_not_in_strips(workspace_id, find_window, &strips, &window_manager).inspect_err(
+                |err| {
+                    warn!("unable to get windows in the current workspace: {err}");
+                },
+            )
+        else {
+            continue;
+        };
+        // Skip known, but unmanaged windows.
+        unresolved.retain(|window_id| {
+            !ignored_windows.0.contains(window_id) && ctx.windows.find(*window_id).is_none()
+        });
+
+        if !unresolved.is_empty() {
+            let unresolved_ids = unresolved.iter().copied().collect::<HashSet<_>>();
+            // Retry unresolved window IDs: during startup bruteforce, windows on
+            // inactive workspaces may have stale AX attributes (e.g. AXGroup instead
+            // of AXWindow).  Now that this workspace is active, re-query each app's
+            // window list — the AX data should be correct.
+            let retry_windows = apps
+                .iter()
+                .flat_map(|app| {
+                    app.window_list(&ctx.config)
+                        .into_iter()
+                        .filter(|window| unresolved_ids.contains(&window.id()))
+                })
+                .collect::<Vec<_>>();
+            if retry_windows.is_empty() {
+                // Bound the set: a pathological app must not grow it without
+                // limit. Clearing loses nothing — genuinely missing windows are
+                // simply re-probed (and re-ignored) on the next activation.
+                if ignored_windows.0.len() > 4096 {
+                    ignored_windows.0.clear();
+                }
+                for id in unresolved_ids {
+                    ignored_windows.0.insert(id);
+                }
+            } else {
+                debug!(
+                    "retrying unresolved windows: {}",
+                    retry_windows
+                        .iter()
+                        .map(|window| format!("{}", window.id()))
+                        .collect::<Vec<_>>()
+                        .join(" ")
+                );
+                ctx.commands.trigger(SpawnWindowTrigger(retry_windows));
+            }
         }
 
-        debug!("Window {entity} moved to workspace {workspace_id}.");
-        let moving_entities = workspaces
-            .iter()
-            .find_map(|(strip, _, _)| strip.tab_group(entity))
-            .unwrap_or_else(|| vec![entity]);
-        for (mut strip, strip_entity, _) in &mut workspaces {
-            if strip_entity == *activated_workspace {
-                strip.append_tab_group(&moving_entities);
-            } else {
-                for moving_entity in &moving_entities {
-                    strip.remove(*moving_entity);
+        for entity in moved_windows {
+            if workspaces
+                .iter()
+                .any(|(strip, _, fullscreen)| fullscreen && strip.contains(entity))
+            {
+                // Do not relocate fullscreen windows, this will happen
+                // during the destructino of their workspace.
+                continue;
+            }
+
+            debug!("Window {entity} moved to workspace {workspace_id}.");
+            let moving_entities = workspaces
+                .iter()
+                .find_map(|(strip, _, _)| strip.tab_group(entity))
+                .unwrap_or_else(|| vec![entity]);
+            for (mut strip, strip_entity, _) in &mut workspaces {
+                if strip_entity == activated_workspace {
+                    strip.append_tab_group(&moving_entities);
+                } else {
+                    for moving_entity in &moving_entities {
+                        strip.remove(*moving_entity);
+                    }
                 }
             }
         }
@@ -484,10 +496,17 @@ fn workspace_destroyed_handler(
 #[instrument(level = Level::DEBUG, skip_all, fields(trigger))]
 fn workspace_created_handler(
     mut messages: MessageReader<Event>,
-    active_display: Single<(&Display, Entity), With<ActiveDisplayMarker>>,
+    active_display: Option<Single<(&Display, Entity), With<ActiveDisplayMarker>>>,
     workspaces: Query<&LayoutStrip>,
     mut commands: Commands,
 ) {
+    // No active display (mid-reconfigure): strip creation needs display
+    // geometry — skip instead of panicking; the space is re-observed on
+    // the next display event.
+    let Some(active_display) = active_display else {
+        debug!("workspace creation with no active display; skipping");
+        return;
+    };
     for event in messages.read() {
         let Event::SpaceCreated { space_id } = event else {
             continue;
@@ -697,13 +716,15 @@ fn cleanup_selected_space_marker(
     });
 }
 
-#[allow(clippy::too_many_lines)]
+#[allow(clippy::too_many_lines, clippy::type_complexity)]
 fn handle_virtual_window_moves(
     moved_windows: Populated<(Entity, &VirtualMoveMarker), With<Window>>,
     mut workspaces: MovableStrips,
     windows: Windows,
     mut scrollings: Query<&mut Scrolling>,
-    active_display: Single<(Entity, &Display, Option<&DockPosition>), With<ActiveDisplayMarker>>,
+    active_display: Option<
+        Single<(Entity, &Display, Option<&DockPosition>), With<ActiveDisplayMarker>>,
+    >,
     config: Res<Config>,
     mut commands: Commands,
 ) {
@@ -714,6 +735,13 @@ fn handle_virtual_window_moves(
         return;
     };
 
+    // No active display (mid-reconfigure): virtual moves need viewport
+    // geometry — the markers persist, so the move applies once a display
+    // exists instead of panicking now.
+    let Some(active_display) = active_display else {
+        debug!("virtual move with no active display; deferring");
+        return;
+    };
     let (display_entity, active_display, dock) = *active_display;
     let viewport = active_display.actual_display_bounds(dock, &config);
     for (window_entity, move_marker) in &moved_windows {
@@ -1183,7 +1211,7 @@ fn column_closest_to_center(
 
 #[instrument(level = Level::DEBUG, skip_all)]
 pub(crate) fn show_active_workspace(
-    activated: Single<Entity, Added<ActiveWorkspaceMarker>>,
+    activated: Populated<Entity, Added<ActiveWorkspaceMarker>>,
     windows: Windows,
     mut workspaces: RestorableStrips,
     displays: Query<(&Display, Option<&DockPosition>)>,
@@ -1191,143 +1219,150 @@ pub(crate) fn show_active_workspace(
     config: Res<Config>,
     mut commands: Commands,
 ) {
-    let Some(workspace_id) = workspaces
-        .iter()
-        .find_map(|(entity, _, strip, _, _, _)| (entity == *activated).then_some(strip.id()))
-    else {
-        return;
-    };
-
-    // Hide other strips on the current workspace
-    let current_focus = windows.focused();
-    let current_workspace = workspaces
-        .iter_mut()
-        .filter(|(entity, _, strip, _, _, _)| strip.id() == workspace_id && *entity != *activated);
-
-    for (entity, mut position, strip, child, previous, moving) in current_workspace {
-        let Ok((active_display, _)) = displays.get(child.parent()) else {
+    // Every activation is shown: a `Single` would silently skip the whole
+    // system when two strips activate in one tick.
+    let arrivals: Vec<Entity> = activated.iter().collect();
+    for activated in arrivals {
+        let Some(workspace_id) = workspaces
+            .iter()
+            .find_map(|(entity, _, strip, _, _, _)| (entity == activated).then_some(strip.id()))
+        else {
             continue;
         };
-        if previous.is_none() {
-            let mut focus =
-                current_focus.and_then(|(_, entity)| strip.contains(entity).then_some(entity));
-            if focus.is_none() {
-                focus = column_closest_to_center(strip, active_display, &windows);
-                debug!("No previous focus, taking centered one {focus:?}.");
-            }
 
-            let origin = match &moving {
-                Some(RepositionMarker(destination)) => *destination,
-                None => position.0,
-            };
-            if let Ok(mut entity_commands) = commands.get_entity(entity) {
-                entity_commands.try_insert(PreviousStripPosition { origin, focus });
-            }
-        }
-
-        let bounds = active_display.bounds();
-
-        if let Ok(mut cmd) = commands.get_entity(entity) {
-            cmd.try_remove::<Scrolling>()
-                .try_remove::<RepositionMarker>()
-                .try_remove::<ManualStripOffset>();
-        }
-
-        if config.virtual_workspace_animations() {
-            commands.reposition_entity(entity, bounds.max - PARKED_STRIP_SLIVER);
-        } else {
-            position.0 = bounds.max - PARKED_STRIP_SLIVER;
-        }
-    }
-
-    let Ok((_, mut position, strip, child, previous_position, _)) = workspaces.get_mut(*activated)
-    else {
-        return;
-    };
-    debug!("showing virtual workspace {} ({})", strip.id(), *activated);
-
-    // If no previous strip position exists, then the workspace was not hidden.
-    if let Some(PreviousStripPosition { origin, focus }) = previous_position {
-        if let Ok(mut entity_commands) = commands.get_entity(*activated) {
-            entity_commands.try_remove::<PreviousStripPosition>();
-        }
-
-        // A window of this strip already holding focus is what activated it in
-        // the first place - a Cmd-Tab straight into one of its windows. The
-        // remembered focus is a fallback for a plain workspace switch, so it
-        // must not pull focus away from that window.
-        let focused = windows
-            .focused()
-            .map(|(_, entity)| entity)
-            .filter(|entity| strip.contains(*entity));
-        let keeps_focus = focused.is_some();
-
-        // Only a focus that arrived with this activation gets the strip moved
-        // for it. A window that held focus all along - switching back from an
-        // empty workspace, say - keeps the offset the user left behind, even
-        // if they had scrolled it out of sight.
-        let arriving_focus = focused.filter(|entity| {
-            focus_markers
-                .get(*entity)
-                .is_ok_and(|marker| marker.is_added())
+        // Hide other strips on the current workspace
+        let current_focus = windows.focused();
+        let current_workspace = workspaces.iter_mut().filter(|(entity, _, strip, _, _, _)| {
+            strip.id() == workspace_id && *entity != activated
         });
 
-        // The saved origin describes where the strip sat when it was parked,
-        // which says nothing about the window that just took focus: it can
-        // easily land mostly off-screen. Scroll the strip the minimum amount
-        // needed to expose it, the same correction `ensure_visible_in_strip`
-        // makes - it cannot do it here, because it skips a strip on the frame
-        // its `ActiveWorkspaceMarker` is added.
-        let origin = arriving_focus
-            .and_then(|focus_entity| {
-                let layout = windows.layout_position(focus_entity)?.0;
-                let size = windows.size(focus_entity)?;
-                let (display, dock) = displays.get(child.parent()).ok()?;
-                let viewport = display.actual_display_bounds(dock, &config);
-                Some(origin_exposing(layout, size, *origin, viewport))
-            })
-            .unwrap_or(*origin);
+        for (entity, mut position, strip, child, previous, moving) in current_workspace {
+            let Ok((active_display, _)) = displays.get(child.parent()) else {
+                continue;
+            };
+            if previous.is_none() {
+                let mut focus =
+                    current_focus.and_then(|(_, entity)| strip.contains(entity).then_some(entity));
+                if focus.is_none() {
+                    focus = column_closest_to_center(strip, active_display, &windows);
+                    debug!("No previous focus, taking centered one {focus:?}.");
+                }
 
-        if config.virtual_workspace_animations() {
-            commands.reposition_entity(*activated, origin);
-        } else {
-            position.0 = origin;
-            // The strip's own offset is fixed instantly, but member windows
-            // (a lower stack member especially) can still need a correction
-            // on a following tick that the ordinary offscreen/parking
-            // heuristic in `position_layout_windows` won't recognize as
-            // restore-driven — see `SnapStripMarker`.
-            spawn_snap_strip_guard(*activated, &mut commands);
-        }
-
-        if keeps_focus {
-            // The layout of a strip that has just been unparked can still
-            // settle over the next frames (widths recomputed, windows the
-            // workspace picked up while it was hidden). Re-check the arriving
-            // window then: `ensure_visible_in_strip` only scrolls if the slot
-            // it ends up in really falls off an edge. That correction fires a
-            // tick after this one (its own `is_added` guard skips the
-            // activation tick), so it must snap rather than animate when
-            // `virtual_workspace_animations` is off — otherwise the strip
-            // (and everything in it) visibly slides on top of the restore
-            // this function just did instantly.
-            if let Some(focus_entity) = arriving_focus {
-                commands.ensure_visible_snap(focus_entity, !config.virtual_workspace_animations());
+                let origin = match &moving {
+                    Some(RepositionMarker(destination)) => *destination,
+                    None => position.0,
+                };
+                if let Ok(mut entity_commands) = commands.get_entity(entity) {
+                    entity_commands.try_insert(PreviousStripPosition { origin, focus });
+                }
             }
-            return;
+
+            let bounds = active_display.bounds();
+
+            if let Ok(mut cmd) = commands.get_entity(entity) {
+                cmd.try_remove::<Scrolling>()
+                    .try_remove::<RepositionMarker>()
+                    .try_remove::<ManualStripOffset>();
+            }
+
+            if config.virtual_workspace_animations() {
+                commands.reposition_entity(entity, bounds.max - PARKED_STRIP_SLIVER);
+            } else {
+                position.0 = bounds.max - PARKED_STRIP_SLIVER;
+            }
         }
 
-        // Focus on the previous window
-        if let Some(focus) = *focus
-            && strip.contains(focus)
-        {
-            spawn_restore_focus_guard(focus, &mut commands);
+        let Ok((_, mut position, strip, child, previous_position, _)) =
+            workspaces.get_mut(activated)
+        else {
+            continue;
+        };
+        debug!("showing virtual workspace {} ({})", strip.id(), activated);
 
-            commands.focus_entity(focus, false);
-            commands.trigger(RaiseWindow {
-                entity: focus,
-                with_strip: true,
+        // If no previous strip position exists, then the workspace was not hidden.
+        if let Some(PreviousStripPosition { origin, focus }) = previous_position {
+            if let Ok(mut entity_commands) = commands.get_entity(activated) {
+                entity_commands.try_remove::<PreviousStripPosition>();
+            }
+
+            // A window of this strip already holding focus is what activated it in
+            // the first place - a Cmd-Tab straight into one of its windows. The
+            // remembered focus is a fallback for a plain workspace switch, so it
+            // must not pull focus away from that window.
+            let focused = windows
+                .focused()
+                .map(|(_, entity)| entity)
+                .filter(|entity| strip.contains(*entity));
+            let keeps_focus = focused.is_some();
+
+            // Only a focus that arrived with this activation gets the strip moved
+            // for it. A window that held focus all along - switching back from an
+            // empty workspace, say - keeps the offset the user left behind, even
+            // if they had scrolled it out of sight.
+            let arriving_focus = focused.filter(|entity| {
+                focus_markers
+                    .get(*entity)
+                    .is_ok_and(|marker| marker.is_added())
             });
+
+            // The saved origin describes where the strip sat when it was parked,
+            // which says nothing about the window that just took focus: it can
+            // easily land mostly off-screen. Scroll the strip the minimum amount
+            // needed to expose it, the same correction `ensure_visible_in_strip`
+            // makes - it cannot do it here, because it skips a strip on the frame
+            // its `ActiveWorkspaceMarker` is added.
+            let origin = arriving_focus
+                .and_then(|focus_entity| {
+                    let layout = windows.layout_position(focus_entity)?.0;
+                    let size = windows.size(focus_entity)?;
+                    let (display, dock) = displays.get(child.parent()).ok()?;
+                    let viewport = display.actual_display_bounds(dock, &config);
+                    Some(origin_exposing(layout, size, *origin, viewport))
+                })
+                .unwrap_or(*origin);
+
+            if config.virtual_workspace_animations() {
+                commands.reposition_entity(activated, origin);
+            } else {
+                position.0 = origin;
+                // The strip's own offset is fixed instantly, but member windows
+                // (a lower stack member especially) can still need a correction
+                // on a following tick that the ordinary offscreen/parking
+                // heuristic in `position_layout_windows` won't recognize as
+                // restore-driven — see `SnapStripMarker`.
+                spawn_snap_strip_guard(activated, &mut commands);
+            }
+
+            if keeps_focus {
+                // The layout of a strip that has just been unparked can still
+                // settle over the next frames (widths recomputed, windows the
+                // workspace picked up while it was hidden). Re-check the arriving
+                // window then: `ensure_visible_in_strip` only scrolls if the slot
+                // it ends up in really falls off an edge. That correction fires a
+                // tick after this one (its own `is_added` guard skips the
+                // activation tick), so it must snap rather than animate when
+                // `virtual_workspace_animations` is off — otherwise the strip
+                // (and everything in it) visibly slides on top of the restore
+                // this function just did instantly.
+                if let Some(focus_entity) = arriving_focus {
+                    commands
+                        .ensure_visible_snap(focus_entity, !config.virtual_workspace_animations());
+                }
+                continue;
+            }
+
+            // Focus on the previous window
+            if let Some(focus) = *focus
+                && strip.contains(focus)
+            {
+                spawn_restore_focus_guard(focus, &mut commands);
+
+                commands.focus_entity(focus, false);
+                commands.trigger(RaiseWindow {
+                    entity: focus,
+                    with_strip: true,
+                });
+            }
         }
     }
 }
@@ -1390,35 +1425,39 @@ fn renumber_virtual_indexes(mut set: RenumberStrips) {
 }
 
 fn reap_empty_virtual_workspaces(
-    changed: Single<Entity, Added<ActiveWorkspaceMarker>>,
+    changed: Populated<Entity, Added<ActiveWorkspaceMarker>>,
     strips: Populated<(Entity, &LayoutStrip)>,
     mut commands: Commands,
 ) {
-    let changed_entity = *changed;
-    let Some(workspace_id) = strips.get(changed_entity).ok().map(|(_, strip)| strip.id()) else {
-        return;
-    };
-    debug!("cleaning up virtual workspaces on space {workspace_id}");
-    let mut rows = strips
-        .iter()
-        .filter(|(_, strip)| strip.id() == workspace_id)
-        .collect::<Vec<_>>();
-    rows.sort_by_key(|(_, strip)| strip.virtual_index);
+    // Every activation reaps: a `Single` would silently skip the whole
+    // system when two strips activate in one tick.
+    for changed_entity in &changed {
+        let Some(workspace_id) = strips.get(changed_entity).ok().map(|(_, strip)| strip.id())
+        else {
+            continue;
+        };
+        debug!("cleaning up virtual workspaces on space {workspace_id}");
+        let mut rows = strips
+            .iter()
+            .filter(|(_, strip)| strip.id() == workspace_id)
+            .collect::<Vec<_>>();
+        rows.sort_by_key(|(_, strip)| strip.virtual_index);
 
-    if rows.is_empty() {
-        return;
-    }
+        if rows.is_empty() {
+            continue;
+        }
 
-    // Do not reap the strip that just became active. Switching/creating onto an
-    // empty virtual workspace is intentional (e.g. South auto-create); only
-    // empty rows left behind should be removed.
-    for (entity, strip) in rows {
-        if entity != changed_entity
-            && strip.virtual_index > 0
-            && strip.len() == 0
-            && let Ok(mut entity_commands) = commands.get_entity(entity)
-        {
-            entity_commands.try_despawn();
+        // Do not reap the strip that just became active. Switching/creating onto an
+        // empty virtual workspace is intentional (e.g. South auto-create); only
+        // empty rows left behind should be removed.
+        for (entity, strip) in rows {
+            if entity != changed_entity
+                && strip.virtual_index > 0
+                && strip.len() == 0
+                && let Ok(mut entity_commands) = commands.get_entity(entity)
+            {
+                entity_commands.try_despawn();
+            }
         }
     }
 }

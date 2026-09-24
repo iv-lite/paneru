@@ -163,8 +163,13 @@ impl LuaWorker {
     /// working (empty) runtime behind.
     ///
     /// `revision` is the script state store's stamp, shared with the ECS
-    /// resource that owns the store.
-    pub fn spawn(source: LuaSource, revision: ScriptStateRevision) -> Self {
+    /// resource that owns the store. Returns `None` when the thread cannot
+    /// start or the load hangs past the deadline — the caller falls back
+    /// to no-script behavior instead of blocking startup forever.
+    ///
+    /// [`spawn`]: LuaWorker::spawn
+    pub fn spawn(source: LuaSource, revision: ScriptStateRevision) -> Option<Self> {
+        const LOAD_DEADLINE: std::time::Duration = std::time::Duration::from_secs(10);
         let (to_lua, from_main) = unbounded();
         let (to_main, outbox) = unbounded();
         let (world_tx, world_queries) = unbounded();
@@ -176,28 +181,56 @@ impl LuaWorker {
         let thread = {
             let has_handlers = Arc::clone(&has_handlers);
             let built_config = Arc::clone(&built_config);
-            std::thread::Builder::new()
+            match std::thread::Builder::new()
                 .name("paneru-lua".to_string())
                 .spawn(move || {
-                    run(
-                        &source,
-                        &from_main,
-                        &to_main,
-                        &world_tx,
-                        &store_tx,
-                        &has_handlers,
-                        &built_config,
-                        &revision,
-                        &ready_tx,
-                    );
-                })
-                .expect("spawning the Lua worker thread")
+                    // A script panic must kill the script, never the daemon:
+                    // channels just disconnect and the main side degrades to
+                    // no-script behavior.
+                    if std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                        run(
+                            &source,
+                            &from_main,
+                            &to_main,
+                            &world_tx,
+                            &store_tx,
+                            &has_handlers,
+                            &built_config,
+                            &revision,
+                            &ready_tx,
+                        );
+                    }))
+                    .is_err()
+                    {
+                        tracing::error!("lua worker thread panicked; scripts disabled");
+                    }
+                }) {
+                Ok(thread) => thread,
+                Err(err) => {
+                    tracing::error!("spawning the Lua worker thread: {err}; scripts disabled");
+                    return None;
+                }
+            }
         };
-        // An error here means the thread died before finishing the load, which
-        // `run` only does after logging why.
-        let _ = ready.recv_blocking();
+        // A missing ready means the thread died before finishing the load
+        // (which `run` logs why) or the load hung: either way proceed
+        // without the script rather than wedging startup.
+        let deadline = std::time::Instant::now() + LOAD_DEADLINE;
+        let loaded = loop {
+            if ready.try_recv().is_ok() {
+                break true;
+            }
+            if std::time::Instant::now() >= deadline {
+                break false;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(10));
+        };
+        if !loaded {
+            tracing::error!("lua worker load timed out after {LOAD_DEADLINE:?}; scripts disabled");
+            return None;
+        }
 
-        Self {
+        Some(Self {
             to_lua,
             outbox,
             world_queries,
@@ -205,7 +238,7 @@ impl LuaWorker {
             has_handlers,
             built_config,
             thread: Some(thread),
-        }
+        })
     }
 
     /// The `Config` the loaded script declared via `paneru.setup{...}`, or
@@ -507,7 +540,7 @@ mod tests {
     fn spawn_with_store(source: LuaSource) -> LuaWorker {
         let revision = revision();
         STORE.with_borrow_mut(|store| *store = TestStore::new(Arc::clone(&revision)));
-        LuaWorker::spawn(source, revision)
+        LuaWorker::spawn(source, revision).expect("test script loads")
     }
 
     /// A revision stamp for a test that has no store behind it.
@@ -744,7 +777,8 @@ mod tests {
         let script = directory.join("init.lua");
         std::fs::write(&script, r#"paneru.bind("alt - b", "window balance")"#).unwrap();
 
-        let worker = LuaWorker::spawn(LuaSource::Path(script.clone()), revision());
+        let worker = LuaWorker::spawn(LuaSource::Path(script.clone()), revision())
+            .expect("test script loads");
         std::fs::write(&script, "this is not lua ===").unwrap();
         worker.send_reload(script.clone());
         assert!(
@@ -769,7 +803,8 @@ mod tests {
         let script = directory.join("init.lua");
         std::fs::write(&script, r#"paneru.bind("alt - b", "window balance")"#).unwrap();
 
-        let worker = LuaWorker::spawn(LuaSource::Path(script.clone()), revision());
+        let worker = LuaWorker::spawn(LuaSource::Path(script.clone()), revision())
+            .expect("test script loads");
         assert!(!worker.has_event_handlers(), "no paneru.on handlers yet");
 
         std::fs::write(

@@ -65,6 +65,21 @@ impl ScriptStateStore {
     }
 
     fn read_file(path: &Path) -> Option<ScriptState> {
+        Self::read_one_file(path).or_else(|| {
+            let backup_path = path.with_extension("json.bak");
+            if backup_path.exists() {
+                warn!(
+                    "script state at {} unreadable; falling back to backup generation",
+                    path.display()
+                );
+                Self::read_one_file(&backup_path)
+            } else {
+                None
+            }
+        })
+    }
+
+    fn read_one_file(path: &Path) -> Option<ScriptState> {
         let data = fs::read_to_string(path).ok()?;
         match serde_json::from_str::<SavedScriptState>(&data) {
             Ok(saved) if saved.version == SUPPORTED_SCRIPT_STATE_VERSION => Some(saved.state),
@@ -158,6 +173,12 @@ impl ScriptStateStore {
         if let Some(parent) = path.parent() {
             fs::create_dir_all(parent)?;
         }
+        // One backup generation, mirroring the layout state file: a
+        // degraded write must not bury the last good one.
+        let backup_path = path.with_extension("json.bak");
+        if path.exists() {
+            let _ = fs::rename(path, &backup_path);
+        }
         let tmp_path = path.with_extension("json.tmp");
         fs::write(&tmp_path, json)?;
         fs::rename(tmp_path, path)?;
@@ -166,9 +187,15 @@ impl ScriptStateStore {
 
     #[must_use]
     pub fn default_file_path() -> PathBuf {
+        // No HOME/XDG: degrade to tmp instead of panicking (see
+        // `PaneruState::default_state_file_path`).
         xdg::BaseDirectories::with_prefix("paneru")
             .get_state_file(SCRIPT_STATE_FILE_NAME)
-            .expect("XDG state directory should be available")
+            .unwrap_or_else(|| {
+                std::env::temp_dir()
+                    .join("paneru")
+                    .join(SCRIPT_STATE_FILE_NAME)
+            })
     }
 }
 

@@ -569,15 +569,34 @@ fn run(
 pub(crate) fn spawn_snapshot_thread(
     window_manager: WindowManagerOS,
     waker: Arc<EventLoopWaker>,
-) -> (SnapshotStore, SnapshotRoster) {
+) -> Option<(SnapshotStore, SnapshotRoster)> {
     let (tx, rx) = unbounded();
     let published = Arc::new(ArcSwap::new(Arc::new(AxSnapshot::default())));
     let thread_published = Arc::clone(&published);
-    std::thread::Builder::new()
+    // Thread exhaustion degrades to direct reads (every snapshot consumer
+    // already falls back past the freshness bounds) instead of panicking.
+    let result = std::thread::Builder::new()
         .name("paneru-ax-snap".to_string())
-        .spawn(move || run(rx, window_manager, thread_published, waker))
-        .expect("spawning the ax snapshot thread");
-    (SnapshotStore(published), SnapshotRoster(tx))
+        .spawn(move || {
+            // A worker panic must degrade to direct reads, never abort the
+            // daemon: the store simply goes stale and every consumer falls
+            // back past its freshness bound (plus the watchdog below strips
+            // a dead store outright).
+            if std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                run(rx, window_manager, thread_published, waker);
+            }))
+            .is_err()
+            {
+                tracing::error!("ax snapshot thread panicked; using direct reads");
+            }
+        });
+    match result {
+        Ok(_) => Some((SnapshotStore(published), SnapshotRoster(tx))),
+        Err(err) => {
+            tracing::error!("spawning the ax snapshot thread: {err}; using direct reads");
+            None
+        }
+    }
 }
 
 #[cfg(test)]
@@ -636,6 +655,44 @@ mod tests {
         assert!(snapshot.windows.is_empty());
         let store = SnapshotStore::default();
         assert_eq!(store.0.load().epoch, 0);
+    }
+
+    #[test]
+    fn dead_store_is_stripped_to_direct_reads() {
+        use bevy::ecs::system::RunSystemOnce as _;
+        use bevy::ecs::world::World;
+
+        let mut world = World::new();
+        let stale = AxSnapshot {
+            at: Instant::now()
+                .checked_sub(std::time::Duration::from_secs(30))
+                .expect("test clock runs forward"),
+            ..Default::default()
+        };
+        world.insert_resource(SnapshotStore(Arc::new(ArcSwap::new(Arc::new(stale)))));
+        world
+            .run_system_once(crate::ecs::systems::watch_snapshot_worker)
+            .expect("watchdog runs");
+        assert!(
+            world.get_resource::<SnapshotStore>().is_none(),
+            "a dead store must be stripped so readers fall back to direct reads"
+        );
+    }
+
+    #[test]
+    fn fresh_store_survives_the_watchdog() {
+        use bevy::ecs::system::RunSystemOnce as _;
+        use bevy::ecs::world::World;
+
+        let mut world = World::new();
+        world.insert_resource(SnapshotStore::default());
+        world
+            .run_system_once(crate::ecs::systems::watch_snapshot_worker)
+            .expect("watchdog runs");
+        assert!(
+            world.get_resource::<SnapshotStore>().is_some(),
+            "a live store must be kept"
+        );
     }
 
     #[test]

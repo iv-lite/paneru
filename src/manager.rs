@@ -49,7 +49,9 @@ pub(crate) use windows::snapshot_frame;
 pub use windows::{
     Window, WindowApi, WindowOS, WindowPadding, ax_window_id, pid_of_element, try_ax_window_id,
 };
-pub(crate) use windows::{ax_set_window_position, enhanced_ui_workaround_absent};
+pub(crate) use windows::{
+    ax_set_window_position, ax_set_window_size, enhanced_ui_workaround_absent,
+};
 
 #[cfg(test)]
 pub use process::MockProcessApi;
@@ -354,10 +356,16 @@ impl WindowManagerApi for WindowManagerOS {
         if count < 1 {
             return vec![];
         }
-        let mut displays = Vec::with_capacity(count.try_into().unwrap());
+        // A bogus count must degrade to an empty list, never panic or
+        // overrun: bound the unsafe `set_len` by the capacity we allocated.
+        let Ok(capacity) = usize::try_from(count) else {
+            return vec![];
+        };
+        let mut displays = Vec::with_capacity(capacity);
         unsafe {
             CGGetActiveDisplayList(count, displays.as_mut_ptr(), &raw mut count);
-            displays.set_len(count.try_into().unwrap());
+            let len = usize::try_from(count).unwrap_or(0).min(capacity);
+            displays.set_len(len);
         }
         displays
             .into_iter()
@@ -764,11 +772,19 @@ impl BruteforceGate {
     }
 
     /// Blocks until a scan slot is free, then reserves it until the returned
-    /// guard is dropped.
+    /// guard is dropped. A poisoned mutex recovers with the guarded value
+    /// instead of cascading the panic: the worst case is a repeated scan,
+    /// never a wedged main thread.
     fn acquire(&self) -> BruteforcePermit<'_> {
-        let mut available = self.available.lock().expect("gate mutex poisoned");
+        let mut available = self
+            .available
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
         while *available == 0 {
-            available = self.freed.wait(available).expect("gate mutex poisoned");
+            available = self
+                .freed
+                .wait(available)
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
         }
         *available -= 1;
         BruteforcePermit(self)
@@ -779,7 +795,11 @@ struct BruteforcePermit<'a>(&'a BruteforceGate);
 
 impl Drop for BruteforcePermit<'_> {
     fn drop(&mut self) {
-        *self.0.available.lock().expect("gate mutex poisoned") += 1;
+        *self
+            .0
+            .available
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner) += 1;
         self.0.freed.notify_one();
     }
 }
@@ -891,12 +911,19 @@ pub fn check_ax_privilege() -> bool {
 /// Subsequent permission polling must use [`check_ax_privilege`] so the system
 /// dialog is not requested repeatedly while the application waits.
 pub fn request_ax_privilege() -> bool {
+    // Static lookups that can only fail under a broken runtime: degrade
+    // to untrusted instead of panicking the daemon.
+    let (Some(prompt), Some(flag)) = (unsafe {
+        (
+            kAXTrustedCheckOptionPrompt.cast::<CFString>().as_ref(),
+            kCFBooleanTrue,
+        )
+    }) else {
+        return false;
+    };
     unsafe {
-        let keys = [kAXTrustedCheckOptionPrompt
-            .cast::<CFString>()
-            .as_ref()
-            .unwrap()];
-        let values = [kCFBooleanTrue.unwrap()];
+        let keys = [prompt];
+        let values = [flag];
         let opts = CFDictionary::from_slices(&keys, &values);
         AXIsProcessTrustedWithOptions((&raw const *opts).cast())
     }

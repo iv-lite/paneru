@@ -1041,6 +1041,12 @@ impl LayoutStrip {
         self.columns.iter().filter_map(Column::top).collect()
     }
 
+    /// First column top without allocating the whole tops vector: for
+    /// single-probe call sites (`or_else` fallbacks) that only need one.
+    pub fn first_top(&self) -> Option<Entity> {
+        self.columns.iter().find_map(Column::top)
+    }
+
     pub fn id(&self) -> WorkspaceId {
         self.id
     }

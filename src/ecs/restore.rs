@@ -56,7 +56,12 @@ pub(super) fn tick_restore_grace(
     session.timer.tick(time.delta());
     if session.timer.is_finished() {
         info!("Session restore grace period ended");
-        if config.restore_missing_windows() == MissingWindowBehavior::Drop {
+        // A crashed previous boot must not prune: slow relaunchers are
+        // still coming up, and dropping their saved windows now would
+        // finish the crash's data loss for it.
+        if crate::ecs::state::PaneruState::take_crash_flag() {
+            warn!("previous session crashed; preserving unlaunched windows instead of pruning");
+        } else if config.restore_missing_windows() == MissingWindowBehavior::Drop {
             // Drop saved windows whose app never opened: without this the
             // stale entries (with their cached displays) sit in the file
             // until the next save and can resurrect across a crash before
@@ -88,6 +93,9 @@ pub(crate) struct CurrentWindowIdentity {
     pub identifier: String,
     pub role: String,
     pub subrole: String,
+    /// Live layout-frame center for geometry tie-breaking. `None` when the
+    /// window has no placed frame (or in tests that predate it).
+    pub frame_center: Option<(i32, i32)>,
 }
 
 impl CurrentWindowIdentity {
@@ -106,6 +114,7 @@ impl CurrentWindowIdentity {
             identifier: "main".to_string(),
             role: "AXWindow".to_string(),
             subrole: "AXStandardWindow".to_string(),
+            frame_center: None,
         }
     }
 }
@@ -298,9 +307,35 @@ impl<'a> RestorePlanner<'a> {
                 plan.ignored_missing_windows += 1;
                 None
             }
-            _ => {
-                plan.skipped_ambiguous_matches += 1;
-                None
+            // Duplicate titles (two terminals, two editors): break the tie
+            // by saved geometry — the live window nearest the saved frame
+            // center wins. Requires both sides to carry frames; otherwise
+            // the match stays ambiguous and is skipped as before.
+            ambiguous => {
+                let saved_center = saved.frame.as_ref().map(|frame| {
+                    (
+                        i32::midpoint(frame.min_x, frame.max_x),
+                        i32::midpoint(frame.min_y, frame.max_y),
+                    )
+                });
+                let best = saved_center.and_then(|(sx, sy)| {
+                    ambiguous
+                        .iter()
+                        .filter_map(|window| {
+                            window
+                                .frame_center
+                                .map(|(x, y)| (window, (x - sx).abs() + (y - sy).abs()))
+                        })
+                        .min_by_key(|(_, distance)| *distance)
+                        .map(|(window, _)| *window)
+                });
+                if let Some(window) = best {
+                    plan.consumed_entities.insert(window.entity);
+                    Some(window.entity)
+                } else {
+                    plan.skipped_ambiguous_matches += 1;
+                    None
+                }
             }
         }
     }
@@ -648,6 +683,10 @@ fn current_window_identities(
                 identifier: String::new(),
                 role: String::new(),
                 subrole: String::new(),
+                frame_center: windows.frame(entity).map(|frame| {
+                    let center = frame.center();
+                    (center.x, center.y)
+                }),
             })
         })
         .collect::<Vec<_>>();

@@ -57,17 +57,19 @@ use objc2_core_foundation::CFRetained;
 use tracing::{debug, trace};
 
 use crate::manager::enhanced_ui_workaround_absent;
-use crate::manager::{Origin, Window, ax_set_window_position};
+use crate::manager::{Origin, Size, Window, ax_set_window_position, ax_set_window_size};
 use crate::platform::WinID;
 use crate::util::AXUIWrapper;
 
-/// One async position write: latest per window wins on drain. `epoch`
-/// tags the commit frame that issued it, so whole-frame convergence stays
-/// observable even though jobs drain latest-per-window.
+/// One async write: a position move, a resize, or both (merged on drain).
+/// Latest per window wins on drain. `epoch` tags the commit frame that
+/// issued it, so whole-frame convergence stays observable even though
+/// jobs drain latest-per-window.
 pub(crate) struct AxWriteJob {
     pub win_id: WinID,
     pub element: CFRetained<AXUIWrapper>,
-    pub origin: Origin,
+    pub origin: Option<Origin>,
+    pub size: Option<Size>,
     pub h_pad: i32,
     pub v_pad: i32,
     pub seq: u64,
@@ -391,7 +393,22 @@ impl AxWriteState {
 /// Folds one drain batch to latest-per-window: intermediate lerp steps
 /// collapse, and a homing re-push simply supersedes whatever is queued.
 fn coalesce_jobs(jobs: &mut HashMap<WinID, AxWriteJob>, job: AxWriteJob) {
-    jobs.insert(job.win_id, job);
+    // Merge, don't replace: a move and a resize for one window issued on
+    // the same tick are independent intents — latest of each kind wins,
+    // and the ack covers both with the newest sequence.
+    jobs.entry(job.win_id)
+        .and_modify(|old| {
+            if job.origin.is_some() {
+                old.origin = job.origin;
+            }
+            if job.size.is_some() {
+                old.size = job.size;
+            }
+            old.seq = old.seq.max(job.seq);
+            old.epoch = old.epoch.max(job.epoch);
+            old.priority = old.priority || job.priority;
+        })
+        .or_insert(job);
 }
 
 /// Worker main loop: block for the first job (idle costs nothing), drain
@@ -422,8 +439,14 @@ fn run(queue: Receiver<AxWriteJob>, acks: Sender<AxWriteAck>) {
         let mut batch: Vec<_> = batch.into_iter().collect();
         batch.sort_by_key(|(win_id, job)| (!job.priority, *win_id));
         for (win_id, job) in batch {
-            ax_set_window_position(&job.element, job.origin, job.h_pad, job.v_pad);
-            trace!("ax writer: wrote window {win_id} seq {}", job.seq);
+            if let Some(origin) = job.origin {
+                ax_set_window_position(&job.element, origin, job.h_pad, job.v_pad);
+                trace!("ax writer: wrote window {win_id} seq {}", job.seq);
+            }
+            if let Some(size) = job.size {
+                ax_set_window_size(&job.element, size, job.h_pad, job.v_pad);
+                trace!("ax writer: resized window {win_id} seq {}", job.seq);
+            }
             // Best effort: if the main thread stopped draining (shutdown,
             // wedged pump), the writer must degrade to dropping completions
             // — never wedge itself behind a full ack channel. A dropped ack
@@ -443,14 +466,31 @@ fn run(queue: Receiver<AxWriteJob>, acks: Sender<AxWriteAck>) {
 /// map lives in `register_systems` (`AxWriteState` init) so the harness —
 /// which never spawns threads — shares the same resource path. Call once
 /// at startup (never in tests).
-pub(crate) fn spawn_ax_writer() -> (AxWriterQueue, AxWriteInbox) {
+pub(crate) fn spawn_ax_writer() -> Option<(AxWriterQueue, AxWriteInbox)> {
     let (job_tx, job_rx) = bounded(AX_WRITER_QUEUE_CAP);
     let (ack_tx, ack_rx) = bounded(AX_WRITER_QUEUE_CAP);
-    std::thread::Builder::new()
+    // Thread exhaustion (FD/memory pressure) degrades to the synchronous
+    // commit path — which the harness exercises exclusively — instead of
+    // panicking startup.
+    let result = std::thread::Builder::new()
         .name("paneru-ax-write".to_string())
-        .spawn(move || run(job_rx, ack_tx))
-        .expect("spawning the ax writer thread");
-    (AxWriterQueue(job_tx), AxWriteInbox(ack_rx))
+        .spawn(move || {
+            // A worker panic must degrade to synchronous commits, never
+            // abort the daemon: the queue senders just start failing and
+            // every commit falls back.
+            if std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| run(job_rx, ack_tx)))
+                .is_err()
+            {
+                tracing::error!("ax writer thread panicked; commits fall back to synchronous path");
+            }
+        });
+    match result {
+        Ok(_) => Some((AxWriterQueue(job_tx), AxWriteInbox(ack_rx))),
+        Err(err) => {
+            tracing::error!("spawning the ax writer thread: {err}; using synchronous commits");
+            None
+        }
+    }
 }
 
 /// How long the main thread waits for a drain when it must observe quiesced
@@ -529,7 +569,8 @@ pub(crate) fn push_position(
     let job = AxWriteJob {
         win_id: window.id(),
         element,
-        origin: target,
+        origin: Some(target),
+        size: None,
         h_pad: window.horizontal_padding(),
         v_pad: window.vertical_padding(),
         seq,
@@ -575,6 +616,63 @@ pub(crate) fn push_position_sync(
     window.reposition(target);
     state.record_sent(window.id(), target);
     PushOutcome::Sent
+}
+
+/// Routes one resize through the single-writer discipline: async size job
+/// while the tween is driving (one write, no reads — the fast path), when
+/// the flag is on and the window is servable; synchronous
+/// [`WindowApi::resize_fast`] otherwise. Settled resizes keep the full
+/// staged path on the caller (confirmatory reads stay main-thread).
+/// Shares the window's sequence/ack accounting with position pushes: both
+/// intents converge under one ack.
+pub(crate) fn push_size(
+    window: &mut Window,
+    target: Size,
+    queue: Option<&AxWriterQueue>,
+    state: &mut AxWriteState,
+    enabled: bool,
+    epoch: u64,
+    priority: bool,
+) -> PushOutcome {
+    let async_job = enabled
+        .then(|| {
+            window
+                .element()
+                .zip(window.pid().ok())
+                .filter(|(_, pid)| enhanced_ui_workaround_absent(*pid))
+        })
+        .flatten();
+    let Some((element, _)) = async_job else {
+        window.resize_fast(target);
+        return PushOutcome::Sent;
+    };
+    let Some(queue) = queue else {
+        window.resize_fast(target);
+        return PushOutcome::Sent;
+    };
+    let seq = state.issue(window.id(), epoch);
+    let job = AxWriteJob {
+        win_id: window.id(),
+        element,
+        origin: None,
+        size: Some(target),
+        h_pad: window.horizontal_padding(),
+        v_pad: window.vertical_padding(),
+        seq,
+        epoch,
+        priority,
+    };
+    match queue.0.try_send(job) {
+        Ok(()) => PushOutcome::Sent,
+        Err(TrySendError::Full(_) | TrySendError::Disconnected(_)) => {
+            state.acknowledge(window.id(), seq, epoch);
+            debug!(
+                "ax writer: queue full, dropped superseded resize for window {}",
+                window.id()
+            );
+            PushOutcome::DroppedFull
+        }
+    }
 }
 
 #[cfg(test)]

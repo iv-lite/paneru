@@ -262,7 +262,11 @@ impl MenuBarManager {
         width_header.setEnabled(false);
         for &percentage in widths {
             let item = self.add_item(&format!("{percentage}%"), Some(sel!(setWidth:)));
-            item.setTag(isize::try_from(percentage).expect("width percentage fits in isize"));
+            // Percentages are small constants; an overflow skips the tag
+            // instead of panicking menu construction.
+            if let Ok(tag) = isize::try_from(percentage) {
+                item.setTag(tag);
+            }
             self.managed_window_items.push(item.clone());
             self.width_items.push((percentage, item));
         }

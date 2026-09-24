@@ -10,6 +10,7 @@ use tracing::{error, warn};
 use tracing_subscriber::{EnvFilter, fmt, prelude::*};
 
 mod accessibility_prompt;
+mod ax_reads;
 mod ax_writer;
 mod client;
 mod commands;
@@ -192,12 +193,21 @@ fn main() -> Result<()> {
                 .with_level(true)
                 .with_line_number(true)
                 .with_file(true)
-                .with_target(true)
                 .with_thread_ids(false)
                 .with_writer(std::io::stderr)
                 .compact(),
         )
         .init();
+
+    // Crash marker: a panic anywhere (daemon or worker thread) records that
+    // the last session did not exit cleanly, so the next boot preserves
+    // unlaunched windows instead of pruning them as stale. Best effort —
+    // a failed write just loses the signal, never the boot.
+    let default_hook = std::panic::take_hook();
+    std::panic::set_hook(Box::new(move |info| {
+        crate::ecs::state::PaneruState::mark_crashed();
+        default_hook(info);
+    }));
 
     let service = || service::Service::try_new(service::ID);
 
@@ -256,7 +266,10 @@ fn main() -> Result<()> {
 }
 
 fn wait_for_accessibility(sender: EventSender, receiver: &Receiver<Event>) -> bool {
-    let mut platform_callbacks = PlatformCallbacks::new(sender.clone());
+    let Some(mut platform_callbacks) = PlatformCallbacks::new(sender.clone()) else {
+        error!("platform callbacks require the main thread; cannot continue");
+        return false;
+    };
     let _menu_bar =
         MenuBarManager::new_accessibility_required(platform_callbacks.main_thread_marker, sender);
 

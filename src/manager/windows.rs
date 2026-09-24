@@ -198,6 +198,29 @@ pub(crate) fn ax_set_window_position(
     };
 }
 
+/// Fire-and-forget size write for the AX writer thread: one `kAXSize`
+/// write, no reads, no cache mutation (the worker owns no truth — the
+/// commit's next pass confirms). Dance apps never reach here (routed
+/// synchronous by the push sites, like positions).
+pub(crate) fn ax_set_window_size(element: &AXUIWrapper, size: Size, h_pad: i32, v_pad: i32) {
+    let mut cgsize = CGSize::new(f64::from(size.x - 2 * h_pad), f64::from(size.y - 2 * v_pad));
+    let size_ref = unsafe {
+        AXValueCreate(
+            kAXValueTypeCGSize,
+            NonNull::from(&mut cgsize).as_ptr().cast(),
+        )
+    };
+    if let Ok(size_value) = AXUIWrapper::retain(size_ref) {
+        unsafe {
+            AXUIElementSetAttributeValue(
+                element.as_ptr(),
+                CFString::from_static_str(kAXSizeAttribute).as_ref(),
+                size_value.as_ref(),
+            )
+        };
+    }
+}
+
 /// Whether `pid` is known to NOT need the `AXEnhancedUserInterface`
 /// workaround (observed absent on an earlier write). The writer thread
 /// serves only such apps async; everyone else stays synchronous on the
@@ -446,11 +469,10 @@ impl WindowOS {
             .is_ok_and(|v| CFBoolean::value(&v));
         if enabled {
             unsafe {
-                AXUIElementSetAttributeValue(
-                    app_element.as_ptr(),
-                    attr.as_ref(),
-                    kCFBooleanFalse.unwrap(),
-                );
+                let Some(flag) = kCFBooleanFalse else {
+                    return;
+                };
+                AXUIElementSetAttributeValue(app_element.as_ptr(), attr.as_ref(), flag);
             }
             // Incremented rather than set: two windows of the same app can race
             // here and both owe a matching `reenable_enhanced_ui`; setting 1
@@ -493,11 +515,10 @@ impl WindowOS {
         if let Some(app_element) = self.app_reference() {
             let attr = CFString::from_static_str("AXEnhancedUserInterface");
             unsafe {
-                AXUIElementSetAttributeValue(
-                    app_element.as_ptr(),
-                    attr.as_ref(),
-                    kCFBooleanTrue.unwrap(),
-                );
+                let Some(flag) = kCFBooleanTrue else {
+                    return;
+                };
+                AXUIElementSetAttributeValue(app_element.as_ptr(), attr.as_ref(), flag);
             }
         }
     }

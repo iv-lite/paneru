@@ -533,14 +533,27 @@ impl AxObserverHandler {
         notifications: &[&'static str],
         which: ObserverType,
     ) -> Result<Vec<&str>> {
+        // `kAXErrorCannotComplete` is transient (app mid-launch, AX storm):
+        // retry with growing backoff before reporting. Bounded and quick —
+        // this runs on the main thread, so a hung app must never wedge it.
+        const REGISTER_RETRIES: u32 = 3;
+        const REGISTER_BACKOFF_MS: u64 = 50;
         let observer: AXObserverRef = self.observer.as_ptr();
         let context_ptr = self.get_or_insert_context(which).as_ptr();
 
-        // TODO: retry re-registering these.
-        let mut retry = vec![];
-        let added = notifications
-            .iter()
-            .filter_map(|name| {
+        let mut pending: Vec<&'static str> = notifications.to_vec();
+        let mut added: Vec<&'static str> = Vec::new();
+        for attempt in 0..=REGISTER_RETRIES {
+            if pending.is_empty() {
+                break;
+            }
+            if attempt > 0 {
+                std::thread::sleep(std::time::Duration::from_millis(
+                    REGISTER_BACKOFF_MS << (attempt - 1).min(4),
+                ));
+            }
+            let mut retry = vec![];
+            for name in pending.drain(..) {
                 debug!("adding {name} {element:x?} {observer:?}");
                 let notification = CFString::from_static_str(name);
                 match unsafe {
@@ -552,25 +565,27 @@ impl AxObserverHandler {
                     )
                 } {
                     accessibility_sys::kAXErrorSuccess
-                    | accessibility_sys::kAXErrorNotificationAlreadyRegistered => Some(*name),
+                    | accessibility_sys::kAXErrorNotificationAlreadyRegistered => added.push(name),
                     accessibility_sys::kAXErrorCannotComplete => {
-                        retry.push(*name);
-                        None
+                        retry.push(name);
                     }
                     result => {
                         error!("error adding {name} {element:x?} {observer:?}: {result}");
-                        None
                     }
                 }
-            })
-            .collect::<Vec<_>>();
+            }
+            pending = retry;
+        }
         if added.is_empty() {
-            Err(Error::PermissionDenied(format!(
-                "{}: unable to register any observers!",
+            Err(Error::Unavailable(format!(
+                "{}: unable to register any observers after retries!",
                 function_name!()
             )))
         } else {
-            Ok(retry)
+            if !pending.is_empty() {
+                debug!("observer registration still pending after retries: {pending:?}");
+            }
+            Ok(pending)
         }
     }
 

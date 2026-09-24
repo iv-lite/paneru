@@ -79,7 +79,10 @@ fn apply(
 
     match op {
         LayoutOp::Focus(_) => {
-            let entity = entity.expect("Focus names a window");
+            let Some(entity) = entity else {
+                debug!(target: "paneru::lua", "skipping {op:?}: no live window target");
+                return;
+            };
             commands.trigger(FocusWindow {
                 entity,
                 raise: true,
@@ -87,7 +90,10 @@ fn apply(
         }
 
         LayoutOp::Swap(_, other) => {
-            let entity = entity.expect("Swap names a window");
+            let Some(entity) = entity else {
+                debug!(target: "paneru::lua", "skipping {op:?}: no live window target");
+                return;
+            };
             let Some((_, other_entity)) = windows.find(other) else {
                 debug!(target: "paneru::lua", "skipping {op:?}: window {other} is gone");
                 return;
@@ -110,7 +116,10 @@ fn apply(
         LayoutOp::MoveToWorkspace {
             workspace, follow, ..
         } => {
-            let entity = entity.expect("MoveToWorkspace names a window");
+            let Some(entity) = entity else {
+                debug!(target: "paneru::lua", "skipping {op:?}: no live window target");
+                return;
+            };
             // Virtual workspaces are numbered from one for a script and from
             // zero inside the layout.
             let Some(target_virtual_index) = workspace.checked_sub(1) else {
@@ -140,7 +149,10 @@ fn apply(
         }
 
         LayoutOp::SetFloating { floating, .. } => {
-            let entity = entity.expect("SetFloating names a window");
+            let Some(entity) = entity else {
+                debug!(target: "paneru::lua", "skipping {op:?}: no live window target");
+                return;
+            };
             if floating {
                 floated.insert(entity);
             } else {
@@ -150,7 +162,10 @@ fn apply(
         }
 
         LayoutOp::SetManaged { managed, .. } => {
-            let entity = entity.expect("SetManaged names a window");
+            let Some(entity) = entity else {
+                debug!(target: "paneru::lua", "skipping {op:?}: no live window target");
+                return;
+            };
             if managed {
                 floated.remove(&entity);
             } else {
@@ -160,7 +175,10 @@ fn apply(
         }
 
         LayoutOp::SetWidth { ratio, .. } => {
-            let entity = entity.expect("SetWidth names a window");
+            let Some(entity) = entity else {
+                debug!(target: "paneru::lua", "skipping {op:?}: no live window target");
+                return;
+            };
             if !ratio.is_finite() || ratio <= 0.0 {
                 debug!(target: "paneru::lua", "skipping {op:?}: a width ratio must be positive");
                 return;
@@ -205,7 +223,10 @@ fn apply(
         }
 
         LayoutOp::SetFrame { frame, .. } => {
-            let entity = entity.expect("SetFrame names a window");
+            let Some(entity) = entity else {
+                debug!(target: "paneru::lua", "skipping {op:?}: no live window target");
+                return;
+            };
             // The layout engine owns a tiled window's geometry and will move
             // it back, so warn if the target isn't floated.
             if !floated.contains(&entity)
@@ -225,7 +246,10 @@ fn apply(
         }
 
         LayoutOp::Stack { onto, .. } => {
-            let entity = entity.expect("Stack names a window");
+            let Some(entity) = entity else {
+                debug!(target: "paneru::lua", "skipping {op:?}: no live window target");
+                return;
+            };
             let Some((_, onto_entity)) = windows.find(onto) else {
                 debug!(target: "paneru::lua", "skipping {op:?}: window {onto} is gone");
                 return;
@@ -245,7 +269,10 @@ fn apply(
         }
 
         LayoutOp::Unstack(_) => {
-            let entity = entity.expect("Unstack names a window");
+            let Some(entity) = entity else {
+                debug!(target: "paneru::lua", "skipping {op:?}: no live window target");
+                return;
+            };
             let Some((mut strip, _)) = workspaces
                 .iter_mut()
                 .find(|(strip, _)| strip.contains(entity))

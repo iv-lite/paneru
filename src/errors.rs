@@ -17,6 +17,10 @@ pub enum Error {
     NotFound(String),
     /// Indicates a permission error.
     PermissionDenied(String),
+    /// A transient failure that a retry may heal (observer registration,
+    /// AX round-trips under storm). Callers should back off and retry
+    /// rather than treat this as permanent.
+    Unavailable(String),
     /// Indicates a problem with input.
     InvalidInput(String),
     /// Represents an I/O error, typically from `std::io::Error`.
@@ -50,6 +54,7 @@ impl Display for Error {
             Error::ConfigurationWatcher(msg) => format!("Watching config file: {msg}"),
             Error::NotFound(msg) => format!("Not found: {msg}"),
             Error::PermissionDenied(msg) => format!("Permission denied: {msg}"),
+            Error::Unavailable(msg) => format!("Temporarily unavailable: {msg}"),
             Error::InvalidInput(msg) => format!("Invalid input: {msg}"),
             Error::IO(msg) => format!("IO error: {msg}"),
             Error::Generic(msg) => format!("Generic error: {msg}"),

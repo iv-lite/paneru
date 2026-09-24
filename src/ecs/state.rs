@@ -350,6 +350,14 @@ impl PaneruState {
         if let Some(parent) = path.parent() {
             fs::create_dir_all(parent)?;
         }
+        // Rotate one backup generation first: tmp+rename is atomic, but it
+        // happily persists a *degraded* snapshot over a good one (crashed
+        // boot, partial restore). The previous generation stays loadable.
+        let backup_path = path.with_extension("json.bak");
+        if path.exists() {
+            // Best effort: a failed rotation must not block the save.
+            let _ = fs::rename(path, &backup_path);
+        }
         let tmp_path = path.with_extension("json.tmp");
         fs::write(&tmp_path, json)?;
         fs::rename(tmp_path, path)?;
@@ -357,11 +365,45 @@ impl PaneruState {
     }
 
     pub fn load_from_file(path: &Path) -> Option<Self> {
+        // Corrupt primary falls back to the backup generation instead of
+        // losing the whole session (any JSON error or version mismatch).
+        Self::load_one_file(path).or_else(|| {
+            let backup_path = path.with_extension("json.bak");
+            if backup_path.exists() {
+                error!("state file unreadable; falling back to backup generation");
+                Self::load_one_file(&backup_path)
+            } else {
+                None
+            }
+        })
+    }
+
+    fn load_one_file(path: &Path) -> Option<Self> {
         let data = fs::read_to_string(path).ok()?;
         let state: Self = serde_json::from_str(&data).ok()?;
         (state.version == SUPPORTED_STATE_VERSION
             || BACKFILL_STATE_VERSIONS.contains(&state.version))
         .then_some(state)
+    }
+
+    /// Path of the crash marker: written by the panic hook, consumed once
+    /// at boot. Lives next to the state file.
+    fn crash_flag_path() -> PathBuf {
+        PaneruState::default_state_file_path().with_extension("crashed")
+    }
+
+    /// Records an unclean shutdown. Best effort by design: called from the
+    /// panic hook, where allocation and I/O may already be compromised —
+    /// a failed write just loses the signal, never the boot.
+    pub fn mark_crashed() {
+        let _ = std::fs::write(PaneruState::crash_flag_path(), "crashed");
+    }
+
+    /// Consumes the crash marker: true when the previous session panicked
+    /// instead of exiting cleanly.
+    pub fn take_crash_flag() -> bool {
+        let path = PaneruState::crash_flag_path();
+        path.exists() && std::fs::remove_file(path).is_ok()
     }
 
     /// Drops saved windows whose application was never observed (bundle id
@@ -441,9 +483,11 @@ impl PaneruState {
     }
 
     pub fn default_state_file_path() -> PathBuf {
+        // No HOME/XDG (broken sandbox, launchd edge): degrade to tmp
+        // instead of panicking — state just won't persist the session.
         xdg::BaseDirectories::with_prefix("paneru")
             .get_state_file(STATE_FILE_NAME)
-            .expect("XDG state directory should be available")
+            .unwrap_or_else(|| std::env::temp_dir().join("paneru").join(STATE_FILE_NAME))
     }
 }
 
@@ -922,5 +966,38 @@ pub fn cleanup_on_exit(
         if let Err(e) = state.save_to_file(&path) {
             error!("Failed to save state on exit: {e}");
         }
+    }
+}
+
+#[cfg(test)]
+mod state_file_tests {
+    use super::*;
+
+    fn minimal_state() -> PaneruState {
+        PaneruState {
+            version: SUPPORTED_STATE_VERSION,
+            timestamp: 1,
+            active_display_id: None,
+            displays: Vec::new(),
+            workspaces: Vec::new(),
+        }
+    }
+
+    #[test]
+    fn corrupt_primary_falls_back_to_backup() {
+        let dir = std::env::temp_dir().join("paneru-state-backup-test");
+        std::fs::create_dir_all(&dir).expect("test dir");
+        let path = dir.join("state.json");
+        // Two saves so a backup generation exists.
+        let state = minimal_state();
+        state.save_to_file(&path).expect("first save");
+        state
+            .save_to_file(&path)
+            .expect("second save rotates a backup");
+        // Corrupt the primary: the backup generation must still load.
+        std::fs::write(&path, "not json").expect("corrupt primary");
+        let loaded = PaneruState::load_from_file(&path).expect("backup generation loads");
+        assert_eq!(loaded.version, SUPPORTED_STATE_VERSION);
+        std::fs::remove_dir_all(&dir).ok();
     }
 }

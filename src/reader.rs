@@ -53,7 +53,17 @@ impl CommandReader {
                 let mut requests = std::pin::pin!(receiver);
                 while let Some(delivery) = requests.next().await {
                     match delivery {
-                        Ok(delivery) => self.dispatch(delivery),
+                        Ok(delivery) => {
+                            // One bad request must not kill the reader: a
+                            // panicking dispatch is logged and skipped.
+                            let result =
+                                std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                                    self.dispatch(delivery);
+                                }));
+                            if result.is_err() {
+                                error!("request dispatch panicked; skipping");
+                            }
+                        }
                         // A request that fails to decode is a bad client, not a
                         // reason to stop serving.
                         Err(err) => warn!("reading request: {err}"),

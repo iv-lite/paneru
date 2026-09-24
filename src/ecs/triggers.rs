@@ -916,7 +916,7 @@ pub(super) fn window_minimized_trigger(
     trigger: On<Add, Unmanaged>,
     windows: Windows,
     workspaces: Query<(&mut LayoutStrip, Has<ActiveWorkspaceMarker>)>,
-    active_display: Single<&Display, With<ActiveDisplayMarker>>,
+    active_display: Option<Single<&Display, With<ActiveDisplayMarker>>>,
     mut config: GlobalState,
     mut commands: Commands,
 ) {
@@ -925,10 +925,12 @@ pub(super) fn window_minimized_trigger(
         windows.get_managed(entity)
     {
         debug!("Entity {entity} is minimized or hidden.");
-        let display_bounds = active_display.bounds();
+        // No active display (mid-reconfigure): still eject from the strip,
+        // just skip the focus handoff that needs viewport geometry.
+        let display_bounds = active_display.map(|display| display.bounds());
 
         for (mut strip, active) in workspaces {
-            if active {
+            if active && let Some(display_bounds) = display_bounds {
                 give_away_focus(
                     entity,
                     &windows,
@@ -947,9 +949,10 @@ pub(super) fn window_minimized_trigger(
 }
 
 #[instrument(level = Level::DEBUG, skip_all, fields(trigger))]
+#[allow(clippy::type_complexity)]
 pub(super) fn window_managed_trigger(
     trigger: On<Remove, Unmanaged>,
-    active_display: Single<(&Display, Option<&DockPosition>), With<ActiveDisplayMarker>>,
+    active_display: Option<Single<(&Display, Option<&DockPosition>), With<ActiveDisplayMarker>>>,
     apps: Query<(Entity, &Application)>,
     mut workspaces: Query<
         (
@@ -980,6 +983,13 @@ pub(super) fn window_managed_trigger(
     }
 
     debug!("Entity {entity} is managed again.");
+    // No active display (mid-reconfigure): placement needs viewport
+    // geometry, so wait for the display set to converge — the audit and
+    // reconcile passes own unplaced windows from there.
+    let Some(active_display) = active_display else {
+        warn!("Entity {entity} managed with no active display; leaving unplaced");
+        return;
+    };
     let (display, dock) = *active_display;
     let display_bounds = display.actual_display_bounds(dock, &ctx.config);
     let mut insert_at = None;

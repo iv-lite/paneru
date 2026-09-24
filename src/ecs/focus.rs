@@ -9,7 +9,7 @@ use bevy::ecs::observer::On;
 use bevy::ecs::query::{Added, Has, Or, With, Without};
 use bevy::ecs::resource::Resource;
 use bevy::ecs::schedule::IntoScheduleConfigs as _;
-use bevy::ecs::system::{Commands, Populated, Query, Res, ResMut, Single};
+use bevy::ecs::system::{Commands, Populated, Query, Res, ResMut};
 use bevy::math::IRect;
 use bevy::prelude::Event as BevyEvent;
 use bevy::time::Time;
@@ -217,16 +217,34 @@ fn shares_a_tab_group(
         })
 }
 
-#[instrument(level = Level::DEBUG, skip_all, fields(focused))]
+#[instrument(level = Level::DEBUG, skip_all)]
 fn clamp_window_size_on_focus(
-    focused: Single<Entity, Added<FocusedMarker>>,
+    arrived: Populated<Entity, Added<FocusedMarker>>,
     mut windows: Query<(&mut Window, &Bounds, Has<ResizeMarker>)>,
     user: Res<UserFocus>,
     press: Res<LastPress>,
     time: Res<Time>,
     mut commands: Commands,
 ) {
-    let Ok((mut window, bounds, resizing)) = windows.get_mut(*focused) else {
+    // Every arrival is handled: a `Single` would panic the daemon on the
+    // two-marker moment of a focus switch (or an empty tick).
+    for focused in &arrived {
+        clamp_one_window(focused, &mut windows, &user, &press, &time, &mut commands);
+    }
+}
+
+/// Single-arrival body of [`clamp_window_size_on_focus`], split so the
+/// caller can iterate every focus arrival without a `Single` panic.
+#[allow(clippy::too_many_arguments)]
+fn clamp_one_window(
+    focused: Entity,
+    windows: &mut Query<(&mut Window, &Bounds, Has<ResizeMarker>)>,
+    user: &UserFocus,
+    press: &LastPress,
+    time: &Time,
+    commands: &mut Commands,
+) {
+    let Ok((mut window, bounds, resizing)) = windows.get_mut(focused) else {
         return;
     };
     if resizing {
@@ -250,7 +268,7 @@ fn clamp_window_size_on_focus(
     // visible on ultrawide viewports. Clamp down only; a click revealing
     // an oversized window still conforms it back to its tile.
     if matches!(
-        focus_cause(&user, &press, time.elapsed(), *focused, window.frame()),
+        focus_cause(user, press, time.elapsed(), focused, window.frame()),
         FocusCause::Press
     ) {
         let grown = Size::new(
@@ -266,7 +284,7 @@ fn clamp_window_size_on_focus(
             frame.size(),
             bounds.0
         );
-        commands.resize_entity(*focused, grown);
+        commands.resize_entity(focused, grown);
         return;
     }
     // Anything larger is never adopted: the tile is the truth, and adopting
@@ -281,12 +299,12 @@ fn clamp_window_size_on_focus(
         frame.size(),
         bounds.0
     );
-    commands.resize_entity(*focused, bounds.0);
+    commands.resize_entity(focused, bounds.0);
 }
 
-#[instrument(level = Level::DEBUG, skip_all, fields(focused))]
+#[instrument(level = Level::DEBUG, skip_all)]
 fn heal_rejected_float(
-    healed: Single<(Entity, Has<crate::ecs::RejectedFloatMarker>), Added<FocusedMarker>>,
+    healed: Populated<(Entity, Has<crate::ecs::RejectedFloatMarker>), Added<FocusedMarker>>,
     mut commands: Commands,
 ) {
     // A rejection float was never user intent — only an app racing the
@@ -294,21 +312,22 @@ fn heal_rejected_float(
     // is still involuntary). Focusing the window is the user asking for it
     // back: drop the float and let `window_managed_trigger` re-tile it
     // instead of stranding it floating until restart. Runs on `Added`, so
-    // the heal itself never refires: no loop.
-    let (entity, rejected) = *healed;
-    if !rejected {
-        return;
-    }
-    debug!("healing rejection-floated window {entity} back into the layout");
-    if let Ok(mut entity_commands) = commands.get_entity(entity) {
-        entity_commands.try_remove::<Unmanaged>();
-        entity_commands.try_remove::<crate::ecs::RejectedFloatMarker>();
+    // the heal itself never refires: no loop. Iterated, never `Single`.
+    for (entity, rejected) in &healed {
+        if !rejected {
+            continue;
+        }
+        debug!("healing rejection-floated window {entity} back into the layout");
+        if let Ok(mut entity_commands) = commands.get_entity(entity) {
+            entity_commands.try_remove::<Unmanaged>();
+            entity_commands.try_remove::<crate::ecs::RejectedFloatMarker>();
+        }
     }
 }
 
-#[instrument(level = Level::DEBUG, skip_all, fields(focused))]
+#[instrument(level = Level::DEBUG, skip_all)]
 fn detect_focus_rejection(
-    focused: Single<Entity, Added<FocusedMarker>>,
+    arrived: Populated<Entity, Added<FocusedMarker>>,
     mut focus_history: ResMut<FocusHistory>,
     mut workspaces: Query<(Entity, &mut LayoutStrip)>,
     windows: Windows,
@@ -317,34 +336,34 @@ fn detect_focus_rejection(
     let Some(target_entity) = focus_history.pending_focus.take() else {
         return;
     };
-    if *focused == target_entity {
-        return;
-    }
+    // Handle every arrival: a `Single` would panic the daemon when focus
+    // lands on two windows in one tick.
+    for focused in &arrived {
+        if focused == target_entity {
+            continue;
+        }
 
-    // Native tabs share one slot: asking for a background tab makes the app
-    // select it, and the focus notification names whichever tab of the group
-    // the app ended up showing. That is the app doing what was asked, not
-    // refusing it — floating the window here is how a tabbed terminal ends up
-    // scattered across the layout as windows nothing tiles.
-    if shares_a_tab_group(&workspaces, &windows, target_entity, *focused) {
-        debug!(
-            "focus landed on tab sibling {} of {target_entity}; not a rejection.",
-            *focused
+        // Native tabs share one slot: asking for a background tab makes the app
+        // select it, and the focus notification names whichever tab of the group
+        // the app ended up showing. That is the app doing what was asked, not
+        // refusing it — floating the window here is how a tabbed terminal ends up
+        // scattered across the layout as windows nothing tiles.
+        if shares_a_tab_group(&workspaces, &windows, target_entity, focused) {
+            debug!("focus landed on tab sibling {focused} of {target_entity}; not a rejection.");
+            continue;
+        }
+
+        warn!(
+            "focus rejection detected: requested {target_entity}, got {focused}. Floating {target_entity} (heals on refocus)."
         );
-        return;
-    }
-
-    warn!(
-        "focus rejection detected: requested {target_entity}, got {}. Floating {target_entity} (heals on refocus).",
-        *focused
-    );
-    if let Ok(mut entity_commands) = commands.get_entity(target_entity) {
-        entity_commands.try_insert(Unmanaged::Floating);
-        entity_commands.try_insert(crate::ecs::RejectedFloatMarker);
-    }
-    for (_, mut strip) in &mut workspaces {
-        if strip.contains(target_entity) {
-            strip.remove(target_entity);
+        if let Ok(mut entity_commands) = commands.get_entity(target_entity) {
+            entity_commands.try_insert(Unmanaged::Floating);
+            entity_commands.try_insert(crate::ecs::RejectedFloatMarker);
+        }
+        for (_, mut strip) in &mut workspaces {
+            if strip.contains(target_entity) {
+                strip.remove(target_entity);
+            }
         }
     }
 }
@@ -445,7 +464,7 @@ fn strip_at_target(current: Origin, target: Origin, flying_to: Option<Origin>) -
 }
 
 fn autocenter_window_on_focus(
-    focused: Single<Entity, Added<FocusedMarker>>,
+    arrived: Populated<Entity, Added<FocusedMarker>>,
     guards: FocusArrivalGuards<'_, '_>,
     strips: Query<(Entity, &LayoutStrip)>,
     global_state: GlobalState,
@@ -453,123 +472,126 @@ fn autocenter_window_on_focus(
     intent: FocusIntent<'_>,
     mut ctx: WindowCtx,
 ) {
-    let entity = *focused;
-
-    // Skip auto-centering when this focus came from a workspace restore, since
-    // the strip is already at its saved origin. window_focused_trigger and
-    // timeout_ticker are responsible for clearing the marker.
-    if guards.restored.iter().any(|marker| marker.entity == entity) {
-        return;
-    }
-
-    if global_state.skip_reshuffle() || global_state.initializing() || !guards.mouse_held.is_empty()
-    {
-        return;
-    }
-    if active_display.active_strip().tabbed(entity) {
-        return;
-    }
-    // Ambient OS focus (self-raise, notification steal, front-switch) must
-    // not rearrange the strip: refocus and reveal still run (marker move,
-    // `ensure_focused_visible` below), but centering and reshuffling belong
-    // to user intent only.
-    if !ctx.windows.frame(entity).is_some_and(|frame| {
-        user_initiated_focus(
-            &intent.user_focus,
-            &intent.last_press,
-            intent.time.elapsed(),
-            entity,
-            frame,
-        )
-    }) {
-        return;
-    }
-    // Already placed: skip when the strip sits where centering would put
-    // it (or glides there) and the window projects inside the viewport. A
-    // redundant marker would restart the glide, jogging an already-correct
-    // strip on lagged Electron frames — the click-then-focus-echo sequence
-    // lands exactly here. Same 1px quantum as `drop_home`. Measured
-    // against the OWNER viewport, not the active display: the
-    // `ActiveDisplayMarker` can lag a cross-display focus arrival (wrap,
-    // transfer, delayed echo), and clamping one display's sizes against
-    // another's bounds false-negatives into a redundant reshuffle that
-    // scrolls the focused window out of view.
-    if let Some(size) = ctx.windows.size(entity)
-        && let Some(layout) = ctx.windows.layout_position(entity)
-        && let Some((strip_entity, _)) = strips.iter().find(|(_, strip)| strip.contains(entity))
-    {
-        let viewport = owner_viewport(
-            Some(strip_entity),
-            &guards.strip_parents,
-            &guards.display_viewports,
-            &active_display,
-            &ctx.config,
-        );
-        let strip_target = Origin::new(
-            viewport.center().x - size.x / 2 - layout.0.x,
-            viewport.min.y,
-        );
-        let placed = guards
-            .strip_motion
-            .get(strip_entity)
-            .is_ok_and(|(position, marker)| {
-                strip_at_target(position.0, strip_target, marker.map(|m| m.0))
-            });
-        let visible = ctx
-            .windows
-            .frame(entity)
-            .is_some_and(|frame| clamp_origin_to_viewport(frame.min, size, viewport) == frame.min);
-        if placed && visible {
-            return;
+    // Every arrival is centered: a `Single` would panic the daemon on the
+    // two-marker moment of a focus switch (or an empty tick).
+    for entity in &arrived {
+        // Skip auto-centering when this focus came from a workspace restore, since
+        // the strip is already at its saved origin. window_focused_trigger and
+        // timeout_ticker are responsible for clearing the marker.
+        if guards.restored.iter().any(|marker| marker.entity == entity) {
+            continue;
         }
-    }
-    // Center by moving the STRIP, never the window: the focused window keeps
-    // no animation marker of its own, so it rides the strip rigidly with its
-    // siblings (see `ride_strip_motion`) instead of chasing a stale target
-    // while the strip settles underneath it. The window still lands
-    // centered — the centering offset is just expressed in strip space.
-    let mut centered = false;
-    if ctx.config.auto_center()
-        && let Some((_, _, None)) = ctx.windows.get_managed(entity)
-        && let Some(size) = ctx.windows.size(entity)
-        && let Some(layout) = ctx.windows.layout_position(entity)
-        && let Some((strip_entity, _)) = strips.iter().find(|(_, strip)| strip.contains(entity))
-    {
-        // Owner viewport, matching the already-placed check above: the
-        // active marker can lag a cross-display arrival, and centering on
-        // a stale display's bounds scrolls the window out of its own view.
-        let viewport = owner_viewport(
-            Some(strip_entity),
-            &guards.strip_parents,
-            &guards.display_viewports,
-            &active_display,
-            &ctx.config,
-        );
-        let center = viewport.center();
-        // Deliberately unclamped, mirroring `reshuffle_layout_strip`: under
-        // `auto_center` the edge invariant is unenforced (magnetic centering
-        // owns out-of-range offsets), so clamping here would uncenter edge
-        // windows and fight the snap force that keeps them centered.
-        let strip_target = Origin::new(center.x - size.x / 2 - layout.0.x, viewport.min.y);
-        ctx.commands.reposition_entity(strip_entity, strip_target);
-        centered = true;
-    }
-    // A reshuffle already queued (typically the command's own arrival
-    // reshuffle) is measured post-strip-move by the Update layout pass —
-    // stacking a second marker only re-measures the same arrival downstream.
-    // Other focus paths (clicks, hover, OS echoes) arrive with no marker and
-    // reshuffle here as before. Skipped entirely once centering drove the
-    // strip itself: a follow-up reshuffle would overwrite the centering
-    // target with a mere expose offset. Plain (not forced): a forced
-    // re-clamp would discard a deliberate `ManualStripOffset` centering on
-    // every refocus — vacated-slot closing on detach paths is already
-    // forced at the detach site itself. Lagged Electron echoes are already
-    // absorbed by the already-placed check above (same 1px quantum), so
-    // this stays unconditional: gating it on window flight broke setup
-    // centering, where the initial placement glide is still in flight when
-    // focus arrives.
-    if !centered && !guards.reshuffling.contains(entity) {
-        ctx.commands.reshuffle_around(entity);
+
+        if global_state.skip_reshuffle()
+            || global_state.initializing()
+            || !guards.mouse_held.is_empty()
+        {
+            continue;
+        }
+        if active_display.active_strip().tabbed(entity) {
+            continue;
+        }
+        // Ambient OS focus (self-raise, notification steal, front-switch) must
+        // not rearrange the strip: refocus and reveal still run (marker move,
+        // `ensure_focused_visible` below), but centering and reshuffling belong
+        // to user intent only.
+        if !ctx.windows.frame(entity).is_some_and(|frame| {
+            user_initiated_focus(
+                &intent.user_focus,
+                &intent.last_press,
+                intent.time.elapsed(),
+                entity,
+                frame,
+            )
+        }) {
+            continue;
+        }
+        // Already placed: skip when the strip sits where centering would put
+        // it (or glides there) and the window projects inside the viewport. A
+        // redundant marker would restart the glide, jogging an already-correct
+        // strip on lagged Electron frames — the click-then-focus-echo sequence
+        // lands exactly here. Same 1px quantum as `drop_home`. Measured
+        // against the OWNER viewport, not the active display: the
+        // `ActiveDisplayMarker` can lag a cross-display focus arrival (wrap,
+        // transfer, delayed echo), and clamping one display's sizes against
+        // another's bounds false-negatives into a redundant reshuffle that
+        // scrolls the focused window out of view.
+        if let Some(size) = ctx.windows.size(entity)
+            && let Some(layout) = ctx.windows.layout_position(entity)
+            && let Some((strip_entity, _)) = strips.iter().find(|(_, strip)| strip.contains(entity))
+        {
+            let viewport = owner_viewport(
+                Some(strip_entity),
+                &guards.strip_parents,
+                &guards.display_viewports,
+                &active_display,
+                &ctx.config,
+            );
+            let strip_target = Origin::new(
+                viewport.center().x - size.x / 2 - layout.0.x,
+                viewport.min.y,
+            );
+            let placed = guards
+                .strip_motion
+                .get(strip_entity)
+                .is_ok_and(|(position, marker)| {
+                    strip_at_target(position.0, strip_target, marker.map(|m| m.0))
+                });
+            let visible = ctx.windows.frame(entity).is_some_and(|frame| {
+                clamp_origin_to_viewport(frame.min, size, viewport) == frame.min
+            });
+            if placed && visible {
+                continue;
+            }
+        }
+        // Center by moving the STRIP, never the window: the focused window keeps
+        // no animation marker of its own, so it rides the strip rigidly with its
+        // siblings (see `ride_strip_motion`) instead of chasing a stale target
+        // while the strip settles underneath it. The window still lands
+        // centered — the centering offset is just expressed in strip space.
+        let mut centered = false;
+        if ctx.config.auto_center()
+            && let Some((_, _, None)) = ctx.windows.get_managed(entity)
+            && let Some(size) = ctx.windows.size(entity)
+            && let Some(layout) = ctx.windows.layout_position(entity)
+            && let Some((strip_entity, _)) = strips.iter().find(|(_, strip)| strip.contains(entity))
+        {
+            // Owner viewport, matching the already-placed check above: the
+            // active marker can lag a cross-display arrival, and centering on
+            // a stale display's bounds scrolls the window out of its own view.
+            let viewport = owner_viewport(
+                Some(strip_entity),
+                &guards.strip_parents,
+                &guards.display_viewports,
+                &active_display,
+                &ctx.config,
+            );
+            let center = viewport.center();
+            // Deliberately unclamped, mirroring `reshuffle_layout_strip`: under
+            // `auto_center` the edge invariant is unenforced (magnetic centering
+            // owns out-of-range offsets), so clamping here would uncenter edge
+            // windows and fight the snap force that keeps them centered.
+            let strip_target = Origin::new(center.x - size.x / 2 - layout.0.x, viewport.min.y);
+            ctx.commands.reposition_entity(strip_entity, strip_target);
+            centered = true;
+        }
+        // A reshuffle already queued (typically the command's own arrival
+        // reshuffle) is measured post-strip-move by the Update layout pass —
+        // stacking a second marker only re-measures the same arrival downstream.
+        // Other focus paths (clicks, hover, OS echoes) arrive with no marker and
+        // reshuffle here as before. Skipped entirely once centering drove the
+        // strip itself: a follow-up reshuffle would overwrite the centering
+        // target with a mere expose offset. Plain (not forced): a forced
+        // re-clamp would discard a deliberate `ManualStripOffset` centering on
+        // every refocus — vacated-slot closing on detach paths is already
+        // forced at the detach site itself. Lagged Electron echoes are already
+        // absorbed by the already-placed check above (same 1px quantum), so
+        // this stays unconditional: gating it on window flight broke setup
+        // centering, where the initial placement glide is still in flight when
+        // focus arrives.
+        if !centered && !guards.reshuffling.contains(entity) {
+            ctx.commands.reshuffle_around(entity);
+        }
     }
 }
 
@@ -643,7 +665,7 @@ const DEFER_EXPOSE_TIMEOUT: Duration = Duration::from_secs(2);
 #[allow(clippy::too_many_arguments)]
 #[instrument(level = Level::DEBUG, skip_all)]
 fn ensure_focused_visible(
-    focused: Single<Entity, Added<FocusedMarker>>,
+    arrived: Populated<Entity, Added<FocusedMarker>>,
     windows: Windows,
     mouse_held: Query<&MouseHeldMarker>,
     restored: Query<&RestoreFocusMarker>,
@@ -662,97 +684,102 @@ fn ensure_focused_visible(
 ) {
     use crate::ecs::layout::clamp_origin_to_viewport;
 
-    let entity = *focused;
-    if global_state.initializing() || !mouse_held.is_empty() {
-        return;
-    }
-    if restored.iter().any(|marker| marker.entity == entity) {
-        return;
-    }
-    let owner = strips
-        .iter()
-        .find(|(_, strip, _, _, _, _)| strip.contains(entity));
-    if let Some((_, _, _, _, previous_position, snap_settling)) = owner {
-        // A restore owns this strip: the pre-show tick still parks the
-        // previous position, snap restores guard, refocuses guard. A focus
-        // arrival never carries any of these, so reaching past here means
-        // nobody else will expose the window.
-        if previous_position || snap_settling {
-            return;
+    // Every arrival is exposed: a `Single` would panic the daemon on the
+    // two-marker moment of a focus switch (or an empty tick).
+    for entity in &arrived {
+        if global_state.initializing() || !mouse_held.is_empty() {
+            continue;
         }
-    }
-    // At rest only: a window or strip mid-animation is on its way somewhere
-    // else, and exposing its transient frame perturbs the motion's own
-    // trajectory (boot layout, swipe momentum, restores).
-    if flight
-        .get(entity)
-        .is_ok_and(|(repositioning, resizing, drive)| {
-            repositioning || resizing || drive.as_ref().is_some_and(|drive| drive.is_verifying())
-        })
-    {
-        return;
-    }
-    if owner
-        .is_some_and(|(_, _, strip_flight, strip_scrolling, _, _)| strip_flight || strip_scrolling)
-    {
-        return;
-    }
-    let tabbed = owner.map_or_else(
-        || active_display.active_strip().tabbed(entity),
-        |(_, strip, _, _, _, _)| strip.tabbed(entity),
-    );
-    if tabbed {
-        return;
-    }
-    // Transient presented frame: an async write is still converging, so the
-    // frame below is stale truth — exposing now scrolls the settled window
-    // out (wrap-back hover on a lagged Electron frame lands exactly here).
-    // Defer for the followup instead of dropping: `Added<FocusedMarker>`
-    // fires once, and the followup retries until the write lands or ages
-    // out into snapshot verify.
-    if windows
-        .get(entity)
-        .is_some_and(|window| write_state.unacked_live(window.id()))
-    {
-        if let Ok(mut entity_commands) = commands.get_entity(entity) {
-            entity_commands.try_insert(DeferredExposeMarker {
-                deadline: time.elapsed() + DEFER_EXPOSE_TIMEOUT,
-            });
+        if restored.iter().any(|marker| marker.entity == entity) {
+            continue;
         }
-        return;
-    }
-    let (Some(frame), Some(size)) = (windows.moving_frame(entity), windows.size(entity)) else {
-        return;
-    };
-    let viewport = owner_viewport(
-        owner.map(|(entity, _, _, _, _, _)| entity),
-        &strip_parents,
-        &display_viewports,
-        &active_display,
-        &config,
-    );
-    if clamp_origin_to_viewport(frame.min, size, viewport) == frame.min {
-        return;
-    }
-    // Already queued: a reveal or reshuffle for this window is pending —
-    // stacking another only re-measures the same arrival downstream.
-    if reveal_queued.contains(entity) {
-        return;
-    }
-    debug!("focus on {entity} outside viewport, exposing");
-    let fresh =
-        owner.is_some_and(|(strip_entity, _, _, _, _, _)| fresh_strips.contains(strip_entity));
-    if fresh {
-        // Fresh strip: the shared machinery skips newly active strips, so
-        // firing now would be consumed as a no-op. Defer one activation
-        // tick; the followup converts once the strip settles.
-        if let Ok(mut entity_commands) = commands.get_entity(entity) {
-            entity_commands.try_insert(DeferredExposeMarker {
-                deadline: time.elapsed() + DEFER_EXPOSE_TIMEOUT,
-            });
+        let owner = strips
+            .iter()
+            .find(|(_, strip, _, _, _, _)| strip.contains(entity));
+        if let Some((_, _, _, _, previous_position, snap_settling)) = owner {
+            // A restore owns this strip: the pre-show tick still parks the
+            // previous position, snap restores guard, refocuses guard. A focus
+            // arrival never carries any of these, so reaching past here means
+            // nobody else will expose the window.
+            if previous_position || snap_settling {
+                continue;
+            }
         }
-    } else {
-        commands.ensure_visible(entity);
+        // At rest only: a window or strip mid-animation is on its way somewhere
+        // else, and exposing its transient frame perturbs the motion's own
+        // trajectory (boot layout, swipe momentum, restores).
+        if flight
+            .get(entity)
+            .is_ok_and(|(repositioning, resizing, drive)| {
+                repositioning
+                    || resizing
+                    || drive.as_ref().is_some_and(|drive| drive.is_verifying())
+            })
+        {
+            continue;
+        }
+        if owner.is_some_and(|(_, _, strip_flight, strip_scrolling, _, _)| {
+            strip_flight || strip_scrolling
+        }) {
+            continue;
+        }
+        let tabbed = owner.map_or_else(
+            || active_display.active_strip().tabbed(entity),
+            |(_, strip, _, _, _, _)| strip.tabbed(entity),
+        );
+        if tabbed {
+            continue;
+        }
+        // Transient presented frame: an async write is still converging, so the
+        // frame below is stale truth — exposing now scrolls the settled window
+        // out (wrap-back hover on a lagged Electron frame lands exactly here).
+        // Defer for the followup instead of dropping: `Added<FocusedMarker>`
+        // fires once, and the followup retries until the write lands or ages
+        // out into snapshot verify.
+        if windows
+            .get(entity)
+            .is_some_and(|window| write_state.unacked_live(window.id()))
+        {
+            if let Ok(mut entity_commands) = commands.get_entity(entity) {
+                entity_commands.try_insert(DeferredExposeMarker {
+                    deadline: time.elapsed() + DEFER_EXPOSE_TIMEOUT,
+                });
+            }
+            continue;
+        }
+        let (Some(frame), Some(size)) = (windows.moving_frame(entity), windows.size(entity)) else {
+            continue;
+        };
+        let viewport = owner_viewport(
+            owner.map(|(entity, _, _, _, _, _)| entity),
+            &strip_parents,
+            &display_viewports,
+            &active_display,
+            &config,
+        );
+        if clamp_origin_to_viewport(frame.min, size, viewport) == frame.min {
+            continue;
+        }
+        // Already queued: a reveal or reshuffle for this window is pending —
+        // stacking another only re-measures the same arrival downstream.
+        if reveal_queued.contains(entity) {
+            continue;
+        }
+        debug!("focus on {entity} outside viewport, exposing");
+        let fresh =
+            owner.is_some_and(|(strip_entity, _, _, _, _, _)| fresh_strips.contains(strip_entity));
+        if fresh {
+            // Fresh strip: the shared machinery skips newly active strips, so
+            // firing now would be consumed as a no-op. Defer one activation
+            // tick; the followup converts once the strip settles.
+            if let Ok(mut entity_commands) = commands.get_entity(entity) {
+                entity_commands.try_insert(DeferredExposeMarker {
+                    deadline: time.elapsed() + DEFER_EXPOSE_TIMEOUT,
+                });
+            }
+        } else {
+            commands.ensure_visible(entity);
+        }
     }
 }
 
@@ -885,7 +912,7 @@ fn deferred_expose_followup(
 #[instrument(level = Level::DEBUG, skip_all, fields(trigger))]
 #[allow(clippy::too_many_arguments)]
 fn mouse_follows_focus(
-    focused: Single<Entity, Added<FocusedMarker>>,
+    arrived: Populated<Entity, Added<FocusedMarker>>,
     windows: Windows,
     global_state: GlobalState,
     config: Res<Config>,
@@ -896,108 +923,111 @@ fn mouse_follows_focus(
     held: Query<&MouseHeldMarker>,
     intent: FocusIntent<'_>,
 ) {
-    let entity = *focused;
-    let Some(window) = windows.get(entity) else {
-        return;
-    };
-    if workspaces
-        .iter()
-        .find_map(|(_, _, _, scrolling, active)| if active { scrolling } else { None })
-        .is_some_and(|scrolling| scrolling.is_user_swiping)
-    {
-        debug!("Suppressing center mouse due to a swipe");
-        return;
-    }
+    // Every arrival is considered: a `Single` would panic the daemon on
+    // the two-marker moment of a focus switch (or an empty tick).
+    for entity in &arrived {
+        let Some(window) = windows.get(entity) else {
+            continue;
+        };
+        if workspaces
+            .iter()
+            .find_map(|(_, _, _, scrolling, active)| if active { scrolling } else { None })
+            .is_some_and(|scrolling| scrolling.is_user_swiping)
+        {
+            debug!("Suppressing center mouse due to a swipe");
+            continue;
+        }
 
-    trace!(
-        "window {}, skip_reshuffle {}, ffm flag {:?}.",
-        window.id(),
-        global_state.skip_reshuffle(),
-        global_state.ffm_flag()
-    );
-    if !(config.mouse_follows_focus()
-        && !global_state.skip_reshuffle()
-        && global_state.ffm_flag().is_none_or(|id| id != window.id()))
-    {
-        return;
-    }
-    // A keyboard focus change mid-drag must not fight the hand.
-    if !held.is_empty() {
-        trace!("drag in flight, skipping warp for window {}", window.id());
-        return;
-    }
-    let Some(raw_frame) = windows.moving_frame(entity) else {
-        return;
-    };
-    // Cursor placement by cause: a click owns its cursor (never yank it),
-    // a keyboard move always recenters onto the window (even when the
-    // cursor is already inside), ambient noise only warps a cursor left
-    // outside. Press wins over keyboard — a keyboard focus landing in a
-    // just-clicked window still must not move the click's cursor.
-    let cause = focus_cause(
-        &intent.user_focus,
-        &intent.last_press,
-        intent.time.elapsed(),
-        entity,
-        raw_frame,
-    );
-    if matches!(cause, FocusCause::Press) {
         trace!(
-            "press owns the cursor for window {}, skipping warp",
-            window.id()
+            "window {}, skip_reshuffle {}, ffm flag {:?}.",
+            window.id(),
+            global_state.skip_reshuffle(),
+            global_state.ffm_flag()
         );
-        return;
-    }
-    let mut frame = raw_frame;
-    // Project the owner strip's in-flight scroll onto the destination slot:
-    // the strip target was issued this tick but hasn't moved `Position`
-    // yet, so the raw moving frame is pre-scroll and the warp would land
-    // off-center as the strip catches up. Project from the *layout* slot
-    // (`layout + strip target`), never by shifting the current frame: an
-    // off-screen window's frame is viewport-parked (sliver), not
-    // layout-plus-offset, so shifting it lands outside the destination.
-    if let Some((strip_entity, _, _, _, _)) = workspaces
-        .iter()
-        .find(|(_, strip, _, _, _)| strip.contains(entity))
-        && let (Ok(RepositionMarker(strip_target)), Some(layout), Some(size)) = (
-            strip_flight.get(strip_entity),
-            windows.layout_position(entity),
-            windows.size(entity),
-        )
-    {
-        let dest = layout.0 + *strip_target;
-        frame = IRect::from_corners(dest, dest + size);
-    }
-    // Keyboard intent always recenters: a keyboard move into the window
-    // holding the cursor must still land on its center. Ambient arrivals
-    // (and clicks, already returned above) leave a cursor that is already
-    // inside alone.
-    if !matches!(cause, FocusCause::Keyboard)
-        && window_manager
-            .cursor_position()
-            .is_some_and(|point| frame.contains(origin_from(point)))
-    {
-        trace!(
-            "cursor already inside window {}, skipping warp",
-            window.id()
+        if !(config.mouse_follows_focus()
+            && !global_state.skip_reshuffle()
+            && global_state.ffm_flag().is_none_or(|id| id != window.id()))
+        {
+            continue;
+        }
+        // A keyboard focus change mid-drag must not fight the hand.
+        if !held.is_empty() {
+            trace!("drag in flight, skipping warp for window {}", window.id());
+            continue;
+        }
+        let Some(raw_frame) = windows.moving_frame(entity) else {
+            continue;
+        };
+        // Cursor placement by cause: a click owns its cursor (never yank it),
+        // a keyboard move always recenters onto the window (even when the
+        // cursor is already inside), ambient noise only warps a cursor left
+        // outside. Press wins over keyboard — a keyboard focus landing in a
+        // just-clicked window still must not move the click's cursor.
+        let cause = focus_cause(
+            &intent.user_focus,
+            &intent.last_press,
+            intent.time.elapsed(),
+            entity,
+            raw_frame,
         );
-        return;
-    }
-    let Some(display_bounds) = workspaces
-        .into_iter()
-        .find_map(|(_, strip, child, _, _)| strip.contains(entity).then_some(child))
-        .and_then(|child| displays.get(child.parent()).ok())
-        .map(|(display, dock)| display.actual_display_bounds(dock, &config))
-    else {
-        return;
-    };
-    let visible = display_bounds.intersect(frame);
-    // If the overlap is smaller than 50x50, the window is probably hidden
-    // off screen, so do not move the mouse.
-    if visible.size().length_squared() > 5000 {
-        let origin = visible.center();
-        debug!("centering on {} {origin}", window.id());
-        window_manager.warp_mouse(origin);
+        if matches!(cause, FocusCause::Press) {
+            trace!(
+                "press owns the cursor for window {}, skipping warp",
+                window.id()
+            );
+            continue;
+        }
+        let mut frame = raw_frame;
+        // Project the owner strip's in-flight scroll onto the destination slot:
+        // the strip target was issued this tick but hasn't moved `Position`
+        // yet, so the raw moving frame is pre-scroll and the warp would land
+        // off-center as the strip catches up. Project from the *layout* slot
+        // (`layout + strip target`), never by shifting the current frame: an
+        // off-screen window's frame is viewport-parked (sliver), not
+        // layout-plus-offset, so shifting it lands outside the destination.
+        if let Some((strip_entity, _, _, _, _)) = workspaces
+            .iter()
+            .find(|(_, strip, _, _, _)| strip.contains(entity))
+            && let (Ok(RepositionMarker(strip_target)), Some(layout), Some(size)) = (
+                strip_flight.get(strip_entity),
+                windows.layout_position(entity),
+                windows.size(entity),
+            )
+        {
+            let dest = layout.0 + *strip_target;
+            frame = IRect::from_corners(dest, dest + size);
+        }
+        // Keyboard intent always recenters: a keyboard move into the window
+        // holding the cursor must still land on its center. Ambient arrivals
+        // (and clicks, already returned above) leave a cursor that is already
+        // inside alone.
+        if !matches!(cause, FocusCause::Keyboard)
+            && window_manager
+                .cursor_position()
+                .is_some_and(|point| frame.contains(origin_from(point)))
+        {
+            trace!(
+                "cursor already inside window {}, skipping warp",
+                window.id()
+            );
+            continue;
+        }
+        let Some(display_bounds) = workspaces
+            .into_iter()
+            .find_map(|(_, strip, child, _, _)| strip.contains(entity).then_some(child))
+            .and_then(|child| displays.get(child.parent()).ok())
+            .map(|(display, dock)| display.actual_display_bounds(dock, &config))
+        else {
+            continue;
+        };
+        let visible = display_bounds.intersect(frame);
+        // If the overlap is smaller than 50x50, the window is probably hidden
+        // off screen, so do not move the mouse.
+        if visible.size().length_squared() > 5000 {
+            let origin = visible.center();
+            debug!("centering on {} {origin}", window.id());
+            window_manager.warp_mouse(origin);
+        }
     }
 }
 

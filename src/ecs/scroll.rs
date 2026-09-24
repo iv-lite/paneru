@@ -98,12 +98,12 @@ impl Plugin for ScrollEventsPlugin {
 }
 
 #[instrument(level = Level::TRACE, skip_all)]
+#[allow(clippy::type_complexity)]
 fn swipe_gesture(
     mut messages: MessageReader<InputEvent>,
     active_display: ActiveDisplay,
-    mut active_workspace: Single<
-        (Entity, &Position, Option<&mut Scrolling>),
-        With<ActiveWorkspaceMarker>,
+    active_workspace: Option<
+        Single<(Entity, &Position, Option<&mut Scrolling>), With<ActiveWorkspaceMarker>>,
     >,
     time: Res<Time>,
     config: Res<Config>,
@@ -147,6 +147,12 @@ fn swipe_gesture(
         return;
     }
 
+    // No active strip (mid-reconfigure): swipe input has no layout to
+    // drive — drop this batch instead of panicking; the fingers are still
+    // down and the next batch re-drives.
+    let Some(mut active_workspace) = active_workspace else {
+        return;
+    };
     let (entity, position, scrolling) = &mut *active_workspace;
 
     // The user is driving the strip by hand now, so an earlier deliberate
@@ -458,7 +464,7 @@ fn nearest_center_target(
 
 #[instrument(level = Level::TRACE, skip_all)]
 fn apply_snap_force(
-    mut strip: Single<(
+    mut strips: Populated<(
         Entity,
         &LayoutStrip,
         &Position,
@@ -480,137 +486,143 @@ fn apply_snap_force(
     /// strip glides to its driven offset and only snaps when close.
     const SNAP_THRESHOLD_MAX_PX: f64 = 600.0;
 
-    // With `center_single_column`, a lone column gets the same magnetic
-    // centering so a swipe can't leave it off-center; the nearest-column
-    // math below reduces to centering the single column.
-    // Magnetic centering runs under `auto_center`; `center_single_column`
-    // extends it to lone columns only (the nearest-column math below then
-    // reduces to centering the single column, so a swipe can't leave it
-    // off-center).
-    let magnetic = config.auto_center() || (config.center_single_column() && strip.1.len() == 1);
-    if !magnetic && !strip.4 {
-        return;
-    }
-
-    let viewport = active_display.actual_bounds(&config);
-    let viewport_center = viewport.center().x;
-    let snap_threshold =
-        (SNAP_DISPLAY_RATIO * f64::from(viewport.width())).min(SNAP_THRESHOLD_MAX_PX);
-
-    let (strip_entity, layout_strip, position, ref mut scroll, settle) = *strip;
-
-    // Drag-release settle: reveal the nearest window instead of centering.
-    // Runs independent of the magnetic options above (see `DragSettleMarker`).
-    // Unlike the magnetic pull it must wait out the release glide, whose
-    // pipeline velocity sits below the fraction-based gate almost immediately.
-    if settle && !magnetic {
-        // Keep the `Scrolling` alive while waiting and settling: the
-        // lift-timeout would otherwise reap a slow glide mid-flight (its
-        // threshold reads pipeline fractions, blind to px rates) or reap
-        // mid-settle and strand the strip half-way. The marker owns the
-        // lifecycle now; completion below reaps both.
-        scroll.last_event = time.elapsed();
-        if scroll.is_user_swiping
-            || scroll.velocity.abs() * f64::from(viewport.width()) > SETTLE_MAX_GLIDE_PX_S
-        {
-            return;
+    // Every scrolling strip is forced: a `Single` would silently skip all
+    // of them when two displays settle at once (and starve all but one).
+    for strip in &mut strips {
+        // With `center_single_column`, a lone column gets the same magnetic
+        // centering so a swipe can't leave it off-center; the nearest-column
+        // math below reduces to centering the single column.
+        // Magnetic centering runs under `auto_center`; `center_single_column`
+        // extends it to lone columns only (the nearest-column math below then
+        // reduces to centering the single column, so a swipe can't leave it
+        // off-center).
+        let magnetic =
+            config.auto_center() || (config.center_single_column() && strip.1.len() == 1);
+        if !magnetic && !strip.4 {
+            continue;
         }
-        let get_window_frame = |entity| windows.moving_frame(entity);
-        let target = nearest_visible_offset(layout_strip, position.0.x, &windows, &viewport)
-            .and_then(|target| {
-                clamp_viewport_offset(
-                    target,
-                    layout_strip,
-                    &windows,
-                    &get_window_frame,
-                    &viewport,
-                    &config,
-                )
-            })
-            .map(|target| {
-                // With more than one window the settle must not strand the
-                // strip next to whitespace: fill the viewport past the
-                // nearest-window target (which on its own can leave the
-                // opposite edge empty, and the continuous-swipe clamp above
-                // allows out-of-fill offsets by design for the manual drive).
-                if layout_strip.len() >= 2
-                    && let Some(total) = strip_total_width(layout_strip, &windows)
-                {
-                    clamp_strip_to_fill(
+
+        let viewport = active_display.actual_bounds(&config);
+        let viewport_center = viewport.center().x;
+        let snap_threshold =
+            (SNAP_DISPLAY_RATIO * f64::from(viewport.width())).min(SNAP_THRESHOLD_MAX_PX);
+
+        let (strip_entity, layout_strip, position, mut scroll, settle) = strip;
+
+        // Drag-release settle: reveal the nearest window instead of centering.
+        // Runs independent of the magnetic options above (see `DragSettleMarker`).
+        // Unlike the magnetic pull it must wait out the release glide, whose
+        // pipeline velocity sits below the fraction-based gate almost immediately.
+        if settle && !magnetic {
+            // Keep the `Scrolling` alive while waiting and settling: the
+            // lift-timeout would otherwise reap a slow glide mid-flight (its
+            // threshold reads pipeline fractions, blind to px rates) or reap
+            // mid-settle and strand the strip half-way. The marker owns the
+            // lifecycle now; completion below reaps both.
+            scroll.last_event = time.elapsed();
+            if scroll.is_user_swiping
+                || scroll.velocity.abs() * f64::from(viewport.width()) > SETTLE_MAX_GLIDE_PX_S
+            {
+                continue;
+            }
+            let get_window_frame = |entity| windows.moving_frame(entity);
+            let target = nearest_visible_offset(layout_strip, position.0.x, &windows, &viewport)
+                .and_then(|target| {
+                    clamp_viewport_offset(
                         target,
-                        total,
-                        layout_strip.len(),
+                        layout_strip,
+                        &windows,
+                        &get_window_frame,
                         &viewport,
-                        config.center_single_column(),
+                        &config,
                     )
-                } else {
-                    target
-                }
-            });
-        let Some(target) = target else {
-            settle_memory.remove(&strip_entity);
-            commands
-                .entity(strip_entity)
-                .try_remove::<DragSettleMarker>();
-            commands.entity(strip_entity).try_remove::<Scrolling>();
-            return;
-        };
-        // The target derives from live window widths: breathing widths move
-        // it under the settle, and the forced >=1px step below would then
-        // creep forever chasing it. Rest after consecutive moves — audit
-        // and verify own any residue instead of an endless glide.
-        if settle_target_unstable(&mut settle_memory, strip_entity, target) {
-            commands
-                .entity(strip_entity)
-                .try_remove::<DragSettleMarker>();
-            commands.entity(strip_entity).try_remove::<Scrolling>();
-            return;
+                })
+                .map(|target| {
+                    // With more than one window the settle must not strand the
+                    // strip next to whitespace: fill the viewport past the
+                    // nearest-window target (which on its own can leave the
+                    // opposite edge empty, and the continuous-swipe clamp above
+                    // allows out-of-fill offsets by design for the manual drive).
+                    if layout_strip.len() >= 2
+                        && let Some(total) = strip_total_width(layout_strip, &windows)
+                    {
+                        clamp_strip_to_fill(
+                            target,
+                            total,
+                            layout_strip.len(),
+                            &viewport,
+                            config.center_single_column(),
+                        )
+                    } else {
+                        target
+                    }
+                });
+            let Some(target) = target else {
+                settle_memory.remove(&strip_entity);
+                commands
+                    .entity(strip_entity)
+                    .try_remove::<DragSettleMarker>();
+                commands.entity(strip_entity).try_remove::<Scrolling>();
+                continue;
+            };
+            // The target derives from live window widths: breathing widths move
+            // it under the settle, and the forced >=1px step below would then
+            // creep forever chasing it. Rest after consecutive moves — audit
+            // and verify own any residue instead of an endless glide.
+            if settle_target_unstable(&mut settle_memory, strip_entity, target) {
+                commands
+                    .entity(strip_entity)
+                    .try_remove::<DragSettleMarker>();
+                commands.entity(strip_entity).try_remove::<Scrolling>();
+                continue;
+            }
+            let dist_to_snap = f64::from(position.0.x - target);
+            if dist_to_snap.abs() < 1.0 {
+                scroll.position = f64::from(target);
+                settle_memory.remove(&strip_entity);
+                commands
+                    .entity(strip_entity)
+                    .try_remove::<DragSettleMarker>();
+                commands.entity(strip_entity).try_remove::<Scrolling>();
+                continue;
+            }
+            // Guarantee at least a pixel of progress: the constraints round the
+            // offset back to int pixels, which would quantize a sub-half-pixel
+            // exponential step away forever just outside the completion band.
+            // (The aliveness refresh above already ran, so the timeout cannot
+            // reap mid-settle.)
+            let approach = (time.delta_secs_f64() * CENTER_MAGNETIC_FORCE).min(1.0);
+            let step = (dist_to_snap * approach)
+                .abs()
+                .max(1.0)
+                .copysign(dist_to_snap);
+            scroll.position -= step;
+            continue;
         }
-        let dist_to_snap = f64::from(position.0.x - target);
-        if dist_to_snap.abs() < 1.0 {
-            scroll.position = f64::from(target);
-            settle_memory.remove(&strip_entity);
-            commands
-                .entity(strip_entity)
-                .try_remove::<DragSettleMarker>();
-            commands.entity(strip_entity).try_remove::<Scrolling>();
-            return;
+
+        if scroll.is_user_swiping || scroll.velocity.abs() > 0.5 {
+            continue;
         }
-        // Guarantee at least a pixel of progress: the constraints round the
-        // offset back to int pixels, which would quantize a sub-half-pixel
-        // exponential step away forever just outside the completion band.
-        // (The aliveness refresh above already ran, so the timeout cannot
-        // reap mid-settle.)
-        let approach = (time.delta_secs_f64() * CENTER_MAGNETIC_FORCE).min(1.0);
-        let step = (dist_to_snap * approach)
-            .abs()
-            .max(1.0)
-            .copysign(dist_to_snap);
-        scroll.position -= step;
-        return;
-    }
 
-    if scroll.is_user_swiping || scroll.velocity.abs() > 0.5 {
-        return;
-    }
+        let target_offset =
+            nearest_center_target(layout_strip, position.x, &windows, viewport_center);
 
-    let target_offset = nearest_center_target(layout_strip, position.x, &windows, viewport_center);
-
-    let dist_to_snap = f64::from(position.x - target_offset);
-    if dist_to_snap.abs() < snap_threshold {
-        // This is an exponential approach, and it only pulls *toward* the
-        // target while the factor stays under 1. Past that it overshoots to the
-        // far side; at a 10s delta it would fling the strip 100x the distance
-        // the wrong way. Clamping the factor rather than `dt` keeps that true
-        // for any timestep and any `CENTER_MAGNETIC_FORCE`.
-        let approach = (time.delta_secs_f64() * CENTER_MAGNETIC_FORCE).min(1.0);
-        scroll.position -= dist_to_snap * approach;
+        let dist_to_snap = f64::from(position.x - target_offset);
+        if dist_to_snap.abs() < snap_threshold {
+            // This is an exponential approach, and it only pulls *toward* the
+            // target while the factor stays under 1. Past that it overshoots to the
+            // far side; at a 10s delta it would fling the strip 100x the distance
+            // the wrong way. Clamping the factor rather than `dt` keeps that true
+            // for any timestep and any `CENTER_MAGNETIC_FORCE`.
+            let approach = (time.delta_secs_f64() * CENTER_MAGNETIC_FORCE).min(1.0);
+            scroll.position -= dist_to_snap * approach;
+        }
     }
 }
 
 #[instrument(level = Level::TRACE, skip_all)]
 fn scrolling_integrator(
-    mut strip: Single<&mut Scrolling, With<LayoutStrip>>,
+    mut strips: Populated<&mut Scrolling, With<LayoutStrip>>,
     time: Res<Time>,
     active_display: ActiveDisplay,
     config: Res<Config>,
@@ -625,9 +637,12 @@ fn scrolling_integrator(
         SwipeGestureDirection::Reversed => 1.0,
     };
 
-    let scroll = &mut *strip;
-    if scroll.velocity.abs() > 0.0001 {
-        scroll.position += scroll.velocity * dt * viewport_width * direction_modifier;
+    // Every scrolling strip integrates: a `Single` would silently skip all
+    // of them when two displays settle at once (and starve all but one).
+    for mut scroll in &mut strips {
+        if scroll.velocity.abs() > 0.0001 {
+            scroll.position += scroll.velocity * dt * viewport_width * direction_modifier;
+        }
     }
 }
 

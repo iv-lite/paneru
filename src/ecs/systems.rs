@@ -1115,6 +1115,106 @@ pub(super) fn fresh_marker_cleanup(cleanup: TimedOutSpawns, mut commands: Comman
     }
 }
 
+/// Strips a dead snapshot store: if the worker stops publishing (panic,
+/// wedged AX), the store goes stale and every consumer degrades to direct
+/// reads anyway — but the frozen epoch also gates overlay repaints and
+/// poisons staleness checks. Removing the resources forces the direct-read
+/// paths everywhere (the harness runs storeless by design) and logs loudly
+/// instead of silently serving rot.
+pub(crate) fn watch_snapshot_worker(
+    store: Option<Res<SnapshotStore>>,
+    roster: Option<Res<SnapshotRoster>>,
+    mut commands: Commands,
+) {
+    // Idle tick is 250ms: 5s without a publish means the worker is gone.
+    const STALL_TIMEOUT: Duration = Duration::from_secs(5);
+    let Some(store) = store else {
+        return;
+    };
+    if store.0.load().at.elapsed() < STALL_TIMEOUT {
+        return;
+    }
+    error!("ax snapshot worker stalled; dropping the store to direct reads");
+    commands.remove_resource::<SnapshotStore>();
+    if roster.is_some() {
+        commands.remove_resource::<SnapshotRoster>();
+    }
+}
+
+/// Rolling frame-time accounting: the pump stamps frame start, a `Last`
+/// system records the elapsed wall time into a bounded ring. Reported
+/// periodically at debug so "snappier" is measured, not felt. Wall clock
+/// (not virtual): the harness never runs this path meaningfully, and
+/// production needs real milliseconds.
+#[derive(Debug, Default, Resource)]
+pub(crate) struct FrameStats {
+    samples: std::collections::VecDeque<Duration>,
+    over_budget: u64,
+}
+
+/// Frames retained for percentile computation: 600 at up to 60fps cover
+/// the reporting window with margin.
+const FRAME_STATS_CAP: usize = 600;
+/// Frame budget for the over-budget counter: one 60fps frame.
+const FRAME_BUDGET: Duration = Duration::from_millis(16);
+
+/// Frame start stamp written by the pump; read once per frame by
+/// [`record_frame_time`]. `None` outside a frame (tests, headless).
+#[derive(Debug, Default, Resource)]
+pub(crate) struct FrameClock(pub Option<Instant>);
+
+/// Records one frame's wall time into [`FrameStats`]. Runs in `Last`, so
+/// the sample covers the whole schedule, pump sleep excluded.
+pub(crate) fn record_frame_time(
+    clock: Option<ResMut<FrameClock>>,
+    stats: Option<ResMut<FrameStats>>,
+) {
+    let (Some(mut clock), Some(mut stats)) = (clock, stats) else {
+        return;
+    };
+    let Some(start) = clock.0.take() else {
+        return;
+    };
+    let elapsed = start.elapsed();
+    if stats.samples.len() >= FRAME_STATS_CAP {
+        stats.samples.pop_front();
+    }
+    if elapsed > FRAME_BUDGET {
+        stats.over_budget += 1;
+    }
+    stats.samples.push_back(elapsed);
+}
+
+/// Logs p50/p99/max frame times plus the over-budget count, then resets
+/// the window. Slow frames cluster around synchronous AX reads; use with
+/// `RUST_LOG=debug` when hunting jank.
+pub(crate) fn report_frame_stats(stats: Option<ResMut<FrameStats>>) {
+    let Some(mut stats) = stats else {
+        return;
+    };
+    if stats.samples.is_empty() {
+        return;
+    }
+    let mut sorted: Vec<Duration> = stats.samples.iter().copied().collect();
+    sorted.sort_unstable();
+    #[allow(
+        clippy::cast_possible_truncation,
+        clippy::cast_sign_loss,
+        clippy::cast_precision_loss
+    )]
+    let percentile = |p: f64| sorted[((p * sorted.len() as f64) as usize).min(sorted.len() - 1)];
+    debug!(
+        "frame times over {} frames: p50 {:?} p99 {:?} max {:?}, {} over {:?}",
+        sorted.len(),
+        percentile(0.5),
+        percentile(0.99),
+        sorted[sorted.len() - 1],
+        stats.over_budget,
+        FRAME_BUDGET,
+    );
+    stats.samples.clear();
+    stats.over_budget = 0;
+}
 /// A Bevy system that ticks `Timeout` timers and despawns entities when their timers finish.
 /// This system is responsible for cleaning up entities that have exceeded their allotted time for an operation.
 ///
@@ -1690,11 +1790,18 @@ pub(crate) fn pump_events(
     // Fresh retrace phase published for commit prediction downstream.
     // Optional: headless/test apps never install it.
     mut vsync_phase: Option<ResMut<crate::ecs::VSyncPhase>>,
+    mut frame_clock: Option<ResMut<FrameClock>>,
 ) {
     let Some((ref mut platform, incoming_events)) = platform.zip(incoming_events) else {
         // No platform interface or incoming event pipe - probably executing in a unit test.
         return;
     };
+
+    // Frame start for the wall-time accounting in `Last`: measures the
+    // whole schedule, pump sleep excluded.
+    if let Some(clock) = frame_clock.as_deref_mut() {
+        clock.0 = Some(Instant::now());
+    }
 
     // Deliberately not paced to a frame period: waiting a full period put a
     // floor under how soon a pump could start, so an event landing right after
@@ -3134,9 +3241,11 @@ pub(super) fn drain_ax_acks(
 /// per tick) decide, with a bounded re-push budget. While the writer is
 /// degraded, repair is restricted to the focused window.
 #[instrument(level = Level::TRACE, skip_all)]
+#[allow(clippy::too_many_arguments)]
 pub(crate) fn verify_window_position(
     mut windows: VerifiableWindows,
     store: Option<Res<SnapshotStore>>,
+    reads: Option<Res<crate::ax_reads::AxReadService>>,
     mut write_state: ResMut<AxWriteState>,
     writer: Option<Res<AxWriterQueue>>,
     config: Res<Config>,
@@ -3211,24 +3320,35 @@ pub(crate) fn verify_window_position(
             }
         }
         // Prefer the snapshot worker's last read over a synchronous round
-        // trip. Absent in tests (identical behavior there), stale, or
-        // missing this window: fall back to a direct read, budgeted.
+        // trip, then the read pool, then a direct read. Absent in tests
+        // (identical behavior there): fall back to a direct read, budgeted.
+        // A `Pending` pool read confirms on a later pass — the leg persists
+        // across passes by design, so waiting costs nothing but a tick.
         let window_id = window.id();
         let live = live_frame_from(snap, window_id, SNAPSHOT_FRAME_MAX_AGE)
             .map(|raw| pad_snapshot_frame(raw, &window));
-        let live = if let Some(frame) = live {
-            frame
+        let live = if live.is_some() {
+            live
         } else {
-            if sync_reads >= VERIFY_SYNC_READS_PER_TICK {
+            let poll = reads.as_deref().map(|reads| {
+                reads.poll_or_request(window_id, window.element(), SNAPSHOT_FRAME_MAX_AGE)
+            });
+            if let Some(crate::ax_reads::ReadPoll::Ready(frame)) = poll {
+                Some(frame)
+            } else if matches!(poll, Some(crate::ax_reads::ReadPoll::Pending)) {
                 continue;
+            } else {
+                if sync_reads >= VERIFY_SYNC_READS_PER_TICK {
+                    continue;
+                }
+                sync_reads += 1;
+                window.update_frame().ok()
             }
-            sync_reads += 1;
-            let Ok(frame) = window.update_frame() else {
-                // Unreadable window (beachballed app): retry next
-                // throttled pass instead of burning lifetime on failures.
-                continue;
-            };
-            frame
+        };
+        let Some(live) = live else {
+            // Unreadable window (beachballed app): retry next throttled
+            // pass instead of burning lifetime on failures.
+            continue;
         };
         // 1px tolerance like the audit: OS rounding must converge, not spin.
         let drift = (live.min - position.0).abs();
@@ -3269,47 +3389,57 @@ pub(crate) fn verify_window_position(
 const VERIFY_SYNC_READS_PER_TICK: u8 = 8;
 
 #[instrument(level = Level::TRACE, skip_all)]
+#[allow(clippy::type_complexity)]
 pub(super) fn commit_window_size(
     active_display: ActiveDisplay,
     mut resized_windows: Populated<
-        (&mut Window, &Bounds, &mut WidthRatio, Has<ResizeMarker>),
+        (
+            &mut Window,
+            &Bounds,
+            &mut WidthRatio,
+            Has<ResizeMarker>,
+            Has<FocusedMarker>,
+        ),
         Changed<Bounds>,
     >,
     config: Res<Config>,
+    writer: Option<Res<AxWriterQueue>>,
     mut write_state: ResMut<AxWriteState>,
 ) {
-    use std::sync::Mutex;
+    use crate::ax_writer::push_size;
 
     // Ratio denominator must be the usable viewport (dock/padding-adjusted),
     // matching `resize_window` / `attach_window_to_display` pixel math.
     // The raw display bounds include menubar/dock/padding, so ratios derived
     // from them inflate on every move/resize cycle.
     let viewport_width = active_display.actual_bounds(&config).width().max(1);
-    // Post-resize OS truth collected from the parallel workers and recorded
-    // sequentially below, so a concurrent move's dedup filter sees the sync
-    // resize path's writes (same accounting as `push_position`).
-    let intents = Mutex::new(Vec::new());
-    resized_windows
-        .par_iter_mut()
-        .for_each(|(mut window, size, mut width_ratio, resizing)| {
-            width_ratio.0 = f64::from(size.0.x) / f64::from(viewport_width);
-            // While the tween is still driving, a single size write per
-            // frame: the staged offscreen retry (up to ~6 AX round-trips)
-            // runs on the settled commit instead. Landed resizes keep the
-            // full confirmatory path.
-            if resizing {
-                window.resize_fast(size.0);
-            } else {
-                window.resize(size.0);
-            }
-            if let Ok(mut intents) = intents.lock() {
-                intents.push((window.id(), window.frame().min));
-            }
-        });
-    if let Ok(intents) = intents.into_inner() {
-        for (id, origin) in intents {
-            write_state.mark_sent(id, origin);
+    // Async enqueue is nanoseconds (no AX round trip), so this loop stays
+    // sequential: the old `par_iter` only paid off for blocking writes.
+    // Joins the in-flight commit epoch rather than beginning a new one, so
+    // a size issued alongside its window's move lands in the same frame.
+    let queue_active = config.ax_writer_enabled() && writer.is_some();
+    let epoch = write_state.current_epoch();
+    for (mut window, size, mut width_ratio, resizing, focused) in &mut resized_windows {
+        width_ratio.0 = f64::from(size.0.x) / f64::from(viewport_width);
+        // While the tween is still driving, a single size write per
+        // frame: the staged offscreen retry (up to ~6 AX round-trips)
+        // runs on the settled commit instead. Landed resizes keep the
+        // full confirmatory path. The driving write goes through the
+        // writer lane when servable, like positions.
+        if resizing {
+            push_size(
+                &mut window,
+                size.0,
+                writer.as_deref(),
+                &mut write_state,
+                queue_active,
+                epoch,
+                focused,
+            );
+        } else {
+            window.resize(size.0);
         }
+        write_state.mark_sent(window.id(), window.frame().min);
     }
 }
 
@@ -3378,7 +3508,7 @@ pub(super) fn cleanup_on_exit(
 
 pub(crate) fn update_flash_messages(
     messages: Populated<(Entity, &FlashMessage, &Timeout)>,
-    active_display: Single<(&Display, Entity), With<ActiveDisplayMarker>>,
+    active_display: Option<Single<(&Display, Entity), With<ActiveDisplayMarker>>>,
     flash_mgr: Option<NonSendMut<FlashMessageManager>>,
     mut commands: Commands,
 ) {
@@ -3391,6 +3521,12 @@ pub(crate) fn update_flash_messages(
         return;
     }
 
+    // No active display (mid-reconfigure): flash messages have nowhere to
+    // paint — drop this tick instead of panicking; the messages persist
+    // and paint once a display exists.
+    let Some(active_display) = active_display else {
+        return;
+    };
     let (display, _) = *active_display;
     let bounds = display.bounds();
     let top_right = NSPoint::new(f64::from(bounds.max.x), f64::from(bounds.min.y));
@@ -3685,10 +3821,15 @@ pub(crate) fn detect_tabbed_windows(
     apps: Query<Entity, With<Application>>,
     mut workspaces: Query<(&mut LayoutStrip, Has<ActiveWorkspaceMarker>)>,
     window_manager: Res<WindowManager>,
-    active_display: Single<&Display, With<ActiveDisplayMarker>>,
+    active_display: Option<Single<&Display, With<ActiveDisplayMarker>>>,
     store: Option<Res<SnapshotStore>>,
     mut commands: Commands,
 ) {
+    // No active display (mid-reconfigure): tab detection needs viewport
+    // geometry — skip instead of panicking; creation events re-drive it.
+    let Some(active_display) = active_display else {
+        return;
+    };
     let display_bounds = active_display.bounds();
     let Some(workspace_entities) = workspaces
         .iter()

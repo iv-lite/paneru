@@ -2159,17 +2159,24 @@ pub(super) struct MouseResizeState {
     window_id: Option<WinID>,
 }
 
-#[allow(clippy::too_many_arguments)]
+#[allow(clippy::too_many_arguments, clippy::type_complexity)]
 fn mouse_resize_trigger(
     mut messages: MessageReader<InputEvent>,
     windows: Windows,
-    active_workspace: Single<(Entity, &LayoutStrip, &Position), With<ActiveWorkspaceMarker>>,
+    active_workspace: Option<
+        Single<(Entity, &LayoutStrip, &Position), With<ActiveWorkspaceMarker>>,
+    >,
     held: Query<(Entity, &MouseHeldMarker, Option<&Gesture>)>,
     window_manager: Res<WindowManager>,
     config: Res<Config>,
     mut state: Local<MouseResizeState>,
     mut commands: Commands,
 ) {
+    // No active strip (mid-reconfigure): a resize drag has no layout to
+    // measure against — skip the events, never panic.
+    let Some(active_workspace) = active_workspace else {
+        return;
+    };
     for InputEvent(event) in messages.read() {
         let Event::MouseMoved { point, modifiers } = event else {
             continue;

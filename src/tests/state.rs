@@ -217,6 +217,53 @@ fn restore_plan_skips_ambiguous_fallback_match() {
     assert_eq!(plan.skipped_ambiguous_matches, 1);
 }
 
+/// Duplicate titles break the tie by saved geometry: the live window
+/// nearest the saved frame center wins instead of skipping as ambiguous.
+/// Without frames on either side, the skip above still applies.
+#[test]
+fn restore_plan_breaks_duplicate_titles_by_geometry() {
+    use crate::ecs::restore::{CurrentWindowIdentity, RestorePlanner};
+
+    let mut world = World::new();
+    let near = world.spawn_empty().id();
+    let far = world.spawn_empty().id();
+    let saved = SavedWindow {
+        frame: Some(SavedRect {
+            min_x: 0,
+            min_y: 20,
+            max_x: 400,
+            max_y: 768,
+        }),
+        ..saved_window(20, 120, "com.example.notes", "Daily Notes")
+    };
+    let state = restore_state(vec![SavedWorkspace {
+        workspace_id: TEST_WORKSPACE_ID,
+        display_id: None,
+        display_uuid: None,
+        active_virtual_index: Some(0),
+        strips: vec![SavedStrip {
+            virtual_index: 0,
+            columns: vec![SavedColumn::Single(saved)],
+        }],
+    }]);
+    let current = vec![
+        CurrentWindowIdentity {
+            frame_center: Some((200, 394)),
+            ..CurrentWindowIdentity::fallback_only(near, "com.example.notes", "Daily Notes")
+        },
+        CurrentWindowIdentity {
+            frame_center: Some((3000, 500)),
+            ..CurrentWindowIdentity::fallback_only(far, "com.example.notes", "Daily Notes")
+        },
+    ];
+
+    let plan = RestorePlanner::new(&state).plan(&current);
+
+    assert_eq!(plan.skipped_ambiguous_matches, 0);
+    assert_eq!(plan.ignored_missing_windows, 0);
+    assert_eq!(plan.consumed_entities, [near].into_iter().collect());
+}
+
 fn restore_state(workspaces: Vec<SavedWorkspace>) -> PaneruState {
     PaneruState {
         version: 2,
@@ -258,6 +305,7 @@ fn current_window(
         identifier: "main".to_string(),
         role: "AXWindow".to_string(),
         subrole: "AXStandardWindow".to_string(),
+        frame_center: None,
     }
 }
 
