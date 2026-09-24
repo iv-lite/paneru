@@ -537,6 +537,12 @@ pub struct SizeDrive {
 /// burst instead. Written only by the animator, which owns every leg birth —
 /// see `animate_entities` / `animate_resize_entities`.
 ///
+/// `deadline` is the opening leg's landing time: joiners stretch their own
+/// proportional duration to it (see [`animation::join_duration`]) so co-born
+/// legs share pacing as well as phase — siblings on different easing curves
+/// overtake mid-glide, which reads as windows colliding instead of moving
+/// together. Never shortens a leg, so huge late moves keep full glides.
+///
 /// Global rather than per-strip: windows parent to applications, not strips,
 /// so per-strip scoping would need a containment walk per birth in the hot
 /// loop. Co-born legs share phase either way (which is the lockstep that
@@ -545,6 +551,7 @@ pub struct SizeDrive {
 #[derive(Resource, Debug, Default)]
 pub struct BurstClock {
     pub opened: Option<Duration>,
+    pub deadline: Option<Duration>,
 }
 
 /// Marker component indicating that windows around the marked entity need to be reshuffled.
@@ -880,8 +887,11 @@ pub struct PendingValidations {
     queue: Vec<PendingValidation>,
 }
 
-/// Retries per element before giving up.
-const PENDING_VALIDATION_TRIES: u8 = 3;
+/// Retries per element before giving up: 500ms, 1s, 2s, 4s, 8s of growing
+/// backoff (~15s total). Slow launchers (Electron apps like Teams publish
+/// transient roles/subroles for seconds) need the long tail; a permanently
+/// invalid window still drops instead of spinning forever.
+const PENDING_VALIDATION_TRIES: u8 = 5;
 /// Cap on queued elements; oldest drops first under app-spawn storms.
 const PENDING_VALIDATION_CAP: usize = 64;
 
@@ -905,7 +915,7 @@ impl PendingValidations {
         });
     }
 
-    /// Growing backoff by tries remaining: 1s, then 2s.
+    /// Growing backoff by tries remaining: 1s, 2s, 4s, 8s.
     fn retry_delay(tries: u8) -> Duration {
         Duration::from_millis(
             500 * 2_u64.pow(u32::from(PENDING_VALIDATION_TRIES.saturating_sub(tries))),

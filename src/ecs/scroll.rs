@@ -6,6 +6,7 @@ use bevy::ecs::schedule::IntoScheduleConfigs as _;
 use bevy::ecs::system::{Commands, Local, Populated, Query, Res, Single};
 use bevy::math::IRect;
 use bevy::time::Time;
+use std::collections::HashMap;
 use std::time::{Duration, Instant};
 use tracing::{Level, instrument};
 
@@ -213,29 +214,63 @@ fn swipe_gesture(
 
 #[instrument(level = Level::TRACE, skip_all)]
 pub(super) fn swiping_timeout(
-    strips: Populated<(Entity, &mut Scrolling), With<LayoutStrip>>,
+    mut strips: Populated<(Entity, &mut Scrolling, &Position), With<LayoutStrip>>,
+    manual_strips: Query<Has<ManualStripOffset>>,
     active_display: ActiveDisplay,
     time: Res<Time>,
     window_manager: Res<WindowManager>,
+    mut poked: Local<HashMap<Entity, i32>>,
     mut commands: Commands,
 ) {
     const FINGER_LIFT_THRESHOLD: Duration = Duration::from_millis(50);
     const MIN_VELOCITY_PX: f64 = 5.0;
+    // Strip travel since the last synthetic hover that justifies another:
+    // below this the cursor's window membership cannot have changed, so a
+    // re-poke can only flip focus on stale state.
+    const HOVER_POKE_PX: i32 = 2;
     // Predicts the distance the integrator is about to move, so it has to use
     // the same bounded step the integrator does.
     let dt = time.delta_secs_f64().min(MAX_STEP_SECS);
     let viewport_width = f64::from(active_display.bounds().width());
 
-    for (entity, mut scroll) in strips {
+    let mut live = Vec::new();
+    for (entity, mut scroll, position) in strips.iter_mut() {
+        live.push(entity);
         if time.elapsed().abs_diff(scroll.last_event) > FINGER_LIFT_THRESHOLD {
             scroll.is_user_swiping = false;
 
             if scroll.velocity.abs() * dt * viewport_width < MIN_VELOCITY_PX
                 && let Ok(mut entity_commands) = commands.get_entity(entity)
             {
-                entity_commands.try_remove::<Scrolling>();
+                // Natural rest (swipe/inertia end, no release seeding it):
+                // settle to nearest-visible + fill instead of stranding the
+                // strip mid-park next to whitespace — the capped magnetic
+                // snap never reaches on ultrawide viewports. Already-tidy
+                // strips no-op through the settle in one tick. Manually
+                // placed strips (Center/Snap) keep their offset: settling
+                // would override explicit user placement.
+                if manual_strips.get(entity).is_ok_and(|manual| !manual) {
+                    entity_commands.try_insert(DragSettleMarker);
+                    scroll.velocity = 0.0;
+                } else {
+                    entity_commands.try_remove::<Scrolling>();
+                }
+                poked.remove(&entity);
+                continue;
             }
-            if let Some(point) = window_manager.cursor_position() {
+            // A settled scroll parks the strip under a stationary cursor, so
+            // focus-follows-mouse gets one synthetic hover to re-evaluate —
+            // but only when the strip actually moved since the last poke.
+            // Poking every tick while `Scrolling` lives flips focus on a
+            // stale cursor, whose expose scroll re-arms this timeout: a
+            // self-perpetuating drift loop with no finger down.
+            let offset = position.0.x;
+            if poked
+                .get(&entity)
+                .is_none_or(|last| (offset - last).abs() > HOVER_POKE_PX)
+                && let Some(point) = window_manager.cursor_position()
+            {
+                poked.insert(entity, offset);
                 commands.trigger(SendMessageTrigger(Event::MouseMoved {
                     point,
                     modifiers: Modifiers::empty(),
@@ -243,6 +278,9 @@ pub(super) fn swiping_timeout(
             }
         }
     }
+    // Strips whose scroll state died outside this system (reaped by drive
+    // takeover, presses, workspace moves) must not hold stale poke offsets.
+    poked.retain(|entity, _| live.contains(entity));
 }
 
 /// Strips with a freshly issued programmatic move plus live scroll state:
@@ -362,6 +400,57 @@ fn nearest_visible_offset(
 /// actual glide instead, so it compares in px/s like the release sampler.
 const SETTLE_MAX_GLIDE_PX_S: f64 = 100.0;
 
+/// Settle-target oscillation guard: the target derives from live window
+/// widths, so breathing widths can move it under the settle while the
+/// forced >=1px step below keeps chasing it forever. This tracks
+/// consecutive target moves per strip and reports when rest is due: a
+/// `true` return means stop (audit and verify own any residue) instead
+/// of gliding on.
+fn settle_target_unstable(
+    memory: &mut HashMap<Entity, (i32, u8)>,
+    strip_entity: Entity,
+    target: i32,
+) -> bool {
+    const SETTLE_TARGET_MOVES: u8 = 3;
+    let (last_target, moved) = memory.get(&strip_entity).copied().unwrap_or((target, 0));
+    if target == last_target {
+        memory.insert(strip_entity, (target, 0));
+        return false;
+    }
+    if moved + 1 >= SETTLE_TARGET_MOVES {
+        memory.remove(&strip_entity);
+        return true;
+    }
+    memory.insert(strip_entity, (target, moved + 1));
+    false
+}
+
+/// Nearest viewport-centering offset for the magnetic snap: each column
+/// votes the offset that would center it, closest wins. Pure over inputs
+/// so the target is unit testable without a world.
+fn nearest_center_target(
+    layout_strip: &LayoutStrip,
+    position_x: i32,
+    windows: &Windows,
+    viewport_center_x: i32,
+) -> i32 {
+    layout_strip
+        .all_columns()
+        .into_iter()
+        .filter_map(|entity| {
+            windows
+                .layout_position(entity)
+                .map(|p| p.0.x)
+                .zip(Some(entity))
+        })
+        .map(|(position, entity)| {
+            let col_width = windows.moving_frame(entity).map_or(0, |f| f.width());
+            viewport_center_x - (position + col_width / 2)
+        })
+        .min_by_key(|target| (position_x - target).abs())
+        .unwrap_or(position_x)
+}
+
 #[instrument(level = Level::TRACE, skip_all)]
 fn apply_snap_force(
     mut strip: Single<(
@@ -375,6 +464,7 @@ fn apply_snap_force(
     windows: Windows,
     config: Res<Config>,
     time: Res<Time>,
+    mut settle_memory: Local<HashMap<Entity, (i32, u8)>>,
     mut commands: Commands,
 ) {
     const CENTER_MAGNETIC_FORCE: f64 = 10.0;
@@ -421,7 +511,7 @@ fn apply_snap_force(
             return;
         }
         let get_window_frame = |entity| windows.moving_frame(entity);
-        let Some(target) = nearest_visible_offset(layout_strip, position.0.x, &windows, &viewport)
+        let target = nearest_visible_offset(layout_strip, position.0.x, &windows, &viewport)
             .and_then(|target| {
                 clamp_viewport_offset(
                     target,
@@ -451,17 +541,30 @@ fn apply_snap_force(
                 } else {
                     target
                 }
-            })
-        else {
+            });
+        let Some(target) = target else {
+            settle_memory.remove(&strip_entity);
             commands
                 .entity(strip_entity)
                 .try_remove::<DragSettleMarker>();
             commands.entity(strip_entity).try_remove::<Scrolling>();
             return;
         };
+        // The target derives from live window widths: breathing widths move
+        // it under the settle, and the forced >=1px step below would then
+        // creep forever chasing it. Rest after consecutive moves — audit
+        // and verify own any residue instead of an endless glide.
+        if settle_target_unstable(&mut settle_memory, strip_entity, target) {
+            commands
+                .entity(strip_entity)
+                .try_remove::<DragSettleMarker>();
+            commands.entity(strip_entity).try_remove::<Scrolling>();
+            return;
+        }
         let dist_to_snap = f64::from(position.0.x - target);
         if dist_to_snap.abs() < 1.0 {
             scroll.position = f64::from(target);
+            settle_memory.remove(&strip_entity);
             commands
                 .entity(strip_entity)
                 .try_remove::<DragSettleMarker>();
@@ -486,21 +589,7 @@ fn apply_snap_force(
         return;
     }
 
-    let target_offset = layout_strip
-        .all_columns()
-        .into_iter()
-        .filter_map(|entity| {
-            windows
-                .layout_position(entity)
-                .map(|p| p.0.x)
-                .zip(Some(entity))
-        })
-        .map(|(position, entity)| {
-            let col_width = windows.moving_frame(entity).map_or(0, |f| f.width());
-            viewport_center - (position + col_width / 2)
-        })
-        .min_by_key(|target| (position.x - target).abs())
-        .unwrap_or(position.x);
+    let target_offset = nearest_center_target(layout_strip, position.x, &windows, viewport_center);
 
     let dist_to_snap = f64::from(position.x - target_offset);
     if dist_to_snap.abs() < snap_threshold {

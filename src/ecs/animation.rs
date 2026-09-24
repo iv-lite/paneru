@@ -208,6 +208,18 @@ pub fn retarget_duration(remaining_px: f32, total_px: f32, base: Duration) -> Du
     Duration::from_secs_f32(scaled.max(MIN_ANIMATION_DURATION_MS as f32 / 1000.0))
 }
 
+/// Burst-synchronized duration for a leg joining a young burst: co-born
+/// legs must share pacing as well as phase, or siblings on different
+/// easing curves overtake and cross mid-glide (windows colliding instead
+/// of moving together). A joiner never shortens below its own
+/// proportional duration — only stretches to the burst's remaining time —
+/// so a huge late move still gets its full glide while short siblings
+/// slow to the shared pace. A spent or missing deadline degrades to the
+/// leg's own duration. Pure so the rule is unit testable.
+pub fn join_duration(own: Duration, now: Duration, deadline: Option<Duration>) -> Duration {
+    deadline.map_or(own, |end| own.max(end.saturating_sub(now)))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -410,6 +422,35 @@ mod tests {
         assert_eq!(
             retarget_duration(10.0, 100.0, Duration::ZERO),
             Duration::ZERO
+        );
+    }
+
+    #[test]
+    fn join_duration_syncs_to_burst_pace() {
+        let own = Duration::from_millis(80);
+        let now = Duration::from_millis(1000);
+        // No deadline: own duration stands.
+        assert_eq!(join_duration(own, now, None), own);
+        // Spent deadline: own duration stands, never shrinks.
+        assert_eq!(
+            join_duration(own, now, Some(Duration::from_millis(900))),
+            own
+        );
+        // Live burst with longer remaining: stretch to the shared pace so
+        // co-born legs land on the same tick instead of overtaking.
+        assert_eq!(
+            join_duration(own, now, Some(Duration::from_millis(1200))),
+            Duration::from_millis(200)
+        );
+        // Huge own move joining a short burst: keep the full glide, never
+        // rush to the burst's early landing.
+        assert_eq!(
+            join_duration(
+                Duration::from_millis(220),
+                now,
+                Some(Duration::from_millis(1050))
+            ),
+            Duration::from_millis(220)
         );
     }
 }

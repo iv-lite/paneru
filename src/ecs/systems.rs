@@ -1264,7 +1264,7 @@ pub(crate) fn animate_entities(
     mut commands: Commands,
 ) {
     use crate::ecs::animation::{
-        FIRST_TICK_WINDOW, birth_phase, eased_factor, kick_start, nudge_landing,
+        FIRST_TICK_WINDOW, birth_phase, eased_factor, join_duration, kick_start, nudge_landing,
         proportional_duration, retarget_duration, should_carry_phase, tween_finished, tween_ivec2,
     };
 
@@ -1363,11 +1363,13 @@ pub(crate) fn animate_entities(
             }
             None => {
                 let (started, opened) = birth_phase(now, bursts.opened);
+                let travel = (origin.as_vec2() - position.0.as_vec2()).length();
+                let duration =
+                    join_duration(proportional_duration(travel, base), now, bursts.deadline);
                 if opened {
                     bursts.opened = Some(now);
+                    bursts.deadline = Some(started + duration);
                 }
-                let travel = (origin.as_vec2() - position.0.as_vec2()).length();
-                let duration = proportional_duration(travel, base);
                 if let Ok(mut entity_commands) = commands.get_entity(entity) {
                     entity_commands.try_insert(crate::ecs::PositionDrive::animating(
                         position.0, *origin, started, duration,
@@ -1431,7 +1433,7 @@ pub(super) fn animate_resize_entities(
     mut commands: Commands,
 ) {
     use crate::ecs::animation::{
-        FIRST_TICK_WINDOW, birth_phase, eased_factor, kick_start, nudge_landing,
+        FIRST_TICK_WINDOW, birth_phase, eased_factor, join_duration, kick_start, nudge_landing,
         proportional_duration, retarget_duration, should_carry_phase, tween_finished, tween_ivec2,
     };
 
@@ -1479,11 +1481,13 @@ pub(super) fn animate_resize_entities(
             }
             None => {
                 let (started, opened) = birth_phase(now, bursts.opened);
+                let travel = (size.as_vec2() - bounds.0.as_vec2()).length();
+                let duration =
+                    join_duration(proportional_duration(travel, base), now, bursts.deadline);
                 if opened {
                     bursts.opened = Some(now);
+                    bursts.deadline = Some(started + duration);
                 }
-                let travel = (size.as_vec2() - bounds.0.as_vec2()).length();
-                let duration = proportional_duration(travel, base);
                 if let Ok(mut entity_commands) = commands.get_entity(entity) {
                     entity_commands.try_insert(crate::ecs::SizeDrive {
                         start: bounds.0,
@@ -2214,7 +2218,13 @@ pub(crate) fn window_moved_update_frame(
                     continue;
                 };
                 let old_frame = IRect::from_corners(position.0, position.0 + bounds.0);
-                if old_frame.min != new_frame.min {
+                // Deadband matches the push-back gate above: 1px app
+                // breathing (Electron re-layout, progress-driven jitter)
+                // must not become layout truth, or audit/verify/settle
+                // push it straight back — a ping-pong that walks windows
+                // apart with no user input.
+                let drift = (new_frame.min - old_frame.min).abs();
+                if drift.x > 1 || drift.y > 1 {
                     position.0 = new_frame.min;
                     counters.move_adopt += 1;
                 }
@@ -2808,18 +2818,29 @@ pub(super) fn update_overlays(
     // source while the drop ghost marks the landing slot. Plain clicks hold
     // unarmed markers, so they never flicker.
     let want_border = border_enabled && {
-        // Parked slivers physically sit inside abutting displays; drawing the
-        // focus border around one paints a stripe on the neighbor. The focused
-        // window belongs on screen, so a center outside its owner display
-        // means it is parked or mid-transfer — skip the border either way.
-        // Strip-less (floating) windows fall back to any display: layout
-        // never parks them.
-        let center = frame.center();
-        match owner_display {
-            Some(display) => display.bounds().contains(center),
-            None => displays
-                .iter()
-                .any(|(_, display, _)| display.bounds().contains(center)),
+        // Borders need a defined layout size: zero/negative `Bounds`
+        // (spawn before first layout, degenerate padding math) paints a
+        // nothing rect while still occupying a border window. Gate on the
+        // layout size — never on the padded/clamped rect, the OS cache, or
+        // snapshot freshness, all of which lag it during launch and
+        // verifying tails.
+        let sized = windows
+            .size(entity)
+            .is_some_and(|size| size.x > 0 && size.y > 0);
+        sized && {
+            // Parked slivers physically sit inside abutting displays; drawing the
+            // focus border around one paints a stripe on the neighbor. The focused
+            // window belongs on screen, so a center outside its owner display
+            // means it is parked or mid-transfer — skip the border either way.
+            // Strip-less (floating) windows fall back to any display: layout
+            // never parks them.
+            let center = frame.center();
+            match owner_display {
+                Some(display) => display.bounds().contains(center),
+                None => displays
+                    .iter()
+                    .any(|(_, display, _)| display.bounds().contains(center)),
+            }
         }
     };
     // The corner radius feeds every bordered window plus the dim cutout
@@ -2888,6 +2909,13 @@ pub(super) fn update_overlays(
                 continue;
             }
             if window.is_full_screen() || !on_screen.contains(&window_id) {
+                continue;
+            }
+            // Same defined-size gate as the focused path above.
+            if !windows
+                .size(entity)
+                .is_some_and(|size| size.x > 0 && size.y > 0)
+            {
                 continue;
             }
             let window_frame = border_frame_for(
@@ -3489,7 +3517,12 @@ pub(crate) fn retry_pending_validations(
                 entry.tries -= 1;
                 entry.next_retry = now + PendingValidations::retry_delay(entry.tries);
                 if entry.tries == 0 {
-                    debug!("pending validation exhausted for element: {err}");
+                    // Visible by default: an untiled window with no log line
+                    // is undiagnosable. The error names the role/subrole that
+                    // failed; a permanently non-standard window needs a
+                    // bundle-scoped `manage=true` rule, a transient one was
+                    // just too slow even for the long tail.
+                    warn!("pending validation exhausted for element (window will not tile): {err}");
                     false
                 } else {
                     trace!("pending validation retry deferred: {err}");

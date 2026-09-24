@@ -354,14 +354,53 @@ fn test_scrolling() {
             assert_window_at!(world, 1, 400, TEST_MENUBAR_HEIGHT);
             assert_window_at!(world, 2, 800, TEST_MENUBAR_HEIGHT);
         })
-        // The strip has come to rest mid-scroll: still one contiguous run of
-        // 400px columns, none of them parked at an edge sliver.
+        // The strip is settling after the swipe: still one contiguous run
+        // of 400px columns, none of them parked at an edge sliver.
         .on_iteration(5, move |world, _state| {
-            assert_window_at!(world, 0, -186, TEST_MENUBAR_HEIGHT);
-            assert_window_at!(world, 1, 214, TEST_MENUBAR_HEIGHT);
-            assert_window_at!(world, 2, 614, TEST_MENUBAR_HEIGHT);
+            let x0 = window_x(world, 0);
+            let x1 = window_x(world, 1);
+            let x2 = window_x(world, 2);
+            assert_eq!(x1 - x0, 400, "columns must stay contiguous mid-settle");
+            assert_eq!(x2 - x1, 400, "columns must stay contiguous mid-settle");
+            assert!(
+                x0 > -400 && x2 < 1024 + 400,
+                "no window may park at an edge sliver mid-settle"
+            );
+        })
+        // Settled: nearest-visible + fill repair pulls the strip to -176,
+        // closing the 10px underfill gap a bare rest would leave trailing.
+        .on_iteration(6, move |world, _state| {
+            assert_window_at!(world, 0, -176, TEST_MENUBAR_HEIGHT);
+            assert_window_at!(world, 1, 224, TEST_MENUBAR_HEIGHT);
+            assert_window_at!(world, 2, 624, TEST_MENUBAR_HEIGHT);
         })
         .run(commands);
+}
+
+/// An idle world must be bit-identical: 5s of simulated time with no input
+/// may not move the strip, adopt echoes, or seat drives. Pins the drift
+/// loop dead (synthetic hover → focus expose → scroll) and every timer
+/// backstop that rewrites `Position` uncommanded.
+#[test]
+fn test_idle_world_never_drifts() {
+    use crate::ecs::sync::SyncCounters;
+
+    let mut h = TestHarness::new().with_windows(3);
+    quiesce(&mut h);
+    let snapshot = |world: &mut World| {
+        let mut strips =
+            world.query_filtered::<&Position, (With<LayoutStrip>, With<ActiveWorkspaceMarker>)>();
+        let x = strips.single(world).expect("active strip").0.x;
+        let adopts = world.resource::<SyncCounters>().move_adopt;
+        (x, adopts)
+    };
+    let before = snapshot(h.app.world_mut());
+    h.advance(Duration::from_secs(5));
+    let after = snapshot(h.app.world_mut());
+    assert_eq!(
+        before, after,
+        "idle strip moved or adopted without input: {before:?} -> {after:?}"
+    );
 }
 
 #[test]
@@ -2483,6 +2522,87 @@ fn test_focus_glide_keeps_siblings_in_lockstep() {
     assert_window_at!(world, 1, 312, TEST_MENUBAR_HEIGHT);
 }
 
+/// Closing a middle window must glide the survivors shut without overlap:
+/// co-born legs share burst pacing as well as phase, so siblings on one
+/// easing curve keep formation instead of faster short legs overtaking
+/// slower long ones mid-flight (windows colliding instead of moving
+/// together).
+#[test]
+fn test_gap_close_glide_never_overlaps() {
+    use crate::events::DestroySource;
+
+    let config: Config = (
+        MainOptions {
+            animations: Some(true),
+            ..Default::default()
+        },
+        vec![],
+    )
+        .into();
+
+    let mut h = TestHarness::new().with_config(config).with_windows(5);
+    quiesce(&mut h);
+    // Close the middle window: the right-hand survivors glide left to
+    // close the gap, each a different travel distance.
+    h.app
+        .world_mut()
+        .write_message::<Event>(Event::WindowDestroyed {
+            window_id: 2,
+            source: DestroySource::Accessibility,
+        });
+    let mut saw_flight = false;
+    for tick in 0..300 {
+        pump_frame(&mut h);
+        let world = h.app.world_mut();
+        let frames: Vec<IRect> = {
+            let mut q = world.query::<(&Position, &Bounds)>();
+            q.iter(world)
+                .map(|(pos, bounds)| IRect::from_corners(pos.0, pos.0 + bounds.0))
+                .collect()
+        };
+        // Four survivors expected once the destroyed window despawns.
+        // Tall windows stack within columns (shared x, split y), so only
+        // a two-axis intersection counts — and only for substantially
+        // visible windows: parked columns pile at the sliver edge by
+        // design, invisible to the user.
+        if frames.len() == 4 {
+            let visible = |frame: &IRect| {
+                let w = frame.max.x.min(TEST_DISPLAY_WIDTH) - frame.min.x.max(0);
+                let h = frame.max.y.min(TEST_DISPLAY_HEIGHT) - frame.min.y.max(0);
+                w > 10 && h > 10
+            };
+            for (i, a) in frames.iter().enumerate() {
+                for b in &frames[i + 1..] {
+                    if !(visible(a) && visible(b)) {
+                        continue;
+                    }
+                    let x_overlap = a.min.x < b.max.x - 1 && b.min.x < a.max.x - 1;
+                    let y_overlap = a.min.y < b.max.y - 1 && b.min.y < a.max.y - 1;
+                    assert!(
+                        !(x_overlap && y_overlap),
+                        "tick {tick}: siblings overlapped mid-glide ({:?} vs {:?})",
+                        (a.min, a.max),
+                        (b.min, b.max),
+                    );
+                }
+            }
+        }
+        let mut markers = world.query_filtered::<(), With<RepositionMarker>>();
+        if markers.iter(world).next().is_some() {
+            saw_flight = true;
+        } else if saw_flight {
+            break;
+        }
+    }
+    assert!(
+        saw_flight,
+        "the survivors must actually have glided for the test to mean anything"
+    );
+    let world = h.app.world_mut();
+    let survivors = world.query::<&Window>().iter(world).count();
+    assert_eq!(survivors, 4, "destroyed window must be gone");
+}
+
 /// Focusing a window whose OS frame drifted must pull the app back to its
 /// tile instead of adopting the drift into layout: adoption is what grew
 /// windows to viewport size over repeated focuses (adopt -> strip dirty ->
@@ -2519,6 +2639,53 @@ fn test_focus_clamps_os_drift_back_to_tile() {
         os_size = w.frame.size();
     });
     assert_eq!(os_size, tile, "OS frame must be pulled back to the tile");
+}
+
+/// A click-focus (Press cause) must never grow the window: if `Bounds`
+/// drifted wide, pulling the OS window up to it is what made single
+/// clicks "maximize" windows — grossly visible on ultrawide viewports.
+/// Shrinks still clamp (see above); growth on click stays put.
+#[test]
+fn test_click_focus_never_grows_window() {
+    let mut h = TestHarness::new().with_windows(2);
+    quiesce(&mut h);
+    let zero = find_window_entity(0, h.app.world_mut());
+    let tile = h.app.world_mut().get::<Bounds>(zero).expect("bounds").0;
+    // OS frame smaller than the tile (native shrink, or tile drifted wide
+    // — either way the OS window is the smaller one).
+    let small = Size::new(tile.x - 200, tile.y);
+    h.mock_state.update_window(0, |w| {
+        w.frame.max = w.frame.min + small;
+    });
+    // Focus window 1 first so the click below genuinely moves focus
+    // (fires `Added<FocusedMarker>` on window 0 with Press cause).
+    h.mock_state.focus_window(1);
+    for _ in 0..10 {
+        pump_frame(&mut h);
+    }
+    // Click inside window 0: records `LastPress` for Press attribution.
+    h.app.world_mut().write_message::<Event>(Event::MouseDown {
+        point: CGPoint::new(100.0, 60.0),
+        modifiers: Modifiers::empty(),
+    });
+    for _ in 0..10 {
+        pump_frame(&mut h);
+    }
+    // The click's focus echo arrives natively after the press.
+    h.mock_state.focus_window(0);
+    for _ in 0..10 {
+        pump_frame(&mut h);
+    }
+    let world = h.app.world_mut();
+    assert_focused!(world, 0);
+    let mut os_size = Size::new(0, 0);
+    h.mock_state.update_window(0, |w| {
+        os_size = w.frame.size();
+    });
+    assert_eq!(
+        os_size, small,
+        "click focus must not grow the OS window toward the tile"
+    );
 }
 
 /// An OS-echo focus (app self-raise: no command, no press) refocuses and

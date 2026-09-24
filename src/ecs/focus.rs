@@ -31,7 +31,7 @@ use crate::ecs::{
     Scrolling, SendMessageTrigger, SpawnCommandsExt, StrayFocusEvent,
 };
 use crate::events::Event;
-use crate::manager::{Application, Display, Origin, Window, WindowManager, origin_from};
+use crate::manager::{Application, Display, Origin, Size, Window, WindowManager, origin_from};
 use crate::platform::WorkspaceId;
 
 const REFRESH_WINDOW_CHECK_FREQ_MS: u64 = 1000;
@@ -214,6 +214,9 @@ fn shares_a_tab_group(
 fn clamp_window_size_on_focus(
     focused: Single<Entity, Added<FocusedMarker>>,
     mut windows: Query<(&mut Window, &Bounds, Has<ResizeMarker>)>,
+    user: Res<UserFocus>,
+    press: Res<LastPress>,
+    time: Res<Time>,
 ) {
     let Ok((mut window, bounds, resizing)) = windows.get_mut(*focused) else {
         return;
@@ -231,6 +234,31 @@ fn clamp_window_size_on_focus(
     // adopt quietly so no `Changed<Bounds>` churn follows every focus.
     let drift = (frame.size() - bounds.0).abs();
     if drift.x <= 1 && drift.y <= 1 {
+        return;
+    }
+    // A click (Press cause) must never grow the window: if `Bounds` itself
+    // drifted wide (adopt/widen loop, stale ratio), pulling the OS window
+    // up to it is what makes single clicks "maximize" windows — grossly
+    // visible on ultrawide viewports. Clamp down only; a click revealing
+    // an oversized window still conforms it back to its tile.
+    if matches!(
+        focus_cause(&user, &press, time.elapsed(), *focused, window.frame()),
+        FocusCause::Press
+    ) {
+        let grown = Size::new(
+            bounds.0.x.min(frame.size().x),
+            bounds.0.y.min(frame.size().y),
+        );
+        if grown == frame.size() {
+            return;
+        }
+        warn!(
+            "focus: click-clamping window {} from OS size {} down toward tile size {}",
+            window.id(),
+            frame.size(),
+            bounds.0
+        );
+        window.resize(grown);
         return;
     }
     // Anything larger is never adopted: the tile is the truth, and adopting

@@ -2592,6 +2592,63 @@ fn test_toolbar_blank_grab_scrolls_strip() {
         .run(commands);
 }
 
+/// Sub-threshold pointer jitter on a scroll-armed titlebar grab must not
+/// move the strip: a press that never travels releases as a click, so
+/// driving earlier turns clicks (e.g. `VSCode` tab clicks misclassified
+/// when the AX hit-test misses Electron chrome) into scrolls plus
+/// release inertia. The dead-zone absorbs the wobble; release stays a
+/// no-reshuffle, no-inertia click.
+#[test]
+fn test_titlebar_jitter_click_does_not_scroll() {
+    // 5 tiled windows: 2000px strip on a 1024px display, so the strip can
+    // actually scroll. Window 0 tiles at (0, 20); y=40 sits inside the
+    // 28px titlebar band with the default mock reporting no interactive
+    // control, so the press arms the scroll drive exactly like the
+    // misclassified tab.
+    let press = CGPoint::new(200.0, 40.0);
+    let commands = vec![
+        Event::MenuOpened { window_id: 0 },
+        Event::MouseDown {
+            point: press,
+            modifiers: Modifiers::empty(),
+        },
+        Event::MouseDragged {
+            point: CGPoint::new(202.0, 40.0),
+            modifiers: Modifiers::empty(),
+        },
+        Event::MouseUp {
+            point: CGPoint::new(202.0, 40.0),
+            modifiers: Modifiers::empty(),
+        },
+        Event::Command {
+            command: Command::PrintState,
+        },
+    ];
+
+    TestHarness::new()
+        .with_windows(5)
+        .on_iteration(2, |world, _state| {
+            // 2px of jitter: absorbed by the dead-zone, strip unmoved.
+            assert_window_at!(world, 0, 0, TEST_MENUBAR_HEIGHT);
+            assert_eq!(
+                strip_x_of_window_0(world),
+                0,
+                "sub-threshold jitter must not scroll the strip"
+            );
+        })
+        .on_iteration(4, |world, _state| {
+            // Click release: no scroll offset kept, no inertia fling, no
+            // reshuffle — the window sits exactly where the press found it.
+            assert_window_at!(world, 0, 0, TEST_MENUBAR_HEIGHT);
+            assert_eq!(
+                strip_x_of_window_0(world),
+                0,
+                "click release must leave the strip at rest"
+            );
+        })
+        .run(commands);
+}
+
 /// X of the strip owning window 0, for drag-scroll assertions.
 fn strip_x_of_window_0(world: &mut World) -> i32 {
     let first = find_window_entity(0, world);

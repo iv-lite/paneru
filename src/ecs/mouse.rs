@@ -746,7 +746,7 @@ fn try_reorder_column(entity: Entity, strips: &mut ReleaseStrips, windows: &Wind
     debug!("mouse up: armed drop relocates column to index {adjusted}");
     true
 }
-#[allow(clippy::too_many_arguments)]
+#[allow(clippy::too_many_arguments, clippy::too_many_lines)]
 fn mouse_up_trigger(
     mut messages: MessageReader<InputEvent>,
     mouse_held: Query<(Entity, &MouseHeldMarker, Option<&Gesture>)>,
@@ -898,8 +898,19 @@ fn mouse_up_trigger(
                 // Reveal the most-visible member: homing glides windows to
                 // slots but never moves the strip, so without this a drop
                 // can strand its window half-visible with nothing scheduled
-                // (the audit only re-homes windows, never scrolls).
-                reveal_most_visible(entity, &strips, &displays, &windows, &config, &mut commands);
+                // (the audit only re-homes windows, never scrolls). Skipped
+                // on pure clicks: nothing moved, so there is nothing to
+                // reveal — scrolling here only makes tab clicks jump.
+                if !click {
+                    reveal_most_visible(
+                        entity,
+                        &strips,
+                        &displays,
+                        &windows,
+                        &config,
+                        &mut commands,
+                    );
+                }
             }
             if let Ok(mut entity_commands) = commands.get_entity(held_entity) {
                 entity_commands.try_despawn();
@@ -1558,6 +1569,18 @@ fn drag_move_held_column(
     // (scroll-disabled) drags take the move path below; content grabs with
     // scrolling enabled are ignored entirely — native owns them.
     if scroll_armed {
+        // Dead-zone: a press that never travels reads as a click on
+        // release, so driving the strip on sub-threshold pointer jitter
+        // (trackpad tap wobble, HiDPI rounding) turns clicks into
+        // scrolls — e.g. VSCode tab clicks misclassified as titlebar
+        // grabs when the AX hit-test misses Electron chrome. Absorb
+        // motion below the click threshold; the press anchor already
+        // refreshed per slice above, so crossing the threshold later
+        // starts clean with no jump. Matches the release branch, which
+        // only keeps the offset past the same threshold.
+        if scroll_state.distance_px <= DRAG_SCROLL_CLICK_THRESHOLD_PX {
+            return;
+        }
         // Threshold and velocity already tracked per raw slice above; the
         // strip follows the folded total 1:1 with no friction while held.
         drive_scroll_strip(

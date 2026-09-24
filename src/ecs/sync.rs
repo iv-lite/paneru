@@ -271,12 +271,14 @@ impl ResizeEvent {
 }
 
 /// Pure transition for resize echoes: our own in-flight resize, an armed
-/// display-drag owning the gesture, and damped app jitter all ignore; the
-/// rest adopts. Same single-decision-point shape as [`reconcile`]. Takes the
-/// machine state for signature symmetry with [`reconcile`]; move-owned
-/// `Homing`/`Verifying` states deliberately do NOT suppress resizes yet —
-/// folding those in is Phase 2c, and suppressing now would change behavior.
-pub fn reconcile_resize(_state: WindowSync, event: ResizeEvent) -> SyncAction {
+/// display-drag owning the gesture, a move-owned in-flight state, and
+/// damped app jitter all ignore; the rest adopts. Same single-decision-point
+/// shape as [`reconcile`]. Own-move suppression (Phase 2c): a homing glide
+/// or landing confirmation owns the window, so a resize echo arriving then
+/// is our own motion echoing back, not user intent — adopting it is what
+/// randomly rewrote window sizes with no explicit action. Damping stays the
+/// fallback for ambient echoes outside any drive.
+pub fn reconcile_resize(state: WindowSync, event: ResizeEvent) -> SyncAction {
     if event.minimized_or_hidden {
         return SyncAction::Ignore;
     }
@@ -284,6 +286,12 @@ pub fn reconcile_resize(_state: WindowSync, event: ResizeEvent) -> SyncAction {
         return SyncAction::Ignore;
     }
     if event.resizing {
+        return SyncAction::Ignore;
+    }
+    if matches!(
+        state,
+        WindowSync::Homing { .. } | WindowSync::Verifying { .. }
+    ) {
         return SyncAction::Ignore;
     }
     if event.jitter_damped {
@@ -526,10 +534,19 @@ mod tests {
                 SyncAction::Ignore
             );
         }
-        // Move-owned machine states do not suppress resizes yet.
+        // Move-owned in-flight states suppress resizes: a homing glide or
+        // landing confirmation owns the window, so the echo is our own
+        // motion, not user intent.
         assert_eq!(
             reconcile_resize(WindowSync::Verifying { retries: 2 }, ResizeEvent::clean()),
-            SyncAction::Adopt
+            SyncAction::Ignore
+        );
+        assert_eq!(
+            reconcile_resize(
+                WindowSync::homing(Duration::from_secs(200)),
+                ResizeEvent::clean()
+            ),
+            SyncAction::Ignore
         );
     }
 

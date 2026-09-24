@@ -955,12 +955,21 @@ pub(super) fn window_managed_trigger(
     {
         let properties = WindowProperties::new(app, window, &ctx.config);
 
-        if let Some(width_ratio) = properties.width_ratio().or(ctx.config.default_ratio()) {
+        if let Some(width_ratio) = properties.width_ratio().or(ctx.config.default_ratio())
+            && let Some(current) = ctx.windows.size(entity)
+        {
             let (_, pad_right, _, pad_left) = ctx.config.edge_padding();
             let padded_width = display_bounds.width() - pad_left - pad_right;
             let width = round_px(f64::from(padded_width) * width_ratio);
-            let height = display_bounds.height();
-            ctx.commands.resize_entity(entity, Size::new(width, height));
+            // Preserve the remembered height instead of forcing full
+            // viewport height: stomping it here discards user-adjusted
+            // stack heights on every unhide with no explicit action. The
+            // layout pass owns height conformance from here (and restores
+            // full height itself when `maximize_tiled_windows` is on).
+            let target = Size::new(width, current.y);
+            if target != current {
+                ctx.commands.resize_entity(entity, target);
+            }
         }
 
         insert_at = properties.insertion();

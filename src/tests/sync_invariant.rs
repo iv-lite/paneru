@@ -4,6 +4,7 @@
 
 use bevy::ecs::system::RunSystemOnce as _;
 
+use crate::ax_writer::AxWriteState;
 use crate::ecs::sync::{SyncCounters, WindowSync};
 use crate::ecs::{MouseHeldMarker, Position, RepositionMarker};
 use crate::events::Event;
@@ -81,4 +82,48 @@ fn own_move_echo_ignored_and_counted() {
         "own-move echo must not adopt"
     );
     assert_eq!(world.resource::<SyncCounters>().move_ignore_reposition, 1);
+}
+
+/// 1px app breathing (Electron re-layout jitter) must not become layout
+/// truth: the adopt deadband matches the push-back gate, or audit/verify
+/// push it straight back — a ping-pong that walks windows apart with no
+/// user input.
+#[test]
+fn breathing_echo_never_adopts() {
+    let mut harness = TestHarness::new().with_windows(1);
+    // Settle spawn layout: an in-flight `RepositionMarker` would route the
+    // echo to Ignore before it ever reaches the Adopt arm under test.
+    harness.advance(std::time::Duration::from_secs(2));
+
+    let world = harness.world();
+    let entity = find_window_entity(0, world);
+    let before = world.get::<Position>(entity).expect("slot").0;
+    // Settle the write state: the spawn commit is still unacked in the
+    // harness (no worker), which would route the echo to Ignore before it
+    // ever reaches the Adopt arm under test.
+    world
+        .resource_mut::<AxWriteState>()
+        .acknowledge(0, u64::MAX, u64::MAX);
+
+    let state = harness.mock_state.clone();
+    state.os_move_window(0, Origin::new(before.x + 1, before.y));
+    harness
+        .world()
+        .write_message(Event::WindowMoved { window_id: 0 });
+    harness
+        .world()
+        .run_system_once(crate::ecs::systems::window_moved_update_frame)
+        .expect("move reconciler runs");
+
+    let world = harness.world();
+    assert_eq!(
+        world.get::<Position>(entity).expect("slot").0,
+        before,
+        "1px breathing must not adopt into tiled Position"
+    );
+    assert_eq!(
+        world.resource::<SyncCounters>().move_adopt,
+        0,
+        "breathing must not count as an adoption"
+    );
 }
