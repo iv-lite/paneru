@@ -300,6 +300,7 @@ fn mouse_moved_trigger(
     mut global_state: GlobalState,
     mut commands: Commands,
     mut last_find_query: Local<Option<Duration>>,
+    held: Query<Entity, With<MouseHeldMarker>>,
 ) {
     const FIND_WINDOW_THROTTLE: Duration = Duration::from_millis(50);
 
@@ -307,6 +308,18 @@ fn mouse_moved_trigger(
         let Event::MouseMoved { point, modifiers } = event else {
             continue;
         };
+
+        // A held button owns the gesture: hover focus is deferred until
+        // release. Otherwise a hover echo landing mid-drag flips
+        // `skip_reshuffle` (or glues the active display to the hovered
+        // window) and the drag's owner strip / transfer hit-test reads a
+        // world the hand never grabbed — the "hover while changing display,
+        // then drag detaches" failure. Events are still consumed so no
+        // stale hover fires on release.
+        if !held.is_empty() {
+            trace!("mouse moved deferred: button held, hover focus waits for release");
+            continue;
+        }
 
         if config
             .mouse_resize_modifier()
@@ -1311,6 +1324,14 @@ fn held_drag_target(
 /// pause reads as holding still — then folds the segment over the whole
 /// gap, so only post-pause motion at a post-pause rate can fling: a
 /// press-hold-release folds ~zero travel and stops dead.
+///
+/// Pointer acceleration is honored by construction, not by a synthetic
+/// gain: the tap reports absolute `CGEvent::location` points (already
+/// shaped by the macOS pointer-acceleration curve), so differencing them
+/// preserves the hand's true pace here and in the 1:1 drive below. A fast
+/// flick folds a large `dx/dt` and seeds a long release glide; the same
+/// travel done slowly folds a small rate and stops. Applying our own
+/// acceleration curve on top would double-apply the system's.
 fn sample_release_velocity(scroll_state: &mut DragScrollState, dx: f64, now: Duration) {
     let Some(last) = scroll_state.last_sample_at else {
         scroll_state.last_sample_at = Some(now);
@@ -1337,6 +1358,12 @@ fn sample_release_velocity(scroll_state: &mut DragScrollState, dx: f64, now: Dur
 /// Above `MAX_RELEASE_PX_S` it clamps. Get-or-insert: a mid-drag pause may have let
 /// the lift-timeout reap `Scrolling`, in which case it is recreated at the
 /// strip's current offset.
+///
+/// Caller contract: ONLY the mouse-up release path for a scroll-drag that
+/// actually traveled (`mouse_up_trigger`'s scroll branch) may call this.
+/// Focus changes, hover arrivals, reshuffles and clicks must never seed
+/// `Scrolling` — they glide via `RepositionMarker` tweens, and
+/// `cancel_driven_strip_glide` yields any live glide to them.
 fn seed_release_inertia(
     entity: Entity,
     ema_px_s: f64,
@@ -1664,6 +1691,19 @@ fn drag_window_across_display(
         let Some((_, entity)) = windows.find(*window_id) else {
             continue;
         };
+        // A strip-glide drag owns its strip's scroll offset and must never
+        // detach: hover motion across a display seam mid-gesture — or a
+        // display reconfigure changing what "foreign" means under a held
+        // cursor — is glide travel, not a transfer. Only grab-time
+        // display-armed drags may relocate across displays.
+        if held.iter().any(|(_, marker, gesture)| {
+            marker.0 == entity && gesture.is_some_and(|g| g.scroll_armed)
+        }) {
+            trace!(
+                "drag transfer: window (id {window_id}, {entity}) is a scroll-glide drag, never a transfer"
+            );
+            continue;
+        }
         // Only while the button is held down on this very window. Arming is
         // grab-time frozen (see `Gesture`): releasing the shortcut mid-drag
         // no longer disarms transfer.
@@ -2448,6 +2488,38 @@ mod tests {
         assert!(state.release_ema_px_s.abs() < f64::EPSILON);
         sample_release_velocity(&mut state, 100.0, Duration::from_millis(1200));
         assert!((state.release_ema_px_s - 0.3 * 500.0).abs() < 1e-9);
+    }
+
+    #[test]
+    fn release_velocity_reflects_drag_pace() {
+        // Pointer acceleration reaches the sampler through the deltas: the
+        // same 500px of travel folds a far hotter EMA when flicked (10ms
+        // segments) than when crawled (100ms segments), so the release
+        // glide matches the hand instead of the distance.
+        fn pace_ema(step_gap_ms: u64) -> f64 {
+            let mut state = DragScrollState::default();
+            let mut now = Duration::from_millis(100);
+            sample_release_velocity(&mut state, 0.0, now);
+            for _ in 0..5 {
+                now += Duration::from_millis(step_gap_ms);
+                sample_release_velocity(&mut state, -100.0, now);
+            }
+            state.release_ema_px_s
+        }
+        let flick = pace_ema(10);
+        let crawl = pace_ema(100);
+        assert!(
+            flick < -5000.0,
+            "a -100px/10ms flick must fold near -10000px/s, got {flick}"
+        );
+        assert!(
+            crawl > -2000.0 && crawl < 0.0,
+            "a -100px/100ms crawl must fold near -1000px/s, got {crawl}"
+        );
+        assert!(
+            flick.abs() > 3.0 * crawl.abs(),
+            "pace must dominate distance: flick {flick} vs crawl {crawl}"
+        );
     }
 
     fn make_display() -> Display {

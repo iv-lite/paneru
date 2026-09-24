@@ -212,6 +212,7 @@ fn display_change_handler(
 /// the same add / remove / move primitives the event handlers use. It also
 /// forces the active workspace to re-tile, because macOS relocates windows while
 /// asleep even when the display set is unchanged.
+#[allow(clippy::too_many_arguments)]
 pub(crate) fn reconcile_displays(
     mut messages: MessageReader<Event>,
     workspaces: Query<(&LayoutStrip, Entity, Option<&ChildOf>)>,
@@ -219,6 +220,7 @@ pub(crate) fn reconcile_displays(
     window_manager: Res<WindowManager>,
     mut display_gen: ResMut<crate::ecs::DisplayGeneration>,
     mut retries: Local<u8>,
+    held: Query<&MouseHeldMarker>,
     mut commands: Commands,
 ) {
     const DISPLAY_RETRY_TIMEOUT: u64 = 5;
@@ -343,10 +345,18 @@ pub(crate) fn reconcile_displays(
     // viewport; members follow through layout → animate → commit → verify.
     // Already-correct strips compute a no-op target (no visible motion, no
     // AX beyond the routine commit path).
+    // Skips strips with a held drag target: the hand owns the strip until
+    // mouse-up (see `MouseHeldMarker`), and a forced reshuffle mid-gesture
+    // would yank the offset from under the drag's owner-strip drive — the
+    // re-clamp is deferred to the release path instead.
+    let held_targets: HashSet<Entity> = held.iter().map(|marker| marker.0).collect();
     for (strip, _, _) in &workspaces {
         let Some(member) = strip.all_columns().into_iter().next() else {
             continue;
         };
+        if held_targets.iter().any(|target| strip.contains(*target)) {
+            continue;
+        }
         commands.reshuffle_around_forced(member);
     }
 

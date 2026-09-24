@@ -1,12 +1,14 @@
 //! Fixed-duration tween math for window motion.
 //!
 //! A tween has a deadline: `progress = (now - started) / duration` through
-//! a snappy ease (gentle attack, decisive landing), so siblings land on the
-//! same tick and the border can ride the exact presented frame. The attack
-//! stays `smootherstep`-gentle — a fast-attack curve spends ~35% of the
-//! distance on the first tick, which the coalesced AX writer turns into a
-//! visible jump-then-crawl — while the tail blends toward linear so the last
-//! frames keep non-zero velocity instead of stalling at zero slope.
+//! an ease-out cubic, so siblings land on the same tick and the border can
+//! ride the exact presented frame. Ease-out cubic covers ground fast up
+//! front and decelerates into the landing: the first ticks are larger than
+//! the old `smootherstep` attack (which spent ~4% of the distance 20ms into
+//! a 150ms glide vs ~35% here), so very large glides may step wider than
+//! the async AX writer tracks in one frame — `proportional_duration` and
+//! the coalesced writer absorb that; the tail keeps non-zero velocity
+//! instead of stalling at zero slope.
 //!
 //! Legs born into the same young burst share one phase stamp (see
 //! [`BURST_JOIN_WINDOW`]): strips, windows and resizes move in lockstep even
@@ -57,35 +59,14 @@ pub const BURST_JOIN_WINDOW: Duration = Duration::from_millis(50);
 /// glide instead of inheriting a nearly-spent phase).
 pub const RETARGET_CARRY_PX: f32 = 32.0;
 
-/// Smootherstep: gentle attack *and* landing, zero velocity at both ends.
-/// `p` is clamped 0..1. At 20ms into a 150ms glide this covers ~4% of the
-/// distance (vs ~35% for a cubic ease-out), so every committed step stays
-/// small enough for the async AX writer to track without jumping.
-pub fn smootherstep(p: f32) -> f32 {
+/// Ease-out cubic: fast attack, decelerating landing (`1 - (1-p)^3`).
+/// `p` is clamped 0..1. At 20ms into a 150ms glide this covers ~35% of the
+/// distance (vs ~4% for [`smootherstep`]), which reads as immediate,
+/// linear-like motion; the end velocity decays to zero smoothly instead of
+/// stalling, and [`nudge_landing`] still owns sub-pixel tails.
+pub fn ease_out_cubic(p: f32) -> f32 {
     let p = p.clamp(0.0, 1.0);
-    p * p * p * (p * (p * 6.0 - 15.0) + 10.0)
-}
-
-/// Snappy ease: `smootherstep` attack through `P = 0.7`, then a blend toward
-/// a linear tail so the landing keeps non-zero velocity. At `p = 0.7` both
-/// value and slope are continuous; at `p = 1` the slope is
-/// `(1 - smootherstep(0.7)) / 0.3 ≈ 0.54` instead of zero, so the last
-/// frames advance instead of rounding to a standstill.
-pub fn snappy_ease(p: f32) -> f32 {
-    /// Handoff point: attack below, linear-blend tail above.
-    const BLEND_START: f32 = 0.7;
-    let p = p.clamp(0.0, 1.0);
-    if p < BLEND_START {
-        return smootherstep(p);
-    }
-    let s = smootherstep(p);
-    let s70 = smootherstep(BLEND_START);
-    let t = (p - BLEND_START) / (1.0 - BLEND_START);
-    // Linear tail from (0.7, s70) to (1, 1), blended in with a smooth ramp
-    // so the handoff has no velocity kink.
-    let linear = s70 + (1.0 - s70) * t;
-    let blend = t * t * (3.0 - 2.0 * t);
-    s + (linear - s) * blend
+    1.0 - (1.0 - p) * (1.0 - p) * (1.0 - p)
 }
 
 /// Eased 0..1 factor for `elapsed` into `duration`.
@@ -96,7 +77,7 @@ pub fn eased_factor(elapsed: Duration, duration: Duration) -> f32 {
         return 1.0;
     }
     let total = duration.as_secs_f32().max(f32::EPSILON);
-    snappy_ease(elapsed.as_secs_f32() / total)
+    ease_out_cubic(elapsed.as_secs_f32() / total)
 }
 
 /// Birth phase for a fresh leg: legs born within [`BURST_JOIN_WINDOW`] of
@@ -232,45 +213,37 @@ mod tests {
     use super::*;
 
     #[test]
-    fn smootherstep_pins_ends_and_midpoint() {
-        assert!(smootherstep(0.0).abs() < 1e-6);
-        assert!((smootherstep(1.0) - 1.0).abs() < 1e-6);
-        assert!((smootherstep(0.5) - 0.5).abs() < 1e-6);
-    }
-
-    #[test]
-    fn smootherstep_is_gentle_at_both_ends() {
-        // Zero end velocities: small first *and* last steps, so committed
-        // frames stay AX-sized through the whole glide.
-        assert!(smootherstep(0.25) < 0.25, "gentle attack");
-        assert!(smootherstep(0.75) > 0.75, "gentle landing");
-        // A 20ms tick of a 150ms glide covers ~4%, not ~35%.
-        assert!(smootherstep(20.0 / 150.0) < 0.06);
-    }
-
-    #[test]
-    fn snappy_ease_pins_ends_and_stays_gentle_up_front() {
-        assert!(snappy_ease(0.0).abs() < 1e-6);
-        assert!((snappy_ease(1.0) - 1.0).abs() < 1e-6);
-        // Attack matches smootherstep (no first-tick jump).
-        assert!((snappy_ease(0.25) - smootherstep(0.25)).abs() < 1e-6);
-        assert!(snappy_ease(20.0 / 150.0) < 0.08);
-        // Decisive landing: the last 10% of time covers ~5x the distance of
-        // smootherstep (non-zero end velocity), so the tail commits instead
-        // of rounding to dead frames.
-        let snappy_tail = snappy_ease(1.0) - snappy_ease(0.9);
-        let smooth_tail = smootherstep(1.0) - smootherstep(0.9);
-        assert!(snappy_tail > smooth_tail * 2.0);
-        assert!(snappy_ease(0.9) < 1.0);
+    fn ease_out_cubic_pins_ends_and_attacks_fast() {
+        assert!(ease_out_cubic(0.0).abs() < 1e-6);
+        assert!((ease_out_cubic(1.0) - 1.0).abs() < 1e-6);
+        // Fast attack: ahead of linear up front, decelerating into the end.
+        assert!(ease_out_cubic(0.25) > 0.25, "fast attack");
+        assert!(ease_out_cubic(0.75) > 0.75, "decelerating landing");
+        // A 20ms tick of a 150ms glide covers ~35%, not ~4%.
+        let early = ease_out_cubic(20.0 / 150.0);
+        assert!(early > 0.25 && early < 0.45);
+        assert!(ease_out_cubic(0.9) < 1.0);
+        // Monotonic: never steps back.
+        let mut prev = 0.0;
+        let mut p = 0.0;
+        while p <= 1.0 {
+            let v = ease_out_cubic(p);
+            assert!(v >= prev);
+            prev = v;
+            p += 0.05;
+        }
     }
 
     #[test]
     fn glide_advances_every_tick_without_jumps() {
-        // Same 150ms, finer steps: an 800px glide sampled at 120Hz must
-        // never step back and must make pixel progress on every mid-glide
-        // tick (the kick/nudge own the first/last ticks, the curve owns
-        // the middle). A stalled mid-glide tick reads as judder; a huge
-        // one reads as a jump the AX writer turns into jump-then-crawl.
+        // Same 150ms, finer steps: an 800px ease-out-cubic glide sampled at
+        // 120Hz must never step back and must make pixel progress on every
+        // mid-glide tick (the kick/nudge own the first/last ticks, the curve
+        // owns the middle). A stalled mid-glide tick reads as judder; an
+        // oversized one reads as a jump the AX writer turns into
+        // jump-then-crawl. Cubic attacks fast, so early ticks are wider
+        // than the old smootherstep glide — the 130px mid-glide bound
+        // reflects that instead of pretending steps stay tiny.
         let start = IVec2::new(0, 0);
         let end = IVec2::new(800, 0);
         let duration = Duration::from_millis(DEFAULT_ANIMATION_DURATION_MS);
@@ -289,7 +262,7 @@ mod tests {
                     "mid-glide tick at {tick:?} must advance"
                 );
                 assert!(
-                    current.x - previous.x <= 120,
+                    current.x - previous.x <= 130,
                     "mid-glide tick at {tick:?} must stay AX-sized"
                 );
             }

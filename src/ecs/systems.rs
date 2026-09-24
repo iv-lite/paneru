@@ -1273,10 +1273,9 @@ pub(crate) fn animate_entities(
     // `started` stamp — strips, windows and resizes move in lockstep even
     // when their markers land on adjacent ticks. A stall advances progress
     // (correct) instead of teleporting (the old uncapped-exponential
-    // failure mode), and the border rides the presented frame. The ease
-    // keeps a gentle attack (AX-sized first steps) with a decisive landing
-    // (non-zero end velocity + 1px landing nudge) so the tail commits
-    // instead of rounding to dead frames.
+    // failure mode), and the border rides the presented frame. The ease is
+    // ease-out cubic (fast attack, decelerating landing) with a 1px landing
+    // nudge so the tail commits instead of rounding to dead frames.
     //
     // Phase prediction: shift `now` forward by the pump's vsync lead so the
     // committed frame is the retrace-time pose, not one frame stale. The

@@ -2603,6 +2603,39 @@ fn strip_x_of_window_0(world: &mut World) -> i32 {
     position.0.x
 }
 
+/// Offset of the test workspace's strip, for close-up assertions (window 0
+/// may already be gone, so the window-0 helper above cannot be used).
+fn test_strip_offset(world: &mut World) -> i32 {
+    let mut strips = world.query::<(&LayoutStrip, &Position)>();
+    let (_, position) = strips
+        .iter(world)
+        .find(|(strip, _)| strip.id() == TEST_WORKSPACE_ID)
+        .expect("need test strip");
+    position.0.x
+}
+
+/// Presented frames of every window on the test workspace's strip.
+fn test_strip_frames(world: &mut World) -> Vec<IRect> {
+    let entities: Vec<Entity> = {
+        let mut strips = world.query::<&LayoutStrip>();
+        strips
+            .iter(world)
+            .find(|strip| strip.id() == TEST_WORKSPACE_ID)
+            .expect("need test strip")
+            .all_windows()
+    };
+    let mut positions = world.query::<&Position>();
+    let mut sizes = world.query::<&crate::ecs::Bounds>();
+    entities
+        .iter()
+        .map(|entity| {
+            let origin = positions.get(world, *entity).expect("need position").0;
+            let size = sizes.get(world, *entity).expect("need bounds").0;
+            IRect::new(origin.x, origin.y, origin.x + size.x, origin.y + size.y)
+        })
+        .collect()
+}
+
 /// A flung header drag keeps gliding after release: the drag tracks its own
 /// release velocity (the shared pipeline zeroes it for pointer-driven
 /// Scrolls) and seeds `Scrolling` with it, so the existing inertia chain
@@ -2671,6 +2704,47 @@ fn test_scroll_drag_release_glides_with_inertia() {
                 strip_x_of_window_0(world) <= -810,
                 "settled offset must keep the glide, got {}",
                 strip_x_of_window_0(world)
+            );
+        })
+        .run(commands);
+}
+
+/// Keyboard focus moves must glide the strip via the tween driver, never via
+/// the friction pipeline: no `Scrolling` may appear on a focus change.
+/// Friction (release inertia) is owned exclusively by the mouse-up release
+/// path (`seed_release_inertia`); focus arrivals use `RepositionMarker`.
+#[test]
+fn test_focus_moves_never_seed_scrolling_friction() {
+    let commands = vec![
+        Event::MenuOpened { window_id: 0 },
+        Event::Command {
+            command: Command::Window(Operation::Focus(Direction::Last)),
+        },
+        Event::Command {
+            command: Command::PrintState,
+        },
+        Event::Command {
+            command: Command::PrintState,
+        },
+    ];
+
+    TestHarness::new()
+        .with_windows(5)
+        .with_focused_window(0)
+        .on_iteration(1, |world, _state| {
+            assert_focused!(world, 4);
+            let mut scrolling = world.query_filtered::<&Scrolling, With<LayoutStrip>>();
+            assert!(
+                scrolling.iter(world).next().is_none(),
+                "focus change must not seed Scrolling friction"
+            );
+        })
+        .on_iteration(3, |world, _state| {
+            assert_focused!(world, 4);
+            let mut scrolling = world.query_filtered::<&Scrolling, With<LayoutStrip>>();
+            assert!(
+                scrolling.iter(world).next().is_none(),
+                "settled focus glide must leave no Scrolling behind"
             );
         })
         .run(commands);
@@ -2902,4 +2976,198 @@ fn test_unarmed_drag_with_scroll_disabled_moves_column_then_glides_home() {
             assert_eq!(position.0.x, 400);
         })
         .run(commands);
+}
+
+/// A header scroll-glide drag must never detach across a display seam: when
+/// a native echo lands the held window's OS frame on another display
+/// mid-hold (suppression race, or a display change under the cursor), the
+/// strip keeps gliding and the window stays on its strip.
+#[test]
+fn test_scroll_glide_drag_across_seam_never_detaches() {
+    let grab = CGPoint::new(200.0, 30.0);
+    let drop_origin = Origin::new(100, -1000);
+    let commands = vec![
+        Event::MenuOpened { window_id: 0 },
+        Event::MouseDown {
+            point: grab,
+            modifiers: Modifiers::empty(),
+        },
+        Event::MouseDragged {
+            point: CGPoint::new(100.0, 30.0),
+            modifiers: Modifiers::empty(),
+        },
+        Event::Command {
+            command: Command::PrintState,
+        },
+        Event::MouseUp {
+            point: CGPoint::new(100.0, 30.0),
+            modifiers: Modifiers::empty(),
+        },
+        Event::Command {
+            command: Command::PrintState,
+        },
+    ];
+
+    TestHarness::new()
+        .with_config(drag_display_config())
+        .with_windows(5)
+        .with_display(
+            EXT_DISPLAY_ID,
+            IRect::new(0, -EXT_DISPLAY_HEIGHT, EXT_DISPLAY_WIDTH, 0),
+            vec![EXT_WORKSPACE_ID],
+        )
+        .on_iteration(3, move |_world, state| {
+            state.os_move_window(0, drop_origin);
+        })
+        .on_iteration(4, move |world, _state| {
+            assert_on_workspace!(world, 0, TEST_WORKSPACE_ID);
+            assert_not_on_workspace!(world, 0, EXT_WORKSPACE_ID);
+        })
+        .on_iteration(5, move |world, _state| {
+            // After release: still home, never transferred.
+            assert_on_workspace!(world, 0, TEST_WORKSPACE_ID);
+            assert_not_on_workspace!(world, 0, EXT_WORKSPACE_ID);
+        })
+        .run(commands);
+}
+
+/// Hover focus waits while a button is held: a `MouseMoved` over another
+/// window mid-drag must not steal focus (which used to flip
+/// `skip_reshuffle` / glue the active display mid-gesture and turn the next
+/// drag segments into a detach instead of a strip glide). Focus follows the
+/// hover only after release.
+#[test]
+fn test_hover_focus_deferred_until_drag_release() {
+    let grab = CGPoint::new(200.0, 30.0);
+    let hover = CGPoint::new(500.0, 400.0);
+    let commands = vec![
+        Event::MenuOpened { window_id: 0 },
+        Event::Command {
+            command: Command::Window(Operation::Focus(Direction::Last)),
+        },
+        Event::MouseDown {
+            point: grab,
+            modifiers: Modifiers::empty(),
+        },
+        Event::MouseMoved {
+            point: hover,
+            modifiers: Modifiers::empty(),
+        },
+        Event::Command {
+            command: Command::PrintState,
+        },
+        Event::MouseUp {
+            point: grab,
+            modifiers: Modifiers::empty(),
+        },
+        Event::MouseMoved {
+            point: hover,
+            modifiers: Modifiers::empty(),
+        },
+        Event::Command {
+            command: Command::PrintState,
+        },
+    ];
+
+    TestHarness::new()
+        .with_windows(3)
+        .on_iteration(4, |world, _state| {
+            // Hover arrived while held: focus must still be on window 2.
+            assert_focused!(world, 2);
+        })
+        .on_iteration(7, |world, _state| {
+            // After release the deferred hover takes effect: (500, 400) sits
+            // inside window 1's tiled frame.
+            assert_focused!(world, 1);
+        })
+        .run(commands);
+}
+
+/// Closing a window left of the viewport must close up the strip on the same
+/// tick: without the forced reshuffle the strip keeps its stale scrolled
+/// offset with trailing whitespace (and the border on the stale rect) until
+/// a focus echo happens to arrive — the close stutter.
+///
+/// Frame-level test with animations on (the suite default snaps): after the
+/// close lands, the strip must already carry its close-up glide marker
+/// within a few frames, and settle gap-free.
+#[test]
+fn test_close_offscreen_window_closes_strip_gap_promptly() {
+    let config: Config = (
+        MainOptions {
+            ..Default::default()
+        },
+        vec![],
+    )
+        .into();
+    let mut h = TestHarness::new()
+        .with_config(config)
+        .with_windows(5)
+        .with_focused_window(0);
+    let drain = |h: &mut TestHarness| {
+        for e in h.mock_state.drain_events() {
+            h.app.world_mut().write_message::<Event>(e);
+        }
+    };
+    // Finish setup and focus the last window; let the scroll settle.
+    h.app
+        .world_mut()
+        .write_message::<Event>(Event::MenuOpened { window_id: 0 });
+    for _ in 0..30 {
+        h.app.update();
+        drain(&mut h);
+    }
+    h.app.world_mut().write_message::<Event>(Event::Command {
+        command: Command::Window(Operation::Focus(Direction::Last)),
+    });
+    for _ in 0..30 {
+        h.app.update();
+        drain(&mut h);
+    }
+    assert_focused!(h.app.world_mut(), 4);
+    let stale = test_strip_offset(h.app.world_mut());
+    assert!(stale < 0, "setup must scroll the strip left, got {stale}");
+
+    // Despawn the offscreen-left window's entity directly: this fires
+    // `On<Remove, Window>` (the strip-splice path shared by every close)
+    // without the focus handoff, isolating the removal trigger — the focus
+    // echo would close the gap a round trip later and mask the stutter.
+    let gone = find_window_entity(0, h.app.world_mut());
+    h.app.world_mut().despawn(gone);
+    for _ in 0..2 {
+        h.app.update();
+        drain(&mut h);
+    }
+
+    // The strip is already gliding closed on the same tick — not waiting
+    // for a focus echo that never comes on this path.
+    let strip_entity = {
+        let world = h.app.world_mut();
+        let mut strips = world.query::<(Entity, &LayoutStrip)>();
+        strips
+            .iter(world)
+            .find(|(_, strip)| strip.id() == TEST_WORKSPACE_ID)
+            .expect("need test strip")
+            .0
+    };
+    assert!(
+        h.app
+            .world_mut()
+            .get::<RepositionMarker>(strip_entity)
+            .is_some(),
+        "strip must carry its close-up glide immediately after removal"
+    );
+
+    // Let the glide land: no hole, viewport filled edge to edge.
+    for _ in 0..30 {
+        h.app.update();
+        drain(&mut h);
+    }
+    let frames = test_strip_frames(h.app.world_mut());
+    let min_x = frames.iter().map(|f| f.min.x).min().expect("need windows");
+    let max_x = frames.iter().map(|f| f.max.x).max().expect("need windows");
+    assert!(
+        min_x <= 0 && max_x >= TEST_DISPLAY_WIDTH,
+        "strip must fill the viewport, got {min_x}..{max_x}"
+    );
 }

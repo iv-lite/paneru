@@ -1470,6 +1470,7 @@ pub(super) fn refresh_configuration_trigger(
 pub(super) fn window_removal_trigger(
     trigger: On<Remove, Window>,
     mut workspaces: Query<&mut LayoutStrip>,
+    mut commands: Commands,
 ) {
     let entity = trigger.event().entity;
 
@@ -1478,7 +1479,26 @@ pub(super) fn window_removal_trigger(
             "Removing despawned entity {entity} from strip {}",
             strip.id()
         );
+        let index = strip.index_of(entity).ok();
         strip.remove(entity);
+        // Close the vacated slot on the same tick: without a forced
+        // reshuffle the strip keeps its old offset with a hole until the
+        // next focus echo arrives (an AX round trip away), and the border
+        // lingers on the stale rect meanwhile — the close stutter. Anchor
+        // on the column now sitting where the removed one was (or the last
+        // one), like the detach paths in `commands.rs` do with their
+        // neighbour.
+        let anchor = index
+            .and_then(|i| {
+                strip
+                    .get(i.min(strip.len().saturating_sub(1)))
+                    .ok()
+                    .and_then(|column| column.top())
+            })
+            .or_else(|| strip.all_windows().first().copied());
+        if let Some(anchor) = anchor {
+            commands.reshuffle_around_forced(anchor);
+        }
     }
 }
 

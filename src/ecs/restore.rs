@@ -2,25 +2,24 @@ use std::collections::{HashMap, HashSet};
 use std::time::Duration;
 
 use bevy::ecs::entity::Entity;
-use bevy::ecs::hierarchy::ChildOf;
 use bevy::ecs::observer::On;
 use bevy::ecs::query::Has;
 use bevy::ecs::resource::Resource;
 use bevy::ecs::system::{Commands, Query, Res, ResMut};
-use bevy::math::IRect;
 use bevy::time::{Time, Timer, TimerMode, Virtual};
 use objc2_core_graphics::CGDirectDisplayID;
 use tracing::{Level, info, instrument, warn};
 
 use crate::config::{Config, MissingWindowBehavior};
-use crate::ecs::layout::{LayoutStrip, PARKED_STRIP_SLIVER};
+use crate::ecs::layout::{LayoutStrip, PARKED_STRIP_SLIVER, clamp_size_to_viewport};
 use crate::ecs::params::{WindowCtx, Windows};
 use crate::ecs::state::{
-    PaneruState, SavedColumn, SavedRect, SavedStackItem, SavedStrip, SavedWindow, SavedWorkspace,
+    PaneruState, SavedColumn, SavedStackItem, SavedStrip, SavedWindow, SavedWorkspace,
 };
 use crate::ecs::workspace::PreviousStripPosition;
 use crate::ecs::{
-    ActiveDisplayMarker, ActiveWorkspaceMarker, RestoreWindowState, SpawnCommandsExt, Unmanaged,
+    ActiveDisplayMarker, ActiveWorkspaceMarker, DockPosition, RestoreWindowState, SpawnCommandsExt,
+    Unmanaged,
 };
 use crate::manager::{Application, Display, Window};
 use crate::platform::{Pid, WinID, WorkspaceId};
@@ -151,9 +150,6 @@ pub(crate) struct PlannedStrip {
     pub display_uuid: Option<String>,
     pub virtual_index: u32,
     pub columns: Vec<PlannedColumn>,
-    /// First saved frame among the strip's windows, for geometric display
-    /// fallback when the saved display id is gone (undock/reorder).
-    pub fallback_frame: Option<SavedRect>,
 }
 
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
@@ -222,7 +218,6 @@ impl<'a> RestorePlanner<'a> {
             display_uuid: workspace.display_uuid.clone(),
             virtual_index: strip.virtual_index,
             columns,
-            fallback_frame: first_saved_frame(strip),
         })
     }
 
@@ -427,13 +422,13 @@ pub(crate) fn matches_startup_restore_state(
 #[instrument(level = Level::DEBUG, skip_all, fields(trigger))]
 pub(super) fn restore_window_state(
     _: On<RestoreWindowState>,
-    mut workspaces: Query<(
+    mut workspaces: Query<(Entity, &mut LayoutStrip, Has<ActiveWorkspaceMarker>)>,
+    displays: Query<(
         Entity,
-        &mut LayoutStrip,
-        Option<&ChildOf>,
-        Has<ActiveWorkspaceMarker>,
+        &Display,
+        Option<&DockPosition>,
+        Has<ActiveDisplayMarker>,
     )>,
-    displays: Query<(Entity, &Display, Has<ActiveDisplayMarker>)>,
     apps: Query<&Application>,
     session: Option<Res<SessionRestore>>,
     restoration: Option<Res<PaneruState>>,
@@ -473,17 +468,11 @@ pub(super) fn restore_window_state(
         return;
     }
 
-    let mut existing_workspace_parents = HashMap::new();
     let mut active_workspace_ids = HashSet::new();
     let mut emptied_existing_strips = HashSet::new();
-    for (entity, mut strip, child, active) in &mut workspaces {
+    for (entity, mut strip, active) in &mut workspaces {
         if active {
             active_workspace_ids.insert(strip.id());
-        }
-        if let Some(child) = child {
-            existing_workspace_parents
-                .entry(strip.id())
-                .or_insert_with(|| child.parent());
         }
 
         let had_consumed_window = plan
@@ -516,24 +505,11 @@ pub(super) fn restore_window_state(
     }
 
     let mut restored_strips = 0;
-    // Saved display bounds by numeric id, for the geometric fallback when
-    // the saved display is gone and no window kept a frame.
-    let saved_bounds_by_display: HashMap<CGDirectDisplayID, SavedRect> = restoration
-        .displays
-        .iter()
-        .map(|display| (display.display_id, display.bounds))
-        .collect();
     for planned in &plan.strips {
-        let saved_bounds = planned
-            .display_id
-            .and_then(|id| saved_bounds_by_display.get(&id).copied());
-        let Some((display_entity, display)) = select_display(
+        let Some((display_entity, display, dock)) = select_display(
             planned.workspace_id,
             planned.display_id,
             planned.display_uuid.as_deref(),
-            planned.fallback_frame,
-            saved_bounds,
-            &existing_workspace_parents,
             &displays,
         ) else {
             warn!(
@@ -542,8 +518,21 @@ pub(super) fn restore_window_state(
             );
             continue;
         };
-
+        // Clamp oversize restores into the target viewport once at
+        // placement: a window saved on a bigger display must arrive at most
+        // maximized for this one, not overflow it. Only shrinks — the
+        // pannable wide-column feature can still widen afterwards.
+        let viewport = display.actual_display_bounds(dock, &ctx.config);
         let mut strip = layout_strip_from_plan(planned);
+        for member in strip.all_windows() {
+            let Some(size) = ctx.windows.size(member) else {
+                continue;
+            };
+            let clamped = clamp_size_to_viewport(size, viewport);
+            if clamped != size {
+                ctx.commands.resize_entity(member, clamped);
+            }
+        }
         if strip.all_windows().is_empty() {
             continue;
         }
@@ -551,8 +540,8 @@ pub(super) fn restore_window_state(
         // Keep unmatched startup windows on the same normal row. Fullscreen
         // strips must remain single-column, so leave those rows separate.
         if !strip.is_fullscreen()
-            && let Some((entity, mut existing, _, _)) =
-                workspaces.iter_mut().find(|(entity, existing, _, _)| {
+            && let Some((entity, mut existing, _)) =
+                workspaces.iter_mut().find(|(entity, existing, _)| {
                     !emptied_existing_strips.contains(entity)
                         && existing.id() == planned.workspace_id
                         && existing.virtual_index == planned.virtual_index
@@ -584,7 +573,7 @@ pub(super) fn restore_window_state(
             .is_some_and(|active| *active == planned.virtual_index);
         let is_global_active = is_active && active_workspace_ids.contains(&planned.workspace_id);
         if is_active {
-            for (entity, strip, _, _) in &mut workspaces {
+            for (entity, strip, _) in &mut workspaces {
                 if strip.id() == planned.workspace_id
                     && !emptied_existing_strips.contains(&entity)
                     && is_global_active
@@ -695,112 +684,58 @@ fn hydrate_fallback_identities(
 
 /// Picks the live display a saved workspace belongs on.
 ///
-/// Match order (stable identity first, live accidents last):
-/// 1. saved UUID (v4+) — survives numeric-id rotation on reboot/replug;
+/// Match order:
+/// 1. saved UUID (v4+) — survives numeric-id rotation on reboot/replug, so
+///    windows stay on the display they were on;
 /// 2. exact numeric display id (back-compat, v2/v3);
-/// 3. geometry: largest overlap with the strip's saved frame (or the saved
-///    display bounds), else the nearest display by center distance — so a
-///    shifted arrangement lands nearby instead of piling onto one display;
-/// 4. the workspace's live parent (native space already there);
-/// 5. the active display, else the lowest id.
-///
-/// The old code returned the live parent before trying geometry, cementing
-/// whatever `CGGetActiveDisplayList` order happened to parent at boot —
-/// with 3+ displays that mis-parents often enough to read as total loss.
-#[allow(clippy::too_many_arguments)]
+/// 3. the active display, else the lowest id — a saved display that is gone
+///    (undock/reorder) lands on the display in front, clamped to its
+///    viewport by the layout pass, instead of scattering by geometry guess.
 fn select_display<'a>(
     workspace_id: WorkspaceId,
     planned_display_id: Option<CGDirectDisplayID>,
     planned_display_uuid: Option<&str>,
-    fallback_frame: Option<SavedRect>,
-    saved_bounds: Option<SavedRect>,
-    existing_workspace_parents: &HashMap<WorkspaceId, Entity>,
-    displays: &'a Query<(Entity, &Display, Has<ActiveDisplayMarker>)>,
-) -> Option<(Entity, &'a Display)> {
+    displays: &'a Query<(
+        Entity,
+        &Display,
+        Option<&DockPosition>,
+        Has<ActiveDisplayMarker>,
+    )>,
+) -> Option<(Entity, &'a Display, Option<&'a DockPosition>)> {
     // 1. Stable identity first.
     if let Some(uuid) = planned_display_uuid
         && let Some(found) = displays
             .iter()
-            .find(|(_, display, _)| display.uuid() == Some(uuid))
+            .find(|(_, display, _, _)| display.uuid() == Some(uuid))
     {
-        return Some((found.0, found.1));
+        return Some((found.0, found.1, found.2));
     }
 
     // 2. Exact numeric id (v2/v3 files, or ids that didn't rotate).
     if let Some(display_id) = planned_display_id
         && let Some(found) = displays
             .iter()
-            .find(|(_, display, _)| display.id() == display_id)
+            .find(|(_, display, _, _)| display.id() == display_id)
     {
-        return Some((found.0, found.1));
+        return Some((found.0, found.1, found.2));
     }
 
-    if planned_display_id.is_some() {
+    if planned_display_id.is_some() || planned_display_uuid.is_some() {
         info!(
-            "Session restore remapping workspace {workspace_id} from missing display {:?}",
-            planned_display_id
+            "Session restore remapping workspace {workspace_id} from missing display {planned_display_id:?} to the active display"
         );
     }
 
-    // 3. Geometry: overlap first, then nearest center. The reference is the
-    // strip's first saved window frame, falling back to the saved display
-    // bounds (whole-display memory when no window kept a frame).
-    let reference = fallback_frame
-        .or(saved_bounds)
-        .map(|frame| IRect::new(frame.min_x, frame.min_y, frame.max_x, frame.max_y));
-    if let Some(frame) = reference {
-        let mut best: Option<((Entity, &'a Display, bool), i64)> = None;
-        for (entity, candidate, active) in displays.iter() {
-            let overlap = frame.intersect(candidate.bounds());
-            let area = i64::from(overlap.width().max(0)) * i64::from(overlap.height().max(0));
-            if area > best.map_or(0, |(_, best_area)| best_area) {
-                best = Some(((entity, candidate, active), area));
-            }
-        }
-        if let Some(((target_entity, target_display, _), _)) = best {
-            let target_id = target_display.id();
-            info!(
-                "Session restore placing workspace {workspace_id} by saved-frame overlap on display {target_id}"
-            );
-            return Some((target_entity, target_display));
-        }
-        // No overlap (shifted arrangement, resolution change): nearest
-        // display center to the saved center, never a blind pile-on.
-        let saved_center = frame.center();
-        let nearest = displays.iter().min_by_key(|(_, candidate, _)| {
-            let center = candidate.bounds().center();
-            let dx = i64::from(center.x - saved_center.x);
-            let dy = i64::from(center.y - saved_center.y);
-            dx * dx + dy * dy
-        });
-        if let Some((target_entity, target_display, _)) = nearest {
-            let target_id = target_display.id();
-            info!(
-                "Session restore placing workspace {workspace_id} on nearest display {target_id} (no saved-frame overlap)"
-            );
-            return Some((target_entity, target_display));
-        }
-    }
-
-    // 4. Live parent: the native space is already there.
-    if let Some(display_entity) = existing_workspace_parents.get(&workspace_id)
-        && let Ok((entity, display, _)) = displays.get(*display_entity)
-    {
-        let live_id = display.id();
-        if planned_display_id.is_some_and(|display_id| display_id != live_id) {
-            info!(
-                "Session restore remapping workspace {workspace_id} from saved display {planned_display_id:?} to current display {live_id}"
-            );
-        }
-        return Some((entity, display));
-    }
-
-    // 5. Last resort: active, else lowest id.
+    // 3. Active display, else lowest id.
     displays
         .iter()
-        .find(|(_, _, active)| *active)
-        .or_else(|| displays.iter().min_by_key(|(_, display, _)| display.id()))
-        .map(|(entity, display, _)| (entity, display))
+        .find(|(_, _, _, active)| *active)
+        .or_else(|| {
+            displays
+                .iter()
+                .min_by_key(|(_, display, _, _)| display.id())
+        })
+        .map(|(entity, display, dock, _)| (entity, display, dock))
 }
 
 fn apply_planned_columns(strip: &mut LayoutStrip, columns: &[PlannedColumn]) {
@@ -850,23 +785,6 @@ fn append_stack_item(strip: &mut LayoutStrip, item: &PlannedStackItem) -> Option
         }
         PlannedStackItem::Tabs(entities) => append_tabs(strip, entities),
     }
-}
-
-/// First saved frame among a strip's windows, for geometric display
-/// fallback at restore. Best-effort: windows of one workspace normally
-/// share a display, so any saved frame anchors the overlap search.
-fn first_saved_frame(strip: &SavedStrip) -> Option<SavedRect> {
-    fn column_frame(column: &SavedColumn) -> Option<SavedRect> {
-        match column {
-            SavedColumn::Single(saved) | SavedColumn::Fullscreen(saved) => saved.frame,
-            SavedColumn::Tabs(tabs) => tabs.iter().find_map(|saved| saved.frame),
-            SavedColumn::Stack(items) => items.iter().find_map(|item| match item {
-                SavedStackItem::Single(saved) => saved.frame,
-                SavedStackItem::Tabs(tabs) => tabs.iter().find_map(|saved| saved.frame),
-            }),
-        }
-    }
-    strip.columns.iter().find_map(column_frame)
 }
 
 fn compact_entities(entities: Vec<Entity>) -> Option<PlannedColumn> {

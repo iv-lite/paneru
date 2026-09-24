@@ -5,6 +5,7 @@ use bevy::prelude::*;
 
 use crate::assert_focused;
 use crate::commands::{Command, Direction, Operation};
+use crate::ecs::Bounds;
 use crate::ecs::ColdStart;
 use crate::ecs::SpawnWindowTrigger;
 use crate::ecs::layout::{Column, LayoutStrip};
@@ -140,6 +141,85 @@ fn test_startup_restore_preserves_saved_display_when_present() {
                 display.id(),
                 EXT_DISPLAY_ID,
                 "restore should keep the exact saved display when it is present"
+            );
+        })
+        .run(commands);
+}
+
+/// A saved display that is gone (undock, reorder, rotation with no UUID
+/// hit) restores onto the active display — never scattered by a geometry
+/// guess — with the tile clamped to that display's viewport.
+#[test]
+fn test_startup_restore_missing_display_falls_back_to_active() {
+    let mut harness = TestHarness::new();
+    harness.mock_state.add_display(
+        EXT_DISPLAY_ID,
+        IRect::new(0, -EXT_DISPLAY_HEIGHT, EXT_DISPLAY_WIDTH, 0),
+        vec![EXT_WORKSPACE_ID],
+    );
+    // The mock keeps the first display active, so rotate the set to make
+    // the external display live-active: the fallback must follow *active*,
+    // not the lowest numeric id.
+    harness.mock_state.remove_display(TEST_DISPLAY_ID);
+    harness.mock_state.add_display(
+        TEST_DISPLAY_ID,
+        IRect::new(0, 0, TEST_DISPLAY_WIDTH, TEST_DISPLAY_HEIGHT),
+        vec![TEST_WORKSPACE_ID],
+    );
+
+    // Last added display is live-active; the live frame is oversized on
+    // purpose and must tile down into the fallback display.
+    let size = Size::new(2500, 1600);
+    let origin = Origin::new(0, TEST_MENUBAR_HEIGHT);
+    harness.mock_state.spawn_window(
+        TEST_PROCESS_ID,
+        TEST_WORKSPACE_ID,
+        300,
+        IRect::from_corners(origin, origin + size),
+    );
+
+    harness.world().insert_resource(PaneruState {
+        version: 4,
+        timestamp: 123_456_789,
+        active_display_id: Some(EXT_DISPLAY_ID),
+        displays: vec![saved_display(TEST_DISPLAY_ID, false)],
+        workspaces: vec![SavedWorkspace {
+            workspace_id: TEST_WORKSPACE_ID,
+            display_id: Some(99),
+            display_uuid: Some("gone-uuid".to_string()),
+            active_virtual_index: Some(0),
+            strips: vec![SavedStrip {
+                virtual_index: 0,
+                columns: vec![SavedColumn::Single(saved_window(300))],
+            }],
+        }],
+    });
+
+    let commands = vec![
+        Event::MenuOpened { window_id: 100 },
+        Event::Command {
+            command: Command::PrintState,
+        },
+    ];
+
+    harness
+        .on_iteration(1, |world, _state| {
+            let restored_window = find_window_entity(300, world);
+            let parent =
+                restored_strip_display_parent(world, TEST_WORKSPACE_ID, 0, restored_window);
+            let display = world
+                .entity(parent)
+                .get::<Display>()
+                .expect("parent should be a display");
+            assert_eq!(
+                display.id(),
+                EXT_DISPLAY_ID,
+                "a missing saved display must fall back to the active display"
+            );
+            let bounds = world.get::<Bounds>(restored_window).expect("need bounds").0;
+            assert!(
+                bounds.x <= EXT_DISPLAY_WIDTH && bounds.y <= EXT_DISPLAY_HEIGHT,
+                "restored tile must fit the fallback display, got {bounds:?}"
             );
         })
         .run(commands);
