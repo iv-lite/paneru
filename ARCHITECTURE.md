@@ -185,7 +185,11 @@ until cutover:
   `src/ax_reads.rs` (verified by `Tests/AXClientChecks`: `swift run
   --package-path swift-daemon AXClientChecks`). Actual AX calls stay behind
   protocols; threading becomes an actor at integration time.
-- **Next:** `EventCore`, `Presentation`, `Scripting`, `IPC`,
+- **`EventCore`** (done): lexical pass order (`ingest → layout → commit →
+  paint`), `DirtyFlags`, pump cadence, and scheduling predicates
+  (`adoptionDistrusted`, `overlayTracksLive`, `driveTrust`), ported verbatim
+  from `src/ecs/systems.rs` (verified by `Tests/EventCoreChecks`).
+- **Next:** `Presentation`, `Scripting`, `IPC`,
   `Service` per the phase plan. Each lands with parity tests before the Rust
   counterpart is touched.
 

@@ -34,6 +34,12 @@ let package = Package(
             dependencies: ["Geometry"],
             path: "Sources/AXClient"
         ),
+        // Synchronous pipeline core: lexical passes, dirty flags, pump
+        // cadence and scheduling predicates (`src/ecs/systems.rs`).
+        .target(
+            name: "EventCore",
+            path: "Sources/EventCore"
+        ),
         // Dependency-free check runners (this toolchain ships neither
         // XCTest nor swift-testing): `swift run --package-path
         // swift-daemon <Name>`. Fail nonzero on first mismatch.
@@ -51,6 +57,11 @@ let package = Package(
             name: "AXClientChecks",
             dependencies: ["AXClient", "Geometry"],
             path: "Tests/AXClientChecks"
+        ),
+        .executableTarget(
+            name: "EventCoreChecks",
+            dependencies: ["EventCore"],
+            path: "Tests/EventCoreChecks"
         ),
     ]
 )
