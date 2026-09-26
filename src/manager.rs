@@ -59,6 +59,7 @@ pub use process::MockProcessApi;
 pub use windows::MockWindowApi;
 
 pub(crate) mod app;
+pub mod capabilities;
 mod display;
 mod process;
 mod skylight;

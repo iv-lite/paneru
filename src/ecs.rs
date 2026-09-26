@@ -1197,6 +1197,11 @@ pub fn setup_bevy_app(sender: EventSender, receiver: Receiver<Event>) -> Result<
         .add_plugins(crate::replay::ReplayPlugin)
         .add_plugins((register_triggers, register_systems, register_commands));
 
+    // Probe private SkyLight/AX symbols before any worker thread can call
+    // them: a missing symbol degrades (see `manager::capabilities`) instead
+    // of faulting the whole process at load.
+    crate::manager::capabilities::SkylightCaps::probe().log();
+
     // Start the AX snapshot worker (kept out of the mock harness: it has no
     // real AX handles, and a thread per harness would leak parked threads by
     // the hundreds). The worker owns a private `WindowManagerOS` for SLS/CG
