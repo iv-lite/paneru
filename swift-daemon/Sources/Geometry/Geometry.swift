@@ -202,3 +202,15 @@ public func borderWindowRect(_ window: CGRect, width: CGFloat) -> CGRect {
         size: CGSize(width: window.size.width + width, height: window.size.height + width)
     )
 }
+
+// MARK: - Drop preview
+
+/// The drop-preview ghost for a landing slot: full viewport height,
+/// clamped into the viewport.
+/// Mirrors `mouse::slot_preview_rect`.
+public func slotPreviewRect(slotX: Int32, viewport: IntRect, size: IntSize) -> IntRect {
+    let height = viewport.height
+    let minX = min(max(slotX, viewport.min.x), max(viewport.max.x - size.x, viewport.min.x))
+    let min = IntPoint(minX, viewport.min.y)
+    return IntRect(min: min, max: IntPoint(min.x + size.x, min.y + height))
+}

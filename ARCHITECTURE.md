@@ -156,8 +156,33 @@ graph TD
     E -->|Periodic / exit save| S
 ```
 
-## 8. Testing Strategy
+## 8. Swift Port (`swift-daemon/`)
 
+The native port grows slice by slice alongside the Rust daemon, which ships
+until cutover:
+
+- **`Geometry`** (done): the single home for pure rect math — `round_px`,
+  viewport clamps, `origin_exposing`, CG↔Cocoa conversion, border rects,
+  drop-preview rects — ported verbatim from `util.rs`, `manager.rs`,
+  `ecs/layout.rs`, `ecs/mouse.rs`, and `overlay.rs`, with parity checks in
+  `Tests/GeometryTests` (`swift run --package-path swift-daemon
+  GeometryChecks`). New pure geometry goes here, not in a fifth Rust site.
+- **`CTapShim`** (done): real-time `CGEventTap` sidecar in C (SPSC ring +
+  translator + callback). No Swift runs at tap priority; the daemon drains
+  the ring on the main thread. Unit-tested without permissions (see
+  `Tests/TapShimCTests`).
+- **Next:** `Layout` (`LayoutStrip` + pure selection helpers), then
+  `AXClient`, `EventCore`, `Presentation`, `Scripting`, `IPC`, `Service`
+  per the phase plan. Each lands with parity tests before the Rust
+  counterpart is touched.
+
+Supporting seams already in the Rust daemon: `src/replay.rs` (Phase 0
+session capture behind `PANERU_REPLAY_RECORD`), snapshot-only Lua boundary
+(`BatchSnapshot` per worker message, acked store writes only),
+`manager::capabilities` (SkyLight `dlsym` probe at startup), and the
+quiet-frame quiescence invariant (`test_settled_world_is_quiescent`).
+
+## 9. Testing Strategy
 1.  **Pure Unit Tests:** Located in `src/tests.rs` and alongside modules. These test layout math and configuration parsing without requiring a macOS environment.
 2.  **ECS Integration Tests:** Use Bevy's `App` or `World` to drive systems in isolation. macOS APIs are typically mocked via the `WindowApi` and `WindowManagerApi` traits.
 3.  **Session Restore Tests:** `src/tests/session_restore.rs` covers restore planning, missing-window compaction, startup grace behavior, config precedence, virtual workspace restoration, and multi-display fallback.

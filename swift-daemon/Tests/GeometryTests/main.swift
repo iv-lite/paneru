@@ -119,6 +119,15 @@ do {
     check(!rectsIntersect(a, CGRect(x: 100, y: 0, width: 100, height: 100)), "touching edge")
 }
 
+// mouse::slot_preview_* (viewport 0,20,1024,768)
+do {
+    let view = IntRect(0, 20, 1024, 768)
+    checkEqual(slotPreviewRect(slotX: 100, viewport: view, size: IntSize(400, 100)), IntRect(100, 20, 500, 768), "preview onscreen")
+    checkEqual(slotPreviewRect(slotX: -500, viewport: view, size: IntSize(400, 300)), IntRect(0, 20, 400, 768), "preview left clamp")
+    checkEqual(slotPreviewRect(slotX: 900, viewport: view, size: IntSize(400, 300)), IntRect(624, 20, 1024, 768), "preview right clamp")
+    checkEqual(slotPreviewRect(slotX: 100, viewport: view, size: IntSize(2000, 300)), IntRect(0, 20, 2000, 768), "preview oversized")
+}
+
 if failures == 0 {
     print("GeometryChecks: all checks passed")
 } else {
