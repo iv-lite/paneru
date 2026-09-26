@@ -167,13 +167,18 @@ until cutover:
   `ecs/layout.rs`, `ecs/mouse.rs`, and `overlay.rs`, with parity checks in
   `Tests/GeometryTests` (`swift run --package-path swift-daemon
   GeometryChecks`). New pure geometry goes here, not in a fifth Rust site.
+- **`Layout`** (done): ECS-free `LayoutStrip`/`Column`/`StackItem` model plus
+  `binpackHeights`/`mostVisibleWindow`, ported verbatim from
+  `src/ecs/layout.rs` (verified by `Tests/LayoutTests`: `swift run
+  --package-path swift-daemon LayoutChecks`). Frame-supplying passes
+  (`relative_positions`, `desired_window_frame`) stay in Rust until the
+  window-frame provider ports.
 - **`CTapShim`** (done): real-time `CGEventTap` sidecar in C (SPSC ring +
   translator + callback). No Swift runs at tap priority; the daemon drains
   the ring on the main thread. Unit-tested without permissions (see
   `Tests/TapShimCTests`).
-- **Next:** `Layout` (`LayoutStrip` + pure selection helpers), then
-  `AXClient`, `EventCore`, `Presentation`, `Scripting`, `IPC`, `Service`
-  per the phase plan. Each lands with parity tests before the Rust
+- **Next:** `AXClient`, `EventCore`, `Presentation`, `Scripting`, `IPC`,
+  `Service` per the phase plan. Each lands with parity tests before the Rust
   counterpart is touched.
 
 Supporting seams already in the Rust daemon: `src/replay.rs` (Phase 0

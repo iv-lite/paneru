@@ -91,6 +91,18 @@ public struct IntRect: Equatable, Hashable, Sendable {
     public func contains(_ point: IntPoint) -> Bool {
         point.x >= min.x && point.x < max.x && point.y >= min.y && point.y < max.y
     }
+
+    /// Intersection (possibly empty/degenerate). Mirrors `IRect::intersect`.
+    public func intersected(with other: IntRect) -> IntRect {
+        IntRect(
+            min: IntPoint(Swift.max(min.x, other.min.x), Swift.max(min.y, other.min.y)),
+            max: IntPoint(Swift.min(max.x, other.max.x), Swift.min(max.y, other.max.y))
+        )
+    }
+
+    public var area: Int64 {
+        Int64(Swift.max(0, width)) * Int64(Swift.max(0, height))
+    }
 }
 
 // MARK: - Pixel rounding

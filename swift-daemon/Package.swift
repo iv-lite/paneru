@@ -8,7 +8,7 @@ let package = Package(
     name: "PaneruDaemon",
     platforms: [.macOS(.v13)],
     products: [
-        .library(name: "PaneruDaemon", targets: ["Geometry"]),
+        .library(name: "PaneruDaemon", targets: ["Geometry", "Layout"]),
     ],
     targets: [
         // Real-time tap sidecar (C only: no Swift on the tap thread).
@@ -22,13 +22,24 @@ let package = Package(
             name: "Geometry",
             path: "Sources/Geometry"
         ),
-        // Dependency-free check runner (this toolchain ships neither
+        // ECS-free strip model port (`src/ecs/layout.rs`).
+        .target(
+            name: "Layout",
+            dependencies: ["Geometry"],
+            path: "Sources/Layout"
+        ),
+        // Dependency-free check runners (this toolchain ships neither
         // XCTest nor swift-testing): `swift run --package-path
-        // swift-daemon GeometryChecks`. Fails nonzero on first mismatch.
+        // swift-daemon <Name>`. Fail nonzero on first mismatch.
         .executableTarget(
             name: "GeometryChecks",
             dependencies: ["Geometry"],
             path: "Tests/GeometryTests"
+        ),
+        .executableTarget(
+            name: "LayoutChecks",
+            dependencies: ["Layout", "Geometry"],
+            path: "Tests/LayoutTests"
         ),
     ]
 )
