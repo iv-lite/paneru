@@ -3,7 +3,7 @@ use bevy::ecs::component::Component;
 use bevy::ecs::entity::Entity;
 use bevy::ecs::hierarchy::ChildOf;
 use bevy::ecs::message::{MessageReader, MessageWriter};
-use bevy::ecs::query::{Has, With, Without};
+use bevy::ecs::query::{Has, With};
 use bevy::ecs::resource::Resource;
 use bevy::ecs::schedule::IntoScheduleConfigs as _;
 use bevy::ecs::system::{Commands, Local, NonSendMut, Populated, Query, Res, ResMut, Single};
@@ -14,20 +14,17 @@ use tracing::{debug, info, trace, warn};
 
 use super::{ActiveDisplayMarker, DragSettleMarker, MouseHeldMarker, Timeout};
 use crate::commands::{OffscreenStrips, attach_column_to_display, detach_column_from_strip};
-use crate::config::swipe::SwipeGestureDirection;
 use crate::config::{Config, decorations::BorderRadiusOption};
 use crate::ecs::layout::{Column, LayoutStrip, desired_window_frame};
 use crate::ecs::params::{ActiveDisplayMut, GlobalState, Windows};
 use crate::ecs::sync::{Gesture, WindowSync, classify_gesture};
 use crate::ecs::workspace::mid_strip_slot;
 use crate::ecs::{
-    ActiveWorkspaceMarker, ColdStart, DockPosition, LastPress, ManualStripOffset,
-    MissionControlActive, Position, RepositionMarker, Scrolling, SelectedVirtualMarker,
-    SpawnCommandsExt, Unmanaged,
+    ActiveWorkspaceMarker, ColdStart, DockPosition, LastPress, MissionControlActive, Position,
+    RepositionMarker, Scrolling, SelectedVirtualMarker, SpawnCommandsExt, Unmanaged,
 };
 use crate::manager::{Display, Origin, Size, Window, WindowManager, origin_from};
 use crate::overlay::{BorderParams, OverlayManager};
-use crate::platform::input::set_scroll_drag_suppress;
 use crate::platform::{Modifiers, WinID, WorkspaceId};
 use crate::util::round_px;
 use bevy::ecs::schedule::common_conditions::{not, on_message, resource_exists};
@@ -41,180 +38,10 @@ use crate::events::{Event, InputEvent};
 /// so the parked sliver of a hidden virtual workspace lives within this region.
 const CORNER_DEAD_ZONE_PX: i32 = 30;
 
-/// Whether a press landed in the strip gutter (padding whitespace between
-/// windows, or trailing viewport whitespace past the last column) as
-/// opposed to on a window. Only gutter presses scroll the strip; presses
-/// on windows keep fully native behavior (text selection, sliders, tab
-/// drags, toolbar interaction, native window drags, ...) and glide home
-/// on release when tiled and non-floating.
-///
-/// Pure geometry over the strip's column slots: a press is gutter when it
-/// sits inside some column's logical slot but outside every member's
-/// padding-inset OS rect, or past the last column inside the viewport.
-/// Single-column strips never arm (no between to grab). Unmanaged members
-/// contribute no intervals. Pure so the rule is unit testable; the caller
-/// supplies the strip, its viewport, and the window frames.
-fn press_in_strip_gutter(
-    point: Origin,
-    strip: &LayoutStrip,
-    strip_pos: Origin,
-    viewport: IRect,
-    windows: &Windows,
-) -> bool {
-    if !viewport.contains(point) || strip.len() < 2 {
-        return false;
-    }
-    let mut past_last_end = viewport.min.x;
-    for column in strip.all_columns() {
-        let (Some(layout_x), Some(frame)) = (
-            windows.layout_position(column).map(|p| p.0.x),
-            windows.moving_frame(column),
-        ) else {
-            continue;
-        };
-        // Unmanaged members are invisible to layout: no slot, no gutter.
-        if windows
-            .get_managed(column)
-            .is_some_and(|(_, _, unmanaged)| unmanaged.is_some())
-        {
-            continue;
-        }
-        let slot_min = layout_x + strip_pos.x;
-        let slot = IRect::from_corners(
-            Origin::new(slot_min, frame.min.y),
-            Origin::new(slot_min + frame.width(), frame.max.y),
-        );
-        if slot.contains(point) {
-            // Inside a column slot: gutter only in the padding inset the
-            // OS window leaves bare.
-            let window = windows.get(column);
-            let (h_pad, v_pad) =
-                window.map_or((0, 0), |w| (w.horizontal_padding(), w.vertical_padding()));
-            let os = IRect::from_corners(
-                Origin::new(slot.min.x + h_pad, slot.min.y + v_pad),
-                Origin::new(slot.max.x - h_pad, slot.max.y - v_pad),
-            );
-            // A degenerate inset (frame narrower than its padding) owns no
-            // gutter: treat the whole slot as window.
-            if os.min.x < os.max.x && os.min.y < os.max.y && !os.contains(point) {
-                return true;
-            }
-            return false;
-        }
-        past_last_end = past_last_end.max(slot.max.x);
-    }
-    // Past every column but inside the viewport: trailing gutter.
-    point.x >= past_last_end
-}
-
-/// Nearest managed strip member to a gutter press: gutter presses hit no
-/// window, but the scroll drive needs a holder target in a strip. Only
-/// multi-column strips qualify (a lone window has no between to grab);
-/// unmanaged members are skipped. Returns `None` when no strip claims
-/// the press as gutter.
-fn gutter_grab_target(
-    point: Origin,
-    strips: &Query<(Entity, &LayoutStrip, &Position, &ChildOf)>,
-    displays: &Query<(&Display, Option<&DockPosition>)>,
-    windows: &Windows,
-    config: &Config,
-) -> Option<Entity> {
-    let mut best: Option<(Entity, i32)> = None;
-    for (_, strip, strip_pos, child) in strips {
-        let Ok((display, dock)) = displays.get(child.parent()) else {
-            continue;
-        };
-        let viewport = display.actual_display_bounds(dock, config);
-        if !press_in_strip_gutter(point, strip, strip_pos.0, viewport, windows) {
-            continue;
-        }
-        for member in strip.all_windows() {
-            let Some(frame) = windows.moving_frame(member) else {
-                continue;
-            };
-            if windows
-                .get_managed(member)
-                .is_some_and(|(_, _, unmanaged)| unmanaged.is_some())
-            {
-                continue;
-            }
-            let travel = (frame.center() - point).abs();
-            let distance = travel.x + travel.y;
-            if best.is_none_or(|(_, known)| distance < known) {
-                best = Some((member, distance));
-            }
-        }
-    }
-    best.map(|(entity, _)| entity)
-}
-
-/// Direct-drives one gutter scroll-drag delta into the owner strip's
-/// scroll offset, same-tick as the column drive. The drive is raw 1:1 with
-/// the pointer: there is no friction while the strip moves — friction lives
-/// only on the release path (`seed_release_inertia` plus the scroll
-/// pipeline's inertia decay), and only when the drag actually moved.
-/// Keeps the integrator's `Scrolling` state glued to the write (zero
-/// velocity, refreshed lift timestamp) so it no-ops plus clamps regardless
-/// of plugin execution order, and clears a deliberate manual placement now
-/// that the user owns the strip. The release path (offset keep, inertia,
-/// settle) is untouched.
-fn drive_scroll_strip(
-    target: Entity,
-    delta_x: i32,
-    strips: &Query<(Entity, &LayoutStrip)>,
-    scroll: &mut ScrollDriveStrips,
-    time: &Time,
-    commands: &mut Commands,
-) {
-    let Some(owner) = strips
-        .iter()
-        .find_map(|(entity, strip)| strip.contains(target).then_some(entity))
-    else {
-        trace!("synthetic drag: held target {target} has no strip, skipping");
-        return;
-    };
-    let Ok((strip_entity, mut strip_position, scrolling)) = scroll.get_mut(owner) else {
-        return;
-    };
-    // Raw hand truth: release-velocity samplers already fold the undamped
-    // delta, so seeding from strip truth and seeding from the pointer agree.
-    strip_position.0.x += delta_x;
-    if let Ok(mut entity_commands) = commands.get_entity(strip_entity) {
-        // Latest intent wins: a stale programmatic flight (kept alive by
-        // the tight snap band's tail) would drag the strip back toward its
-        // old target behind the hand. The hand owns the strip now.
-        entity_commands.try_remove::<RepositionMarker>();
-    }
-    if let Some(mut scrolling) = scrolling {
-        // Keep the integrator's state glued to the direct write: with zero
-        // velocity it no-ops and the constraints just clamp, regardless of
-        // plugin execution order.
-        scrolling.velocity = 0.0;
-        scrolling.is_user_swiping = true;
-        scrolling.last_event = time.elapsed();
-        scrolling.position = f64::from(strip_position.0.x);
-    } else if let Ok(mut entity_commands) = commands.get_entity(strip_entity) {
-        entity_commands.try_insert(Scrolling {
-            velocity: 0.0,
-            position: f64::from(strip_position.0.x),
-            is_user_swiping: true,
-            last_event: time.elapsed(),
-        });
-    }
-    if let Ok(mut entity_commands) = commands.get_entity(strip_entity) {
-        entity_commands.try_remove::<ManualStripOffset>();
-    }
-}
-
-/// Accumulated left-drag travel (px) in the current press, for telling a
-/// strip-scroll drag apart from a click on release. Written by
-/// [`drag_move_held_column`], read and reset by [`mouse_up_trigger`].
-const DRAG_SCROLL_CLICK_THRESHOLD_PX: f64 = 4.0;
-
 /// Pointer travel (px, per axis) below which a press-release pair counts as
 /// a click: no reorder, no homing, and — since clicks never move anything —
 /// no reshuffle. Compared release point against `LastPress.point`, so it
-/// holds for every grab kind, not just scroll-armed drags.
+/// holds for every grab kind.
 const CLICK_RELEASE_MAX_TRAVEL_PX: i32 = 4;
 
 /// Whether a release at `release_point` after a press at `press_point`
@@ -278,9 +105,7 @@ impl Plugin for MouseEventsPlugin {
         // dragging. Ordered after adoption so the hit-test reads fresh frames,
         // and after the synthetic move so transfer sees this tick's motion.
         app.init_resource::<DragModifierState>();
-        app.init_resource::<DragScrollState>();
         app.init_resource::<DropPreviewState>();
-        app.init_resource::<FfmDragSuppress>();
         app.init_resource::<WarpAnchor>();
         // Never during warmup: relocation needs converged strips.
         app.add_systems(
@@ -326,7 +151,6 @@ fn mouse_moved_trigger(
     window_manager: Res<WindowManager>,
     config: Res<Config>,
     time: Res<Time>,
-    suppress: Res<FfmDragSuppress>,
     mut global_state: GlobalState,
     mut commands: Commands,
     mut last_find_query: Local<Option<Duration>>,
@@ -349,15 +173,6 @@ fn mouse_moved_trigger(
         // stale hover fires on release.
         if !held.is_empty() {
             trace!("mouse moved deferred: button held, hover focus waits for release");
-            continue;
-        }
-
-        // Post-drag sleep: a hand that just flung the strip across the
-        // viewport must not immediately refocus wherever the cursor
-        // stopped (covers real hovers and the synthetic settle hover).
-        // Click intent still lands via `LastPress`, only hover sleeps.
-        if suppress.0.is_some_and(|until| now < until) {
-            trace!("mouse moved suppressed: post-drag hover sleep");
             continue;
         }
 
@@ -468,8 +283,6 @@ fn mouse_down_trigger(
     mut messages: MessageReader<InputEvent>,
     windows: Windows,
     active_workspace: Query<(Entity, Option<&Scrolling>), With<ActiveWorkspaceMarker>>,
-    strips: Query<(Entity, &LayoutStrip, &Position, &ChildOf)>,
-    displays: Query<(&Display, Option<&DockPosition>)>,
     window_manager: Res<WindowManager>,
     config: Res<Config>,
     mouse_held: Query<Entity, With<MouseHeldMarker>>,
@@ -483,11 +296,10 @@ fn mouse_down_trigger(
     if !*logged_config {
         *logged_config = true;
         info!(
-            "mouse drag config: drag_modifier={:?}, resize_modifier={:?}, warp={:?}, left_drag_scrolls_strip={}",
+            "mouse drag config: drag_modifier={:?}, resize_modifier={:?}, warp={:?}",
             config.mouse_drag_display_modifier(),
             config.mouse_resize_modifier(),
             config.horizontal_mouse_warp(),
-            config.left_drag_scrolls_strip(),
         );
     }
     for InputEvent(event) in messages.read() {
@@ -506,25 +318,14 @@ fn mouse_down_trigger(
         last_press.at = time.elapsed();
         last_press.point = origin_from(*point);
 
-        // Resolve the grab: a window under the cursor, else a gutter grab
-        // on the nearest strip member (gutter presses hit no window —
-        // they land in padding whitespace). Window presses always stay
-        // native; only gutter grabs may scroll the strip.
-        let press_point = origin_from(*point);
-        let Some((window, entity, gutter)) = window_manager
+        // Resolve the grab: the window under the cursor. Presses elsewhere
+        // hold nothing.
+        let Some((window, entity)) = window_manager
             .find_window_at_point(point)
             .ok()
             .and_then(|window_id| windows.find(window_id))
-            .map(|(window, entity)| (window, entity, false))
-            .or_else(|| {
-                gutter_grab_target(press_point, &strips, &displays, &windows, &config)
-                    .and_then(|target| windows.get(target).map(|window| (window, target, true)))
-            })
         else {
             debug!("mouse down at {point:?}: no managed window under cursor, nothing held");
-            // No grab, so no drag can follow: make sure a stale suppress
-            // from a lost mouse-up can never swallow future drags.
-            set_scroll_drag_suppress(false);
             continue;
         };
 
@@ -583,16 +384,14 @@ fn mouse_down_trigger(
         // The holder (and the adoption lock on it) owns echo handling from
         // here — notably an armed re-grab inside the grace window, whose
         // transfer hit-test needs live adoption. (The grace itself was
-        // already cleared above, for gutter and window presses alike.)
+        // already cleared above.)
         // Arm display transfer only for the grab-time conjunction the
         // user asked for: shortcut held while left-clicking a window.
         // This holder defines the drag target; pressing the shortcut
-        // later in the drag never arms. Gutter grabs never transfer —
-        // the gutter is a scroll-only surface.
-        let armed = !gutter
-            && config
-                .mouse_drag_display_modifier()
-                .is_some_and(|required| required.matches(*modifiers));
+        // later in the drag never arms.
+        let armed = config
+            .mouse_drag_display_modifier()
+            .is_some_and(|required| required.matches(*modifiers));
         if armed {
             debug!(
                 "mouse drag armed on window {} with modifiers {modifiers:?}",
@@ -604,32 +403,12 @@ fn mouse_down_trigger(
                 window.id()
             );
         }
-        // Scroll-drag arming: gutter presses only (padding whitespace
-        // between windows, or trailing viewport whitespace). A tiled,
-        // unmodified gutter grab scrolls the columns; presses on windows —
-        // titlebar, toolbar, tabs, content — keep fully native behavior
-        // and glide home on release, as do armed, floating or fullscreen
-        // grabs. The tap pre-suppresses broadly and this corrects it a
-        // frame later.
-        let tiled = windows
-            .get_managed(entity)
-            .is_some_and(|(_, _, unmanaged)| unmanaged.is_none());
-        let scroll_armed = config.left_drag_scrolls_strip() && tiled && !armed && gutter;
-        if scroll_armed {
-            debug!(
-                "mouse drag scroll-armed on window {} gutter at {point:?}",
-                window.id()
-            );
-        }
         // Classify-once descriptor for the whole gesture: downstream systems
         // read this instead of re-deriving press context or re-checking live
-        // modifiers. Dual-write alongside the markers until they migrate.
-        let gesture = classify_gesture(gutter, armed, config.left_drag_scrolls_strip() && tiled);
-        debug_assert_eq!(gesture.gutter, gutter);
+        // modifiers.
+        let gesture = classify_gesture(armed);
         debug_assert_eq!(gesture.display_armed, armed);
-        debug_assert_eq!(gesture.scroll_armed, scroll_armed);
         holder.try_insert(gesture);
-        set_scroll_drag_suppress(scroll_armed);
     }
 }
 
@@ -646,22 +425,8 @@ type ReleaseStrips<'w, 's> = Query<
     ),
 >;
 
-/// Scroll-drive strips: layout strips with mutable scroll state. The
-/// `Without<Window>` filter keeps the mutable `Position` access disjoint
-/// from window queries in the same system (strips never carry `Window`).
-type ScrollDriveStrips<'w, 's> = Query<
-    'w,
-    's,
-    (
-        Entity,
-        &'static mut Position,
-        Option<&'static mut Scrolling>,
-    ),
-    (With<LayoutStrip>, Without<Window>),
->;
-
 /// Held-drag candidates: the holder marker plus the grab-time gesture
-/// descriptor every drag path branches on (display arming, scroll arming).
+/// descriptor the drag paths branch on (display arming).
 /// Test-spawned bare holders carry no gesture and read as unarmed content
 /// grabs — same as marker absence today.
 type HeldDrag<'w, 's> = Query<'w, 's, (Entity, &'static MouseHeldMarker, Option<&'static Gesture>)>;
@@ -709,8 +474,7 @@ fn drop_home(
 
 /// Reveals the member holding the largest viewport share after a release:
 /// homing glides windows to slots but never moves the strip, so a dropped
-/// window can land half-visible with nothing scheduled. The scroll path
-/// keeps its own settle; every other release funnels here. `ensure_visible`
+/// window can land half-visible with nothing scheduled. `ensure_visible`
 /// scrolls the minimal shortfall (animated, no-op when already visible),
 /// computed from slots — so it converges correctly even while homing
 /// glides are still in flight.
@@ -747,7 +511,7 @@ fn reveal_most_visible(
 
 /// Relocates the dragged column to the nearest slot on an armed
 /// same-display drop. Returns true when surgery happened (the layout chain
-/// animates members into place; the caller adds the scroll reshuffle).
+/// animates members into place; the caller adds the layout reshuffle).
 /// Pure strip surgery on `strips`; `None`/false leaves everything untouched.
 fn try_reorder_column(entity: Entity, strips: &mut ReleaseStrips, windows: &Windows) -> bool {
     let Some((strip_entity, scroll_x)) =
@@ -798,95 +562,35 @@ fn mouse_up_trigger(
     scrolling: Query<Entity, With<Scrolling>>,
     config: Res<Config>,
     time: Res<Time>,
-    mut scroll_state: ResMut<DragScrollState>,
     cold: Option<Res<ColdStart>>,
     in_flight: Query<(), With<RepositionMarker>>,
     last_press: Res<LastPress>,
-    mut suppress: ResMut<FfmDragSuppress>,
     mut commands: Commands,
 ) {
     for InputEvent(event) in messages.read() {
         let Event::MouseUp { point, .. } = event else {
             continue;
         };
-        // The grab is over either way: never let a lost press leave native
-        // drags swallowed. Holder paint dies with the holder despawn below,
-        // so no paint cleanup exists.
-        set_scroll_drag_suppress(false);
+        // The grab is over either way. Holder paint dies with the holder
+        // despawn below, so no paint cleanup exists.
         // A press-release pair with no pointer travel is a click: it moved
         // nothing, so release issues no reorder, no homing, and no
         // reshuffle — only the echo shield and reveal below still run.
         let click = is_click_release(origin_from(*point), last_press.point);
-        let scroll_distance = std::mem::take(&mut scroll_state.distance_px);
-        // Release velocity is per-gesture too: a stale EMA must never leak
-        // into the next press (its MouseDown resets the sampler anyway).
-        let release_ema_px_s = std::mem::take(&mut scroll_state.release_ema_px_s);
-        scroll_state.last_sample_at = None;
 
         for (held_entity, marker, gesture) in &mouse_held {
             let entity = marker.0;
-            let (armed, scroll_armed) =
-                gesture.map_or((false, false), |g| (g.display_armed, g.scroll_armed));
+            let armed = gesture.is_some_and(|g| g.display_armed);
             if cold.is_some() {
                 // Warmup: release bookkeeping only (despawn below) plus the
-                // echo shield — the OS window may have moved natively while
-                // the slot stayed pinned, and its echo can arrive after
+                // echo shield — the held column may have moved while the
+                // world converges, and its echo can arrive after
                 // warmup ends looking legitimate. No reorder, homing,
                 // reshuffle, or inertia until the world converges.
                 arm_release_grace(
                     release_column_members(entity, &strips),
                     &mut commands,
                     time.elapsed(),
-                );
-                if let Ok(mut entity_commands) = commands.get_entity(held_entity) {
-                    entity_commands.try_despawn();
-                }
-                continue;
-            }
-            // A strip-scroll drag (gutter grab that actually moved through
-            // the shared scroll pipeline): the new scroll offset is the
-            // intended result — no reorder, no homing, no click-reshuffle.
-            // A press without travel falls through to today's click behavior
-            // below.
-            if scroll_armed && scroll_distance > DRAG_SCROLL_CLICK_THRESHOLD_PX {
-                debug!(
-                    "mouse up: strip-scroll drag on {entity} traveled {scroll_distance:.0}px, keeping scroll offset"
-                );
-                // Viewport-crossing drags sleep hover-focus: the hand just
-                // flung the strip, so the cursor's landing window must not
-                // steal focus until the user really hovers. Click intent
-                // still lands via `LastPress`; only hover sleeps.
-                if drag_covers_viewport(
-                    scroll_distance,
-                    release_viewport_width(entity, &strips, &displays, &config),
-                    config.ffm_drag_suppress_ratio(),
-                ) {
-                    let ms = config.ffm_drag_suppress_ms();
-                    if ms > 0 {
-                        suppress.0 = Some(time.elapsed() + Duration::from_millis(ms));
-                    }
-                }
-                // Record the column for the post-release grace: a native
-                // session that slipped through before suppression still ends
-                // with an echo that must not rewrite the slot (see the
-                // adoption grace in `window_moved_update_frame`), and any
-                // residue gets one settle check (see below). Seat verifying
-                // legs as the backstop past the grace, like the homed path.
-                let members = release_column_members(entity, &strips);
-                arm_release_grace(members.clone(), &mut commands, time.elapsed());
-                for member in &members {
-                    if in_flight.get(*member).is_err() {
-                        commands.ensure_verifying(*member);
-                    }
-                }
-                seed_release_inertia(
-                    entity,
-                    release_ema_px_s,
-                    &strips,
-                    &displays,
-                    &config,
-                    time.elapsed(),
-                    &mut commands,
                 );
                 if let Ok(mut entity_commands) = commands.get_entity(held_entity) {
                     entity_commands.try_despawn();
@@ -962,11 +666,10 @@ fn mouse_up_trigger(
                         commands.reshuffle_around(entity);
                     }
                 }
-                // Echo shield for every non-transfer release, not just
-                // scroll drags: a native-owned drag moved the OS window
-                // while the slot stayed pinned, and its lagging echo must
-                // not rewrite the slot. Transfers skip it — the hit-test
-                // needs live adoption on the new strip.
+                // Echo shield for every non-transfer release: a held drag
+                // moved the OS window while the slot drove separately, and
+                // its lagging echo must not rewrite the slot. Transfers skip
+                // it — the hit-test needs live adoption on the new strip.
                 arm_release_grace(members, &mut commands, time.elapsed());
                 // Reveal the most-visible member: homing glides windows to
                 // slots but never moves the strip, so without this a drop
@@ -1029,54 +732,14 @@ pub(crate) struct WarpAnchor {
 /// jump.
 const MAX_FOLD_DX_PX_PER_FRAME: i32 = 512;
 
-/// Per-gesture scroll-drag telemetry: accumulated travel in pixels plus the
-/// release-velocity EMA. Written on every mouse-up (scroll drags
-/// additionally feed the scroll pipeline mid-gesture); read on release to
-/// tell a scroll (keep the new scroll offset, no homing, no reshuffle)
-/// apart from a click (today's focus/reshuffle behavior), and to seed
-/// release inertia. The post-release echo shield it used to carry now lives
-/// in per-window `WindowSync::Homing` (see `arm_release_grace`).
-#[derive(Debug, Resource, Default)]
-pub(crate) struct DragScrollState {
-    pub(crate) distance_px: f64,
-    /// EMA of the horizontal drag rate (strip px/s) and the virtual time of
-    /// the last sample. The shared scroll pipeline zeroes velocity for
-    /// pointer-driven `Scroll` events, so the drag tracks its own release
-    /// velocity here and seeds `Scrolling` with it on mouse-up; the existing
-    /// inertia chain then glides, clamps and cleans up like a trackpad fling.
-    /// This release seed is the only friction a left-drag ever gets: while
-    /// held, motion tracks the pointer 1:1, and a press without travel
-    /// releases with ~zero velocity and stops dead.
-    pub(crate) release_ema_px_s: f64,
-    pub(crate) last_sample_at: Option<Duration>,
-}
-
-/// Hover-focus sleep after a viewport-crossing drag: a hand that just
-/// flung the strip across the monitor must not immediately refocus
-/// wherever the cursor stopped. Suppress-until timestamp in virtual time
-/// (harness-controlled expiry, like the release grace); `None` rests.
-/// Written in `mouse_up_trigger`, read in `mouse_moved_trigger` (which
-/// also covers the synthetic settle hover).
-#[derive(Debug, Resource, Default)]
-pub(crate) struct FfmDragSuppress(pub Option<Duration>);
-
-/// Whether a scroll-drag travel covers the configured share of the
-/// viewport width and should therefore sleep hover-focus. Pure so the
-/// rule is unit testable; the harness pins exact pointer tracking.
-fn drag_covers_viewport(distance_px: f64, viewport_width_px: f64, ratio: f64) -> bool {
-    ratio > 0.0 && viewport_width_px > 0.0 && distance_px > ratio * viewport_width_px
-}
-
 /// Paint-only drag tracker on the holder: grab frame plus accumulated
-/// pointer offset for the held gesture, so the border can follow a
-/// native-owned drag at input rate while the layout slot stays pinned
-/// (adoption skips held windows by design) and the 250ms snapshot would
-/// otherwise step.
+/// pointer offset for the held gesture. Recorded per drag for diagnosis
+/// (see `printstate`) and kept alongside the holder; dies with the holder
+/// despawn, so no end-of-gesture cleanup exists by construction.
 ///
-/// Also tracks a per-axis velocity EMA so the border can extrapolate one
-/// vsync lead ahead of the last event instead of painting a frame behind.
-/// Written from the `MouseDragged` stream, read by the overlay's
-/// `native_held` branch. Never written back to `Position`: release homing
+/// Also tracks a per-axis velocity EMA so a one-vsync-lead extrapolation is
+/// available instead of painting a frame behind. Written from the
+/// `MouseDragged` stream. Never written back to `Position`: release homing
 /// still owns the glide home. Seeded at press time (when the OS frame is
 /// at-rest accurate); a missed press leaves no holder and the border falls
 /// back to snapshot/cached frames as before. Dies with the holder despawn,
@@ -1168,7 +831,7 @@ impl DragPaint {
     }
 }
 
-/// Delay after a scroll release before the settle check re-reads OS truth.
+/// Delay after a release before the settle check re-reads OS truth.
 const SCROLL_SETTLE_DELAY: Duration = Duration::from_millis(200);
 /// Re-arm step while displaced members persist.
 const SCROLL_SETTLE_STEP: Duration = Duration::from_millis(300);
@@ -1176,28 +839,10 @@ const SCROLL_SETTLE_STEP: Duration = Duration::from_millis(300);
 /// frame counts: idle pump sleeps stretch frames to 500ms.
 const SCROLL_SETTLE_GRACE: Duration = Duration::from_secs(1);
 
-/// Floor for release-velocity sample timesteps: a catch-up frame can drive
-/// `dt` arbitrarily close to zero and `dx / dt` would diverge (same hazard
-/// as `MIN_STEP_SECS` in the swipe pipeline).
-const RELEASE_VELOCITY_MIN_STEP_SECS: f64 = 1.0 / 1000.0;
-/// EMA weight for release-velocity samples, mirroring `swipe_gesture`'s
-/// gesture smoothing (0.3 new, 0.7 history).
-const RELEASE_VELOCITY_EMA_NEW: f64 = 0.3;
-/// A sample gap past this resets the EMA: a pause mid-drag means "holding
-/// still", and only post-pause motion may seed a fling — a press-hold-release
-/// with no final travel must stop dead, never fling from stale motion.
-const RELEASE_VELOCITY_GAP_RESET: Duration = Duration::from_millis(150);
-/// Floor below which a release stops dead: residue the swipe pipeline's own
-/// lift-timeout would reap on its first pass.
-const MIN_RELEASE_PX_S: f64 = 100.0;
-/// Cap so a teleporting pointer (warp, multi-monitor jump) can't fling the
-/// strip at unbounded speed.
-const MAX_RELEASE_PX_S: f64 = 12_000.0;
-
 /// Column members for release handling: the whole column a dragged window
 /// belongs to (so stacked/tabbed mates are covered), or the lone window.
-/// Shared by the scroll branch, the general homing path, and the warmup
-/// bookkeeping so all three agree on who the echo shield covers.
+/// Shared by the homing path and the warmup bookkeeping so both agree on
+/// who the echo shield covers.
 fn release_column_members(entity: Entity, strips: &ReleaseStrips) -> Vec<Entity> {
     strips
         .iter()
@@ -1210,33 +855,13 @@ fn release_column_members(entity: Entity, strips: &ReleaseStrips) -> Vec<Entity>
         .map_or_else(|| vec![entity], |column| column.window_iter().collect())
 }
 
-/// Working viewport width of the display owning `entity`'s strip: the
-/// denominator for the post-drag hover sleep. Falls back to 0 (no sleep)
-/// when the strip or display is gone — an unmeasurable drag suppresses
-/// nothing.
-fn release_viewport_width(
-    entity: Entity,
-    strips: &ReleaseStrips,
-    displays: &PreviewDisplays,
-    config: &Config,
-) -> f64 {
-    strips
-        .iter()
-        .find(|(_, strip, _, _)| strip.contains(entity))
-        .and_then(|(_, _, _, child)| displays.get(child.parent()).ok())
-        .map_or(0.0, |(_, display, dock, _)| {
-            f64::from(display.actual_display_bounds(dock, config).width())
-        })
-}
-
 /// Arms the post-release echo shield for `members`: seats per-window
 /// `WindowSync::Homing` with a virtual-time deadline and schedules one
-/// settle check. A native-owned drag moved the OS window while the slot
-/// stayed pinned, and its lagging echo must not rewrite the slot (the
+/// settle check. A held drag moved the OS window while the slot drove
+/// separately, and its lagging echo must not rewrite the slot (the
 /// permanent-detach path) — the adoption grace (`window_moved_update_frame`)
 /// refuses homing echoes inside the deadline, and the settle check repairs
-/// residue with no echo at all. Previously scroll-drags only; now every
-/// release, since plain content drags detach the same way.
+/// residue with no echo at all.
 ///
 /// `now` is virtual elapsed (`Time::elapsed`), never wall time, so the
 /// harness controls grace expiry.
@@ -1254,10 +879,10 @@ pub(crate) fn arm_release_grace(members: Vec<Entity>, commands: &mut Commands, n
 /// Re-reads OS truth for homing windows once they have had a moment to
 /// land, pushing any displaced window back into its slot.
 ///
-/// A native session that slipped through before suppression still ends with
-/// an echo the adoption grace refuses to legitimize — but if no echo ever
-/// arrives (a push the app ate with no notification), nothing would repair
-/// the OS side. This bounded check (first run +200ms, re-armed only while
+/// A held drag moved the OS window while the slot drove separately: its
+/// echo lands post-release, when the adoption grace refuses to legitimize
+/// it — but if no echo ever arrives (a push the app ate with no
+/// notification), nothing would repair the OS side. This bounded check (first run +200ms, re-armed only while
 /// `Homing` members persist) closes that residue. Runs via `Timeout`, not
 /// every frame. Expired members hand off to the verifier instead of being
 /// dropped: a slow-applying app (Electron) can still be converging past the
@@ -1280,7 +905,7 @@ fn scroll_settle_check(
         if !sync.homing_active(now) {
             // Grace over with residue unconfirmed: verify owns it now.
             // Verifying legs are throttled and self-clear on landing.
-            warn!("scroll release: window {member} still displaced after settle, verifying");
+            warn!("release: window {member} still displaced after settle, verifying");
             commands.ensure_verifying(member);
             if let Ok(mut entity_commands) = commands.get_entity(member) {
                 entity_commands.try_remove::<WindowSync>();
@@ -1288,7 +913,7 @@ fn scroll_settle_check(
             continue;
         }
         let Ok(live) = window.update_frame().inspect_err(|err| {
-            debug!("scroll settle: re-reading OS frame for {member} failed: {err}");
+            debug!("settle: re-reading OS frame for {member} failed: {err}");
         }) else {
             pending += 1;
             continue;
@@ -1300,7 +925,7 @@ fn scroll_settle_check(
             // signal for whether native sessions are still starting.
             // Human-rate releases keep this far from spammy. Routes through
             // the single-writer discipline when the flag is on.
-            info!("scroll settle: OS window {member} drifted {drift:?}, pushing slot");
+            info!("settle: OS window {member} drifted {drift:?}, pushing slot");
             let epoch = write_state.current_epoch();
             // Observed drift invalidates the dedup entry (see
             // `AxWriteState::invalidate_sent`): the repair must send even
@@ -1398,8 +1023,7 @@ struct DragMoveState {
 
 /// Resolves the held target's column members plus the raw horizontal delta
 /// to drive them by: while held, motion tracks the pointer 1:1 with no
-/// friction — friction lives only on the release path, once the drag had
-/// motion and the button comes up.
+/// friction.
 fn column_drive(
     target: Entity,
     raw_dx: i32,
@@ -1420,120 +1044,20 @@ fn column_drive(
 }
 
 /// Resolves the held target of a synthetic drag to its window id plus the
-/// grab-time arming flags. `None` when nothing is held, the target has no
+/// grab-time arming flag. `None` when nothing is held, the target has no
 /// window, or it is unmanaged (native-owned).
 fn held_drag_target(
     held: &HeldDrag<'_, '_>,
     windows: &Query<(&Window, Entity, Option<&Unmanaged>)>,
-) -> Option<(Entity, WinID, bool, bool)> {
+) -> Option<(Entity, WinID, bool)> {
     let (_, marker, gesture) = held.iter().next()?;
     let target = marker.0;
     let (window, _, unmanaged) = windows.iter().find(|(_, entity, _)| *entity == target)?;
     if unmanaged.is_some() {
         return None;
     }
-    let (armed, scroll_armed) =
-        gesture.map_or((false, false), |g| (g.display_armed, g.scroll_armed));
-    Some((target, window.id(), armed, scroll_armed))
-}
-
-/// Folds one horizontal drag segment into the release-velocity EMA. The
-/// first sample after a press only stores its time (no `dt` to divide by).
-/// A gap past `RELEASE_VELOCITY_GAP_RESET` zeroes the average first — a
-/// pause reads as holding still — then folds the segment over the whole
-/// gap, so only post-pause motion at a post-pause rate can fling: a
-/// press-hold-release folds ~zero travel and stops dead.
-///
-/// Pointer acceleration is honored by construction, not by a synthetic
-/// gain: the tap reports absolute `CGEvent::location` points (already
-/// shaped by the macOS pointer-acceleration curve), so differencing them
-/// preserves the hand's true pace here and in the 1:1 drive below. A fast
-/// flick folds a large `dx/dt` and seeds a long release glide; the same
-/// travel done slowly folds a small rate and stops. Applying our own
-/// acceleration curve on top would double-apply the system's.
-fn sample_release_velocity(scroll_state: &mut DragScrollState, dx: f64, now: Duration) {
-    let Some(last) = scroll_state.last_sample_at else {
-        scroll_state.last_sample_at = Some(now);
-        return;
-    };
-    let gap = now.saturating_sub(last);
-    if gap > RELEASE_VELOCITY_GAP_RESET {
-        scroll_state.release_ema_px_s = 0.0;
-    }
-    let dt = gap.as_secs_f64().max(RELEASE_VELOCITY_MIN_STEP_SECS);
-    let instant = dx / dt;
-    scroll_state.release_ema_px_s = RELEASE_VELOCITY_EMA_NEW * instant
-        + (1.0 - RELEASE_VELOCITY_EMA_NEW) * scroll_state.release_ema_px_s;
-    scroll_state.last_sample_at = Some(now);
-}
-
-/// Seeds the shared scroll pipeline with the drag's release velocity so the
-/// strip glides after a fling instead of stopping dead. The pipeline zeroes
-/// velocity for pointer-driven `Scroll` events (native momentum doesn't
-/// apply), so without this the existing inertia chain starts from rest.
-/// Below `MIN_RELEASE_PX_S` the release stops dead (today's behavior) but
-/// still arms the drag-release settle, so the nearest window glides back
-/// into the viewport instead of stranding half-out at the kept offset.
-/// Above `MAX_RELEASE_PX_S` it clamps. Get-or-insert: a mid-drag pause may have let
-/// the lift-timeout reap `Scrolling`, in which case it is recreated at the
-/// strip's current offset.
-///
-/// Caller contract: ONLY the mouse-up release path for a scroll-drag that
-/// actually traveled (`mouse_up_trigger`'s scroll branch) may call this.
-/// Focus changes, hover arrivals, reshuffles and clicks must never seed
-/// `Scrolling` — they glide via `RepositionMarker` tweens, and
-/// `cancel_driven_strip_glide` yields any live glide to them.
-fn seed_release_inertia(
-    entity: Entity,
-    ema_px_s: f64,
-    strips: &ReleaseStrips<'_, '_>,
-    displays: &PreviewDisplays<'_, '_>,
-    config: &Config,
-    now: Duration,
-    commands: &mut Commands,
-) {
-    let Some((strip_entity, _, position, child)) = strips
-        .iter()
-        .find(|(_, strip, _, _)| strip.contains(entity))
-    else {
-        return;
-    };
-    let Ok((_, display, _, _)) = displays.get(child.parent()) else {
-        return;
-    };
-    let viewport_width = f64::from(display.bounds().width());
-    if viewport_width <= f64::EPSILON {
-        return;
-    }
-    // Strip px/s into the pipeline's velocity units: the integrator advances
-    // `velocity * dt * viewport_width * direction`, so dividing the measured
-    // rate back through the gain continues at exactly the release pace.
-    let direction = match config.swipe_gesture_direction() {
-        SwipeGestureDirection::Natural => -1.0,
-        SwipeGestureDirection::Reversed => 1.0,
-    };
-    let velocity = if ema_px_s.abs() < MIN_RELEASE_PX_S {
-        0.0
-    } else {
-        ema_px_s.clamp(-MAX_RELEASE_PX_S, MAX_RELEASE_PX_S) / (viewport_width * direction)
-    };
-    // Replace (never touch `Query<&mut Scrolling>` here: declaring mutable
-    // access on the release path perturbs an unrelated pinning test, so the
-    // seed goes through ordered commands instead — remove then insert lands
-    // as a replace at flush, a tick later at most, which the glide absorbs.
-    // The settle marker rides along so the strip reveals the nearest window
-    // once the glide decays (see `DragSettleMarker`).
-    if let Ok(mut entity_commands) = commands.get_entity(strip_entity) {
-        entity_commands.try_remove::<Scrolling>();
-        entity_commands.try_insert(Scrolling {
-            velocity,
-            position: f64::from(position.0.x),
-            is_user_swiping: false,
-            last_event: now,
-        });
-        entity_commands.try_insert(DragSettleMarker);
-    }
-    debug!("mouse up: strip-scroll release at {ema_px_s:.0}px/s, seeding glide");
+    let armed = gesture.is_some_and(|g| g.display_armed);
+    Some((target, window.id(), armed))
 }
 
 /// Moves a held column synthetically from `MouseDragged` deltas, 1:1 with
@@ -1550,12 +1074,6 @@ fn seed_release_inertia(
 /// or must glide home on release is decided downstream by arming, not here.
 /// Floating/minimized/hidden windows are untouched (they keep native
 /// behavior plus the pin path).
-///
-/// Exception: a gutter scroll-drag (grab-time scroll-armed `Gesture`) drives
-/// the owner strip's scroll offset directly, 1:1 with the pointer, when
-/// `left_drag_scrolls_strip` is enabled. The tap swallows the native drag
-/// for those grabs, so no `WindowMoved` echo and no adoption fight; armed
-/// modifier drags take the move path below, content grabs stay fully native.
 #[allow(clippy::too_many_arguments)]
 fn drag_move_held_column(
     mut messages: MessageReader<InputEvent>,
@@ -1564,10 +1082,8 @@ fn drag_move_held_column(
     windows: Query<(&Window, Entity, Option<&Unmanaged>)>,
     mut positions: Query<&mut Position, With<Window>>,
     strips: Query<(Entity, &LayoutStrip)>,
-    mut scroll_strips: ScrollDriveStrips,
     config: Res<Config>,
     time: Res<Time>,
-    mut scroll_state: ResMut<DragScrollState>,
     mut holder_paint: Query<&mut DragPaint>,
     cold: Option<Res<ColdStart>>,
     mut state: Local<DragMoveState>,
@@ -1575,19 +1091,16 @@ fn drag_move_held_column(
     mut commands: Commands,
 ) {
     // HID bursts can deliver many `MouseDragged` per frame; driving the
-    // strip/column once per folded delta (instead of once per event) keeps
-    // a long gutter-drag at constant cost: one strip write, one paint
-    // advance, one commit push per frame. Velocity EMA still samples each
-    // raw delta so the release glide keeps its shape.
+    // column once per folded delta (instead of once per event) keeps
+    // a long drag at constant cost: one column write, one paint
+    // advance, one commit push per frame.
     //
     // Edge-warp rebase: a warp last tick teleported the cursor to another
     // display. The press anchor still holds the pre-warp point, so adopt
     // the landing before folding — otherwise the first post-warp delta is
-    // the inter-display span. The velocity sampler is also reset (a pause
-    // means holding still); only post-warp motion may seed a fling.
+    // the inter-display span.
     if let Some(landing) = warp_anchor.landing.take() {
         state.last = Some(landing);
-        scroll_state.last_sample_at = None;
     }
     let mut folded_dx: i32 = 0;
     let mut latest_modifiers = None;
@@ -1596,10 +1109,6 @@ fn drag_move_held_column(
         match event {
             Event::MouseDown { point, .. } => {
                 state.last = Some(origin_from(*point));
-                // Travel is per-gesture.
-                scroll_state.distance_px = 0.0;
-                scroll_state.release_ema_px_s = 0.0;
-                scroll_state.last_sample_at = None;
             }
             Event::MouseUp { .. } => {
                 state.last = None;
@@ -1619,21 +1128,18 @@ fn drag_move_held_column(
                 // into column positions drags whole columns off their slots,
                 // and the adoption/verify/audit machinery fighting those
                 // off-slot frames every tick is what turned vertical wiggles
-                // sluggish. Project here so every path below (scroll drive,
-                // column drive, paint, release EMA) only ever sees `dx`; a
-                // pure-vertical wiggle becomes a no-op that also keeps the
-                // press anchor fresh via `state.last` above.
+                // sluggish. Project here so every path below (column drive,
+                // paint) only ever sees `dx`; a pure-vertical wiggle becomes
+                // a no-op that also keeps the press anchor fresh via
+                // `state.last` above.
                 let dx = delta.x;
                 if dx == 0 {
                     continue;
                 }
-                // Fold for the single post-loop drive; EMA samples the raw
-                // per-event slice so release velocity still tracks the hand.
+                // Fold for the single post-loop drive.
                 folded_dx = folded_dx.saturating_add(dx);
                 latest_modifiers = Some(*modifiers);
                 saw_drag = true;
-                scroll_state.distance_px += f64::from(dx.abs());
-                sample_release_velocity(&mut scroll_state, f64::from(dx), time.elapsed());
             }
             _ => {}
         }
@@ -1651,7 +1157,7 @@ fn drag_move_held_column(
     // Teleport backstop (see `MAX_FOLD_DX_PX_PER_FRAME`): the anchor rebase
     // above is the real fix; this bounds any race to a nudge.
     let folded_dx = folded_dx.clamp(-MAX_FOLD_DX_PX_PER_FRAME, MAX_FOLD_DX_PX_PER_FRAME);
-    let Some((target, window_id, armed, scroll_armed)) = held_drag_target(&held, &windows) else {
+    let Some((target, window_id, armed)) = held_drag_target(&held, &windows) else {
         trace!("synthetic drag: no managed held target, skipping move");
         return;
     };
@@ -1669,43 +1175,10 @@ fn drag_move_held_column(
         // scroll pipeline must not move before the world converges.
         return;
     }
-    // Gutter scroll-drag (grab-time armed): drive the owner strip directly,
-    // 1:1 with the folded pointer travel and same-tick as the column drive
-    // below — instead of emitting a `Scroll` event that trails a message
-    // hop plus an unordered plugin behind. Armed modifier drags and legacy
-    // (scroll-disabled) drags take the move path below; window grabs fall
-    // through with no motion at all — native owns them, release homing
-    // glides them back.
-    if scroll_armed {
-        // Dead-zone: a press that never travels reads as a click on
-        // release, so driving the strip on sub-threshold pointer jitter
-        // (trackpad tap wobble, HiDPI rounding) turns clicks into
-        // scrolls. Absorb motion below the click threshold; the press
-        // anchor already refreshed per slice above, so crossing the
-        // threshold later starts clean with no jump. Matches the release
-        // branch, which only keeps the offset past the same threshold.
-        if scroll_state.distance_px <= DRAG_SCROLL_CLICK_THRESHOLD_PX {
-            return;
-        }
-        // Threshold and velocity already tracked per raw slice above; the
-        // strip follows the folded total 1:1 with no friction while held.
-        drive_scroll_strip(
-            target,
-            folded_dx,
-            &strips,
-            &mut scroll_strips,
-            &time,
-            &mut commands,
-        );
-        return;
-    }
     // Drive the whole column so stacked/tabbed mates follow the grab
-    // instead of tearing off. Reached for armed drags and for legacy
-    // scroll-disabled drags; content grabs with scrolling enabled fall
-    // through with no motion at all.
-    if !armed && config.left_drag_scrolls_strip() {
-        return;
-    }
+    // instead of tearing off. Reached for every held drag; whether the
+    // column may *relocate* (reorder/transfer) or must glide home on
+    // release is decided downstream by arming, not here.
     // Raw 1:1 while held, wherever the grab landed: friction applies only
     // on release, never to the displacement itself.
     let (delta, members) = column_drive(target, folded_dx, &strips);
@@ -1715,9 +1188,8 @@ fn drag_move_held_column(
             position.0 += delta;
             moved_any = true;
         }
-        // Latest intent wins, as in `drive_scroll_strip`: a stale slide
-        // marker would drag the member back toward its old target behind
-        // the hand.
+        // Latest intent wins: a stale slide marker would drag the member
+        // back toward its old target behind the hand.
         if let Ok(mut entity_commands) = commands.get_entity(member) {
             entity_commands.try_remove::<RepositionMarker>();
         }
@@ -1820,19 +1292,6 @@ fn drag_window_across_display(
         let Some((_, entity)) = windows.find(*window_id) else {
             continue;
         };
-        // A strip-glide drag owns its strip's scroll offset and must never
-        // detach: hover motion across a display seam mid-gesture — or a
-        // display reconfigure changing what "foreign" means under a held
-        // cursor — is glide travel, not a transfer. Only grab-time
-        // display-armed drags may relocate across displays.
-        if held.iter().any(|(_, marker, gesture)| {
-            marker.0 == entity && gesture.is_some_and(|g| g.scroll_armed)
-        }) {
-            trace!(
-                "drag transfer: window (id {window_id}, {entity}) is a scroll-glide drag, never a transfer"
-            );
-            continue;
-        }
         // Only while the button is held down on this very window. Arming is
         // grab-time frozen (see `Gesture`): releasing the shortcut mid-drag
         // no longer disarms transfer.
@@ -2403,7 +1862,7 @@ fn horizontal_warp_mouse_trigger(
     for InputEvent(event) in messages.read() {
         // Edge-warp fires on plain moves (display traversal) and mid-drag
         // for shortcut-armed display drags; other drags (text selection,
-        // resize handles, unarmed strip drags) keep native edge behavior.
+        // resize handles, unarmed drags) keep native edge behavior.
         // Grab-time arming (see `Gesture`) is what distinguishes drags; the
         // live shortcut state no longer gates mid-drag behavior. The
         // ping-pong trap at shared corners is closed structurally in
@@ -2468,20 +1927,6 @@ mod tests {
 
     fn test_viewport() -> IRect {
         IRect::new(0, 20, 1024, 768)
-    }
-
-    #[test]
-    fn viewport_crossing_drag_rule() {
-        // Strictly greater: exactly 100% still hovers.
-        assert!(drag_covers_viewport(1025.0, 1024.0, 1.0));
-        assert!(!drag_covers_viewport(1024.0, 1024.0, 1.0));
-        assert!(!drag_covers_viewport(500.0, 1024.0, 1.0));
-        // Disabled ratio or unmeasurable viewport suppresses nothing.
-        assert!(!drag_covers_viewport(5000.0, 1024.0, 0.0));
-        assert!(!drag_covers_viewport(5000.0, 0.0, 1.0));
-        // Custom ratios scale the bar.
-        assert!(drag_covers_viewport(600.0, 1024.0, 0.5));
-        assert!(!drag_covers_viewport(400.0, 1024.0, 0.5));
     }
 
     #[test]
@@ -2597,78 +2042,6 @@ mod tests {
         assert_eq!(
             paint.predicted(now, 0.0),
             Some(IRect::new(200, 20, 600, 1020))
-        );
-    }
-
-    #[test]
-    fn release_velocity_first_sample_only_stores_time() {
-        let mut state = DragScrollState::default();
-        sample_release_velocity(&mut state, 300.0, Duration::from_millis(100));
-        assert!(
-            state.release_ema_px_s.abs() < f64::EPSILON,
-            "no dt on the first sample: nothing to divide by"
-        );
-        assert_eq!(state.last_sample_at, Some(Duration::from_millis(100)));
-    }
-
-    #[test]
-    fn release_velocity_folds_segments_with_ema_smoothing() {
-        let mut state = DragScrollState::default();
-        sample_release_velocity(&mut state, 300.0, Duration::from_millis(100));
-        // 200px over 200ms past the first sample: the gap resets, then folds
-        // 1000px/s instantaneous at 0.3 weight like the swipe pipeline's
-        // gesture smoothing.
-        sample_release_velocity(&mut state, 200.0, Duration::from_millis(300));
-        assert!((state.release_ema_px_s - 300.0).abs() < 1e-9);
-        // Back-to-back segments inside the gap keep blending, not replacing:
-        // 200px over 100ms is 2000px/s instantaneous.
-        sample_release_velocity(&mut state, 200.0, Duration::from_millis(400));
-        assert!((state.release_ema_px_s - (0.3 * 2000.0 + 0.7 * 300.0)).abs() < 1e-9);
-    }
-
-    #[test]
-    fn release_velocity_gap_resets_stale_motion() {
-        let mut state = DragScrollState::default();
-        sample_release_velocity(&mut state, 300.0, Duration::from_millis(100));
-        sample_release_velocity(&mut state, 200.0, Duration::from_millis(300));
-        assert!(state.release_ema_px_s > 0.0);
-        // A pause past the gap zeroes the average, then folds the new
-        // segment over the whole gap: post-pause motion at a post-pause rate.
-        sample_release_velocity(&mut state, 0.0, Duration::from_millis(1000));
-        assert!(state.release_ema_px_s.abs() < f64::EPSILON);
-        sample_release_velocity(&mut state, 100.0, Duration::from_millis(1200));
-        assert!((state.release_ema_px_s - 0.3 * 500.0).abs() < 1e-9);
-    }
-
-    #[test]
-    fn release_velocity_reflects_drag_pace() {
-        // Pointer acceleration reaches the sampler through the deltas: the
-        // same 500px of travel folds a far hotter EMA when flicked (10ms
-        // segments) than when crawled (100ms segments), so the release
-        // glide matches the hand instead of the distance.
-        fn pace_ema(step_gap_ms: u64) -> f64 {
-            let mut state = DragScrollState::default();
-            let mut now = Duration::from_millis(100);
-            sample_release_velocity(&mut state, 0.0, now);
-            for _ in 0..5 {
-                now += Duration::from_millis(step_gap_ms);
-                sample_release_velocity(&mut state, -100.0, now);
-            }
-            state.release_ema_px_s
-        }
-        let flick = pace_ema(10);
-        let crawl = pace_ema(100);
-        assert!(
-            flick < -5000.0,
-            "a -100px/10ms flick must fold near -10000px/s, got {flick}"
-        );
-        assert!(
-            crawl > -2000.0 && crawl < 0.0,
-            "a -100px/100ms crawl must fold near -1000px/s, got {crawl}"
-        );
-        assert!(
-            flick.abs() > 3.0 * crawl.abs(),
-            "pace must dominate distance: flick {flick} vs crawl {crawl}"
         );
     }
 

@@ -42,20 +42,6 @@ pub fn set_focused_passthrough(keys: Vec<(u8, Modifiers)>) {
     FOCUSED_PASSTHROUGH.store(Arc::new(keys));
 }
 
-/// While true, an unmodified left-drag on a tiled window pans the workspace
-/// strip instead of moving the window, so the tap swallows the native
-/// `LeftMouseDragged` (which would otherwise move the OS window underneath).
-/// Set by the ECS mouse-down/up triggers; only read here. `Down`/`Up` always
-/// pass through so clicks, focus and buttons keep working, as do right-drags
-/// and modifier-armed display drags.
-static SCROLL_DRAG_SUPPRESS: AtomicBool = AtomicBool::new(false);
-
-/// Toggle native-drag suppression for strip-scroll drags. Called from the
-/// main thread by the ECS mouse triggers.
-pub(crate) fn set_scroll_drag_suppress(suppress: bool) {
-    SCROLL_DRAG_SUPPRESS.store(suppress, Ordering::Release);
-}
-
 /// How long to suppress scroll wheel events after a vertical swipe gesture,
 /// covering macOS momentum scroll that continues after finger lift.
 const VERTICAL_GESTURE_SCROLL_SUPPRESS: Duration = Duration::from_millis(1200);
@@ -126,34 +112,6 @@ static LEFT_BUTTON_HELD: AtomicBool = AtomicBool::new(false);
 /// from the main thread by the adoption path.
 pub(crate) fn left_button_held() -> bool {
     LEFT_BUTTON_HELD.load(Ordering::Acquire)
-}
-
-/// Gate for pre-suppressing native left-drags in the tap, before the ECS has
-/// seen the press. Mirrors the `mouse_down_trigger` scroll rule
-/// (`left_drag_scrolls_strip` on, drag shortcut not held); published from the
-/// ECS on startup and every config reload because the tap's own `Config`
-/// snapshot is startup-only. Slight staleness is harmless: the ECS remains
-/// authoritative per grab and corrects the flag a frame later.
-#[derive(Clone, Copy)]
-struct ScrollDragGate {
-    enabled: bool,
-    drag_modifier: Option<Modifiers>,
-}
-
-static SCROLL_DRAG_GATE: LazyLock<ArcSwap<ScrollDragGate>> = LazyLock::new(|| {
-    ArcSwap::from_pointee(ScrollDragGate {
-        enabled: true,
-        drag_modifier: None,
-    })
-});
-
-/// Publish the strip-scroll drag gate the tap checks on every left press.
-/// Called from the main thread on startup and config reload.
-pub(crate) fn publish_scroll_drag_gate(config: &Config) {
-    SCROLL_DRAG_GATE.store(Arc::new(ScrollDragGate {
-        enabled: config.left_drag_scrolls_strip(),
-        drag_modifier: config.mouse_drag_display_modifier(),
-    }));
 }
 
 const SWIPE_THRESHOLD: f64 = 0.001;
@@ -420,54 +378,26 @@ impl InputHandler {
         let flags = CGEvent::flags(Some(event));
         let modifiers = get_modifiers(flags);
 
-        // Set when this event's native delivery must be swallowed after the
-        // ECS has seen it (strip-scroll drags: the ECS needs the deltas, but
-        // macOS must not move the window).
-        let mut swallow_native = false;
         let result = match event_type {
             CGEventType::LeftMouseDown | CGEventType::RightMouseDown => {
                 let point = CGEvent::location(Some(event));
                 if matches!(event_type, CGEventType::LeftMouseDown) {
                     // Physical button state for the adoption path (see
-                    // `LEFT_BUTTON_HELD`); updated before the gate below so a
-                    // suppressed press still counts as held.
+                    // `LEFT_BUTTON_HELD`).
                     LEFT_BUTTON_HELD.store(true, Ordering::Release);
-                    // Pre-suppress synchronously: the ECS only learns about
-                    // the press (and sets the flag authoritatively) a frame
-                    // later, and any drag slipping through in between starts
-                    // a real native drag session. Assume a scroll grab until
-                    // the ECS rules otherwise — floating, armed and
-                    // window-less presses clear the flag a frame later, and a
-                    // release always clears it, so a wrong guess costs at
-                    // most a frame of swallowed motion, never a stuck tap.
-                    let gate = SCROLL_DRAG_GATE.load();
-                    if gate.enabled
-                        && gate
-                            .drag_modifier
-                            .is_none_or(|required| !required.matches(modifiers))
-                    {
-                        SCROLL_DRAG_SUPPRESS.store(true, Ordering::Release);
-                    }
                 }
                 events.send(Event::MouseDown { point, modifiers })
             }
             CGEventType::LeftMouseUp | CGEventType::RightMouseUp => {
-                // A release ends any drag: never let a lost press leave native
-                // drags swallowed, and report the button up for adoption.
+                // A release ends any drag: report the button up for adoption.
                 if matches!(event_type, CGEventType::LeftMouseUp) {
                     LEFT_BUTTON_HELD.store(false, Ordering::Release);
                 }
-                SCROLL_DRAG_SUPPRESS.store(false, Ordering::Release);
                 let point = CGEvent::location(Some(event));
                 events.send(Event::MouseUp { point, modifiers })
             }
             CGEventType::LeftMouseDragged | CGEventType::RightMouseDragged => {
                 let point = CGEvent::location(Some(event));
-                if matches!(event_type, CGEventType::LeftMouseDragged)
-                    && SCROLL_DRAG_SUPPRESS.load(Ordering::Acquire)
-                {
-                    swallow_native = true;
-                }
                 events.send(Event::MouseDragged { point, modifiers })
             }
             CGEventType::MouseMoved => {
@@ -495,10 +425,10 @@ impl InputHandler {
             // Trigger cleanup destructor, unregistering the handler.
             self.events = None;
         }
-        // Strip-scroll drags still reach the ECS (sent above) but never reach
-        // macOS: the OS window stays in its slot while the strip follows the
-        // cursor. Everything else falls through.
-        swallow_native
+        // Every event above was forwarded to the ECS; native delivery always
+        // falls through (no drag suppression: all drags reach macOS and the
+        // ECS drives its own column from the same deltas).
+        false
     }
 
     /// Handles scroll wheel events. If configured modifier is held, it transforms the scroll into a swipe event.

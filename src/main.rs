@@ -216,16 +216,6 @@ fn main() -> Result<()> {
 
     match subcmd {
         SubCmd::Launch => {
-            // Best-effort drift check: the Spotlight shim may still exec an
-            // older daemon path after an update. Never fatal — just point
-            // at the heal.
-            if let Ok(launcher) = platform::app_launcher::AppLauncher::try_new()
-                && launcher.shim_stale()
-            {
-                warn!(
-                    "Paneru.app shim does not point at the canonical daemon; re-run `paneru install-app` to refresh it"
-                );
-            }
             let (sender, receiver) = EventSender::new();
             let sender_c = sender.clone();
             // bevy's `TerminalCtrlCHandlerPlugin` was not fast enough. maybe because of its use of `Relaxed` atomic variable?

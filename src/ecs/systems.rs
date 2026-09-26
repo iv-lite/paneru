@@ -2178,15 +2178,14 @@ pub(crate) fn window_moved_update_frame(
         let draggable = held.iter().any(|(_, marker, gesture)| {
             marker.0 == entity && gesture.is_some_and(|g| g.display_armed)
         });
-        // Post-release grace for scroll-dragged columns: a lagging echo from
-        // a native session that slipped through before suppression must not
+        // Post-release grace for dragged columns: a lagging echo must not
         // rewrite the slot (the permanent-detach path). Owned by the
         // `Homing` machine state now; the deadline bounds it so a stuck
         // grace can never suppress adoption forever.
         let machine_state = sync_states.get(entity).copied().unwrap_or_default();
         let in_grace = machine_state.homing_active(time.elapsed());
-        // A native session paneru never tracked (press-frame leak, stale
-        // suppress gate, tap-disabled gap): an echo with no holder, no
+        // A native session paneru never tracked (press-frame leak,
+        // tap-disabled gap): an echo with no holder, no marker, *and* the
         // marker, *and* the button held is a session we missed, never
         // intent. Atomic load, safe to evaluate eagerly per echo.
         let distrust = adoption_distrusted(
@@ -2768,11 +2767,11 @@ pub(super) fn update_overlays(
         return;
     }
 
-    // Borders during a held drag: a gesture the layout drives (armed column
-    // or scroll drag) keeps its border riding the live frame — truth is
+    // Borders during a held drag: a gesture the layout drives (armed or
+    // unarmed column drag) keeps its border riding the live frame — truth is
     // produced 1:1 with the pointer, so hiding would blink a glued outline
-    // for no reason. Anything else held (plain content grabs, bare test
-    // holders) hides for the gesture and reappears at the release point
+    // for no reason. Anything else held (bare test holders) hides for the
+    // gesture and reappears at the release point
     // (the `drag_ended` gate guarantees the repaint). The button-state arm
     // covers missed-press native drags with no holder, where the slot stays
     // pinned while the OS moves. Dim surfaces stay frozen (never hidden —
@@ -2878,19 +2877,12 @@ pub(super) fn update_overlays(
             "overlay drag tick: swiping={swiping} tracking_live={tracking_live} settle={settle}",
         );
     }
-    // A native-owned held drag (content grab with strip scrolling enabled:
-    // unarmed, not scroll-armed, so neither the column drive nor the strip
-    // scroll moved the slot) keeps its synthetic slot while the OS window
-    // follows the cursor — paint the grab frame plus pointer deltas so the
-    // border rides the cursor at input rate. Legacy scroll-disabled drags
-    // drive the column directly and header scroll-drags drive the strip, so
-    // both keep the layout frame.
-    let is_native_held = |entity: Entity| {
-        config.left_drag_scrolls_strip()
-            && drag_held.iter().any(|(marker, gesture, _)| {
-                marker.0 == entity && gesture.is_none_or(|g| !g.display_armed && !g.scroll_armed)
-            })
-    };
+    // Every held drag drives its column from the pointer (see
+    // `drag_move_held_column`), so the slot is never stale by design and the
+    // border always rides the layout frame below. There is no native-owned
+    // held drag anymore: all drags reach macOS and the ECS drives the same
+    // deltas into the column.
+    let is_native_held = |_entity: Entity| false;
     // Grab-time driving gesture on this window (armed column or scroll
     // drag): the layout moves with the pointer, so the border trusts the
     // presented frame exactly (see `drive_trust`).

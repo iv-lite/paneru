@@ -333,9 +333,9 @@ impl FrameActivity<'_, '_> {
     /// Returns `true` while any window is being moved, resized or scrolled, a
     /// drag is held, a flash message is on screen, or the app is still
     /// warming up — i.e. while frames still need drawing. Held drags count
-    /// even with no `RepositionMarker`: a native-owned content drag moves the
-    /// OS window every tick while the layout slot stays pinned, and backing
-    /// off to the idle cadence would starve the border repaint. Warmup
+    /// even with no `RepositionMarker`: a held column drag moves the slot
+    /// every tick, and backing off to the idle cadence would starve the
+    /// border repaint. Warmup
     /// counts so the first seconds converge at the active cadence instead of
     /// the 500ms idle ramp, when nothing above exists yet by construction.
     /// Verifying drives and resends count too: a landed glide drops its

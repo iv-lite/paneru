@@ -300,68 +300,35 @@ pub fn reconcile_resize(state: WindowSync, event: ResizeEvent) -> SyncAction {
     SyncAction::Adopt
 }
 
-/// Where a press landed, classified once at the edge: the strip gutter
-/// between windows (the only surface that scrolls the strip) versus
-/// everything that stays native (window content, tabs, buttons — presses
-/// on windows never drive anything).
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-#[allow(dead_code)]
-pub enum GestureKind {
-    Gutter,
-    Content,
-    /// A press that never classified: always push back, explicitly.
-    Unknown,
-}
-
-/// Full gesture descriptor stored on the holder; downstream systems read this
-/// instead of re-deriving press context (kills live-modifier re-checks and
-/// duplicate gutter/armed markers).
+/// Grab-time arming flag stored on the holder; downstream systems read this
+/// instead of re-deriving press context (kills live-modifier re-checks).
+/// Only modifier-armed display drags drive anything; plain content holders
+/// are tracked for column motion plus release bookkeeping.
 #[derive(Clone, Component, Copy, Debug, PartialEq, Eq)]
 pub struct Gesture {
-    pub kind: GestureKind,
-    pub gutter: bool,
     pub display_armed: bool,
-    pub scroll_armed: bool,
 }
 
 impl Gesture {
-    /// Whether this holder drives anything (display transfer or strip
-    /// scroll). Plain content holders are tracked for release bookkeeping
-    /// only and must not key per-frame costs.
+    /// Whether this holder drives a display transfer or reorder. Plain
+    /// content holders still move their column while held (gliding home on
+    /// release) but must not key transfer costs.
     pub fn drives(self) -> bool {
-        self.display_armed || self.scroll_armed
+        self.display_armed
     }
 }
 
-/// Pure classifier: geometry facts in, descriptor out. No AX, no ECS, no
-/// clock — unit-tested here; `mouse_down_trigger` wires it up in Phase 3.
-#[allow(
-    clippy::fn_params_excessive_bools,
-    clippy::too_many_arguments,
-    dead_code
-)]
-pub fn classify_gesture(gutter: bool, display_armed: bool, scroll_capable: bool) -> Gesture {
-    let kind = if gutter {
-        GestureKind::Gutter
-    } else {
-        GestureKind::Content
-    };
-    Gesture {
-        kind,
-        gutter,
-        display_armed,
-        scroll_armed: scroll_capable && !display_armed && gutter,
-    }
+/// Pure classifier: arming fact in, descriptor out. No AX, no ECS, no
+/// clock — unit-tested here; `mouse_down_trigger` wires it up.
+pub fn classify_gesture(display_armed: bool) -> Gesture {
+    Gesture { display_armed }
 }
 
 /// Explicit constructor for the never-classified press: always push back.
 #[allow(dead_code)]
 pub fn unknown_gesture() -> Gesture {
     Gesture {
-        kind: GestureKind::Unknown,
-        gutter: false,
         display_armed: false,
-        scroll_armed: false,
     }
 }
 
@@ -546,22 +513,18 @@ mod tests {
 
     #[test]
     fn gesture_classification() {
-        let g = classify_gesture(true, false, true);
-        assert_eq!(g.kind, GestureKind::Gutter);
-        assert!(g.gutter && g.scroll_armed);
+        let g = classify_gesture(false);
+        assert!(!g.display_armed);
+        assert!(!g.drives());
 
-        // Display-drag armed: scroll must stand down.
-        let g = classify_gesture(true, true, true);
-        assert!(!g.scroll_armed);
+        // Display-drag armed: drives transfer/reorder.
+        let g = classify_gesture(true);
+        assert!(g.display_armed);
+        assert!(g.drives());
 
-        // Content never scrolls.
-        let g = classify_gesture(false, false, true);
-        assert_eq!(g.kind, GestureKind::Content);
-        assert!(!g.gutter && !g.scroll_armed);
-
-        // Unknown is never gutter.
+        // Unknown is never armed.
         let g = unknown_gesture();
-        assert_eq!(g.kind, GestureKind::Unknown);
-        assert!(!g.gutter);
+        assert!(!g.display_armed);
+        assert!(!g.drives());
     }
 }

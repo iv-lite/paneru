@@ -647,7 +647,7 @@ pub struct Scrolling {
     pub last_event: Duration,
 }
 
-/// Settle request for a strip-scroll drag release: once the release glide
+/// Settle request for a swipe release: once the release glide decays, pull
 /// decays, pull the strip just enough to bring the nearest window fully into
 /// the viewport instead of stranding it half-out at the kept offset. Runs
 /// independent of `auto_center`/`center_single_column` (which center instead

@@ -438,8 +438,8 @@ fn test_scrolling_stop() {
         .run(commands);
 }
 
-/// Active strip offset plus drag-settle transient state for the
-/// strip-scroll release test below.
+/// Active strip offset plus drag-settle transient state for the swipe
+/// release test below.
 fn strip_scroll_state(world: &mut World) -> (i32, bool, bool) {
     let (entity, x) = {
         let mut strips = world.query_filtered::<(Entity, &Position), (With<LayoutStrip>, With<ActiveWorkspaceMarker>)>();

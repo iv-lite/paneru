@@ -8,7 +8,6 @@ use std::{
 
 use tracing::info;
 
-use crate::platform::service;
 use crate::util::exe_path;
 
 const APP_BUNDLE_NAME: &str = "Paneru.app";
@@ -26,18 +25,10 @@ impl AppLauncher {
             ErrorKind::NotFound,
             "Cannot find home directory.",
         ))?;
-        // Prefer the canonical daemon path: the shim survives updates only
-        // when it points at `~/.local/bin/paneru` instead of wherever the
-        // invoking binary happens to live (Cellar, tarball dir, …).
-        let canonical = service::canonical_path(&home_dir);
-        let paneru_path = if canonical.is_file() {
-            canonical
-        } else {
-            exe_path().ok_or(Error::new(
-                ErrorKind::NotFound,
-                "Cannot find current executable path.",
-            ))?
-        };
+        let paneru_path = exe_path().ok_or(Error::new(
+            ErrorKind::NotFound,
+            "Cannot find current executable path.",
+        ))?;
         Ok(Self::new(
             paneru_path,
             home_dir.join("Applications").join(APP_BUNDLE_NAME),
@@ -83,22 +74,6 @@ impl AppLauncher {
         fs::remove_dir_all(&self.app_path)?;
         info!("removed app launcher from `{}`", self.app_path.display());
         Ok(())
-    }
-
-    /// Whether the installed shim points somewhere other than this
-    /// launcher's daemon path. A missing or unparseable shim counts as
-    /// stale so callers converge it via `install`. Never fails — I/O
-    /// errors read as stale.
-    #[must_use]
-    pub fn shim_stale(&self) -> bool {
-        let script_path = self
-            .app_path
-            .join("Contents/MacOS")
-            .join(APP_EXECUTABLE_NAME);
-        let Ok(script) = fs::read_to_string(&script_path) else {
-            return true;
-        };
-        shim_target(&script).is_none_or(|target| target != self.paneru_path)
     }
 
     fn write_bundle(&self, app_path: &Path) -> Result<()> {
@@ -180,22 +155,6 @@ fn shell_quote(value: &str) -> String {
     format!("'{}'", value.replace('\'', "'\"'\"'"))
 }
 
-/// Extracts the daemon path a launcher script `exec`s. Inverse of
-/// [`launcher_script`] (single-quote unwrapping); `None` when unparseable.
-fn shim_target(script: &str) -> Option<PathBuf> {
-    let line = script
-        .lines()
-        .map(str::trim_start)
-        .find(|line| line.starts_with("exec "))?;
-    let quoted = line
-        .strip_prefix("exec ")?
-        .trim()
-        .strip_suffix(" start")?
-        .trim();
-    let inner = quoted.strip_prefix('\'')?.strip_suffix('\'')?;
-    Some(PathBuf::from(inner.replace("'\"'\"'", "'")))
-}
-
 fn sign_bundle(app_path: &Path) -> Result<()> {
     let output = Command::new("/usr/bin/codesign")
         .args(["--force", "--deep", "--sign", "-"])
@@ -222,7 +181,7 @@ mod tests {
 
     use super::{
         APP_BUNDLE_ID, APP_EXECUTABLE_NAME, AppLauncher, ensure_owned_bundle, launcher_script,
-        shell_quote, shim_target,
+        shell_quote,
     };
 
     static NEXT_TEST_ID: AtomicU64 = AtomicU64::new(0);
@@ -240,24 +199,6 @@ mod tests {
         let script = launcher_script(PathBuf::from("/tmp/Paneru's bin").as_path());
         assert_eq!(script, "#!/bin/sh\nexec '/tmp/Paneru'\"'\"'s bin' start\n");
         assert_eq!(shell_quote("paneru"), "'paneru'");
-    }
-
-    #[test]
-    fn shim_target_round_trips_launcher_script() {
-        for path in [
-            "/Users/test/.local/bin/paneru",
-            "/opt/homebrew/bin/paneru",
-            "/tmp/Paneru's bin",
-        ] {
-            let script = launcher_script(PathBuf::from(path).as_path());
-            assert_eq!(shim_target(&script), Some(PathBuf::from(path)));
-        }
-        assert_eq!(shim_target("nothing to parse"), None);
-        assert_eq!(
-            shim_target("#!/bin/sh\nexec '/a/b' stop\n"),
-            None,
-            "only `start` shims parse"
-        );
     }
 
     #[test]

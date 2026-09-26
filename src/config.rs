@@ -750,12 +750,6 @@ impl Config {
         self.options().mouse_drag_display_modifier
     }
 
-    /// Whether an unmodified left-drag on a tiled window pans the workspace
-    /// strip instead of moving the window. Default: true.
-    pub fn left_drag_scrolls_strip(&self) -> bool {
-        self.options().left_drag_scrolls_strip.unwrap_or(true)
-    }
-
     /// Whether tiled windows are resized to fill their tile slot — at
     /// launch when windows snap into strips and on every later layout
     /// change. Default: true. Disable to tile windows at their native
@@ -884,23 +878,6 @@ impl Config {
     pub fn focus_follows_mouse(&self) -> bool {
         // Default is enabled.
         self.options().focus_follows_mouse.is_none_or(|ffm| ffm)
-    }
-
-    /// Drag travel, as a ratio of the working viewport width, above which
-    /// hover-focus sleeps after release — a hand that just flung the strip
-    /// across the monitor must not immediately refocus wherever the cursor
-    /// stopped. `<= 0.0` disables. Default `1.0` (a full viewport width).
-    pub fn ffm_drag_suppress_ratio(&self) -> f64 {
-        self.options()
-            .ffm_drag_suppress_ratio
-            .unwrap_or(1.0)
-            .clamp(0.0, 8.0)
-    }
-
-    /// How long hover-focus sleeps after a viewport-crossing drag.
-    /// `0` disables. Default 400ms.
-    pub fn ffm_drag_suppress_ms(&self) -> u64 {
-        self.options().ffm_drag_suppress_ms.unwrap_or(400)
     }
 
     /// Returns `true` if the mouse cursor should follow the focused window based on the current configuration.
@@ -1332,13 +1309,6 @@ pub struct RestoreOptions {
 pub struct MainOptions {
     /// Enables or disables focus follows mouse behavior.
     pub focus_follows_mouse: Option<bool>,
-    /// Drag travel, as a ratio of the working viewport width, above which
-    /// hover-focus sleeps after release. See
-    /// [`Config::ffm_drag_suppress_ratio`]. Default `1.0`; `<= 0` disables.
-    pub ffm_drag_suppress_ratio: Option<f64>,
-    /// Milliseconds hover-focus sleeps after a viewport-crossing drag. See
-    /// [`Config::ffm_drag_suppress_ms`]. Default `400`; `0` disables.
-    pub ffm_drag_suppress_ms: Option<u64>,
     /// Enables or disables mouse follows focus behavior.
     pub mouse_follows_focus: Option<bool>,
     /// Warps the mouse to the closest screen when at the edge.
@@ -1415,13 +1385,6 @@ pub struct MainOptions {
     /// dragged windows snap back to their own strip like foreign moves.
     #[serde(default, deserialize_with = "deserialize_modifier")]
     pub mouse_drag_display_modifier: Option<Modifiers>,
-    /// When enabled (default), dragging a tiled window with the left mouse
-    /// button — without the display-drag modifier held — scrolls the
-    /// workspace strip through the shared modifier+scroll pipeline instead
-    /// of moving the window, and the native drag is swallowed so macOS
-    /// can't move it either. Modifier-held (armed) drags still move and
-    /// transfer as before.
-    pub left_drag_scrolls_strip: Option<bool>,
     /// Resize tiled windows to fill their tile slot. See
     /// [`Config::maximize_tiled_windows`].
     pub maximize_tiled_windows: Option<bool>,

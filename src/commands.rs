@@ -2107,7 +2107,7 @@ fn print_internal_state_handler(
         .map(|(holder, marker, gesture)| format!("{holder}->{} gesture={gesture:?}", marker.0))
         .collect::<Vec<_>>();
     info!(
-        "Drag: holders=[{}], modifiers={:?}, preview={:?}, mission_control={}, drag_modifier={:?}, resize_modifier={:?}, warp={:?}, left_drag_scrolls_strip={}",
+        "Drag: holders=[{}], modifiers={:?}, preview={:?}, mission_control={}, drag_modifier={:?}, resize_modifier={:?}, warp={:?}",
         holders.join(", "),
         drag_modifiers.current,
         drop_preview.rect,
@@ -2115,7 +2115,6 @@ fn print_internal_state_handler(
         config.mouse_drag_display_modifier(),
         config.mouse_resize_modifier(),
         config.horizontal_mouse_warp(),
-        config.left_drag_scrolls_strip(),
     );
 
     if let Some(pool) = bevy::tasks::ComputeTaskPool::try_get() {

@@ -38,8 +38,8 @@ https://github.com/user-attachments/assets/793e7eaa-7909-4086-8380-1fb7861f8780
   A filled ghost spanning the dragged column marks the landing slot
   throughout the drag, and the edge
   warp carries the cursor across when `horizontal_mouse_warp` is set.
-  Without the shortcut, dragging in the strip gutter scrolls the workspace strip; window drags stay native and glide home
-  instead of moving anything (content grabs stay native; disable with `left_drag_scrolls_strip = false`) —
+  Without the shortcut, window drags move their column with the pointer
+  and glide home on release instead of transferring anything —
   only armed drags reorder or transfer.
 - **Virtual Workspaces (Experimental):** Group your windows into tasks by
   stacking multiple horizontal strips (rows) within a single space. Use native
@@ -128,29 +128,13 @@ $ cargo install --path .
 ```
 
 A locally built binary carries a fresh ad-hoc signature every time, which
-macOS treats as a new app: after (re)installing, converge the service onto
-the new binary, re-grant it Accessibility access (System Settings → Privacy
-& Security → Accessibility), and restart — or paneru will sit in the menu
-bar without tiling:
-
-```shell
-$ paneru install   # copies this binary to ~/.local/bin/paneru, heals the agent
-$ paneru restart   # picks up the new binary
-# then re-grant Accessibility once for the updated build
-```
-
-Source builds pin a stable signing identifier automatically (via the `rustc`
+macOS treats as a new app: after (re)installing, re-grant it Accessibility
+access (System Settings → Privacy & Security → Accessibility) and restart
+the service, or paneru will sit in the menu bar without tiling. Source
+builds pin a stable signing identifier automatically (via the `rustc`
 wrapper in `.cargo/config.toml`), but ad-hoc signatures still change hash
-per build, so every update needs one fresh grant. `paneru install` skips
-the copy and the re-stamp when the canonical binary already matches, so a
-redundant install never invalidates a live grant. Make sure
-`~/.local/bin` is on your `PATH`:
-
-```shell
-$ export PATH="$HOME/.local/bin:$PATH"
-```
-
-For an already-installed binary, pin the identifier by hand once:
+per build, so currently every reinstall needs a fresh grant; for an
+already-installed binary, pin it by hand once:
 
 ```shell
 $ codesign --force --sign - --identifier com.github.karinushka.paneru "$(which paneru)"
@@ -184,15 +168,6 @@ Or by first adding the tap and then installing by name:
 ```shell
 $ brew tap karinushka/paneru
 $ brew install paneru
-```
-
-After installing or upgrading, converge onto the stable daemon path and
-re-grant access once (same ad-hoc-signature caveat as source builds):
-
-```shell
-$ paneru install
-$ paneru restart
-# then re-grant Accessibility once for the updated build
 ```
 
 ### Installing with Nix
@@ -279,14 +254,6 @@ $ paneru install
 $ paneru start
 ```
 
-`paneru install` is idempotent and doubles as the updater: it copies the
-invoking binary to the canonical `~/.local/bin/paneru`, re-stamps the
-stable ad-hoc identifier when the bytes changed, and rewrites the launch
-agent whenever its `Program=` drifted elsewhere. `paneru start` and
-`paneru restart` heal a drifted agent the same way, so update → restart
-always converges. Only the binary bytes changing (every build, ad-hoc
-signing) still needs one fresh Accessibility grant per update.
-
 ### Installing an app launcher
 
 To start Paneru from Spotlight, Alfred, Raycast, or another application launcher,
@@ -297,9 +264,7 @@ $ paneru install-app
 ```
 
 This creates `$HOME/Applications/Paneru.app`. Opening the app starts the
-installed Paneru launch agent and exits immediately. The wrapper points at
-the canonical daemon path, so it survives updates; if the daemon ever warns
-the shim is stale, just re-run `paneru install-app`. Remove the wrapper with:
+installed Paneru launch agent and exits immediately. Remove the wrapper with:
 
 ```shell
 $ paneru uninstall-app

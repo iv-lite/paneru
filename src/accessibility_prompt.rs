@@ -25,9 +25,7 @@ pub(crate) fn show_accessibility_setup(
         "Paneru needs Accessibility access to move, resize, and arrange windows.\n\n\
          In System Settings, open Privacy & Security → Accessibility, then turn on Paneru.\n\n\
          If Paneru is already listed but access still does not work, remove the old entry with \
-         the – button, add Paneru.app again with the + button, and turn it on.\n\n\
-         After updating Paneru, run `paneru install` followed by `paneru restart` first, so the \
-         service points at the new binary — then grant access once for the updated build.",
+         the – button, add Paneru.app again with the + button, and turn it on.",
     ));
     alert.addButtonWithTitle(&NSString::from_str("Continue"));
     alert.addButtonWithTitle(&NSString::from_str("Not Now"));
