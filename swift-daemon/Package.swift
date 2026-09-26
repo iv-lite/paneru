@@ -11,6 +11,13 @@ let package = Package(
         .library(name: "PaneruDaemon", targets: ["Geometry"]),
     ],
     targets: [
+        // Real-time tap sidecar (C only: no Swift on the tap thread).
+        // Public headers under Sources/CTapShim/include.
+        .target(
+            name: "CTapShim",
+            path: "Sources/CTapShim",
+            publicHeadersPath: "include"
+        ),
         .target(
             name: "Geometry",
             path: "Sources/Geometry"
