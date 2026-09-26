@@ -177,7 +177,15 @@ until cutover:
   translator + callback). No Swift runs at tap priority; the daemon drains
   the ring on the main thread. Unit-tested without permissions (see
   `Tests/TapShimCTests`).
-- **Next:** `AXClient`, `EventCore`, `Presentation`, `Scripting`, `IPC`,
+- **`AXClient`** (done): commit/read discipline port — `AXWriteState`
+  (sequence/epoch tracking, whole-frame convergence, stuck-writer watchdog
+  ladder, send dedup), drain coalescing (latest-per-window merge, priority
+  order), and the read tracker's cache/inflight/completed protocol with an
+  injectable clock — ported verbatim from `src/ax_writer.rs` and
+  `src/ax_reads.rs` (verified by `Tests/AXClientChecks`: `swift run
+  --package-path swift-daemon AXClientChecks`). Actual AX calls stay behind
+  protocols; threading becomes an actor at integration time.
+- **Next:** `EventCore`, `Presentation`, `Scripting`, `IPC`,
   `Service` per the phase plan. Each lands with parity tests before the Rust
   counterpart is touched.
 

@@ -13,10 +13,10 @@ import Geometry
 // (leftmost stack, fullscreen target, non-stack unstack), which also
 // return `Ok` in Rust.
 
-public typealias WindowID = Int32
-public typealias WorkspaceID = UInt64
+// Window identity (`WindowID`) and workspace identity (`WorkspaceID`) live
+// in Geometry, shared by every daemon module.
 
-// MARK: - StackItem
+ // MARK: - StackItem
 
 /// One item in a stack: a single window or a native tab group.
 public enum StackItem: Equatable, Sendable {

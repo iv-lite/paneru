@@ -28,6 +28,12 @@ let package = Package(
             dependencies: ["Geometry"],
             path: "Sources/Layout"
         ),
+        // AX commit/read discipline port (`src/ax_writer.rs`, `src/ax_reads.rs`).
+        .target(
+            name: "AXClient",
+            dependencies: ["Geometry"],
+            path: "Sources/AXClient"
+        ),
         // Dependency-free check runners (this toolchain ships neither
         // XCTest nor swift-testing): `swift run --package-path
         // swift-daemon <Name>`. Fail nonzero on first mismatch.
@@ -40,6 +46,11 @@ let package = Package(
             name: "LayoutChecks",
             dependencies: ["Layout", "Geometry"],
             path: "Tests/LayoutTests"
+        ),
+        .executableTarget(
+            name: "AXClientChecks",
+            dependencies: ["AXClient", "Geometry"],
+            path: "Tests/AXClientChecks"
         ),
     ]
 )

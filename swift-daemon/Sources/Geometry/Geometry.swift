@@ -14,6 +14,11 @@ import CoreGraphics
 // Integer coordinates are `Int32`, matching Rust `i32` exactly (including the
 // `round_px` clamp range and truncating `/` in `clampStripToFill`).
 
+/// Window identity. Mirrors `platform::WinID` (`i32`).
+public typealias WindowID = Int32
+/// Workspace identity. Mirrors `platform::WorkspaceId` (`u64`).
+public typealias WorkspaceID = UInt64
+
 // MARK: - Integer primitives
 
 /// Integer point. Mirrors `manager::Origin` (`IVec2`).
