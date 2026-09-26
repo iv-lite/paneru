@@ -63,25 +63,51 @@ impl Plugin for LuaPlugin {
         app.add_systems(
             PreUpdate,
             (
-                // Before the pump so a read left outstanding from last frame is
-                // answered before the main thread goes back to sleep waiting on
-                // Cocoa.
-                serve_lua_queries.before(crate::ecs::systems::pump_events),
+                // Before the pump so a write ack left outstanding from last
+                // frame lands before the main thread goes back to sleep
+                // waiting on Cocoa.
                 serve_lua_store.before(crate::ecs::systems::pump_events),
                 drain_lua_outbox,
                 command_lua_handler,
             ),
         );
-        // ...and again after everything, for reads made during this frame's
+        // ...and again after everything, for writes made during this frame's
         // `Update` dispatch.
-        app.add_systems(PostUpdate, (serve_lua_queries, serve_lua_store));
+        app.add_systems(PostUpdate, serve_lua_store);
         app.add_systems(Update, (dispatch_lua_events, lua_reload_system));
     }
 }
 
+/// Builds the batch snapshot dispatched to the worker: the query documents,
+/// the layout tree, and the script store, each extracted at most once however
+/// many handlers ask. Reads every window's title over the accessibility API,
+/// so this is the frame's one expensive script-related read.
+fn snapshot_batch(
+    state: &QueryStateParams,
+    store: &Option<Res<ScriptStateStore>>,
+) -> world::BatchSnapshot {
+    world::BatchSnapshot {
+        state: state.extract().map(Arc::new).map_err(|err| err.to_string()),
+        window_set: state
+            .extract_window_set()
+            .map(Arc::new)
+            .map_err(|err| err.to_string()),
+        script_state: store
+            .as_ref()
+            .map(|store| store.snapshot())
+            .ok_or_else(|| MISSING_STORE.to_string()),
+    }
+}
+
 /// Forwards window-manager events to the worker for dispatch to `paneru.on`
-/// callbacks.
-pub fn dispatch_lua_events(worker: Option<Res<LuaWorker>>, mut reader: MessageReader<Event>) {
+/// callbacks, attaching the frame's snapshot so handlers read the world
+/// synchronously instead of round-tripping for it.
+pub fn dispatch_lua_events(
+    worker: Option<Res<LuaWorker>>,
+    state: QueryStateParams,
+    store: Option<Res<ScriptStateStore>>,
+    mut reader: MessageReader<Event>,
+) {
     let Some(worker) = worker else {
         return;
     };
@@ -98,11 +124,20 @@ pub fn dispatch_lua_events(worker: Option<Res<LuaWorker>>, mut reader: MessageRe
     if events.is_empty() {
         return;
     }
-    worker.send_events(events);
+    worker.send_events(worker::EventBatch {
+        events,
+        snapshot: snapshot_batch(&state, &store),
+    });
 }
 
-/// Handles `Command::Lua(id)` by handing the bound callback to the worker.
-pub fn command_lua_handler(worker: Option<Res<LuaWorker>>, mut reader: MessageReader<Event>) {
+/// Handles `Command::Lua(id)` by handing the bound callback to the worker,
+/// attaching the frame's snapshot for the same reason.
+pub fn command_lua_handler(
+    worker: Option<Res<LuaWorker>>,
+    state: QueryStateParams,
+    store: Option<Res<ScriptStateStore>>,
+    mut reader: MessageReader<Event>,
+) {
     let Some(worker) = worker else {
         return;
     };
@@ -118,50 +153,12 @@ pub fn command_lua_handler(worker: Option<Res<LuaWorker>>, mut reader: MessageRe
     if ids.is_empty() {
         return;
     }
-    worker.send_binds(ids);
+    worker.send_binds(ids, snapshot_batch(&state, &store));
 }
 
-/// Answers pending `paneru.query*` and window-set reads from the worker.
+/// Applies pending `paneru.state` writes against the store.
 ///
-/// Runs in both `PreUpdate` and `PostUpdate`. Each request kind is extracted
-/// at most once per pass and shared among all waiters, since building the
-/// query document reads every window's title over the accessibility API.
-///
-/// Deliberately does *not* take the script state store: Bevy derives a
-/// system's access statically for the whole run, so asking for the store here
-/// would make every pass hold it exclusively even when no script has
-/// mentioned `paneru.state`. See [`serve_lua_store`].
-pub fn serve_lua_queries(worker: Option<Res<LuaWorker>>, state: QueryStateParams) {
-    let Some(worker) = worker else {
-        return;
-    };
-    // Collected up front so a waiter later in the queue isn't re-read for.
-    let requests: Vec<_> = worker.pending_world_queries().collect();
-    if requests.is_empty() {
-        return;
-    }
-
-    // Filled on the first waiter that asks for that kind, reused by the rest.
-    let mut extracted_state = None;
-    let mut extracted_set = None;
-
-    for request in requests {
-        match request {
-            worker::WorldRequest::State { reply } => {
-                let _ = reply.try_send(extract_once(&mut extracted_state, || state.extract()));
-            }
-            worker::WorldRequest::WindowSet { reply } => {
-                let _ = reply.try_send(extract_once(&mut extracted_set, || {
-                    state.extract_window_set()
-                }));
-            }
-        }
-    }
-}
-
-/// Answers pending `paneru.state` calls waiting on the store.
-///
-/// Separate from [`serve_lua_queries`] because this needs the store
+/// Separate from the dispatch systems because this needs the store
 /// *mutably*; keeping it in its own system limits that exclusivity to store
 /// traffic only, rather than blocking every system that touches the store.
 pub fn serve_lua_store(
@@ -172,37 +169,15 @@ pub fn serve_lua_store(
         return;
     };
     for request in worker.pending_store_queries() {
-        match request {
-            worker::StoreRequest::Read { reply } => {
-                let answer = script_state
-                    .as_ref()
-                    .map(|store| store.snapshot())
-                    .ok_or_else(|| MISSING_STORE.to_string());
-                let _ = reply.try_send(answer);
-            }
-            // Unlike a read, a write's reply is acted on: `paneru.state.mutate`
-            // retries when this reports the value was overtaken.
-            worker::StoreRequest::Write { write, reply } => {
-                let answer = script_state.as_mut().map_or_else(
-                    || Err(MISSING_STORE.to_string()),
-                    |store| store.apply(&write),
-                );
-                let _ = reply.try_send(answer);
-            }
-        }
+        // Unlike a read, a write's reply is acted on: `paneru.state.mutate`
+        // retries when this reports the value was overtaken.
+        let worker::StoreWrite { write, reply } = request;
+        let answer = script_state.as_mut().map_or_else(
+            || Err(MISSING_STORE.to_string()),
+            |store| store.apply(&write),
+        );
+        let _ = reply.try_send(answer);
     }
-}
-
-/// Reads the world once per pass, however many waiters ask for it.
-///
-/// `slot` holds what the first asker got — including a failure, which is
-/// shared rather than retried per waiter.
-fn extract_once<T>(
-    slot: &mut Option<worker::Shared<T>>,
-    extract: impl FnOnce() -> crate::errors::Result<T>,
-) -> worker::Shared<T> {
-    slot.get_or_insert_with(|| extract().map(Arc::new).map_err(|err| err.to_string()))
-        .clone()
 }
 
 /// Puts what the callbacks queued onto the command bus.
@@ -285,50 +260,8 @@ fn paths_match(changed: &Path, script: &Path) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::cell::Cell;
 
-    // Many concurrent waiters should share a single read of the world.
-    #[test]
-    fn one_extraction_answers_every_waiter() {
-        let reads = Cell::new(0);
-        let mut slot = None;
-        let answers: Vec<_> = (0..5)
-            .map(|_| {
-                extract_once(&mut slot, || {
-                    reads.set(reads.get() + 1);
-                    Ok(7_u32)
-                })
-            })
-            .collect();
-
-        assert_eq!(reads.get(), 1, "the world should be read once for all five");
-        for answer in &answers {
-            assert_eq!(*answer.as_ref().expect("a successful read"), Arc::new(7));
-        }
-        let first = answers[0].as_ref().expect("a successful read");
-        assert!(
-            answers[1..]
-                .iter()
-                .all(|other| Arc::ptr_eq(first, other.as_ref().expect("a successful read"))),
-            "every waiter should hold the same extraction"
-        );
-    }
-
-    // A failed read is shared rather than retried per waiter.
-    #[test]
-    fn a_failed_extraction_is_shared_not_retried() {
-        let reads = Cell::new(0);
-        let mut slot = None;
-        let answers: Vec<_> = (0..3)
-            .map(|_| {
-                extract_once(&mut slot, || -> crate::errors::Result<u32> {
-                    reads.set(reads.get() + 1);
-                    Err(crate::errors::Error::InvalidInput("no world".to_string()))
-                })
-            })
-            .collect();
-
-        assert_eq!(reads.get(), 1, "a failure should not be retried per waiter");
-        assert!(answers.iter().all(std::result::Result::is_err));
-    }
+    // Sharing is structural now: `snapshot_batch` extracts each document
+    // exactly once per frame and every handler reads the same attachment
+    // (see `one_attach_serves_every_dispatch_in_the_batch` in `runtime`).
 }

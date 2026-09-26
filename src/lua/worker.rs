@@ -2,17 +2,18 @@
 //!
 //! `mlua::Lua` is `!Send`, and a handler is arbitrary script code of unbounded
 //! duration, so it cannot run on the main thread without blocking window
-//! management for as long as it takes. The main thread only sends
-//! ([`ToLua`]) and drains ([`FromLua`]) over unbounded, non-blocking
-//! channels; world reads ([`WorldRequest`]) and script-state access
-//! ([`StoreRequest`]) go through their own reply channels, so a handler
-//! awaiting an answer never blocks the others. Nothing crossing either
-//! channel is a Lua value — only plain data ([`LuaEvent`], [`WindowSet`],
-//! [`Command`], [`PaneruQueryState`]); see [`super::convert`] for the
-//! marshalling.
+//! management for as long as it takes. The main thread sends work
+//! ([`ToLua`], each message carrying the frame's [`BatchSnapshot`]) and drains
+//! effects ([`FromLua`]) over unbounded, non-blocking channels; handlers read
+//! the world out of the attached snapshot, synchronously — no round trips.
+//! The one exception is script-state *writes*, which must know whether they
+//! landed ([`StoreWrite`]), so those alone carry a reply channel. Nothing
+//! crossing either channel is a Lua value — only plain data ([`LuaEvent`],
+//! [`WindowSet`], [`Command`], [`PaneruQueryState`]); see [`super::convert`]
+//! for the marshalling.
 
 use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 use std::thread::JoinHandle;
 use std::time::Duration;
@@ -28,13 +29,11 @@ use tracing::{error, info, warn};
 
 use super::convert::{self, LuaEvent};
 use super::runtime::LuaRuntime;
-use super::world::{DispatchWorld, WorldAccess};
+use super::world::{BatchSnapshot, DispatchWorld, WriteAccess};
 use crate::commands::Command;
 use crate::config::Config;
-use crate::ecs::state::PaneruQueryState;
 use crate::platform::input::set_lua_keybinds;
-use paneru_shared_types::script_state::{ScriptState, ScriptStateWrite, WriteOutcome};
-use paneru_shared_types::windowset::WindowSet;
+use paneru_shared_types::script_state::{ScriptStateWrite, WriteOutcome};
 
 /// How long [`Drop`] waits for an in-flight dispatch to finish before giving
 /// up and detaching the thread. Bounded, so a script stuck in a loop can
@@ -53,15 +52,28 @@ pub enum LuaSource {
 
 /// Work for the interpreter. Unbounded and FIFO, so a reload can never
 /// overtake events queued before it.
+///
+/// Every dispatch-carrying message brings the frame's [`BatchSnapshot`]:
+/// handlers read the world out of the attachment, synchronously, so no
+/// round trip ever stalls the interpreter behind the main thread.
 enum ToLua {
-    /// One frame's worth of events, already extracted from the world.
-    Events(Vec<LuaEvent>),
-    /// One frame's worth of keybind ids.
+    /// One frame's worth of events plus its world snapshot.
+    Events(EventBatch),
+    /// One frame's worth of keybind ids plus its world snapshot.
     Binds {
         ids: Vec<u32>,
+        snapshot: BatchSnapshot,
     },
     Reload(PathBuf),
     Shutdown,
+}
+
+/// One frame's worth of events and the world they happened in.
+pub(super) struct EventBatch {
+    /// Events, already extracted from the world.
+    pub(super) events: Vec<LuaEvent>,
+    /// The frame's state documents, store included.
+    pub(super) snapshot: BatchSnapshot,
 }
 
 /// A side effect a callback produced, on its way back to the command bus.
@@ -81,52 +93,17 @@ pub(super) enum FromLua {
 /// the same way as a successful one.
 pub(super) type Shared<T> = Result<Arc<T>, String>;
 
-/// A read of the live ECS world that a handler is waiting on, carrying only
-/// the reply channel.
+/// One write against the script state store, carrying its reply channel.
 ///
-/// Kept on a separate channel from [`StoreRequest`] so each can be served by
-/// a different system: Bevy grants a system static access to everything its
-/// parameters mention, so one system serving both would hold read access to
-/// the whole world and exclusive access to the state store on every pass.
-pub(super) enum WorldRequest {
-    /// The `paneru.query*` documents.
-    State {
-        reply: Sender<Shared<PaneruQueryState>>,
-    },
-    /// The layout tree a handler transforms.
-    WindowSet { reply: Sender<Shared<WindowSet>> },
-}
-
-/// A read or write of the script state store. See [`WorldRequest`] for why this
-/// is a separate channel rather than two more variants.
-pub(super) enum StoreRequest {
-    /// The store, whenever the worker's cached copy is stale.
-    Read {
-        reply: Sender<Result<ScriptState, String>>,
-    },
-    /// One write against the store.
-    ///
-    /// Unlike a command, a write waits for its answer: the store has a
-    /// second writer (a socket client), and `paneru.state.mutate` needs to
-    /// know whether it was overtaken while the handler can still retry.
-    Write {
-        write: ScriptStateWrite,
-        reply: Sender<Result<WriteOutcome, String>>,
-    },
-}
-
-#[cfg(test)]
-impl WorldRequest {
-    /// Answers a state query. Panics on a window-set request, which the tests
-    /// using this never make.
-    fn answer(self, state: Shared<PaneruQueryState>) {
-        match self {
-            WorldRequest::State { reply } => {
-                let _ = reply.try_send(state);
-            }
-            WorldRequest::WindowSet { .. } => panic!("expected a state query"),
-        }
-    }
+/// The only round trip left: unlike a command, a write waits for its answer
+/// because `paneru.state.mutate` needs to know whether it was overtaken while
+/// the handler can still retry. Reads never leave the worker — they come out
+/// of the batch snapshot instead.
+pub(super) struct StoreWrite {
+    /// The write to apply.
+    pub(super) write: ScriptStateWrite,
+    /// Where the outcome goes.
+    pub(super) reply: Sender<Result<WriteOutcome, String>>,
 }
 
 /// The main thread's handle on the interpreter.
@@ -137,10 +114,8 @@ impl WorldRequest {
 pub struct LuaWorker {
     to_lua: Sender<ToLua>,
     outbox: Receiver<FromLua>,
-    /// Reads of the ECS world, and store traffic, on separate channels so
-    /// separate systems can serve them. See [`WorldRequest`].
-    world_queries: Receiver<WorldRequest>,
-    store_queries: Receiver<StoreRequest>,
+    /// Script-state writes awaiting their ack. See [`StoreWrite`].
+    store_queries: Receiver<StoreWrite>,
     /// Mirrors the runtime's `has_event_handlers`, republished after every
     /// load and reload, so the main thread's fast path never has to ask and
     /// wait.
@@ -151,28 +126,21 @@ pub struct LuaWorker {
     thread: Option<JoinHandle<()>>,
 }
 
-/// How the worker learns that the script state store has moved under it: the
-/// worker caches the store and only re-reads it when this stamp no longer
-/// matches the one its copy was taken at.
-pub type ScriptStateRevision = Arc<AtomicU64>;
-
 impl LuaWorker {
     /// Starts the worker and waits for it to finish loading `source`, so a
     /// script error is reported at startup, keybinds are published before
     /// the event tap can see a keypress, and a broken script still leaves a
     /// working (empty) runtime behind.
     ///
-    /// `revision` is the script state store's stamp, shared with the ECS
-    /// resource that owns the store. Returns `None` when the thread cannot
-    /// start or the load hangs past the deadline — the caller falls back
-    /// to no-script behavior instead of blocking startup forever.
+    /// Returns `None` when the thread cannot start or the load hangs past
+    /// the deadline — the caller falls back to no-script behavior instead of
+    /// blocking startup forever.
     ///
     /// [`spawn`]: LuaWorker::spawn
-    pub fn spawn(source: LuaSource, revision: ScriptStateRevision) -> Option<Self> {
+    pub fn spawn(source: LuaSource) -> Option<Self> {
         const LOAD_DEADLINE: std::time::Duration = std::time::Duration::from_secs(10);
         let (to_lua, from_main) = unbounded();
         let (to_main, outbox) = unbounded();
-        let (world_tx, world_queries) = unbounded();
         let (store_tx, store_queries) = unbounded();
         let (ready_tx, ready) = bounded(1);
         let has_handlers = Arc::new(AtomicBool::new(false));
@@ -192,11 +160,9 @@ impl LuaWorker {
                             &source,
                             &from_main,
                             &to_main,
-                            &world_tx,
                             &store_tx,
                             &has_handlers,
                             &built_config,
-                            &revision,
                             &ready_tx,
                         );
                     }))
@@ -233,7 +199,6 @@ impl LuaWorker {
         Some(Self {
             to_lua,
             outbox,
-            world_queries,
             store_queries,
             has_handlers,
             built_config,
@@ -258,15 +223,15 @@ impl LuaWorker {
         self.has_handlers.load(Ordering::Relaxed)
     }
 
-    /// Queues events for dispatch. Never blocks; a send only fails once the
-    /// worker is gone.
-    pub(super) fn send_events(&self, events: Vec<LuaEvent>) {
-        let _ = self.to_lua.try_send(ToLua::Events(events));
+    /// Queues events plus their world snapshot for dispatch. Never blocks; a
+    /// send only fails once the worker is gone.
+    pub(super) fn send_events(&self, batch: EventBatch) {
+        let _ = self.to_lua.try_send(ToLua::Events(batch));
     }
 
-    /// Queues keybind callbacks for dispatch.
-    pub(super) fn send_binds(&self, ids: Vec<u32>) {
-        let _ = self.to_lua.try_send(ToLua::Binds { ids });
+    /// Queues keybind callbacks plus their world snapshot for dispatch.
+    pub(super) fn send_binds(&self, ids: Vec<u32>, snapshot: BatchSnapshot) {
+        let _ = self.to_lua.try_send(ToLua::Binds { ids, snapshot });
     }
 
     /// Asks the worker to rebuild itself from `path`.
@@ -279,13 +244,8 @@ impl LuaWorker {
         std::iter::from_fn(|| self.outbox.try_recv().ok())
     }
 
-    /// The `paneru.query*` and window-set calls currently waiting on the world.
-    pub(super) fn pending_world_queries(&self) -> impl Iterator<Item = WorldRequest> + '_ {
-        std::iter::from_fn(|| self.world_queries.try_recv().ok())
-    }
-
-    /// The `paneru.state` calls currently waiting on the store.
-    pub(super) fn pending_store_queries(&self) -> impl Iterator<Item = StoreRequest> + '_ {
+    /// The `paneru.state` writes currently waiting on the store.
+    pub(super) fn pending_store_queries(&self) -> impl Iterator<Item = StoreWrite> + '_ {
         std::iter::from_fn(|| self.store_queries.try_recv().ok())
     }
 }
@@ -296,8 +256,8 @@ impl Drop for LuaWorker {
         let Some(thread) = self.thread.take() else {
             return;
         };
-        // Dropping the query receiver unblocks a handler waiting on a reply:
-        // its sender dies with the queue, so `recv` errors instead of
+        // Dropping the write receiver unblocks a handler parked on a store
+        // ack: its sender dies with the queue, so `recv` errors instead of
         // waiting forever.
         let mut waited = Duration::ZERO;
         while !thread.is_finished() && waited < SHUTDOWN_GRACE {
@@ -393,18 +353,12 @@ fn run(
     source: &LuaSource,
     from_main: &Receiver<ToLua>,
     to_main: &Sender<FromLua>,
-    world_queries: &Sender<WorldRequest>,
-    store_queries: &Sender<StoreRequest>,
+    store_queries: &Sender<StoreWrite>,
     has_handlers: &AtomicBool,
     built_config: &Mutex<Option<Config>>,
-    revision: &ScriptStateRevision,
     ready: &Sender<()>,
 ) {
-    let world = DispatchWorld::new(WorldAccess::new(
-        world_queries.clone(),
-        store_queries.clone(),
-        Arc::clone(revision),
-    ));
+    let world = DispatchWorld::new(WriteAccess::new(store_queries.clone()));
     let loaded = load(source, &world);
     has_handlers.store(loaded.has_event_handlers(), Ordering::Relaxed);
     if let Some(config) = loaded.built_config() {
@@ -418,15 +372,16 @@ fn run(
     let current = RefCell::new(Rc::new(loaded));
 
     // One task per handler, all on this one thread: a handler parked on a
-    // world read is not holding the interpreter, so the next one runs
-    // instead of queueing behind it.
+    // store ack or a `paneru.exec` run is not holding the interpreter, so
+    // the next one runs instead of queueing behind it.
     let executor = LocalExecutor::new();
     block_on(executor.run(async {
         while let Ok(message) = from_main.recv().await {
             match message {
-                ToLua::Events(events) => {
+                ToLua::Events(batch) => {
+                    world.attach(batch.snapshot);
                     let runtime = Rc::clone(&current.borrow());
-                    for event in &events {
+                    for event in &batch.events {
                         let Some((name, table)) = convert::event_table(runtime.lua(), event) else {
                             continue;
                         };
@@ -457,7 +412,8 @@ fn run(
                         }
                     }
                 }
-                ToLua::Binds { ids } => {
+                ToLua::Binds { ids, snapshot } => {
+                    world.attach(snapshot);
                     let runtime = Rc::clone(&current.borrow());
                     for id in ids {
                         let task = Task {
@@ -516,9 +472,12 @@ impl Task<'_> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::ecs::state::{PaneruActiveState, PaneruVirtualWorkspaceState, PaneruWindowState};
+    use crate::ecs::state::{
+        PaneruActiveState, PaneruQueryState, PaneruVirtualWorkspaceState, PaneruWindowState,
+    };
     use crate::lua::convert::WindowSpawnPayload;
-    use paneru_shared_types::windowset::{LayoutOp, WinID};
+    use paneru_shared_types::script_state::ScriptState;
+    use paneru_shared_types::windowset::{LayoutOp, WinID, WindowSet};
 
     /// How long a test waits for the worker before calling it wedged. Generous:
     /// it only ever elapses on failure.
@@ -527,25 +486,36 @@ mod tests {
     thread_local! {
         /// The store behind the worker under test. Thread-local because each
         /// test runs on its own thread, so a test never sees another's writes.
-        static STORE: std::cell::RefCell<TestStore> =
-            std::cell::RefCell::new(TestStore::new(revision()));
+        static STORE: std::cell::RefCell<TestStore> = std::cell::RefCell::new(TestStore::new());
     }
 
     fn worker(source: &str) -> LuaWorker {
         spawn_with_store(LuaSource::Inline(source.to_string()))
     }
 
-    /// Spawns a worker with a fresh store behind it, wired to the stamp the
-    /// worker watches.
+    /// Spawns a worker with a fresh store behind it.
     fn spawn_with_store(source: LuaSource) -> LuaWorker {
-        let revision = revision();
-        STORE.with_borrow_mut(|store| *store = TestStore::new(Arc::clone(&revision)));
-        LuaWorker::spawn(source, revision).expect("test script loads")
+        STORE.with_borrow_mut(|store| *store = TestStore::new());
+        LuaWorker::spawn(source).expect("test script loads")
     }
 
-    /// A revision stamp for a test that has no store behind it.
-    fn revision() -> ScriptStateRevision {
-        Arc::new(AtomicU64::new(0))
+    /// The batch snapshot tests dispatch against: the canned state and window
+    /// set plus whatever the test store currently holds.
+    fn test_snapshot() -> BatchSnapshot {
+        BatchSnapshot {
+            state: Ok(Arc::new(test_state())),
+            window_set: Ok(Arc::new(test_window_set())),
+            script_state: Ok(STORE.with_borrow(|store| store.state.clone())),
+        }
+    }
+
+    /// The same, with a custom window set for layout tests.
+    fn snapshot_with_set(set: WindowSet) -> BatchSnapshot {
+        BatchSnapshot {
+            state: Ok(Arc::new(test_state())),
+            window_set: Ok(Arc::new(set)),
+            script_state: Ok(STORE.with_borrow(|store| store.state.clone())),
+        }
     }
 
     /// Answers everything currently waiting on the store, so a test about
@@ -556,52 +526,22 @@ mod tests {
         }
     }
 
-    /// The next read of the world, serving the store meanwhile: a handler may
-    /// well be waiting on its own state before it gets round to asking for this.
-    fn next_world_request(worker: &LuaWorker, what: &str) -> WorldRequest {
-        let deadline = std::time::Instant::now() + TIMEOUT;
-        loop {
-            serve_store(worker);
-            if let Ok(request) = worker.world_queries.try_recv() {
-                return request;
-            }
-            assert!(
-                std::time::Instant::now() < deadline,
-                "timed out waiting for {what}"
-            );
-            std::thread::sleep(Duration::from_millis(1));
-        }
-    }
-
-    /// The main thread's side of the store: what reads are answered from and
-    /// what writes land in, with the stamp the worker's cache watches.
+    /// The main thread's side of the store: what writes land in.
     struct TestStore {
         state: ScriptState,
-        revision: ScriptStateRevision,
     }
 
     impl TestStore {
-        fn new(revision: ScriptStateRevision) -> Self {
+        fn new() -> Self {
             Self {
                 state: ScriptState::default(),
-                revision,
             }
         }
 
-        /// Answers one request the way `serve_lua_store` does.
-        fn answer(&mut self, request: StoreRequest) {
-            match request {
-                StoreRequest::Read { reply } => {
-                    let _ = reply.try_send(Ok(self.state.clone()));
-                }
-                StoreRequest::Write { write, reply } => {
-                    let outcome = self.state.apply(&write);
-                    if matches!(outcome, Ok(WriteOutcome::Applied { changed: true })) {
-                        self.revision.fetch_add(1, Ordering::Release);
-                    }
-                    let _ = reply.try_send(outcome);
-                }
-            }
+        /// Applies one write the way `serve_lua_store` does.
+        fn answer(&mut self, request: StoreWrite) {
+            let StoreWrite { write, reply } = request;
+            let _ = reply.try_send(self.state.apply(&write));
         }
     }
 
@@ -610,20 +550,6 @@ mod tests {
         let deadline = std::time::Instant::now() + TIMEOUT;
         loop {
             serve_store(worker);
-            if let Ok(request) = worker.world_queries.try_recv() {
-                // Every dispatch is handed a window set now, whether or not the
-                // handler touches it, so answering that is part of standing in
-                // for the main thread rather than something a test opts into.
-                match request {
-                    WorldRequest::WindowSet { reply } => {
-                        let _ = reply.try_send(Ok(Arc::new(test_window_set())));
-                    }
-                    WorldRequest::State { .. } => {
-                        panic!("this test only expects store and window-set requests")
-                    }
-                }
-                continue;
-            }
             if let Ok(effect) = worker.outbox.try_recv() {
                 return effect;
             }
@@ -684,7 +610,7 @@ mod tests {
     #[test]
     fn bind_dispatch_reaches_the_outbox() {
         let worker = worker(r#"paneru.bind("alt - b", "window balance")"#);
-        worker.send_binds(vec![1]);
+        worker.send_binds(vec![1], test_snapshot());
         let FromLua::Command(command) = next_effect(&worker, "the bound command") else {
             panic!("expected a command");
         };
@@ -701,12 +627,15 @@ mod tests {
     fn event_dispatch_reaches_the_outbox() {
         let worker = worker(r#"paneru.on("space_changed", function(e) paneru.flash(e.type) end)"#);
         assert!(worker.has_event_handlers());
-        worker.send_events(vec![LuaEvent::SpaceChanged]);
+        worker.send_events(EventBatch {
+            events: vec![LuaEvent::SpaceChanged],
+            snapshot: test_snapshot(),
+        });
         assert_eq!(next_flash(&worker, "the event flash"), "space_changed");
     }
 
     #[test]
-    fn query_round_trip_is_served_by_the_host() {
+    fn query_reads_the_attached_snapshot() {
         let worker = worker(
             r#"
             paneru.bind("alt - q", function()
@@ -714,19 +643,13 @@ mod tests {
             end)
             "#,
         );
-        worker.send_binds(vec![1]);
-
-        // Every dispatch is handed a window set before the handler runs, so that
-        // is the first thing to arrive whether or not the handler wants one.
-        serve_window_set(&worker);
-        let request = next_world_request(&worker, "the world");
-        request.answer(Ok(Arc::new(test_state())));
+        worker.send_binds(vec![1], test_snapshot());
 
         assert_eq!(next_flash(&worker, "the queried app name"), "Test App");
     }
 
     #[test]
-    fn two_queries_in_one_dispatch_cost_one_round_trip() {
+    fn two_queries_in_one_dispatch_share_the_snapshot() {
         let worker = worker(
             r#"
             paneru.bind("alt - q", function()
@@ -736,31 +659,26 @@ mod tests {
             end)
             "#,
         );
-        worker.send_binds(vec![1]);
+        worker.send_binds(vec![1], test_snapshot());
 
-        serve_window_set(&worker);
-        next_world_request(&worker, "the first query").answer(Ok(Arc::new(test_state())));
         assert_eq!(next_flash(&worker, "the handler to finish"), "done");
         assert!(
-            worker.world_queries.try_recv().is_err(),
-            "the second query should have been served from the cached extraction"
+            worker.store_queries.try_recv().is_err(),
+            "reads must not touch the store channel"
         );
     }
 
     #[test]
-    fn a_dropped_reply_channel_errors_the_handler_not_the_worker() {
+    fn a_failing_handler_does_not_break_the_worker() {
         let worker = worker(
             r#"
-            paneru.bind("alt - q", function() paneru.query_active() end)
+            paneru.bind("alt - q", function() paneru.query("bogus") end)
             paneru.bind("alt - b", "window balance")
             "#,
         );
-        worker.send_binds(vec![1]);
-        // Drop the request without answering, as a shutdown would.
-        drop(next_world_request(&worker, "the world"));
-
-        // The handler's error is not the worker's: it is still dispatching.
-        worker.send_binds(vec![2]);
+        worker.send_binds(vec![1], test_snapshot());
+        // No effect from the failed handler; the worker is still dispatching.
+        worker.send_binds(vec![2], test_snapshot());
         let FromLua::Command(command) = next_effect(&worker, "the next bind") else {
             panic!("expected a command");
         };
@@ -777,8 +695,7 @@ mod tests {
         let script = directory.join("init.lua");
         std::fs::write(&script, r#"paneru.bind("alt - b", "window balance")"#).unwrap();
 
-        let worker = LuaWorker::spawn(LuaSource::Path(script.clone()), revision())
-            .expect("test script loads");
+        let worker = LuaWorker::spawn(LuaSource::Path(script.clone())).expect("test script loads");
         std::fs::write(&script, "this is not lua ===").unwrap();
         worker.send_reload(script.clone());
         assert!(
@@ -787,7 +704,7 @@ mod tests {
         );
 
         // ...and the bind registered by the working script still dispatches.
-        worker.send_binds(vec![1]);
+        worker.send_binds(vec![1], test_snapshot());
         assert!(matches!(
             next_effect(&worker, "the surviving bind"),
             FromLua::Command(Command::Window(crate::commands::Operation::Balance))
@@ -803,8 +720,7 @@ mod tests {
         let script = directory.join("init.lua");
         std::fs::write(&script, r#"paneru.bind("alt - b", "window balance")"#).unwrap();
 
-        let worker = LuaWorker::spawn(LuaSource::Path(script.clone()), revision())
-            .expect("test script loads");
+        let worker = LuaWorker::spawn(LuaSource::Path(script.clone())).expect("test script loads");
         assert!(!worker.has_event_handlers(), "no paneru.on handlers yet");
 
         std::fs::write(
@@ -819,7 +735,10 @@ mod tests {
             "the reloaded script's handler should be visible to the fast path"
         );
 
-        worker.send_events(vec![LuaEvent::SpaceChanged]);
+        worker.send_events(EventBatch {
+            events: vec![LuaEvent::SpaceChanged],
+            snapshot: test_snapshot(),
+        });
         assert_eq!(next_flash(&worker, "the new handler"), "reloaded");
 
         std::fs::remove_dir_all(&directory).ok();
@@ -898,16 +817,6 @@ mod tests {
         )
     }
 
-    /// Answers the next window-set request with `set`.
-    fn serve(worker: &LuaWorker, set: WindowSet) {
-        match next_world_request(worker, "the window set") {
-            WorldRequest::WindowSet { reply } => {
-                let _ = reply.try_send(Ok(Arc::new(set)));
-            }
-            WorldRequest::State { .. } => panic!("expected a window-set request"),
-        }
-    }
-
     /// The ops of the next layout command.
     fn next_ops(worker: &LuaWorker, what: &str) -> Vec<LayoutOp> {
         match next_effect(worker, what) {
@@ -971,16 +880,6 @@ mod tests {
         )
     }
 
-    /// Answers the next window-set request, or panics saying what arrived.
-    fn serve_window_set(worker: &LuaWorker) {
-        match next_world_request(worker, "the window set") {
-            WorldRequest::WindowSet { reply } => {
-                let _ = reply.try_send(Ok(Arc::new(test_window_set())));
-            }
-            WorldRequest::State { .. } => panic!("expected a window-set request"),
-        }
-    }
-
     #[test]
     fn script_state_survives_a_reload() {
         let directory = std::env::temp_dir().join("paneru-lua-worker-state-reload");
@@ -996,7 +895,7 @@ mod tests {
 
         let worker = spawn_with_store(LuaSource::Path(script.clone()));
 
-        worker.send_binds(vec![1]);
+        worker.send_binds(vec![1], test_snapshot());
         // Serving is what lets the write land; the flash is how we know the
         // handler got that far.
         std::fs::write(
@@ -1016,7 +915,7 @@ mod tests {
         };
         assert_eq!(message, "Lua reloaded");
 
-        worker.send_binds(vec![1]);
+        worker.send_binds(vec![1], test_snapshot());
         let FromLua::Flash { message, .. } = serve_until_effect(&worker, "the value read back")
         else {
             panic!("expected the flash the reloaded script sends");
@@ -1033,8 +932,7 @@ mod tests {
     fn a_returned_window_set_commits_its_operations() {
         let worker =
             worker(r#"paneru.bind("alt - f", function(ws) return ws:focus(ws:focused()) end)"#);
-        worker.send_binds(vec![1]);
-        serve_window_set(&worker);
+        worker.send_binds(vec![1], test_snapshot());
 
         let FromLua::Command(command) = next_effect(&worker, "the layout command") else {
             panic!("expected a command");
@@ -1055,8 +953,7 @@ mod tests {
             end)
             "#,
         );
-        worker.send_binds(vec![1]);
-        serve_window_set(&worker);
+        worker.send_binds(vec![1], test_snapshot());
 
         assert_eq!(next_flash(&worker, "the handler to finish"), "discarded");
         assert!(
@@ -1076,11 +973,10 @@ mod tests {
             paneru.bind("alt - b", "window balance")
             "#,
         );
-        worker.send_binds(vec![1]);
-        serve_window_set(&worker);
+        worker.send_binds(vec![1], test_snapshot());
 
         // Nothing from the failed handler; the worker is still dispatching.
-        worker.send_binds(vec![2]);
+        worker.send_binds(vec![2], test_snapshot());
         assert!(matches!(
             next_effect(&worker, "the next bind"),
             FromLua::Command(Command::Window(crate::commands::Operation::Balance))
@@ -1096,8 +992,7 @@ mod tests {
             end)
             "#,
         );
-        worker.send_binds(vec![1]);
-        serve_window_set(&worker);
+        worker.send_binds(vec![1], test_snapshot());
 
         let FromLua::Command(Command::Layout(ops)) = next_effect(&worker, "the layout command")
         else {
@@ -1121,19 +1016,19 @@ mod tests {
     }
 
     #[test]
-    fn a_handler_that_ignores_the_window_set_never_fetches_one() {
-        // Laziness is what keeps the window set affordable on hot events: it
-        // costs a round-trip and reads every window title over the AX API.
+    fn a_pure_bind_needs_no_world_traffic() {
+        // A string-command bind never touches the world: after it dispatches,
+        // no store write is waiting either.
         let worker = worker(r#"paneru.bind("alt - b", "window balance")"#);
-        worker.send_binds(vec![1]);
+        worker.send_binds(vec![1], test_snapshot());
 
         assert!(matches!(
             next_effect(&worker, "the bound command"),
             FromLua::Command(Command::Window(crate::commands::Operation::Balance))
         ));
         assert!(
-            worker.world_queries.try_recv().is_err(),
-            "a handler that never touches the window set should not ask for one"
+            worker.store_queries.try_recv().is_err(),
+            "a pure bind should cause no store traffic"
         );
     }
 
@@ -1145,43 +1040,10 @@ mod tests {
             paneru.bind("alt - b", function(ws) paneru.flash(tostring(ws:focused())) end)
             "#,
         );
-        worker.send_binds(vec![1, 2]);
-        serve_window_set(&worker);
+        worker.send_binds(vec![1, 2], test_snapshot());
 
         assert_eq!(next_flash(&worker, "the first handler"), "7");
         assert_eq!(next_flash(&worker, "the second handler"), "7");
-        assert!(
-            worker.world_queries.try_recv().is_err(),
-            "the second handler should have reused the first fetch"
-        );
-    }
-
-    /// A handler parked on a world read does not hold up the next one: it is
-    /// left waiting on purpose while a second handler runs to completion.
-    #[test]
-    fn a_handler_waiting_on_the_world_does_not_hold_up_the_next_one() {
-        let worker = worker(
-            r#"
-            paneru.bind("alt - a", function()
-              paneru.flash(paneru.query_active().focused_app_name)
-            end)
-            paneru.bind("alt - b", function() paneru.flash("second") end)
-            "#,
-        );
-        worker.send_binds(vec![1, 2]);
-        serve_window_set(&worker);
-
-        // Taken but deliberately not answered: the first handler stays parked.
-        let parked = next_world_request(&worker, "the state query");
-
-        assert_eq!(
-            next_flash(&worker, "the second handler"),
-            "second",
-            "the second handler should not be waiting on the first"
-        );
-
-        parked.answer(Ok(Arc::new(test_state())));
-        assert_eq!(next_flash(&worker, "the first handler"), "Test App");
     }
 
     #[test]
@@ -1193,8 +1055,10 @@ mod tests {
             end)
             "#,
         );
-        worker.send_events(vec![LuaEvent::SpaceChanged]);
-        serve_window_set(&worker);
+        worker.send_events(EventBatch {
+            events: vec![LuaEvent::SpaceChanged],
+            snapshot: test_snapshot(),
+        });
         assert_eq!(next_flash(&worker, "the event handler"), "space_changed:7");
     }
 
@@ -1212,16 +1076,11 @@ mod tests {
             paneru.bind("alt - b", function() paneru.flash(tostring(escaped:focused())) end)
             "#,
         );
-        worker.send_binds(vec![1]);
-        serve_window_set(&worker);
+        worker.send_binds(vec![1], test_snapshot());
         assert_eq!(next_flash(&worker, "the first handler"), "7");
 
-        worker.send_binds(vec![2]);
+        worker.send_binds(vec![2], test_snapshot());
         assert_eq!(next_flash(&worker, "the captured set"), "7");
-        assert!(
-            worker.world_queries.try_recv().is_err(),
-            "reading a captured set should not go back to the world"
-        );
     }
 
     /// The scratchpad module documented in CONFIGURATION.md, kept here so the
@@ -1343,7 +1202,7 @@ mod tests {
     /// A bare `try_recv` would race the worker, which may not have finished the
     /// dispatch under test yet.
     fn assert_nothing_queued(worker: &LuaWorker) {
-        worker.send_binds(vec![4]);
+        worker.send_binds(vec![4], test_snapshot());
         assert_eq!(
             next_flash(worker, "the sentinel"),
             "sentinel",
@@ -1354,8 +1213,7 @@ mod tests {
     #[test]
     fn a_scratchpad_on_screen_is_parked() {
         let worker = worker(SCRATCHPAD);
-        worker.send_binds(vec![1]);
-        serve(&worker, layout(&[(7, "Alacritty", 1)]));
+        worker.send_binds(vec![1], snapshot_with_set(layout(&[(7, "Alacritty", 1)])));
 
         assert_eq!(
             next_ops(&worker, "the stash"),
@@ -1370,8 +1228,7 @@ mod tests {
     #[test]
     fn a_stashed_scratchpad_is_summoned_and_focused() {
         let worker = worker(SCRATCHPAD);
-        worker.send_binds(vec![1]);
-        serve(&worker, layout(&[(7, "Alacritty", 9)]));
+        worker.send_binds(vec![1], snapshot_with_set(layout(&[(7, "Alacritty", 9)])));
 
         assert_eq!(
             next_ops(&worker, "the summons"),
@@ -1389,8 +1246,10 @@ mod tests {
     #[test]
     fn a_scratchpad_that_is_not_running_is_spawned_and_nothing_moves() {
         let worker = worker(SCRATCHPAD);
-        worker.send_binds(vec![1]);
-        serve(&worker, layout(&[(3, "Something Else", 1)]));
+        worker.send_binds(
+            vec![1],
+            snapshot_with_set(layout(&[(3, "Something Else", 1)])),
+        );
 
         // `spawn` is `true`, so the only observable effect is that no layout
         // command is issued.
@@ -1402,8 +1261,10 @@ mod tests {
         let worker = worker(SCRATCHPAD);
         // Notes is on screen; summoning the terminal from the stash should put
         // notes away first.
-        worker.send_binds(vec![1]);
-        serve(&worker, layout(&[(7, "Alacritty", 9), (8, "Obsidian", 1)]));
+        worker.send_binds(
+            vec![1],
+            snapshot_with_set(layout(&[(7, "Alacritty", 9), (8, "Obsidian", 1)])),
+        );
 
         assert_eq!(
             next_ops(&worker, "the exclusive swap"),
@@ -1426,10 +1287,13 @@ mod tests {
     #[test]
     fn hide_all_parks_every_visible_scratchpad() {
         let worker = worker(SCRATCHPAD);
-        worker.send_binds(vec![3]);
-        serve(
-            &worker,
-            layout(&[(7, "Alacritty", 1), (8, "Obsidian", 1), (9, "Mail", 1)]),
+        worker.send_binds(
+            vec![3],
+            snapshot_with_set(layout(&[
+                (7, "Alacritty", 1),
+                (8, "Obsidian", 1),
+                (9, "Mail", 1),
+            ])),
         );
 
         assert_eq!(
@@ -1452,8 +1316,10 @@ mod tests {
     #[test]
     fn the_manage_hook_floats_a_pad_window_once() {
         let worker = worker(SCRATCHPAD);
-        worker.send_events(vec![LuaEvent::WindowFocused { window_id: 7 }]);
-        serve(&worker, layout(&[(7, "Alacritty", 1)]));
+        worker.send_events(EventBatch {
+            events: vec![LuaEvent::WindowFocused { window_id: 7 }],
+            snapshot: snapshot_with_set(layout(&[(7, "Alacritty", 1)])),
+        });
 
         assert_eq!(
             next_ops(&worker, "the float"),
@@ -1478,7 +1344,10 @@ mod tests {
         // Focusing it again is neither a new window nor a focus change, so
         // both handlers bail before touching the set — which is why this needs
         // no second `serve`: nothing asks for one.
-        worker.send_events(vec![LuaEvent::WindowFocused { window_id: 7 }]);
+        worker.send_events(EventBatch {
+            events: vec![LuaEvent::WindowFocused { window_id: 7 }],
+            snapshot: test_snapshot(),
+        });
         assert_nothing_queued(&worker);
     }
 
@@ -1487,8 +1356,10 @@ mod tests {
         // `notes` declares no `float`, so the manage hook leaves it tiled: no
         // float, and above all no frame invented for it.
         let worker = worker(SCRATCHPAD);
-        worker.send_events(vec![LuaEvent::WindowFocused { window_id: 8 }]);
-        serve(&worker, layout(&[(8, "Obsidian", 1)]));
+        worker.send_events(EventBatch {
+            events: vec![LuaEvent::WindowFocused { window_id: 8 }],
+            snapshot: snapshot_with_set(layout(&[(8, "Obsidian", 1)])),
+        });
         assert_nothing_queued(&worker);
     }
 
@@ -1497,10 +1368,9 @@ mod tests {
         // The same fractions, resolved against a second display: proportional
         // placement is what makes one pad definition work on both.
         let worker = worker(SCRATCHPAD);
-        worker.send_events(vec![LuaEvent::WindowFocused { window_id: 7 }]);
-        serve(
-            &worker,
-            layout_on(
+        worker.send_events(EventBatch {
+            events: vec![LuaEvent::WindowFocused { window_id: 7 }],
+            snapshot: snapshot_with_set(layout_on(
                 2,
                 paneru_shared_types::state::Frame {
                     x: 1920,
@@ -1509,8 +1379,8 @@ mod tests {
                     height: 800,
                 },
                 &[(7, "Alacritty", 1)],
-            ),
-        );
+            )),
+        });
 
         assert_eq!(
             next_ops(&worker, "the float"),
@@ -1538,12 +1408,13 @@ mod tests {
         // The placement is a manage-hook concern; toggling it in and out of
         // view stays a workspace move, and does not re-place the window.
         let worker = worker(SCRATCHPAD);
-        worker.send_events(vec![LuaEvent::WindowFocused { window_id: 7 }]);
-        serve(&worker, layout(&[(7, "Alacritty", 1)]));
+        worker.send_events(EventBatch {
+            events: vec![LuaEvent::WindowFocused { window_id: 7 }],
+            snapshot: snapshot_with_set(layout(&[(7, "Alacritty", 1)])),
+        });
         assert_eq!(next_ops(&worker, "the float").len(), 2, "float then place");
 
-        worker.send_binds(vec![1]);
-        serve(&worker, layout(&[(7, "Alacritty", 1)]));
+        worker.send_binds(vec![1], snapshot_with_set(layout(&[(7, "Alacritty", 1)])));
         assert_eq!(
             next_ops(&worker, "the stash"),
             vec![LayoutOp::MoveToWorkspace {
@@ -1553,8 +1424,7 @@ mod tests {
             }]
         );
 
-        worker.send_binds(vec![1]);
-        serve(&worker, layout(&[(7, "Alacritty", 9)]));
+        worker.send_binds(vec![1], snapshot_with_set(layout(&[(7, "Alacritty", 9)])));
         assert_eq!(
             next_ops(&worker, "the summons"),
             vec![
@@ -1571,8 +1441,10 @@ mod tests {
     #[test]
     fn losing_focus_parks_a_scratchpad() {
         let worker = worker(SCRATCHPAD);
-        worker.send_events(vec![LuaEvent::WindowFocused { window_id: 7 }]);
-        serve(&worker, layout(&[(7, "Alacritty", 1), (8, "Mail", 1)]));
+        worker.send_events(EventBatch {
+            events: vec![LuaEvent::WindowFocused { window_id: 7 }],
+            snapshot: snapshot_with_set(layout(&[(7, "Alacritty", 1), (8, "Mail", 1)])),
+        });
         assert_eq!(
             next_ops(&worker, "the float").first(),
             Some(&LayoutOp::SetFloating {
@@ -1581,8 +1453,10 @@ mod tests {
             })
         );
 
-        worker.send_events(vec![LuaEvent::WindowFocused { window_id: 8 }]);
-        serve(&worker, layout(&[(7, "Alacritty", 1), (8, "Mail", 1)]));
+        worker.send_events(EventBatch {
+            events: vec![LuaEvent::WindowFocused { window_id: 8 }],
+            snapshot: snapshot_with_set(layout(&[(7, "Alacritty", 1), (8, "Mail", 1)])),
+        });
         // Two handlers are registered for this event and each commits its own
         // result: the manage hook passes on a non-pad window, the focus-loss
         // hook parks the one that lost it.
@@ -1636,7 +1510,10 @@ mod tests {
             floating: false,
             managed: true,
         });
-        worker.send_events(vec![event]);
+        worker.send_events(EventBatch {
+            events: vec![event],
+            snapshot: test_snapshot(),
+        });
         assert_eq!(
             next_flash(&worker, "window_spawned"),
             "window_spawned:42:Terminal:Ghostty"
@@ -1684,11 +1561,17 @@ mod tests {
         });
 
         // Non-matching event should not trigger flash
-        worker.send_events(vec![ghostty_event]);
+        worker.send_events(EventBatch {
+            events: vec![ghostty_event],
+            snapshot: test_snapshot(),
+        });
         assert!(worker.outbox.try_recv().is_err());
 
         // Matching event should trigger flash
-        worker.send_events(vec![libreoffice_event]);
+        worker.send_events(EventBatch {
+            events: vec![libreoffice_event],
+            snapshot: test_snapshot(),
+        });
         assert_eq!(
             next_flash(&worker, "libreoffice match"),
             "matched:LibreOffice"

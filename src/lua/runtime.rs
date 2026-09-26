@@ -130,8 +130,8 @@ pub struct LuaRuntime {
     outbox: Rc<RefCell<Outbox>>,
     registry: SharedRegistry,
     /// World access for the dispatches in flight, shared with the `paneru.*`
-    /// functions that read through it. Outlives a reload: the caches behind it
-    /// are keyed by batch and revision, not by interpreter.
+    /// functions that read through it. Outlives a reload: the snapshot behind
+    /// it is attached per batch, not per interpreter.
     world: Rc<DispatchWorld>,
     /// The `Config` a script declared via `paneru.setup{...}`, if it called it.
     /// `None` means the script left configuration to the TOML file.
@@ -233,7 +233,7 @@ impl LuaRuntime {
     pub(super) async fn dispatch_event(&self, name: &str, event: &Table, handler: &Function) {
         let context = format!("event handler '{name}'");
         let _dispatch = self.world.enter();
-        let Some(window_set) = self.window_set_arg(&context).await else {
+        let Some(window_set) = self.window_set_arg(&context) else {
             return;
         };
         match handler
@@ -255,7 +255,7 @@ impl LuaRuntime {
             Some(Value::Function(handler)) => {
                 let context = format!("keybind handler {id}");
                 let _dispatch = self.world.enter();
-                let Some(window_set) = self.window_set_arg(&context).await else {
+                let Some(window_set) = self.window_set_arg(&context) else {
                     return;
                 };
                 match handler.call_async::<Value>(window_set).await {
@@ -278,8 +278,8 @@ impl LuaRuntime {
     /// The window set a handler is handed, materialised up front since
     /// fetching it lazily would need a synchronous call that cannot suspend.
     /// Each handler gets its own copy to transform.
-    async fn window_set_arg(&self, context: &str) -> Option<AnyUserData> {
-        let set = match self.world.layout().await {
+    fn window_set_arg(&self, context: &str) -> Option<AnyUserData> {
+        let set = match self.world.layout() {
             Ok(set) => set,
             Err(err) => {
                 error!("lua {context}: {err}");
@@ -337,7 +337,6 @@ impl LuaRuntime {
 mod tests {
     use std::future::Future;
     use std::sync::Arc;
-    use std::sync::atomic::{AtomicU64, Ordering};
 
     use async_channel::{Receiver, unbounded};
     use futures_lite::future::{block_on, poll_once};
@@ -345,8 +344,8 @@ mod tests {
     use paneru_shared_types::windowset::WindowSet;
 
     use super::super::convert;
-    use super::super::worker::{Shared, StoreRequest, WorldRequest};
-    use super::super::world::WorldAccess;
+    use super::super::worker::{Shared, StoreWrite};
+    use super::super::world::{BatchSnapshot, WriteAccess};
     use super::*;
     use crate::ecs::state::PaneruQueryState;
     use crate::events::Event;
@@ -354,33 +353,26 @@ mod tests {
     /// A competing writer, run just before a write lands.
     type Interjection = Box<dyn FnMut(&mut ScriptState)>;
 
-    /// The main thread's half of the script state store: what a read answers
-    /// from and what a write lands in, with the revision the worker's cache
-    /// watches.
+    /// The main thread's half of the script state store: what writes land in.
+    /// Reads come out of the attached snapshot instead.
     struct TestWorld {
         store: RefCell<ScriptState>,
-        revision: Arc<AtomicU64>,
         /// For the tests that need someone else to get there first.
         interject: RefCell<Option<Interjection>>,
-        /// The main thread's ends of the two request channels, drained by
+        /// The main thread's end of the store-write channel, drained by
         /// [`TestWorld::drive`].
-        world_queries: Receiver<WorldRequest>,
-        store_queries: Receiver<StoreRequest>,
+        store_queries: Receiver<StoreWrite>,
         dispatch: Rc<DispatchWorld>,
     }
 
     impl Default for TestWorld {
         fn default() -> Self {
-            let (world_tx, world_queries) = unbounded();
             let (store_tx, store_queries) = unbounded();
-            let revision = Arc::new(AtomicU64::new(0));
             Self {
                 store: RefCell::new(ScriptState::default()),
-                revision: Arc::clone(&revision),
                 interject: RefCell::new(None),
-                world_queries,
                 store_queries,
-                dispatch: DispatchWorld::new(WorldAccess::new(world_tx, store_tx, revision)),
+                dispatch: DispatchWorld::new(WriteAccess::new(store_tx)),
             }
         }
     }
@@ -391,15 +383,34 @@ mod tests {
             LuaRuntime::from_source(source, &self.dispatch)
         }
 
-        /// Runs one dispatch to completion, answering its reads the way the
-        /// main thread's `serve_lua_queries` does. A dispatch suspends
-        /// whenever it reads the world, so this polls the future and drains
-        /// the request queue in turn rather than simply blocking on it.
-        fn drive<T>(
+        /// Attaches a batch snapshot built from `extract`, sharing it the way
+        /// the worker shares one frame's extraction across a batch.
+        /// Attaches a batch snapshot built from `extract`, sharing it the way
+        /// the worker shares one frame's extraction across a batch.
+        fn attach(&self, extract: &dyn Fn() -> Shared<PaneruQueryState>) {
+            self.dispatch.attach(BatchSnapshot {
+                state: extract(),
+                window_set: Ok(Arc::new(WindowSet::default())),
+                script_state: Ok(self.store.borrow().clone()),
+            });
+        }
+
+        /// Convenience: attach a snapshot, then drive one dispatch against it.
+        fn drive_with<T>(
             &self,
             extract: &dyn Fn() -> Shared<PaneruQueryState>,
             future: impl Future<Output = T>,
         ) -> T {
+            self.attach(extract);
+            self.drive(future)
+        }
+
+        /// Runs one dispatch to completion against the attached snapshot.
+        /// Reads are synchronous out of the snapshot; only store writes (and
+        /// `paneru.exec`) suspend, so this polls the future while serving
+        /// writes.
+        fn drive<T>(&self, future: impl Future<Output = T>) -> T {
+            let _dispatch = self.dispatch.enter();
             /// Ample for any dispatch here; only reached if one is wedged.
             const TURNS: usize = 1000;
 
@@ -408,38 +419,29 @@ mod tests {
                 if let Some(done) = block_on(poll_once(future.as_mut())) {
                     return done;
                 }
-                while let Ok(request) = self.world_queries.try_recv() {
-                    match request {
-                        WorldRequest::State { reply } => {
-                            let _ = reply.try_send(extract());
-                        }
-                        WorldRequest::WindowSet { reply } => {
-                            let _ = reply.try_send(Ok(Arc::new(WindowSet::default())));
-                        }
-                    }
-                }
                 while let Ok(request) = self.store_queries.try_recv() {
-                    match request {
-                        StoreRequest::Read { reply } => {
-                            let _ = reply.try_send(self.read());
-                        }
-                        StoreRequest::Write { write, reply } => {
-                            let _ = reply.try_send(self.write(&write));
-                        }
-                    }
+                    let StoreWrite { write, reply } = request;
+                    let _ = reply.try_send(self.write(&write));
                 }
             }
             panic!("the dispatch never finished");
         }
 
-        /// [`Self::drive`], but waiting between turns instead of spinning: for
-        /// a dispatch parked on `paneru.exec`, which is waiting on a process
-        /// rather than on this thread.
-        fn drive_patiently<T>(
+        /// Convenience: attach a snapshot, then drive patiently against it.
+        fn drive_patiently_with<T>(
             &self,
             extract: &dyn Fn() -> Shared<PaneruQueryState>,
             future: impl Future<Output = T>,
         ) -> T {
+            self.attach(extract);
+            self.drive_patiently(future)
+        }
+
+        /// [`Self::drive`], but waiting between turns instead of spinning: for
+        /// a dispatch parked on `paneru.exec`, which is waiting on a process
+        /// rather than on this thread.
+        fn drive_patiently<T>(&self, future: impl Future<Output = T>) -> T {
+            let _dispatch = self.dispatch.enter();
             const TURNS: usize = 2_000;
 
             let mut future = Box::pin(future);
@@ -447,38 +449,20 @@ mod tests {
                 if let Some(done) = block_on(poll_once(future.as_mut())) {
                     return done;
                 }
-                while let Ok(request) = self.world_queries.try_recv() {
-                    match request {
-                        WorldRequest::State { reply } => {
-                            let _ = reply.try_send(extract());
-                        }
-                        WorldRequest::WindowSet { reply } => {
-                            let _ = reply.try_send(Ok(Arc::new(WindowSet::default())));
-                        }
-                    }
+                while let Ok(request) = self.store_queries.try_recv() {
+                    let StoreWrite { write, reply } = request;
+                    let _ = reply.try_send(self.write(&write));
                 }
                 std::thread::sleep(std::time::Duration::from_millis(1));
             }
             panic!("the dispatch never finished");
         }
 
-        // Fallible to match what the worker hands the runtime, which reads over
-        // a channel that can be gone.
-        #[allow(clippy::unnecessary_wraps)]
-        fn read(&self) -> Result<ScriptState, String> {
-            Ok(self.store.borrow().clone())
-        }
-
         fn write(&self, write: &ScriptStateWrite) -> Result<WriteOutcome, String> {
             if let Some(interject) = self.interject.borrow_mut().as_mut() {
                 interject(&mut self.store.borrow_mut());
-                self.revision.fetch_add(1, Ordering::Release);
             }
-            let outcome = self.store.borrow_mut().apply(write)?;
-            if matches!(outcome, WriteOutcome::Applied { changed: true }) {
-                self.revision.fetch_add(1, Ordering::Release);
-            }
-            Ok(outcome)
+            self.store.borrow_mut().apply(write)
         }
 
         fn get(&self, key: &str) -> Option<ScriptValue> {
@@ -536,7 +520,7 @@ mod tests {
             .runtime(r#"paneru.bind("alt - b", "window balance")"#)
             .unwrap();
         let extract = || Ok(Arc::new(test_state()));
-        world.drive(&extract, runtime.dispatch_bind(1));
+        world.drive_with(&extract, runtime.dispatch_bind(1));
         let commands = drained_commands(&runtime);
         assert!(
             matches!(
@@ -556,7 +540,7 @@ mod tests {
             )
             .unwrap();
         let extract = || Ok(Arc::new(test_state()));
-        world.drive(&extract, runtime.dispatch_bind(1));
+        world.drive_with(&extract, runtime.dispatch_bind(1));
         assert_eq!(drained_commands(&runtime).len(), 1);
     }
 
@@ -568,11 +552,9 @@ mod tests {
             .unwrap();
         let (name, table) = convert::event_to_lua(runtime.lua(), &Event::SpaceChanged).unwrap();
         let extract = || Ok(Arc::new(test_state()));
+        world.attach(&extract);
         for handler in runtime.event_handlers(&name) {
-            world.drive(
-                &extract,
-                runtime.dispatch_event(&name, &table, &handler.handler),
-            );
+            world.drive(runtime.dispatch_event(&name, &table, &handler.handler));
         }
         assert_eq!(drained_commands(&runtime).len(), 1);
     }
@@ -634,7 +616,7 @@ mod tests {
             )
             .unwrap();
         let extract = || Ok(Arc::new(test_state()));
-        world.drive(&extract, runtime.dispatch_bind(1));
+        world.drive_with(&extract, runtime.dispatch_bind(1));
 
         let flashes: Vec<String> = runtime
             .outbox
@@ -654,7 +636,7 @@ mod tests {
     }
 
     #[test]
-    fn the_state_is_extracted_once_per_dispatch_and_only_on_demand() {
+    fn one_attach_serves_every_dispatch_in_the_batch() {
         let world = TestWorld::default();
         let runtime = world
             .runtime(
@@ -673,15 +655,16 @@ mod tests {
             *extractions.borrow_mut() += 1;
             Ok(Arc::new(test_state()))
         };
-        world.drive(&extract, runtime.dispatch_bind(2));
+        // One attach for two dispatches: the extraction runs once no matter
+        // how many handlers read from it.
+        world.attach(&extract);
+        world.drive(runtime.dispatch_bind(2));
+        world.drive(runtime.dispatch_bind(1));
         assert_eq!(
             *extractions.borrow(),
-            0,
-            "a handler that never queries pays nothing"
+            1,
+            "two dispatches share one extraction"
         );
-
-        world.drive(&extract, runtime.dispatch_bind(1));
-        assert_eq!(*extractions.borrow(), 1, "two queries share one extraction");
     }
 
     #[test]
@@ -706,7 +689,7 @@ mod tests {
             )
             .unwrap();
         let extract = || Ok(Arc::new(test_state()));
-        world.drive(&extract, runtime.dispatch_bind(1));
+        world.drive_with(&extract, runtime.dispatch_bind(1));
         assert!(
             runtime.lua().load("escaped()").exec().is_err(),
             "a query captured during dispatch should not answer afterwards"
@@ -738,10 +721,9 @@ mod tests {
         let world = TestWorld::default();
         let runtime = world.runtime("").unwrap();
         let extract = || Ok(Arc::new(test_state()));
-        // Driven as a dispatch, because `paneru.query` is async now: at top
-        // level there is no coroutine to suspend in.
+        // Driven as a dispatch, because `paneru.query` only answers inside one.
         let error = world
-            .drive(&extract, async {
+            .drive_with(&extract, async {
                 runtime
                     .lua()
                     .load(r#"return paneru.query("windows")"#)
@@ -770,7 +752,7 @@ mod tests {
             )
             .unwrap();
         let extract = || Ok(Arc::new(test_state()));
-        world.drive(&extract, runtime.dispatch_bind(1));
+        world.drive_with(&extract, runtime.dispatch_bind(1));
         let (commands, flashes) = runtime.drain_outbox();
         assert_eq!(commands.len(), 1);
         assert_eq!(flashes, vec![("done".to_string(), 3.0)]);
@@ -786,11 +768,11 @@ mod tests {
             ))
             .expect("script should load");
         let extract = || Ok(Arc::new(test_state()));
-        world.drive(&extract, runtime.dispatch_bind(1));
+        world.drive_with(&extract, runtime.dispatch_bind(1));
     }
 
     #[test]
-    fn state_round_trips_every_kind_of_value() {
+    fn state_reads_and_writes_every_kind_of_value() {
         let world = TestWorld::default();
         run_with_store(
             r#"
@@ -909,7 +891,7 @@ mod tests {
             .expect("script should load");
 
         let extract = || Ok(Arc::new(test_state()));
-        world.drive_patiently(&extract, runtime.dispatch_bind(1));
+        world.drive_patiently_with(&extract, runtime.dispatch_bind(1));
 
         let globals = runtime.lua().globals();
         assert_eq!(globals.get::<i32>("code").expect("an exit code"), 0);
@@ -937,7 +919,7 @@ mod tests {
             .expect("script should load");
 
         let extract = || Ok(Arc::new(test_state()));
-        world.drive_patiently(&extract, runtime.dispatch_bind(1));
+        world.drive_patiently_with(&extract, runtime.dispatch_bind(1));
 
         let globals = runtime.lua().globals();
         assert!(
@@ -998,7 +980,7 @@ mod tests {
             )
             .expect("script should load");
         let extract = || Ok(Arc::new(test_state()));
-        world.drive(&extract, runtime.dispatch_bind(1));
+        world.drive_with(&extract, runtime.dispatch_bind(1));
 
         assert!(
             runtime.lua.globals().get::<bool>("errored").unwrap(),

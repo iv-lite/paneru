@@ -1,205 +1,126 @@
-//! What a handler can ask the main thread for, and the cache in front of it.
+//! What a handler sees of the world: a per-batch snapshot, not a round trip.
 //!
-//! Every read here is a round trip: the worker sends a request carrying a
-//! reply channel and *awaits* it, while the main thread answers from the ECS
-//! in `serve_lua_queries`. Awaiting rather than blocking lets handlers
-//! overlap — a handler parked on a read is not holding the interpreter.
+//! The main thread attaches one [`BatchSnapshot`] to every message it sends
+//! the worker (events or binds). Every read below clones out of that
+//! snapshot — synchronously, with no channels and no awaits — so a handler
+//! parked on `paneru.exec` never holds the interpreter waiting on the main
+//! thread, and overlapping handlers all read the same frame's world.
 //!
 //! Two invariants:
 //!
-//! * **The caches are per batch, not per dispatch.** Handlers that overlap
-//!   are reading the same frame's world, so [`DispatchWorld`] clears them
-//!   only when the last dispatch in the batch finishes.
-//! * **No borrow may be held across an await.** These are `RefCell`s on a
-//!   single thread, so a borrow spanning a suspension point is not a wait —
-//!   it is a `BorrowMutError` panic the moment another dispatch touches the
-//!   same cell. Every read below takes what it needs, drops the borrow,
-//!   *then* awaits.
+//! * **The snapshot is per batch, not per dispatch.** It is attached before
+//!   the message's tasks spawn and cleared when the last dispatch in flight
+//!   finishes (see [`Dispatch`]).
+//! * **Same-batch writes are overlaid.** `paneru.state.set` lands on the
+//!   main thread and is acked, so a later read in the same batch must see
+//!   it: acked outcomes fold into a pending overlay applied on top of the
+//!   snapshot. Anything the main thread rejected never enters the overlay.
 
-use std::cell::{Cell, RefCell};
-use std::future::Future;
+use std::cell::RefCell;
 use std::rc::Rc;
 use std::sync::Arc;
-use std::sync::atomic::{AtomicU64, Ordering};
 
-use async_channel::{Sender, bounded};
+use async_channel::Sender;
 
-use super::worker::{Shared, StoreRequest, WorldRequest};
+use super::worker::StoreWrite;
 use crate::ecs::state::PaneruQueryState;
 use paneru_shared_types::script_state::{ScriptState, ScriptStateWrite, WriteOutcome};
+use paneru_shared_types::script_value::ScriptValue;
 use paneru_shared_types::windowset::WindowSet;
 
 /// What the worker reported when the main thread has already gone away. Surfaces
 /// inside the handler as an ordinary error, so the script unwinds normally
-/// instead of the task hanging on a reply that can never come.
+/// instead of hanging.
 const SHUTTING_DOWN: &str = "the window manager is shutting down";
 
 /// What a script is told when it reaches for the world from outside a handler.
 const NO_DISPATCH: &str = "only available inside a paneru.on handler or a paneru.bind callback";
 
-/// The main thread, as a handler sees it: ask, and await the answer.
+/// One frame's world, as handed to the worker with its message.
 ///
-/// Cheap to clone — it is a channel sender and a shared stamp — because every
-/// dispatch task needs its own handle.
+/// Each document is the extraction the main thread already made (once per
+/// frame, shared by every waiter), or the error it failed with — shared
+/// rather than retried per handler.
 #[derive(Clone)]
-pub(super) struct WorldAccess {
-    /// Two channels rather than one, because two *systems* serve them: see
-    /// [`WorldRequest`] for what that buys.
-    world: Sender<WorldRequest>,
-    store: Sender<StoreRequest>,
-    revision: Arc<AtomicU64>,
+pub(super) struct BatchSnapshot {
+    /// The `paneru.query*` documents.
+    pub(super) state: super::worker::Shared<PaneruQueryState>,
+    /// The layout tree a handler transforms.
+    pub(super) window_set: super::worker::Shared<WindowSet>,
+    /// The script state store.
+    pub(super) script_state: Result<ScriptState, String>,
 }
 
-/// Sends one request down `channel` and waits for its reply.
+/// The main thread's store-write end, as a handler sees it: send, and await
+/// the ack. The only round trip left — reads never leave the worker.
 ///
-/// Either half failing means the main thread has dropped its end, which is how a
-/// handler parked here is woken at shutdown rather than waiting for a reply that
-/// is never coming.
-async fn ask<R, T>(channel: &Sender<R>, request: impl FnOnce(Sender<T>) -> R) -> Result<T, String> {
-    let (reply, answer) = bounded(1);
-    channel
-        .send(request(reply))
-        .await
-        .map_err(|_| SHUTTING_DOWN.to_string())?;
-    answer.recv().await.map_err(|_| SHUTTING_DOWN.to_string())
+/// Either half failing means the main thread has dropped its end, which is
+/// how a handler parked here is woken at shutdown rather than waiting for a
+/// reply that is never coming.
+#[derive(Clone)]
+pub(super) struct WriteAccess {
+    store: Sender<StoreWrite>,
 }
 
-impl WorldAccess {
-    pub(super) fn new(
-        world: Sender<WorldRequest>,
-        store: Sender<StoreRequest>,
-        revision: Arc<AtomicU64>,
-    ) -> Self {
-        Self {
-            world,
-            store,
-            revision,
-        }
+impl WriteAccess {
+    pub(super) fn new(store: Sender<StoreWrite>) -> Self {
+        Self { store }
     }
 
-    async fn state(&self) -> Shared<PaneruQueryState> {
-        ask(&self.world, |reply| WorldRequest::State { reply })
+    async fn write(&self, write: &ScriptStateWrite) -> Result<WriteOutcome, String> {
+        let (reply, answer) = async_channel::bounded(1);
+        self.store
+            .send(StoreWrite {
+                write: write.clone(),
+                reply,
+            })
             .await
-            .unwrap_or_else(Err)
-    }
-
-    async fn window_set(&self) -> Shared<WindowSet> {
-        ask(&self.world, |reply| WorldRequest::WindowSet { reply })
-            .await
-            .unwrap_or_else(Err)
-    }
-
-    async fn script_state(&self) -> Result<ScriptState, String> {
-        ask(&self.store, |reply| StoreRequest::Read { reply })
-            .await
-            .unwrap_or_else(Err)
-    }
-
-    async fn write_script_state(&self, write: &ScriptStateWrite) -> Result<WriteOutcome, String> {
-        ask(&self.store, |reply| StoreRequest::Write {
-            write: write.clone(),
-            reply,
-        })
-        .await
-        .unwrap_or_else(Err)
+            .map_err(|_| SHUTTING_DOWN.to_string())?;
+        answer.recv().await.map_err(|_| SHUTTING_DOWN.to_string())?
     }
 }
 
-/// One read of the world that several dispatches may want at once.
-///
-/// The first caller makes the round trip; anyone who asks while it's still
-/// out queues behind it and is handed the same answer when it lands, rather
-/// than each sending a request of its own.
-struct SharedRead<T> {
-    cached: RefCell<Option<Arc<T>>>,
-    /// `Some` while a read is out, holding whoever is waiting on it.
-    waiting: RefCell<Option<Vec<Sender<Shared<T>>>>>,
-}
-
-impl<T> SharedRead<T> {
-    fn new() -> Self {
-        Self {
-            cached: RefCell::new(None),
-            waiting: RefCell::new(None),
-        }
-    }
-
-    fn clear(&self) {
-        self.cached.borrow_mut().take();
-    }
-
-    /// The value, reading it through `read` if this is the first ask.
-    async fn get<F>(&self, read: impl FnOnce() -> F) -> Shared<T>
-    where
-        F: Future<Output = Shared<T>>,
-    {
-        // Every borrow here is taken, used, and dropped before an `await`: a
-        // `RefCell` borrow spanning a suspension point panics rather than waits.
-        let cached = self.cached.borrow().clone();
-        if let Some(cached) = cached {
-            return Ok(cached);
-        }
-
-        let joined = {
-            let mut waiting = self.waiting.borrow_mut();
-            if let Some(queue) = waiting.as_mut() {
-                let (tell, told) = bounded(1);
-                queue.push(tell);
-                Some(told)
-            } else {
-                // Nobody is reading, so this caller does it.
-                *waiting = Some(Vec::new());
-                None
-            }
-        };
-        if let Some(told) = joined {
-            return told
-                .recv()
-                .await
-                .unwrap_or_else(|_| Err(SHUTTING_DOWN.to_string()));
-        }
-
-        let answer = read().await;
-        if let Ok(value) = &answer {
-            *self.cached.borrow_mut() = Some(Arc::clone(value));
-        }
-        // Taken, not borrowed, across the sends: a woken waiter may ask again
-        // before this returns.
-        let queued = self.waiting.borrow_mut().take().unwrap_or_default();
-        for waiter in queued {
-            let _ = waiter.try_send(answer.clone());
-        }
-        answer
-    }
-}
-
-/// World access for the dispatches currently in flight, and the reads they share.
+/// World access for the dispatches currently in flight, and the snapshot
+/// they share.
 pub(super) struct DispatchWorld {
-    access: WorldAccess,
+    access: WriteAccess,
+    /// The current batch's snapshot. Set by the worker before spawning the
+    /// message's tasks; cleared when the last dispatch finishes.
+    snapshot: RefCell<Option<Rc<BatchSnapshot>>>,
+    /// This batch's acked writes, applied on top of the snapshot for later
+    /// reads in the same batch.
+    pending: RefCell<Vec<(String, Option<ScriptValue>)>>,
     /// How many dispatches are running. Zero means a script is reaching for the
     /// world from somewhere that has none — top-level code, say — which is an
     /// error rather than a stale answer.
-    in_flight: Cell<usize>,
-    state: SharedRead<PaneruQueryState>,
-    window_set: SharedRead<WindowSet>,
-    /// Unlike the other two caches, this survives the batch — the store only
-    /// changes on a write, tracked by the revision stamp.
-    script_state: RefCell<Option<(u64, ScriptState)>>,
+    in_flight: std::cell::Cell<usize>,
 }
 
 impl DispatchWorld {
-    pub(super) fn new(access: WorldAccess) -> Rc<Self> {
+    pub(super) fn new(access: WriteAccess) -> Rc<Self> {
         Rc::new(Self {
             access,
-            in_flight: Cell::new(0),
-            state: SharedRead::new(),
-            window_set: SharedRead::new(),
-            script_state: RefCell::new(None),
+            snapshot: RefCell::new(None),
+            pending: RefCell::new(Vec::new()),
+            in_flight: std::cell::Cell::new(0),
         })
     }
 
+    /// Attaches the incoming message's snapshot. Called once per message,
+    /// before its tasks spawn. Starts a fresh batch: the previous message's
+    /// pending writes are dropped, since they already landed on the main
+    /// thread and the new snapshot includes them.
+    pub(super) fn attach(&self, snapshot: BatchSnapshot) {
+        *self.snapshot.borrow_mut() = Some(Rc::new(snapshot));
+        self.pending.borrow_mut().clear();
+    }
+
     /// Marks a dispatch as running. World access is available until the returned
-    /// guard is dropped; when the last one goes, the batch's reads go with it.
+    /// guard is dropped. The snapshot itself is replaced by the next message's
+    /// attach rather than cleared: tasks of one message are queued together
+    /// but run cooperatively, so a task may still be waiting when an earlier
+    /// sibling finishes — clearing at zero would pull the world out from
+    /// under it. Top-level access stays rejected via the counter.
     pub(super) fn enter(self: &Rc<Self>) -> Dispatch {
         self.in_flight.set(self.in_flight.get() + 1);
         Dispatch {
@@ -207,44 +128,47 @@ impl DispatchWorld {
         }
     }
 
-    /// `Err` when nothing is dispatching, so `paneru.query` at script top level
-    /// says why rather than handing back an answer from nowhere.
-    fn available(&self, call: &str) -> Result<(), String> {
+    /// `Err` when nothing is dispatching or no batch is attached, so
+    /// `paneru.query` at script top level says why rather than handing back
+    /// an answer from nowhere.
+    fn snapshot(&self, call: &str) -> Result<Rc<BatchSnapshot>, String> {
         if self.in_flight.get() == 0 {
             return Err(format!("{call} is {NO_DISPATCH}"));
         }
-        Ok(())
+        self.snapshot
+            .borrow()
+            .clone()
+            .ok_or_else(|| SHUTTING_DOWN.to_string())
     }
 
-    /// The query documents, read once per batch however many handlers ask.
-    pub(super) async fn query_state(&self) -> Result<Arc<PaneruQueryState>, String> {
-        self.available("paneru.query")?;
-        self.state.get(|| self.access.state()).await
+    /// The query documents for this batch.
+    pub(super) fn query_state(&self) -> Result<Arc<PaneruQueryState>, String> {
+        self.snapshot("paneru.query")?.state.clone()
     }
 
-    /// The layout tree, read once per batch. Handlers each transform their own
+    /// The layout tree for this batch. Handlers each transform their own
     /// copy, so this hands out the shared read and they clone from it.
-    pub(super) async fn layout(&self) -> Result<Arc<WindowSet>, String> {
-        self.available("the window set")?;
-        self.window_set.get(|| self.access.window_set()).await
+    pub(super) fn layout(&self) -> Result<Arc<WindowSet>, String> {
+        self.snapshot("the window set")?.window_set.clone()
     }
 
-    /// The script state store, re-read whenever the revision says the cached
-    /// copy is stale. The stamp is taken *before* the read, so a write landing
-    /// mid-read leaves the copy marked older than it is — re-read needlessly
-    /// next time, which is the harmless direction to be wrong in.
-    pub(super) async fn script_state(&self) -> Result<ScriptState, String> {
-        self.available("paneru.state")?;
-        let revision = self.access.revision.load(Ordering::Acquire);
-        let cached = self.script_state.borrow().clone();
-        match cached {
-            Some((stamp, state)) if stamp == revision => Ok(state),
-            _ => {
-                let fresh = self.access.script_state().await?;
-                *self.script_state.borrow_mut() = Some((revision, fresh.clone()));
-                Ok(fresh)
-            }
+    /// The script state store for this batch, with this batch's acked writes
+    /// applied on top.
+    pub(super) fn script_state(&self) -> Result<ScriptState, String> {
+        let snapshot = self.snapshot("paneru.state")?;
+        let mut store = snapshot.script_state.clone()?;
+        for (key, value) in self.pending.borrow().iter() {
+            let write = match value {
+                Some(value) => ScriptStateWrite::set(key.clone(), value.clone()),
+                None => ScriptStateWrite::remove(key.clone()),
+            };
+            // Best effort: the ack path already validated the real write, so
+            // a rejection here only means the snapshot itself moved under a
+            // key the main thread accepted — vanishingly rare, and the acked
+            // outcome (already returned) stays authoritative.
+            let _ = store.apply(&write);
         }
+        Ok(store)
     }
 
     /// Applies one write and reports what became of it. Unlike a command, this
@@ -254,8 +178,25 @@ impl DispatchWorld {
         &self,
         write: &ScriptStateWrite,
     ) -> Result<WriteOutcome, String> {
-        self.available("paneru.state")?;
-        self.access.write_script_state(write).await
+        self.snapshot("paneru.state")?;
+        let outcome = self.access.write(write).await?;
+        match &outcome {
+            // Fold acked truth into the overlay so later reads in this batch
+            // see what this dispatch wrote.
+            WriteOutcome::Applied { .. } => {
+                self.pending
+                    .borrow_mut()
+                    .push((write.key.clone(), write.value.clone()));
+            }
+            // The refusal carries what the key holds now — overlay it so the
+            // next attempt transforms the live value.
+            WriteOutcome::Conflict { current, .. } => {
+                self.pending
+                    .borrow_mut()
+                    .push((write.key.clone(), current.clone()));
+            }
+        }
+        Ok(outcome)
     }
 }
 
@@ -269,11 +210,5 @@ impl Drop for Dispatch {
     fn drop(&mut self) {
         let remaining = self.world.in_flight.get().saturating_sub(1);
         self.world.in_flight.set(remaining);
-        if remaining == 0 {
-            // The next batch is a different frame's world. The store is left
-            // alone: it is keyed by revision, not by batch.
-            self.world.state.clear();
-            self.world.window_set.clear();
-        }
     }
 }

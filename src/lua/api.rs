@@ -355,9 +355,7 @@ pub(super) fn install(
     // paneru.windows(fn) — xmonad's `windows`: hand the window set to `fn` and
     // commit whatever it returns.
     //
-    // Async because `fn` may itself query and fetching the set is a round
-    // trip to the main thread; concurrent callers share one fetch via the
-    // batch's cached copy.
+    // Async because `fn` may itself await (a `paneru.exec` run, say).
     let windows = {
         let outbox = Rc::clone(outbox);
         let world = Rc::clone(world);
@@ -365,7 +363,7 @@ pub(super) fn install(
             let outbox = Rc::clone(&outbox);
             let world = Rc::clone(&world);
             async move {
-                let set = world.layout().await.map_err(mlua::Error::runtime)?;
+                let set = world.layout().map_err(mlua::Error::runtime)?;
                 let window_set = lua.create_userdata((*set).clone())?;
                 let returned: Value = transform.call_async(window_set).await?;
                 let ops = returned_ops(&returned)?;
@@ -444,37 +442,34 @@ fn query_function(
     as_json: bool,
 ) -> mlua::Result<mlua::Function> {
     let world = Rc::clone(world);
-    lua.create_async_function(move |lua, requested: Option<String>| {
+    lua.create_function(move |lua, requested: Option<String>| {
         let world = Rc::clone(&world);
-        async move {
-            let kind = if let Some(kind) = fixed {
-                kind
-            } else {
-                let token = requested
-                    .as_deref()
-                    .unwrap_or(StateQueryKind::State.token());
-                // Rejected here as well as host-side so the error names the
-                // valid kinds.
-                StateQueryKind::parse(token).ok_or_else(|| {
-                    mlua::Error::RuntimeError(format!(
-                        "paneru.query: unknown kind '{token}'; expected one of {}",
-                        StateQueryKind::tokens()
-                    ))
-                })?
-            };
-            let state = world
-                .query_state()
-                .await
-                .map_err(|err| mlua::Error::RuntimeError(format!("paneru.query: {err}")))?;
-            if as_json {
-                state
-                    .to_query_json(kind)
-                    .map_err(mlua::Error::external)?
-                    .into_lua(&lua)
-            } else {
-                let value = state.to_query_value(kind).map_err(mlua::Error::external)?;
-                lua.to_value(&value)
-            }
+        let kind = if let Some(kind) = fixed {
+            kind
+        } else {
+            let token = requested
+                .as_deref()
+                .unwrap_or(StateQueryKind::State.token());
+            // Rejected here as well as host-side so the error names the
+            // valid kinds.
+            StateQueryKind::parse(token).ok_or_else(|| {
+                mlua::Error::RuntimeError(format!(
+                    "paneru.query: unknown kind '{token}'; expected one of {}",
+                    StateQueryKind::tokens()
+                ))
+            })?
+        };
+        let state = world
+            .query_state()
+            .map_err(|err| mlua::Error::RuntimeError(format!("paneru.query: {err}")))?;
+        if as_json {
+            state
+                .to_query_json(kind)
+                .map_err(mlua::Error::external)?
+                .into_lua(lua)
+        } else {
+            let value = state.to_query_value(kind).map_err(mlua::Error::external)?;
+            lua.to_value(&value)
         }
     })
 }
@@ -503,15 +498,12 @@ fn install_script_state(
 
     state.set("get", {
         let world = Rc::clone(world);
-        lua.create_async_function(move |lua, key: String| {
+        lua.create_function(move |lua, key: String| {
             let world = Rc::clone(&world);
-            async move {
-                let store = world
-                    .script_state()
-                    .await
-                    .map_err(|err| store_error("get", &err))?;
-                to_lua_value(&lua, store.get(&key))
-            }
+            let store = world
+                .script_state()
+                .map_err(|err| store_error("get", &err))?;
+            to_lua_value(lua, store.get(&key))
         })?
     })?;
 
@@ -527,8 +519,9 @@ fn install_script_state(
                 } else {
                     ScriptStateWrite::set(key, from_lua_value(&lua, value, "set")?)
                 };
-                // The write has landed by the time this returns, so the cached
-                // copy's revision has moved and the next read refreshes.
+                // The write has landed by the time this returns, and the ack
+                // folds it into the batch overlay, so the next read in this
+                // batch sees it.
                 world
                     .write_script_state(&write)
                     .await
@@ -540,8 +533,8 @@ fn install_script_state(
 
     // Read, transform, write, retrying against whatever the value moved to if
     // it changed underneath. `transform` runs here on the worker; only the
-    // compare-and-set crosses to the main thread, which is what keeps this
-    // atomic without the Lua function ever leaving this thread.
+    // compare-and-set crosses to the main thread for its ack, which is what
+    // keeps this atomic without the store ever leaving this thread.
     state.set("mutate", {
         let world = Rc::clone(world);
         lua.create_async_function(move |lua, (key, transform): (String, mlua::Function)| {
@@ -549,7 +542,6 @@ fn install_script_state(
             async move {
                 let store = world
                     .script_state()
-                    .await
                     .map_err(|err| store_error("mutate", &err))?;
                 let mut current = store.get(&key).cloned();
 

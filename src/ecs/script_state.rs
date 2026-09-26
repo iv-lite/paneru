@@ -2,8 +2,8 @@
 //!
 //! [`ScriptState`] is the data; this is where it lives while Paneru runs and how
 //! it gets to disk. Both the embedded Lua runtime and a socket client write
-//! through this single-authority resource; the Lua worker caches a copy and
-//! checks [`ScriptStateStore::revision_handle`] to know when to re-read.
+//! through this single-authority resource; script reads come out of the batch
+//! snapshot the main thread attaches to each worker message.
 //!
 //! Kept separate from [`PaneruState`] (which is rebuilt from the world on every
 //! save) since script state has neither that property nor a reason to be
@@ -13,8 +13,6 @@
 
 use std::fs;
 use std::path::{Path, PathBuf};
-use std::sync::Arc;
-use std::sync::atomic::{AtomicU64, Ordering};
 
 use bevy::app::AppExit;
 use bevy::ecs::message::MessageReader;
@@ -42,9 +40,6 @@ struct SavedScriptState {
 #[derive(Debug, Default, Resource)]
 pub struct ScriptStateStore {
     state: ScriptState,
-    /// Bumped on every applied mutation. The Lua worker compares this against
-    /// the stamp its cached copy was hydrated at to know when to re-read.
-    revision: Arc<AtomicU64>,
     dirty: bool,
 }
 
@@ -101,20 +96,9 @@ impl ScriptStateStore {
         }
     }
 
-    /// A handle on the revision stamp, for the Lua worker to watch.
-    ///
-    /// Only the worker wants it, so without the `lua` feature there is no
-    /// caller — which is not the same as the method being dead.
-    #[cfg_attr(not(feature = "lua"), allow(dead_code))]
-    #[must_use]
-    pub fn revision_handle(&self) -> Arc<AtomicU64> {
-        Arc::clone(&self.revision)
-    }
-
     /// The whole store, for answering a read.
     ///
-    /// As with [`Self::revision_handle`], the only caller is behind the `lua`
-    /// feature.
+    /// The only caller is behind the `lua` feature.
     #[cfg_attr(not(feature = "lua"), allow(dead_code))]
     #[must_use]
     pub fn snapshot(&self) -> ScriptState {
@@ -128,10 +112,10 @@ impl ScriptStateStore {
         &self.state
     }
 
-    /// Applies `write`, bumping the revision and marking the store dirty only
-    /// if it actually changed something. This is the one place the store is
-    /// written, whether the caller is a Lua handler or a socket client, which
-    /// is what makes a compare-and-set write race-free.
+    /// Applies `write`, marking the store dirty only if it actually changed
+    /// something. This is the one place the store is written, whether the
+    /// caller is a Lua handler or a socket client, which is what makes a
+    /// compare-and-set write race-free.
     ///
     /// # Errors
     ///
@@ -141,7 +125,6 @@ impl ScriptStateStore {
     pub fn apply(&mut self, write: &ScriptStateWrite) -> Result<WriteOutcome, String> {
         let outcome = self.state.apply(write)?;
         if matches!(outcome, WriteOutcome::Applied { changed: true }) {
-            self.revision.fetch_add(1, Ordering::Release);
             self.dirty = true;
         }
         Ok(outcome)
@@ -282,18 +265,16 @@ mod tests {
     }
 
     #[test]
-    fn apply_bumps_the_revision_only_on_a_real_change() {
+    fn apply_reports_change_only_on_a_real_change() {
         let mut store = ScriptStateStore::default();
-        let revision = store.revision_handle();
 
         assert!(applied(&mut store, &set("a", json!(1))));
-        assert_eq!(revision.load(Ordering::Acquire), 1);
+        assert_eq!(store.state().get("a"), Some(&ScriptValue::from(json!(1))));
 
         assert!(!applied(&mut store, &set("a", json!(1))));
-        assert_eq!(revision.load(Ordering::Acquire), 1);
 
         assert!(applied(&mut store, &set("a", json!(2))));
-        assert_eq!(revision.load(Ordering::Acquire), 2);
+        assert_eq!(store.state().get("a"), Some(&ScriptValue::from(json!(2))));
     }
 
     #[test]

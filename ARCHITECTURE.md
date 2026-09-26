@@ -32,9 +32,9 @@ Bevy is typically used for games, so Paneru implements a custom bridge to intera
 
 The embedded scripting runtime is the one deliberate exception to "everything interesting happens on the main thread". A handler is arbitrary user code of unbounded duration, and `pump_events` is itself main-thread-pinned, so running handlers inline meant a slow script stalled the frame clock. `src/lua/worker.rs` runs the interpreter on a dedicated thread instead:
 
-- **Main → worker:** `dispatch_lua_events` and `command_lua_handler` extract plain data (`LuaEvent`, `StateSnapshot`) out of the world and send it over an unbounded channel. Neither ever blocks.
-- **Worker → main:** `drain_lua_outbox` non-blockingly drains queued `Command`s and flash messages onto the command bus, one frame behind.
-- **The query round-trip:** `paneru.query*` still reads the *live* world. The worker sends a request carrying a reply channel and blocks on it; `serve_lua_queries` answers it from `QueryStateParams` in `PreUpdate` (before the pump) and again in `PostUpdate`. Shutdown drops the request queue, which unblocks any waiting handler with an error rather than a hang.
+- **Main → worker:** `dispatch_lua_events` and `command_lua_handler` extract plain data (`LuaEvent`, `StateSnapshot`) out of the world and send it over an unbounded channel, attaching the frame's `BatchSnapshot` (query documents, layout tree, script store) so handlers read the world synchronously out of the message. Neither ever blocks.
+- **Worker → main:** `drain_lua_outbox` non-blockingly drains queued `Command`s and flash messages onto the command bus, one frame behind; script-state writes go through a narrow ack channel (`StoreWrite`) so `paneru.state.mutate` keeps its compare-and-set semantics.
+- **No live queries:** `paneru.query*` reads the attached snapshot, never the live world. Shutdown drops the request queue, which unblocks any waiting writer with an error rather than a hang.
 
 This is what keeps `src/lua/runtime.rs` free of any `bevy` import: it reaches the world only through an `extract` callback, which on the main thread is a direct query and on the worker is that round-trip.
 

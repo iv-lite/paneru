@@ -1309,16 +1309,9 @@ pub fn setup_bevy_app(sender: EventSender, receiver: Receiver<Event>) -> Result<
         // keymap behind that goes through Carbon/TIS — must capture it here,
         // on the main thread, before the worker can ask for it.
         crate::config::prime_virtual_keymap();
-        // The worker caches the script state store and watches this stamp to
-        // know when its copy is stale — including when the writer was a client
-        // rather than the script itself.
-        let revision = app
-            .world()
-            .resource::<script_state::ScriptStateStore>()
-            .revision_handle();
         // A failed load falls back to no-script behavior (TOML config,
         // no plugin): startup never wedges on a broken script.
-        if let Some(worker) = lua::LuaWorker::spawn(lua::LuaSource::Path(path.clone()), revision) {
+        if let Some(worker) = lua::LuaWorker::spawn(lua::LuaSource::Path(path.clone())) {
             // A script that called `paneru.setup{...}` is authoritative: insert its
             // config now, before `app.run()`, so it exists ahead of the Startup
             // schedule and wins over the TOML `InitialConfig` (see
