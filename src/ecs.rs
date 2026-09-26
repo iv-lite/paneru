@@ -1192,6 +1192,9 @@ pub fn setup_bevy_app(sender: EventSender, receiver: Receiver<Event>) -> Result<
         .add_plugins(layout::LayoutEventsPlugin)
         .add_plugins(focus::FocusEventsPlugin)
         .add_plugins(display::DisplayEventsPlugin)
+        // Phase 0 replay recorder: env-gated (`PANERU_REPLAY_RECORD`), one
+        // branch per frame when unset.
+        .add_plugins(crate::replay::ReplayPlugin)
         .add_plugins((register_triggers, register_systems, register_commands));
 
     // Start the AX snapshot worker (kept out of the mock harness: it has no

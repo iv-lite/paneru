@@ -28,6 +28,7 @@ mod overlay_bridge;
 mod pasteboard;
 mod platform;
 mod reader;
+mod replay;
 mod snapshot;
 mod util;
 
