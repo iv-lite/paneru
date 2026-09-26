@@ -90,6 +90,26 @@ This is what keeps `src/lua/runtime.rs` free of any `bevy` import: it reaches th
 - **Pure Layout:** Layout math (in `layout.rs`) should remain as pure as possible, operating on coordinates and ratios rather than directly calling OS APIs.
 - **Bounded Restore:** Saved session state is only consulted during startup restore. After `SessionRestore` expires, normal config and window-rule placement owns newly discovered windows.
 - **Reactive Power Saving:** Systems should use Bevy's reactive scheduling to avoid CPU usage when no windows are moving or events are occurring.
+- **Quiet-Frame Quiescence:** A settled world holds no flight markers (`RepositionMarker`), scroll state (`Scrolling`), held gestures (`MouseHeldMarker`), animating drives, or live homing graces — see `test_settled_world_is_quiescent`. Quiet frames do no work because nothing is flagged. The Swift port preserves this by construction (lexical pass order, explicit dirty flags) rather than by scan.
+
+## 5b. Target Synchronous Pipeline (Swift Port)
+
+The Bevy schedules stay until cutover, but new logic must fit the explicit
+pass list below so the port is mechanical. Each pass has one owner and runs
+in lexical order — `ingest → layout → commit → paint` — instead of emergent
+`Changed/Added` gating:
+
+| Pass | Today (reactive) | Target (explicit) |
+| :--- | :--- | :--- |
+| Ingest | `pump_events` + `demux_input_events` + tap WS observers | Drain tap-shim ring + Mach queue into one event vec |
+| Layout | `register_systems` `Update` chain keyed on `Changed<Position/Bounds>` | `LayoutStrip` recompute behind a `layout_dirty` flag set at mutation sites |
+| Commit | `commit_window_position/size` on `CommittedWindows` (`Or<Changed…>`) | Per-window `target/lastSent` compare in the AX actor's coalescing inbox |
+| Paint | Overlay gate's 8 `or_eager` terms (`vw_indicator_dirty`, `overlay_tracking_motion`, `bordered_set_changed`, `any_window_animating`, `drag_ended`, `mission_control_changed`, `display_set_changed`, `snapshot_advanced` in `ecs.rs`) | Explicit `paint_dirty` set by commit/focus/drag/mission-control/display/snapshot owners |
+| Queries | `serve_lua_store` + per-pass extraction | Per-frame `BatchSnapshot` attached to the worker message |
+
+`FrameActivity::mid_frame` (7 queries) collapses to the same dirty flags.
+No new `Changed`/`Added`/`RemovedComponents` run conditions: if a change can
+happen, its owner sets the flag.
 
 ## 6. Session Restore
 

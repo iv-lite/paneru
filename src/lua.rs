@@ -84,7 +84,7 @@ impl Plugin for LuaPlugin {
 /// so this is the frame's one expensive script-related read.
 fn snapshot_batch(
     state: &QueryStateParams,
-    store: &Option<Res<ScriptStateStore>>,
+    store: Option<&Res<ScriptStateStore>>,
 ) -> world::BatchSnapshot {
     world::BatchSnapshot {
         state: state.extract().map(Arc::new).map_err(|err| err.to_string()),
@@ -126,7 +126,7 @@ pub fn dispatch_lua_events(
     }
     worker.send_events(worker::EventBatch {
         events,
-        snapshot: snapshot_batch(&state, &store),
+        snapshot: snapshot_batch(&state, store.as_ref()),
     });
 }
 
@@ -153,7 +153,7 @@ pub fn command_lua_handler(
     if ids.is_empty() {
         return;
     }
-    worker.send_binds(ids, snapshot_batch(&state, &store));
+    worker.send_binds(ids, snapshot_batch(&state, store.as_ref()));
 }
 
 /// Applies pending `paneru.state` writes against the store.
@@ -255,13 +255,4 @@ pub fn lua_reload_system(
 /// by filename, covering atomic-save temp-file renames).
 fn paths_match(changed: &Path, script: &Path) -> bool {
     changed == script || changed.file_name() == script.file_name()
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    // Sharing is structural now: `snapshot_batch` extracts each document
-    // exactly once per frame and every handler reads the same attachment
-    // (see `one_attach_serves_every_dispatch_in_the_batch` in `runtime`).
 }

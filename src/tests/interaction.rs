@@ -534,6 +534,75 @@ fn test_strip_scroll_release_settles_and_cleans_up() {
         .run(commands);
 }
 
+/// A settled world is quiescent: after input stops and tweens converge, no
+/// flight markers, scroll state, held gestures, or live homing grace may
+/// remain. This is the idle invariant the Swift port's synchronous pipeline
+/// must preserve: quiet frames do no work because there is nothing flagged,
+///
+/// not because a scan happened to find nothing.
+#[test]
+fn test_settled_world_is_quiescent() {
+    use crate::ecs::sync::WindowSync;
+    use crate::ecs::{DrivePhase, MouseHeldMarker, PositionDrive};
+
+    let mut h = TestHarness::new().with_windows(2);
+    h.run(vec![
+        Event::MenuOpened { window_id: 0 },
+        Event::Command {
+            command: Command::Window(Operation::Focus(Direction::Last)),
+        },
+        Event::Command {
+            command: Command::PrintState,
+        },
+        Event::Command {
+            command: Command::PrintState,
+        },
+    ]);
+    // Three idle seconds: every tween, grace, and settle check converges.
+    h.advance(Duration::from_millis(3000));
+
+    let world = h.app.world_mut();
+    assert!(
+        world
+            .query_filtered::<Entity, With<RepositionMarker>>()
+            .iter(world)
+            .next()
+            .is_none(),
+        "no window may be mid-glide in a settled world"
+    );
+    assert!(
+        world
+            .query_filtered::<Entity, With<Scrolling>>()
+            .iter(world)
+            .next()
+            .is_none(),
+        "no strip may be scrolling in a settled world"
+    );
+    assert!(
+        world
+            .query_filtered::<Entity, With<MouseHeldMarker>>()
+            .iter(world)
+            .next()
+            .is_none(),
+        "no drag may be held in a settled world"
+    );
+    assert!(
+        !world
+            .query::<&PositionDrive>()
+            .iter(world)
+            .any(|drive| drive.phase == DrivePhase::Animating),
+        "no drive may be animating in a settled world"
+    );
+    let now = world.resource::<Time>().elapsed();
+    assert!(
+        !world
+            .query::<&WindowSync>()
+            .iter(world)
+            .any(|sync| sync.homing_active(now)),
+        "no homing grace may be live in a settled world"
+    );
+}
+
 #[test]
 fn test_window_hidden_ratio() {
     let commands = vec![

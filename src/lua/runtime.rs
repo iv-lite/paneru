@@ -410,10 +410,10 @@ mod tests {
         /// `paneru.exec`) suspend, so this polls the future while serving
         /// writes.
         fn drive<T>(&self, future: impl Future<Output = T>) -> T {
-            let _dispatch = self.dispatch.enter();
             /// Ample for any dispatch here; only reached if one is wedged.
             const TURNS: usize = 1000;
 
+            let _dispatch = self.dispatch.enter();
             let mut future = Box::pin(future);
             for _ in 0..TURNS {
                 if let Some(done) = block_on(poll_once(future.as_mut())) {
@@ -441,9 +441,9 @@ mod tests {
         /// a dispatch parked on `paneru.exec`, which is waiting on a process
         /// rather than on this thread.
         fn drive_patiently<T>(&self, future: impl Future<Output = T>) -> T {
-            let _dispatch = self.dispatch.enter();
             const TURNS: usize = 2_000;
 
+            let _dispatch = self.dispatch.enter();
             let mut future = Box::pin(future);
             for _ in 0..TURNS {
                 if let Some(done) = block_on(poll_once(future.as_mut())) {
