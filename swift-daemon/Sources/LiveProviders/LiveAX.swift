@@ -1,0 +1,434 @@
+// Live AX window access (`src/manager/windows.rs`, `src/ax_writer.rs`,
+// `src/ax_reads.rs`, `src/snapshot.rs` behavior). ApplicationServices
+// calls, main-thread confined like the Rust original (its three detached
+// workers owned cloned element refs; here the host serializes onto main).
+// Everything is best-effort: reads yield nil/defaults, writes verify with
+// a 1px deadband, and a denied or wedged app degrades to cached truth —
+// one bad window never stalls the roster.
+//
+// Two non-negotiables from the Rust path: the per-app messaging timeout
+// is 0.25s (the 6s default would wedge the caller on a beachballed app),
+// and position writes add padding while size writes subtract it (reads
+// expand back out).
+import ApplicationServices
+import CoreGraphics
+import Foundation
+import Geometry
+
+// MARK: - Private SkyLight import
+
+/// Window id for an element. No public equivalent; nil on any failure.
+@_silgen_name("_AXUIElementGetWindow")
+private func _AXUIElementGetWindow(
+    _ element: AXUIElement, _ wid: UnsafeMutablePointer<CGWindowID>
+) -> AXError
+
+// MARK: - Constants
+
+/// Per-app AX messaging timeout: a hung app fails fast instead of
+/// wedging the caller for the 6s default.
+public let axMessagingTimeout: Float = 0.25
+/// Position/size writes within a pixel are already converged.
+public let axDeadband: Double = 1.0
+/// Observer registration retries on transient failure.
+public let axObserverMaxAttempts = 3
+
+// MARK: - Errors
+
+public struct AXFailure: Error, Equatable, CustomStringConvertible {
+    public var message: String
+    public init(_ message: String) { self.message = message }
+    public var description: String { message }
+}
+
+// MARK: - App root
+
+/// One application's AX root with the wedged-app timeout applied.
+public final class LiveApp {
+    public let pid: pid_t
+    public let element: AXUIElement
+
+    public init(pid: pid_t) {
+        self.pid = pid
+        self.element = AXUIElementCreateApplication(pid)
+        AXUIElementSetMessagingTimeout(element, axMessagingTimeout)
+    }
+
+    /// Window ids via the private resolver; windows that fail resolve
+    /// are skipped, never fatal.
+    public func windowIDs() -> [CGWindowID] {
+        guard let raw = windowListElements() else { return [] }
+        return raw.compactMap { LiveWindow.windowID(of: $0) }
+    }
+
+    public func windowListElements() -> [AXUIElement]? {
+        var value: CFTypeRef?
+        guard AXUIElementCopyAttributeValue(
+            element, kAXWindowsAttribute as CFString, &value
+        ) == .success, let array = value as? [AXUIElement] else {
+            return nil
+        }
+        return array
+    }
+
+    /// The focused window's id, if the app reports one.
+    public func focusedWindowID() -> CGWindowID? {
+        var value: CFTypeRef?
+        guard AXUIElementCopyAttributeValue(
+            element, kAXFocusedWindowAttribute as CFString, &value
+        ) == .success,
+            let value,
+            CFGetTypeID(value) == AXUIElementGetTypeID()
+        else {
+            return nil
+        }
+        return LiveWindow.windowID(of: unsafeDowncast(value, to: AXUIElement.self))
+    }
+}
+
+// MARK: - Window
+
+/// Qualification for tiling candidacy.
+public enum WindowQualification: Equatable, Sendable {
+    case tile
+    case float
+    case reject
+}
+
+/// One live window: element plus cached truth. Main-thread confined.
+public final class LiveWindow {
+    public let id: WindowID
+    public let element: AXUIElement
+    public var frame: IntRect
+    public var horizontalPadding: Int32
+    public var verticalPadding: Int32
+    /// Pids whose apps lack the enhanced-UI workaround stay synchronous.
+    public var enhancedUIAbsent: Bool
+
+    public init(
+        id: WindowID, element: AXUIElement, frame: IntRect,
+        horizontalPadding: Int32 = 0, verticalPadding: Int32 = 0,
+        enhancedUIAbsent: Bool = false
+    ) {
+        self.id = id
+        self.element = element
+        self.frame = frame
+        self.horizontalPadding = horizontalPadding
+        self.verticalPadding = verticalPadding
+        self.enhancedUIAbsent = enhancedUIAbsent
+    }
+
+    /// Resolve an element's window id, nil on any failure.
+    public static func windowID(of element: AXUIElement) -> CGWindowID? {
+        var wid: CGWindowID = 0
+        guard _AXUIElementGetWindow(element, &wid) == .success, wid != 0 else {
+            return nil
+        }
+        return wid
+    }
+
+    // MARK: Reads
+
+    private func stringAttribute(_ name: String) -> String? {
+        var value: CFTypeRef?
+        guard AXUIElementCopyAttributeValue(element, name as CFString, &value) == .success else {
+            return nil
+        }
+        return value as? String
+    }
+
+    private func boolAttribute(_ name: String, default defaultValue: Bool = false) -> Bool {
+        var value: CFTypeRef?
+        guard AXUIElementCopyAttributeValue(element, name as CFString, &value) == .success,
+              let number = value as? NSNumber else {
+            return defaultValue
+        }
+        return number.boolValue
+    }
+
+    public var role: String? { stringAttribute(kAXRoleAttribute as String) }
+    public var subrole: String? { stringAttribute(kAXSubroleAttribute as String) }
+    public var title: String? { stringAttribute(kAXTitleAttribute as String) }
+    public var identifier: String? { stringAttribute("AXIdentifier") }
+    public var isMinimized: Bool { boolAttribute(kAXMinimizedAttribute as String) }
+    public var isFullscreen: Bool { boolAttribute("AXFullScreen") }
+
+    /// Standard windows tile; floating windows float; unknown subroles
+    /// reject unless a window rule forces management.
+    public func qualification(forcedManage: Bool) -> WindowQualification {
+        let role = self.role ?? ""
+        let subrole = self.subrole ?? ""
+        if subrole == (kAXUnknownSubrole as String), !forcedManage {
+            return .reject
+        }
+        if subrole == (kAXStandardWindowSubrole as String) {
+            return .tile
+        }
+        if role == (kAXWindowRole as String),
+           subrole == (kAXFloatingWindowSubrole as String)
+        {
+            return .float
+        }
+        if role == "AXSheet" || role == "AXDrawer" {
+            return .reject
+        }
+        return forcedManage ? .tile : .reject
+    }
+
+    /// Raw CG frame: position and size attributes decoded and rounded.
+    public func readRawFrame() -> CGRect? {
+        var positionValue: CFTypeRef?
+        var sizeValue: CFTypeRef?
+        guard AXUIElementCopyAttributeValue(
+            element, kAXPositionAttribute as CFString, &positionValue
+        ) == .success,
+            AXUIElementCopyAttributeValue(
+                element, kAXSizeAttribute as CFString, &sizeValue
+            ) == .success,
+            let positionValue = positionValue,
+            let sizeValue = sizeValue
+        else { return nil }
+        var point = CGPoint.zero
+        var size = CGSize.zero
+        guard AXValueGetValue(positionValue as! AXValue, .cgPoint, &point),
+              AXValueGetValue(sizeValue as! AXValue, .cgSize, &size)
+        else { return nil }
+        return CGRect(origin: point, size: size)
+    }
+
+    /// Padded frame: raw CG truth expanded back out by the padding.
+    public func updateFrame() -> IntRect? {
+        guard let raw = readRawFrame() else { return nil }
+        let padded = IntRect(
+            min: IntPoint(
+                Int32(raw.minX.rounded()) - horizontalPadding,
+                Int32(raw.minY.rounded()) - verticalPadding
+            ),
+            max: IntPoint(
+                Int32(raw.maxX.rounded()) + horizontalPadding,
+                Int32(raw.maxY.rounded()) + verticalPadding
+            )
+        )
+        frame = padded
+        return padded
+    }
+
+    // MARK: Writes
+
+    private func withEnhancedUIDisabled(_ body: () -> AXError) -> AXError {
+        if enhancedUIAbsent { return body() }
+        let app = AXUIElementCreateApplication(pidOfElement())
+        var previous: CFTypeRef?
+        let had = AXUIElementCopyAttributeValue(
+            app, "AXEnhancedUserInterface" as CFString, &previous
+        ) == .success && (previous as? NSNumber)?.boolValue == true
+        if had {
+            AXUIElementSetAttributeValue(
+                app, "AXEnhancedUserInterface" as CFString, kCFBooleanFalse
+            )
+        }
+        let status = body()
+        if had {
+            AXUIElementSetAttributeValue(
+                app, "AXEnhancedUserInterface" as CFString, kCFBooleanTrue
+            )
+        }
+        return status
+    }
+
+    private func pidOfElement() -> pid_t {
+        var pid: pid_t = 0
+        AXUIElementGetPid(element, &pid)
+        return pid
+    }
+
+    /// Move with padding added and a 1px deadband; returns the frame the
+    /// OS now holds (cached truth on failure).
+    @discardableResult
+    public func reposition(to origin: IntPoint) -> IntRect {
+        let driftX = Double(origin.x + horizontalPadding) - Double(frame.min.x)
+        let driftY = Double(origin.y + verticalPadding) - Double(frame.min.y)
+        guard abs(driftX) > axDeadband || abs(driftY) > axDeadband else {
+            return frame
+        }
+        var point = CGPoint(
+            x: Double(origin.x + horizontalPadding),
+            y: Double(origin.y + verticalPadding)
+        )
+        guard let value = AXValueCreate(.cgPoint, &point) else {
+            return frame
+        }
+        let status = withEnhancedUIDisabled {
+            AXUIElementSetAttributeValue(element, kAXPositionAttribute as CFString, value)
+        }
+        if status == .success {
+            _ = updateFrame()
+        }
+        return frame
+    }
+
+    /// Resize with padding subtracted and staged retry for partial
+    /// growth: when the app lands between the old and target widths, the
+    /// origin shifts left by the shortfall and the size is set again.
+    @discardableResult
+    public func resize(to size: IntSize, origin: IntPoint? = nil) -> IntRect {
+        let target = CGSize(
+            width: Double(size.x - 2 * horizontalPadding),
+            height: Double(size.y - 2 * verticalPadding)
+        )
+        guard abs(target.width - Double(frame.width)) > axDeadband
+            || abs(target.height - Double(frame.height)) > axDeadband
+        else { return frame }
+        var attempt = target
+        guard let value = AXValueCreate(.cgSize, &attempt) else {
+            return frame
+        }
+        let previousWidth = Double(frame.width)
+        let status = withEnhancedUIDisabled {
+            AXUIElementSetAttributeValue(element, kAXSizeAttribute as CFString, value)
+        }
+        guard status == .success, let landed = updateFrame() else {
+            return frame
+        }
+        let landedWidth = Double(landed.width)
+        if landedWidth > previousWidth, landedWidth < target.width,
+           let origin
+        {
+            // Partial growth: shift left by the shortfall and set again.
+            let shortfall = Int32((target.width - landedWidth).rounded())
+            _ = reposition(to: IntPoint(origin.x - shortfall, origin.y))
+            var retry = target
+            if let retryValue = AXValueCreate(.cgSize, &retry) {
+                _ = withEnhancedUIDisabled {
+                    AXUIElementSetAttributeValue(
+                        element, kAXSizeAttribute as CFString, retryValue
+                    )
+                }
+                _ = updateFrame()
+            }
+            _ = reposition(to: origin)
+        }
+        return frame
+    }
+
+    /// Best-effort raise; cannot lift above another app's frontmost.
+    public func raise() {
+        AXUIElementPerformAction(element, kAXRaiseAction as CFString)
+    }
+}
+
+// MARK: - Observers
+
+/// Notification sets: app-level lifecycle plus per-window changes.
+public let appNotifications = [
+    kAXCreatedNotification,
+    kAXFocusedWindowChangedNotification,
+    kAXFocusedUIElementChangedNotification,
+    kAXWindowMovedNotification,
+    kAXWindowResizedNotification,
+    kAXMenuOpenedNotification,
+    kAXMenuClosedNotification,
+]
+public let windowNotifications = [
+    kAXUIElementDestroyedNotification,
+    kAXWindowMiniaturizedNotification,
+    kAXWindowDeminiaturizedNotification,
+    kAXTitleChangedNotification,
+] as [String]
+
+/// Register observer notifications with transient-error retries
+/// (50ms doubling, up to three attempts); already-registered counts as
+/// success. `isLive` is false when nothing registered. Owns the callback
+/// box for the C function's `refcon` and releases it on teardown.
+public final class LiveObserver {
+    private var observer: AXObserver?
+    private var context: Unmanaged<ObserverContext>?
+
+    public private(set) var isLive = false
+
+    public init(
+        app: LiveApp, notifications: [String],
+        callback: @escaping (String) -> Void
+    ) {
+        let context = ObserverContext(callback: callback)
+        let retained = Unmanaged.passRetained(context)
+        var observer: AXObserver?
+        guard AXObserverCreate(app.pid, { _, _, notification, refcon in
+            guard let refcon else { return }
+            Unmanaged<ObserverContext>.fromOpaque(refcon)
+                .takeUnretainedValue().callback(notification as String)
+        }, &observer) == .success, let observer else {
+            retained.release()
+            return
+        }
+        var registered = 0
+        for notification in notifications {
+            var attempt = 0
+            while attempt < axObserverMaxAttempts {
+                let status = AXObserverAddNotification(
+                    observer, app.element, notification as CFString,
+                    retained.toOpaque()
+                )
+                if status == .success || status == .notificationAlreadyRegistered {
+                    registered += 1
+                    break
+                }
+                if status != .cannotComplete { break }
+                Thread.sleep(forTimeInterval: 0.05 * Double(1 << attempt))
+                attempt += 1
+            }
+        }
+        guard registered > 0 else {
+            retained.release()
+            return
+        }
+        CFRunLoopAddSource(
+            CFRunLoopGetMain(),
+            AXObserverGetRunLoopSource(observer),
+            .commonModes
+        )
+        self.observer = observer
+        self.context = retained
+        self.isLive = true
+    }
+
+    deinit {
+        context?.release()
+    }
+}
+
+private final class ObserverContext {
+    var callback: (String) -> Void
+    init(callback: @escaping (String) -> Void) {
+        self.callback = callback
+    }
+}
+
+// MARK: - Enumeration
+
+/// On-screen window numbers via the WindowServer list.
+public func onScreenWindowIDs() -> [CGWindowID]? {
+    guard let list = CGWindowListCopyWindowInfo(
+        [.optionOnScreenOnly, .excludeDesktopElements], kCGNullWindowID
+    ) as? [[String: Any]] else {
+        return nil
+    }
+    return list.compactMap { dict in
+        (dict[kCGWindowNumber as String] as? NSNumber).map {
+            CGWindowID($0.uint32Value)
+        }
+    }
+}
+
+/// Whether the process holds the Accessibility grant.
+public func hasAccessibilityGrant() -> Bool {
+    AXIsProcessTrusted()
+}
+
+/// Prompt once for the grant; polling must use the check variant.
+@discardableResult
+public func requestAccessibilityGrant() -> Bool {
+    AXIsProcessTrustedWithOptions(
+        [kAXTrustedCheckOptionPrompt.takeUnretainedValue() as String: true] as CFDictionary
+    )
+}

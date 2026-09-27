@@ -223,6 +223,16 @@ let package = Package(
             path: "Tests/PresenterChecks"
         ),
         .executableTarget(
+            name: "MenuBarChecks",
+            dependencies: ["MenuBar"],
+            path: "Tests/MenuBarChecks"
+        ),
+        .executableTarget(
+            name: "LiveProvidersChecks",
+            dependencies: ["LiveProviders", "Geometry"],
+            path: "Tests/LiveProvidersChecks"
+        ),
+        .executableTarget(
             name: "ScriptingChecks",
             dependencies: ["Scripting"],
             path: "Tests/ScriptingChecks"
@@ -380,6 +390,22 @@ let package = Package(
             name: "Presenter",
             dependencies: ["Geometry", "Presentation"],
             path: "Sources/Presenter"
+        ),
+        // Menu bar: pure indicator/menu model plus the live NSStatusItem
+        // shell (`src/menubar.rs`).
+        .target(
+            name: "MenuBar",
+            path: "Sources/MenuBar"
+        ),
+        // Live OS providers, proven on a permissioned host: AX
+        // reads/writes/observers, event-tap lifecycle, writer coalescing,
+        // launchd service runtime (`src/manager/windows.rs`,
+        // `src/platform/input.rs`, `src/ax_writer.rs`,
+        // `src/platform/service.rs`).
+        .target(
+            name: "LiveProviders",
+            dependencies: ["Geometry"],
+            path: "Sources/LiveProviders"
         ),
     ]
 )
