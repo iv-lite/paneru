@@ -125,6 +125,11 @@ let package = Package(
             path: "Tests/CommandsChecks"
         ),
         .executableTarget(
+            name: "ConfigChecks",
+            dependencies: ["Config"],
+            path: "Tests/ConfigChecks"
+        ),
+        .executableTarget(
             name: "ScriptingChecks",
             dependencies: ["Scripting"],
             path: "Tests/ScriptingChecks"
@@ -165,6 +170,11 @@ let package = Package(
         .target(
             name: "Commands",
             path: "Sources/Commands"
+        ),
+        // Resolved daemon configuration (`src/config.rs` getters).
+        .target(
+            name: "Config",
+            path: "Sources/Config"
         ),
     ]
 )

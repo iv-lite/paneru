@@ -1,0 +1,147 @@
+import Foundation
+import Config
+
+// Parity ports of the default/clamp rules in `src/config.rs` getters.
+// Expectations copied verbatim.
+// Exits nonzero on the first mismatch.
+
+private var failures = 0
+
+private func check(_ condition: Bool, _ message: String) {
+    if !condition {
+        failures += 1
+        print("FAIL: \(message)")
+    }
+}
+
+private func checkEqual<T: Equatable>(_ a: T, _ b: T, _ message: String) {
+    check(a == b, "\(message) (got \(a), want \(b))")
+}
+
+private func checkEqual2(_ a: (Int32, Int32), _ b: (Int32, Int32), _ message: String) {
+    check(a == b, "\(message) (got \(a), want \(b))")
+}
+
+private func checkEqual3(_ a: (Double, Double, Double), _ b: (Double, Double, Double), _ message: String) {
+    check(a == b, "\(message) (got \(a), want \(b))")
+}
+
+// Bare defaults match the Rust getters with no options set.
+do {
+    let c = DaemonOptions().resolved()
+    check(c.focusFollowsMouse, "ffm defaults on")
+    check(c.mouseFollowsFocus, "mff defaults on")
+    checkEqual(c.sliverWidth, 5, "sliver width default")
+    checkEqual(c.sliverHeight, 1.0, "sliver height default")
+    checkEqual2((c.gapHorizontal, c.gapVertical), (8, 8), "gaps default 8/8")
+    check(!c.borderActive, "borders default off")
+    checkEqual3(c.borderColor, (1.0, 1.0, 1.0), "border defaults white")
+    checkEqual(c.borderOpacity, 1.0, "opacity default")
+    checkEqual(c.borderWidth, 2.0, "width default")
+    checkEqual(c.borderRadius, .auto, "radius default auto")
+    checkEqual(c.dimOpacity, 0, "dim off without color")
+    checkEqual(c.swipeSensitivity, 0.35, "swipe sensitivity default")
+    check(c.swipeContinuous, "continuous swipe defaults on")
+    checkEqual(c.swipeDeceleration, 4.0, "deceleration default")
+    check(c.swipeVertical, "vertical swipe defaults on")
+    checkEqual(c.swipeDirection, .natural, "swipe direction default")
+    check(c.maximizeTiledWindows, "maximize defaults on")
+    checkEqual(c.windowHiddenRatio, 0.0, "hidden ratio eager")
+    check(c.windowResizeCycle, "resize cycles")
+    check(c.nativeTabsEnabled, "native tabs on")
+    check(!c.insertWindowsMidStrip, "append by default")
+    checkEqual(c.defaultWorkspaces, 1, "one workspace by default")
+    check(c.axWriterEnabled, "ax writer on")
+    check(c.restoreEnabled, "restore on")
+    checkEqual(c.restoreStartupGraceMs, 2000, "grace default")
+    checkEqual(c.restoreMissingWindows, .ignore, "missing windows ignored")
+    checkEqual(c.presetColumnWidths, [0.25, 0.33333, 0.50, 0.66667, 0.75, 1.0, 1.5, 2.0], "column presets")
+    checkEqual(c.presetStackHeights, [0.25, 0.33333, 0.50, 0.66667, 0.75], "stack presets")
+    checkEqual(c.animationDurationMs, 250, "animation default")
+}
+
+// Clamps mirror the getters.
+do {
+    var o = DaemonOptions()
+    o.sliverHeight = 5.0
+    o.sliverWidth = 0
+    o.gapHorizontal = 99
+    o.swipeSensitivity = 9.0
+    o.swipeDeceleration = 0.1
+    o.borderOpacity = 2.0
+    o.borderWidth = -3.0
+    o.windowHiddenRatio = -1.0
+    o.defaultRatio = 4.0
+    o.defaultWorkspaces = 0
+    let c = o.resolved()
+    checkEqual(c.sliverHeight, 1.0, "sliver height clamps high")
+    checkEqual(c.sliverWidth, 1, "sliver width floors at 1")
+    checkEqual(c.gapHorizontal, 50, "gaps clamp at 50")
+    checkEqual(c.swipeSensitivity, 2.0, "sensitivity clamps high")
+    checkEqual(c.swipeDeceleration, 1.0, "deceleration clamps low")
+    checkEqual(c.borderOpacity, 1.0, "opacity clamps high")
+    checkEqual(c.borderWidth, 0.0, "width floors at 0")
+    checkEqual(c.windowHiddenRatio, 0.0, "hidden ratio clamps low")
+    checkEqual(c.defaultRatio, 1.0, "ratio clamps to unit")
+    checkEqual(c.defaultWorkspaces, 1, "workspaces floor at 1")
+}
+
+// animations = false snaps instantly regardless of duration.
+do {
+    var o = DaemonOptions()
+    o.animations = false
+    o.animationDurationMs = 500
+    let c = o.resolved()
+    check(!c.animationsEnabled, "animations off")
+    checkEqual(c.animationDurationMs, 0, "off snaps instantly")
+    var o2 = DaemonOptions()
+    o2.animationDurationMs = 5000
+    checkEqual(o2.resolved().animationDurationMs, 2000, "duration clamps at 2000")
+}
+
+// Dim activates on color; opacity composes with alpha.
+do {
+    var o = DaemonOptions()
+    o.dimInactiveColor = "#000000"
+    o.dimInactiveOpacity = 0.5
+    let c = o.resolved()
+    checkEqual3(c.dimColor, (0.0, 0.0, 0.0), "dim color parsed")
+    checkEqual(c.dimOpacity, 0.5, "dim opacity applied")
+    checkEqual(c.dimAlpha, 1.0, "no hex alpha means 1")
+}
+
+// Hex parsing mirrors parse_hex_color / parse_hex_alpha.
+do {
+    checkEqual3(parseHexColor("#FF0000"), (255.0, 0.0, 0.0), "red parses")
+    checkEqual3(parseHexColor("#FFFFFF66"), (255.0, 255.0, 255.0), "alpha ignored in channels")
+    checkEqual3(parseHexColor("bogus"), (1.0, 1.0, 1.0), "garbage is white")
+    checkEqual(parseHexAlpha("#FFFFFF66"), 102.0 / 255.0, "alpha composes")
+    checkEqual(parseHexAlpha("#FFFFFF"), 1.0, "no alpha means 1")
+    var o = DaemonOptions()
+    o.borderColor = "#FF000080"
+    let c = o.resolved()
+    checkEqual3(c.borderColor, (255.0, 0.0, 0.0), "border channels")
+    checkEqual(c.borderAlpha, 128.0 / 255.0, "border alpha composes")
+}
+
+// Opt-in flags stay off unless set.
+do {
+    let c = DaemonOptions().resolved()
+    check(!c.autoCenter, "auto-center off")
+    check(!c.reapEmptyWorkspaces, "reap off")
+    check(!c.virtualWorkspaceAnimations, "vw animations off")
+    check(!c.createWorkspaceAutomatically, "no auto-create")
+    var o = DaemonOptions()
+    o.autoCenter = true
+    o.insertWindowsMidStrip = true
+    o.reapEmptyWorkspaces = true
+    let c2 = o.resolved()
+    check(c2.autoCenter && c2.insertWindowsMidStrip && c2.reapEmptyWorkspaces, "opt-ins enable")
+}
+
+if failures == 0 {
+    print("ConfigChecks: all checks passed")
+} else {
+    print("ConfigChecks: \(failures) failure(s)")
+    exit(1)
+}
