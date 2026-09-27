@@ -215,8 +215,12 @@ until cutover:
   pass list — ingest, layout, hand-owned commit, homing, border paint —
   against injected frame providers (verified by `Tests/DaemonChecks`
   end-to-end frames).
+- **`PaneruXPC`** (done): XPC transport replacing the raw Mach bootstrap —
+  `@objc` protocol, error-string convention, client + loopback listener —
+  verified by in-process round trips (`Tests/XPCChecks`, no bundle or
+  launchd needed).
 - **Next:** live AX/AppKit providers behind the protocols, LuaJIT
-  linkage, XPC cutover, then retirement of `src/`. Each lands with
+  linkage, launchd XPC service registration, then retirement of `src/`. Each lands with
   parity tests before the Rust counterpart is touched.
 
 Supporting seams already in the Rust daemon: `src/replay.rs` (Phase 0

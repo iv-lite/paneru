@@ -114,6 +114,11 @@ let package = Package(
             path: "Tests/DaemonChecks"
         ),
         .executableTarget(
+            name: "XPCChecks",
+            dependencies: ["PaneruXPC"],
+            path: "Tests/XPCChecks"
+        ),
+        .executableTarget(
             name: "ScriptingChecks",
             dependencies: ["Scripting"],
             path: "Tests/ScriptingChecks"
@@ -142,6 +147,12 @@ let package = Package(
                 "Presentation", "Scripting",
             ],
             path: "Sources/Daemon"
+        ),
+        // XPC transport replacing the raw Mach bootstrap. Named PaneruXPC:
+        // `XPC` alone collides with the system framework module.
+        .target(
+            name: "PaneruXPC",
+            path: "Sources/PaneruXPC"
         ),
     ]
 )
