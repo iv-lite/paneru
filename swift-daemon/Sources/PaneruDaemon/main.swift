@@ -9,12 +9,14 @@
 // runtime yet (script handlers have no host). It tiles, focuses, and
 // presents — enough to prove live parity on a permissioned host.
 import AppKit
-import ConfigFiles
 import Commands
+import Config
+import ConfigFiles
 import CoreGraphics
 import Daemon
 import Foundation
 import Geometry
+import KeyChords
 import LiveProviders
 import MenuBar
 import Presentation
@@ -61,6 +63,38 @@ for warning in discoveredTOML.warnings + discoveredLua.warnings {
 }
 if let note { print("config: \(note)") }
 
+// Bindings + window rules from the TOML source (TOML ignored under Lua
+// or bare launches). Parse failures warn and fall back to empty tables;
+// the daemon stays up on defaults.
+var bindings: [ResolvedBinding] = []
+var windowRules: [WindowRule] = []
+if case .toml(let path) = source,
+   let text = try? String(contentsOfFile: path, encoding: .utf8)
+{
+    do {
+        bindings = try resolveBindingsTable(parseBindingsSection(text))
+        windowRules = try resolveWindowsTable(parseWindowsSections(text))
+        print("config: \(bindings.count) bindings, \(windowRules.count) window rules")
+    } catch {
+        print("config: warning: \(error) (running empty)")
+    }
+}
+
+/// NX tap bits onto config bits: the orders differ, so map explicitly.
+func keyModifiers(_ tap: TapModifiers) -> KeyModifiers {
+    var out = KeyModifiers()
+    if tap.contains(.leftShift) { out.insert(.leftShift) }
+    if tap.contains(.rightShift) { out.insert(.rightShift) }
+    if tap.contains(.leftControl) { out.insert(.leftCtrl) }
+    if tap.contains(.rightControl) { out.insert(.rightCtrl) }
+    if tap.contains(.leftAlternate) { out.insert(.leftAlt) }
+    if tap.contains(.rightAlternate) { out.insert(.rightAlt) }
+    if tap.contains(.leftCommand) { out.insert(.leftCmd) }
+    if tap.contains(.rightCommand) { out.insert(.rightCmd) }
+    if tap.contains(.function) { out.insert(.fn_) }
+    return out
+}
+
 // MARK: - State
 
 var core = DaemonCore()
@@ -68,6 +102,8 @@ var apps: [pid_t: LiveApp] = [:]
 var roster: [CGWindowID: LiveWindow] = [:]
 var observers: [pid_t: LiveObserver] = [:]
 var pending: [DaemonEvent] = []
+/// Windows whose rules suppress focus arrival.
+var dontFocus: Set<WindowID> = []
 var borderRects: [WindowID: CGRect] = [:]
 var borderStyles: [WindowID: BorderStyle] = [:]
 let focusedStyle = BorderStyle(r: 1, g: 1, b: 1, opacity: 1, width: 2, radius: 8)
@@ -117,7 +153,18 @@ func syncRoster() {
                 max: IntPoint(Int32(raw.maxX.rounded()), Int32(raw.maxY.rounded()))
             )
         )
-        switch window.qualification(forcedManage: false) {
+        // Window rules: manage forces adoption past role rejection;
+        // dont_focus suppresses focus arrival below. Floating, width,
+        // and index need targeted core ops — slice 2 wires them.
+        let title = window.title ?? ""
+        let bundle = NSRunningApplication(processIdentifier: info.ownerPID)?
+            .bundleIdentifier ?? ""
+        let rules = matchWindowRules(title: title, bundleID: bundle, in: windowRules)
+        if rules.contains(where: { $0.dontFocus }) {
+            dontFocus.insert(windowID(wid))
+        }
+        let forced = rules.contains { $0.manage }
+        switch window.qualification(forcedManage: forced) {
         case .reject:
             continue
         case .tile, .float:
@@ -127,6 +174,7 @@ func syncRoster() {
     }
     for wid in known.subtracting(current) {
         roster.removeValue(forKey: wid)
+        dontFocus.remove(windowID(wid))
         pending.append(.disappeared(id: windowID(wid)))
     }
 }
@@ -147,7 +195,10 @@ func windowInfo(_ wid: CGWindowID) -> WindowInfo? {
 
 func observeFired(app: LiveApp) {
     // Cheap re-read: focus may have moved; roster sync heals the rest.
-    if let focused = app.focusedWindowID() {
+    // Rule-suppressed windows never take focus arrival.
+    if let focused = app.focusedWindowID(),
+       !dontFocus.contains(windowID(focused))
+    {
         pending.append(.focus(id: windowID(focused)))
     }
     syncRoster()
@@ -157,6 +208,12 @@ func observeFired(app: LiveApp) {
 
 let tap = LiveTap()
 tap.sink = { pending.append(tapEvent($0)) }
+// Config bindings resolve through the table; scripted binds arrive with
+// the Lua host (slice 7) and focused passthrough with slice 4.
+tap.configured = { code, mods in
+    findBinding(code: code, held: keyModifiers(mods), in: bindings)?
+        .toArgv()?.joined(separator: " ")
+}
 if tap.install() {
     print("input: event tap installed")
 } else {

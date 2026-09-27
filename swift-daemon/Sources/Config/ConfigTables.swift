@@ -1,0 +1,260 @@
+// `[bindings]` and `[windows]` tables (`src/config.rs` resolution).
+// The file text arrives as TOML; only the subset these tables need is
+// parsed here (sections, quoted strings, string arrays, bare
+// numbers/bools) — full TOML decoding travels the Lua path. Resolution
+// mirrors `parse_config_with_virtual_keys`: command keys split on `_`
+// into argv, chord strings resolve via `KeyChords`, and failures throw
+// instead of landing a half-bound table.
+import Commands
+import Foundation
+import KeyChords
+
+// MARK: - Bindings
+
+/// One resolved binding: keycode, required modifiers, command.
+public struct ResolvedBinding: Equatable, Sendable {
+    public var code: UInt8
+    public var modifiers: KeyModifiers
+    public var command: PaneruCommand
+
+    public init(code: UInt8, modifiers: KeyModifiers, command: PaneruCommand) {
+        self.code = code
+        self.modifiers = modifiers
+        self.command = command
+    }
+}
+
+public struct TableError: Error, Equatable, CustomStringConvertible {
+    public var message: String
+    public init(_ message: String) { self.message = message }
+    public var description: String { message }
+}
+
+/// Resolve a decoded bindings table (`command_key → chords`) into flat
+/// bindings. The key spells argv with `_` (`window_focus_east`);
+/// each chord spells `"mod+mod-key"` (`"alt-h"`).
+public func resolveBindingsTable(
+    _ table: [String: [String]],
+    virtualKeys: [(String, UInt8)] = []
+) throws -> [ResolvedBinding] {
+    var out: [ResolvedBinding] = []
+    for key in table.keys.sorted() {
+        let argv = key.split(separator: "_").map(String.init)
+        let command: PaneruCommand
+        do {
+            command = try parseCommand(argv)
+        } catch {
+            throw TableError("bindings: invalid command '\(key)': \(error)")
+        }
+        for chord in table[key] ?? [] {
+            let (code, modifiers): (UInt8, KeyModifiers)
+            do {
+                (code, modifiers) = try resolveChord(chord, virtualKeys: virtualKeys)
+            } catch {
+                throw TableError("bindings: invalid chord '\(chord)' for '\(key)': \(error)")
+            }
+            out.append(ResolvedBinding(code: code, modifiers: modifiers, command: command))
+        }
+    }
+    return out
+}
+
+/// First binding whose keycode matches with all required modifiers held.
+public func findBinding(
+    code: UInt8, held: KeyModifiers, in bindings: [ResolvedBinding]
+) -> PaneruCommand? {
+    bindings.first {
+        $0.code == code && $0.modifiers.isSubset(of: held)
+    }?.command
+}
+
+// MARK: - Window rules
+
+/// One `[windows.<name>]` rule. Only the slice the daemon applies today:
+/// regex title + exact bundle match, float/manage/dont-focus flags, and
+/// initial width ratio. `grid`, `border_radius`, and per-rule paddings
+/// parse but wait for a core that can place them.
+public struct WindowRule: Sendable {
+    public var name: String
+    public var title: NSRegularExpression
+    public var bundleID: String?
+    public var floating: Bool
+    public var manage: Bool
+    public var index: Int?
+    public var dontFocus: Bool
+    public var width: Double?
+    public var grid: String?
+    public var borderRadius: Double?
+    public var passthrough: [(UInt8, KeyModifiers)]
+
+    public init(
+        name: String, title: NSRegularExpression, bundleID: String? = nil,
+        floating: Bool = false, manage: Bool = false, index: Int? = nil,
+        dontFocus: Bool = false, width: Double? = nil, grid: String? = nil,
+        borderRadius: Double? = nil,
+        passthrough: [(UInt8, KeyModifiers)] = []
+    ) {
+        self.name = name
+        self.title = title
+        self.bundleID = bundleID
+        self.floating = floating
+        self.manage = manage
+        self.index = index
+        self.dontFocus = dontFocus
+        self.width = width
+        self.grid = grid
+        self.borderRadius = borderRadius
+        self.passthrough = passthrough
+    }
+}
+
+/// All rules matching a window: bundle exact-or-absent plus title search.
+public func matchWindowRules(
+    title: String, bundleID: String, in rules: [WindowRule]
+) -> [WindowRule] {
+    rules.filter { rule in
+        guard rule.bundleID == nil || rule.bundleID == bundleID else {
+            return false
+        }
+        let range = NSRange(title.startIndex..., in: title)
+        return rule.title.firstMatch(in: title, range: range) != nil
+    }
+}
+
+// MARK: - TOML subset
+
+/// Pull one table's string list values: `[bindings]` keys map to a
+/// string or an array of strings.
+public func parseBindingsSection(_ text: String) -> [String: [String]] {
+    var table: [String: [String]] = [:]
+    var inBindings = false
+    for rawLine in text.components(separatedBy: "\n") {
+        let line = rawLine.trimmingCharacters(in: .whitespaces)
+        if line.hasPrefix("[") {
+            inBindings = line == "[bindings]"
+            continue
+        }
+        guard inBindings,
+              !line.isEmpty, !line.hasPrefix("#"),
+              let equals = line.firstIndex(of: "=")
+        else { continue }
+        let key = line[..<equals].trimmingCharacters(in: .whitespaces)
+        let value = line[line.index(after: equals)...].trimmingCharacters(in: .whitespaces)
+        table[String(key)] = parseStringList(value)
+    }
+    return table
+}
+
+/// Pull `[windows.<name>]` sections into raw string maps.
+public func parseWindowsSections(_ text: String) -> [String: [String: String]] {
+    var sections: [String: [String: String]] = [:]
+    var current: String?
+    for rawLine in text.components(separatedBy: "\n") {
+        let line = rawLine.trimmingCharacters(in: .whitespaces)
+        if line.hasPrefix("[") {
+            if line.hasPrefix("[windows."),
+               line.hasSuffix("]"),
+               !line.hasPrefix("[[")
+            {
+                let name = String(line.dropFirst("[windows.".count).dropLast())
+                    .trimmingCharacters(in: .whitespaces)
+                    .trimmingCharacters(in: CharacterSet(charactersIn: "\"'"))
+                current = name.isEmpty ? nil : name
+                if current != nil, sections[current!] == nil {
+                    sections[current!] = [:]
+                }
+            } else {
+                current = nil
+            }
+            continue
+        }
+        guard let current,
+              !line.isEmpty, !line.hasPrefix("#"),
+              let equals = line.firstIndex(of: "=")
+        else { continue }
+        let key = line[..<equals].trimmingCharacters(in: .whitespaces)
+        let value = line[line.index(after: equals)...].trimmingCharacters(in: .whitespaces)
+        sections[current]?[String(key)] = unquote(value)
+    }
+    return sections
+}
+
+private func unquote(_ value: String) -> String {
+    let text = value
+    if (text.hasPrefix("\"") && text.hasSuffix("\"") && text.count >= 2)
+        || (text.hasPrefix("'") && text.hasSuffix("'") && text.count >= 2)
+    {
+        return String(text.dropFirst().dropLast())
+    }
+    // Inline comments after a bare value.
+    if let hash = text.firstIndex(of: "#") {
+        return text[..<hash].trimmingCharacters(in: .whitespaces)
+    }
+    return text
+}
+
+private func parseStringList(_ value: String) -> [String] {
+    let text = value.trimmingCharacters(in: .whitespaces)
+    guard text.hasPrefix("["), text.hasSuffix("]") else {
+        return [unquote(text)]
+    }
+    let inner = text.dropFirst().dropLast()
+    // Chord strings never contain commas inside quotes; split plainly.
+    return inner.split(separator: ",").map {
+        unquote($0.trimmingCharacters(in: .whitespaces))
+    }.filter { !$0.isEmpty }
+}
+
+private func parseBool(_ value: String?) -> Bool {
+    value?.lowercased() == "true"
+}
+
+private func parseInt(_ value: String?) -> Int? {
+    value.flatMap(Int.init)
+}
+
+private func parseDouble(_ value: String?) -> Double? {
+    value.flatMap(Double.init)
+}
+
+/// Resolve decoded windows sections into rules. Bad title patterns and
+/// bad passthrough chords throw; unknown keys are ignored.
+public func resolveWindowsTable(
+    _ sections: [String: [String: String]],
+    virtualKeys: [(String, UInt8)] = []
+) throws -> [WindowRule] {
+    var out: [WindowRule] = []
+    for name in sections.keys.sorted() {
+        let fields = sections[name] ?? [:]
+        guard let pattern = fields["title"] else {
+            throw TableError("windows: rule '\(name)' needs a title pattern")
+        }
+        let title: NSRegularExpression
+        do {
+            title = try NSRegularExpression(pattern: pattern)
+        } catch {
+            throw TableError("windows: bad title pattern in '\(name)': \(error)")
+        }
+        var passthrough: [(UInt8, KeyModifiers)] = []
+        if let raw = fields["bindings_passthrough"] {
+            for chord in parseStringList(raw) {
+                do {
+                    passthrough.append(try resolveChord(chord, virtualKeys: virtualKeys))
+                } catch {
+                    throw TableError("windows: bad passthrough '\(chord)' in '\(name)': \(error)")
+                }
+            }
+        }
+        out.append(WindowRule(
+            name: name, title: title, bundleID: fields["bundle_id"],
+            floating: parseBool(fields["floating"]),
+            manage: parseBool(fields["manage"]),
+            index: parseInt(fields["index"]),
+            dontFocus: parseBool(fields["dont_focus"]),
+            width: parseDouble(fields["width"]).flatMap { $0 > 0 ? $0 : nil },
+            grid: fields["grid"], borderRadius: parseDouble(fields["border_radius"]),
+            passthrough: passthrough
+        ))
+    }
+    return out
+}

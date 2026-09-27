@@ -232,8 +232,9 @@ let package = Package(
         .executableTarget(
             name: "PaneruDaemon",
             dependencies: [
-                "Commands", "ConfigFiles", "Daemon", "Geometry",
-                "LiveProviders", "MenuBar", "Presentation", "Presenter",
+                "Commands", "Config", "ConfigFiles", "Daemon", "Geometry",
+                "KeyChords", "LiveProviders", "MenuBar", "Presentation",
+                "Presenter",
             ],
             path: "Sources/PaneruDaemon"
         ),
@@ -319,6 +320,7 @@ let package = Package(
         // Resolved daemon configuration (`src/config.rs` getters).
         .target(
             name: "Config",
+            dependencies: ["Commands", "KeyChords"],
             path: "Sources/Config"
         ),
         // Key-chord resolution (`resolve_chord`, modifier + keycode tables).

@@ -145,3 +145,80 @@ if failures == 0 {
     print("ConfigChecks: \(failures) failure(s)")
     exit(1)
 }
+
+// [bindings]: command keys split on `_`, chords resolve, misses fall
+// through in order.
+do {
+    let text = """
+        [bindings]
+        window_focus_east = "alt-h"
+        window_balance = ["alt-b", "alt+shift-b"]
+
+        [options]
+        """
+    let table = parseBindingsSection(text)
+    checkEqual(
+        table["window_balance"], ["alt-b", "alt+shift-b"],
+        "arrays decode in order"
+    )
+    let bindings = try! resolveBindingsTable(table)
+    checkEqual(bindings.count, 3, "every chord resolves")
+    let eastBinding = bindings.first { $0.command == .window(.focus(.east)) }!
+    let east = findBinding(
+        code: eastBinding.code, held: eastBinding.modifiers, in: bindings
+    )
+    checkEqual(east, .window(.focus(.east)), "keys split into argv")
+    checkEqual(findBinding(code: 255, held: [], in: bindings), nil, "misses fall through")
+    do {
+        _ = try resolveBindingsTable(["bogus_command": ["alt-h"]])
+        check(false, "bad commands throw")
+    } catch {
+        check("\(error)".contains("bogus_command"), "bad commands name the key")
+    }
+    do {
+        _ = try resolveBindingsTable(["window_balance": ["alt - - b"]])
+        check(false, "bad chords throw")
+    } catch {
+        check("\(error)".contains("alt - - b"), "bad chords name the chord")
+    }
+}
+
+// [windows.<name>]: bundle exact-or-absent plus title search; width
+// guards positivity; rules apply in table order.
+do {
+    let text = """
+        [windows.term]
+        title = "Term"
+        floating = true
+        width = 0.5
+
+        [windows.wide]
+        title = ".*"
+        bundle_id = "com.example.wide"
+        dont_focus = true
+        width = -2.0
+        """
+    let sections = parseWindowsSections(text)
+    checkEqual(sections["term"]?["floating"], "true", "bool fields decode raw")
+    let rules = try! resolveWindowsTable(sections)
+    checkEqual(rules.count, 2, "both rules resolve")
+    let term = matchWindowRules(title: "MyTerm", bundleID: "com.example.other", in: rules)
+    checkEqual(term.map { $0.name }, ["term"], "title search with absent bundle")
+    checkEqual(term.first?.floating, true, "flags decode")
+    checkEqual(term.first?.width, 0.5, "widths decode")
+    let wide = matchWindowRules(title: "Anything", bundleID: "com.example.wide", in: rules)
+    checkEqual(wide.map { $0.name }, ["wide"], "bundle narrows the match")
+    checkEqual(wide.first?.dontFocus, true, "dont-focus decodes")
+    checkEqual(wide.first?.width, nil, "non-positive widths drop")
+    check(
+        matchWindowRules(title: "Anything", bundleID: "com.example.other", in: rules)
+            .isEmpty,
+        "bundle mismatches miss"
+    )
+    do {
+        _ = try resolveWindowsTable(["bad": ["floating": "true"]])
+        check(false, "titleless rules throw")
+    } catch {
+        check("\(error)".contains("bad"), "titleless rules name the section")
+    }
+}
