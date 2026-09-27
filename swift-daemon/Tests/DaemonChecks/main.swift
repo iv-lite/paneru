@@ -194,7 +194,7 @@ do {
         frames: frames(slots: [0: IntPoint(0, 0), 1: IntPoint(400, 0), 2: IntPoint(800, 0)]),
         viewport: viewport, focusedStyle: style
     )
-    checkEqual(daemon.offsets[1], -512, "swipe pans the offset")
+    checkEqual(daemon.offsets[1], -176 - 512, "reveal plus swipe compose on the offset")
     check(!swiped.quiescent, "swipe tick works")
 }
 
