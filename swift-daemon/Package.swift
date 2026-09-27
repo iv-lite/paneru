@@ -115,6 +115,16 @@ let package = Package(
             path: "Tests/DaemonChecks"
         ),
         .executableTarget(
+            name: "AnimationChecks",
+            dependencies: ["Animation", "Geometry"],
+            path: "Tests/AnimationChecks"
+        ),
+        .executableTarget(
+            name: "ScrollChecks",
+            dependencies: ["Scroll", "Geometry"],
+            path: "Tests/ScrollChecks"
+        ),
+        .executableTarget(
             name: "XPCChecks",
             dependencies: ["PaneruXPC"],
             path: "Tests/XPCChecks"
@@ -140,6 +150,11 @@ let package = Package(
             path: "Tests/ConfigChecks"
         ),
         .executableTarget(
+            name: "SessionChecks",
+            dependencies: ["Session"],
+            path: "Tests/SessionChecks"
+        ),
+        .executableTarget(
             name: "ScriptingChecks",
             dependencies: ["Scripting"],
             path: "Tests/ScriptingChecks"
@@ -159,6 +174,18 @@ let package = Package(
         .target(
             name: "Service",
             path: "Sources/Service"
+        ),
+        // Fixed-duration tween math (`src/ecs/animation.rs`).
+        .target(
+            name: "Animation",
+            dependencies: ["Geometry"],
+            path: "Sources/Animation"
+        ),
+        // Trackpad/scroll physics (`src/ecs/scroll.rs`).
+        .target(
+            name: "Scroll",
+            dependencies: ["Geometry"],
+            path: "Sources/Scroll"
         ),
         // Serial daemon assembly wiring every module through the pass list.
         .target(
@@ -198,6 +225,12 @@ let package = Package(
         .target(
             name: "Config",
             path: "Sources/Config"
+        ),
+        // Session restore planning + state model (`src/ecs/restore.rs`,
+        // `src/ecs/state.rs` shapes).
+        .target(
+            name: "Session",
+            path: "Sources/Session"
         ),
     ]
 )

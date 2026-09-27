@@ -215,12 +215,24 @@ until cutover:
   pass list — ingest, layout, hand-owned commit, homing, border paint —
   against injected frame providers (verified by `Tests/DaemonChecks`
   end-to-end frames).
+- **`Commands`** (done): full command vocabulary + argv encoding with
+  round-trip checks (`Tests/CommandsChecks`).
+- **`Config`** (done): resolved defaults/clamps/hex parsing
+  (`Tests/ConfigChecks`).
 - **`Focus`** (done): same-strip stepping, edge entry, 45° cone, focus
   history tiers — from `src/commands.rs` focus half and `src/ecs/focus.rs`
   (verified by `Tests/FocusChecks`).
 - **`Workspace`** (done): virtual-switch index resolution with creation
   gating and the FocusOrVirtual sibling-first contract — from
   `src/ecs/workspace.rs` (verified by `Tests/WorkspaceChecks`).
+- **`Animation`/`Scroll`** (done): tween math, burst phases, swipe
+  physics, snap targets, settle guard, viewport clamp — from
+  `src/ecs/animation.rs` and `src/ecs/scroll.rs` (verified by
+  `Tests/AnimationChecks`, `Tests/ScrollChecks`).
+- **`Session`** (done): Codable state model with version gate + restore
+  planner (hard/fallback/geometry matching, compaction) — from
+  `src/ecs/state.rs` shapes and `src/ecs/restore.rs` (verified by
+  `Tests/SessionChecks`).
 - **`PaneruXPC`** (done): XPC transport replacing the raw Mach bootstrap —
   `@objc` protocol, error-string convention, client + loopback listener —
   verified by in-process round trips (`Tests/XPCChecks`, no bundle or
