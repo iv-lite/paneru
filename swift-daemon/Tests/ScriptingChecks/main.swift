@@ -151,6 +151,31 @@ do {
     check(bytes.count < maxSerialisedBytes, "nested value within budget")
 }
 
+// JSON edge: numbers fitting Int64 become .int (even 1.0), the rest
+// .float; outcomes flatten under "outcome".
+do {
+    checkEqual(ScriptValue(json: 1 as NSNumber), .int(1), "integers stay int")
+    checkEqual(ScriptValue(json: 1.0 as NSNumber), .int(1), "whole doubles become int")
+    checkEqual(ScriptValue(json: 0.25 as NSNumber), .float(0.25), "fractions stay float")
+    checkEqual(
+        ScriptValue(json: NSNumber(value: UInt64.max)), .float(Double(UInt64.max)),
+        "integers past Int64 become float"
+    )
+    checkEqual(ScriptValue(json: true as NSNumber), .bool(true), "booleans stay bool")
+    checkEqual(
+        ScriptValue(json: ["a", 1] as [Any]),
+        .list([.str("a"), .int(1)]), "arrays recurse"
+    )
+    let applied = WriteOutcome.applied(changed: true).toJSON()
+    checkEqual(applied["outcome"] as? String, "applied", "applied names its outcome")
+    checkEqual(applied["changed"] as? Bool, true, "applied carries changed")
+    let conflict = WriteOutcome.conflict(current: .int(2)).toJSON()
+    checkEqual(conflict["outcome"] as? String, "conflict", "conflict names its outcome")
+    checkEqual(conflict["current"] as? Int64, 2, "conflict carries current")
+    let absent = WriteOutcome.conflict(current: nil).toJSON()
+    check(absent["current"] is NSNull, "absent current spells null")
+}
+
 if failures == 0 {
     print("ScriptingChecks: all checks passed")
 } else {

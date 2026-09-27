@@ -3,6 +3,8 @@
 // keys, the `send-cmd` socket protocol, embedded Lua, and the client
 // module. Ports `crates/shared_types/src/commands.rs` (types) and
 // `argv.rs` (argv encoding, parsing + formatting together, checked by
+
+import WindowSet
 // round-trip tests).
 //
 // `Operation.setWidth` has no argv verb (it comes from window rules); it
@@ -162,6 +164,9 @@ public enum PaneruCommand: Equatable, Sendable {
     case printState
     /// A Lua keybind handler id. Never produced by parsing.
     case lua(UInt32)
+    /// Window-addressed ops from a `WindowSet` transform. Best-effort,
+    /// never parsed, never encoded.
+    case layout([LayoutOp])
 }
 
 // MARK: - Parsing
@@ -295,6 +300,7 @@ extension PaneruCommand {
         case .restart: return ["restart"]
         case .printState: return ["printstate"]
         case .lua: return nil
+        case .layout: return nil
         }
     }
 }

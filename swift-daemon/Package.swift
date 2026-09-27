@@ -190,6 +190,21 @@ let package = Package(
             path: "Tests/SessionChecks"
         ),
         .executableTarget(
+            name: "WindowSetChecks",
+            dependencies: ["WindowSet", "Geometry"],
+            path: "Tests/WindowSetChecks"
+        ),
+        .executableTarget(
+            name: "StateQueryChecks",
+            dependencies: ["StateQuery", "IPC"],
+            path: "Tests/StateQueryChecks"
+        ),
+        .executableTarget(
+            name: "LuaAPIChecks",
+            dependencies: ["LuaAPI", "Commands", "IPC", "Scripting", "StateQuery", "WindowSet"],
+            path: "Tests/LuaAPIChecks"
+        ),
+        .executableTarget(
             name: "ScriptingChecks",
             dependencies: ["Scripting"],
             path: "Tests/ScriptingChecks"
@@ -247,6 +262,7 @@ let package = Package(
         // `argv.rs`).
         .target(
             name: "Commands",
+            dependencies: ["WindowSet"],
             path: "Sources/Commands"
         ),
         // Same-strip focus stepping + history (`src/commands.rs` focus half,
@@ -303,6 +319,27 @@ let package = Package(
         .target(
             name: "Session",
             path: "Sources/Session"
+        ),
+        // Script-side predicted layout tree + replay log
+        // (`crates/shared_types/windowset.rs`).
+        .target(
+            name: "WindowSet",
+            dependencies: ["Geometry"],
+            path: "Sources/WindowSet"
+        ),
+        // Query documents + subscription events
+        // (`crates/shared_types/state.rs`, `json.rs`).
+        .target(
+            name: "StateQuery",
+            dependencies: ["IPC"],
+            path: "Sources/StateQuery"
+        ),
+        // Live-runtime-free Lua client surface
+        // (`crates/lua/src/lib.rs`, `client.rs` truth tables).
+        .target(
+            name: "LuaAPI",
+            dependencies: ["Commands", "IPC", "Scripting", "StateQuery", "WindowSet"],
+            path: "Sources/LuaAPI"
         ),
     ]
 )

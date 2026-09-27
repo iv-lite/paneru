@@ -88,6 +88,36 @@ extension ScriptValue {
         ) else { return nil }
         return Array(data)
     }
+
+    /// The reverse edge: decoded JSON back into a store value. Numbers
+    /// that fit `Int64` exactly become `.int` (matching Rust `as_i64`,
+    /// which also accepts `1.0`); everything else numeric — floats and
+    /// integers past `Int64` — becomes `.float`.
+    public init(json: Any) {
+        switch json {
+        case is NSNull:
+            self = .null
+        case let number as NSNumber:
+            if CFGetTypeID(number) == CFBooleanGetTypeID() {
+                self = .bool(number.boolValue)
+            } else {
+                let double = number.doubleValue
+                if double == double.rounded(), let exact = Int64(exactly: double) {
+                    self = .int(exact)
+                } else {
+                    self = .float(double)
+                }
+            }
+        case let string as String:
+            self = .str(string)
+        case let array as [Any]:
+            self = .list(array.map(ScriptValue.init(json:)))
+        case let object as [String: Any]:
+            self = .map(object.mapValues(ScriptValue.init(json:)))
+        default:
+            self = .null
+        }
+    }
 }
 
 // MARK: - Writes
@@ -141,6 +171,18 @@ public enum WriteOutcome: Equatable, Sendable {
     /// holds instead, so the caller can transform the current value and
     /// try again.
     case conflict(current: ScriptValue?)
+
+    /// Terminal JSON: `{"outcome": "applied", "changed": …}` or
+    /// `{"outcome": "conflict", "current": …}` — the flattened tag form,
+    /// built directly so this module stays dependency-free.
+    public func toJSON() -> [String: Any] {
+        switch self {
+        case .applied(let changed):
+            return ["outcome": "applied", "changed": changed]
+        case .conflict(let current):
+            return ["outcome": "conflict", "current": current?.toJSON() ?? NSNull()]
+        }
+    }
 }
 
 // MARK: - Store

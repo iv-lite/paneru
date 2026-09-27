@@ -29,7 +29,8 @@ import Workspace
 // Deferred to the integrator: cross-display fall-through (swap north/south
 // with no neighbour, toNext/PreviousDisplay — no display strips modelled),
 // floating focus/raise tiers (need FocusHistory plus AX raise), copyRule
-// (clipboard plus app bundle ids), mouse moves, and quit/restart
+// (clipboard plus app bundle ids), LayoutOp replay (needs the display/
+// workspace address mapping), mouse moves, and quit/restart
 // (process control).
 
 // MARK: - Events
@@ -224,8 +225,8 @@ public struct DaemonCore: Sendable {
 
     /// Fold one parsed command into state. Focus, stack, surgery, virtual,
     /// and gesture ops only; floating focus/raise tiers, cross-display
-    /// moves, mouse, copyRule, and process control stay with the
-    /// integrator (documented above).
+    /// moves, mouse, copyRule, LayoutOp replay, and process control stay
+    /// with the integrator (documented above).
     private mutating func ingestCommand(
         _ command: PaneruCommand, frames: (WindowID) -> IntRect?,
         viewport: IntRect, epoch: UInt64
@@ -233,7 +234,7 @@ public struct DaemonCore: Sendable {
         switch command {
         case .window(let op):
             ingestWindowOperation(op, frames: frames, viewport: viewport, epoch: epoch)
-        case .mouse, .quit, .restart, .printState, .lua:
+        case .mouse, .quit, .restart, .printState, .lua, .layout:
             break
         }
     }
