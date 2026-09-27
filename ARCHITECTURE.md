@@ -233,6 +233,9 @@ until cutover:
   planner (hard/fallback/geometry matching, compaction) — from
   `src/ecs/state.rs` shapes and `src/ecs/restore.rs` (verified by
   `Tests/SessionChecks`).
+- **`ScriptEvents`** (done): script-visible event taxonomy with handler
+  table shapes — from `src/lua/convert.rs` (verified by
+  `Tests/ScriptEventsChecks`).
 - **`PaneruXPC`** (done): XPC transport replacing the raw Mach bootstrap —
   `@objc` protocol, error-string convention, client + loopback listener —
   verified by in-process round trips (`Tests/XPCChecks`, no bundle or

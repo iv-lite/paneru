@@ -71,6 +71,11 @@ let package = Package(
             dependencies: ["CLua", "Scripting"],
             path: "Sources/LuaBridge"
         ),
+        // Script-visible event taxonomy (`src/lua/convert.rs`).
+        .target(
+            name: "ScriptEvents",
+            path: "Sources/ScriptEvents"
+        ),
         // Dependency-free check runners (this toolchain ships neither
         // XCTest nor swift-testing): `swift run --package-path
         // swift-daemon <Name>`. Fail nonzero on first mismatch.
@@ -163,6 +168,11 @@ let package = Package(
             name: "LuaBridgeChecks",
             dependencies: ["LuaBridge", "Scripting"],
             path: "Tests/LuaBridgeChecks"
+        ),
+        .executableTarget(
+            name: "ScriptEventsChecks",
+            dependencies: ["ScriptEvents"],
+            path: "Tests/ScriptEventsChecks"
         ),
         // Daemon↔client protocol shapes (`crates/shared_types/wire.rs`).
         .target(
