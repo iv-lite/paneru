@@ -205,6 +205,19 @@ let package = Package(
             path: "Tests/LuaAPIChecks"
         ),
         .executableTarget(
+            name: "ConfigFilesChecks",
+            dependencies: ["ConfigFiles"],
+            path: "Tests/ConfigFilesChecks"
+        ),
+        .executableTarget(
+            name: "ScriptHostChecks",
+            dependencies: [
+                "Commands", "ScriptEvents", "ScriptHost", "Scripting",
+                "StateQuery", "WindowSet",
+            ],
+            path: "Tests/ScriptHostChecks"
+        ),
+        .executableTarget(
             name: "ScriptingChecks",
             dependencies: ["Scripting"],
             path: "Tests/ScriptingChecks"
@@ -340,6 +353,21 @@ let package = Package(
             name: "LuaAPI",
             dependencies: ["Commands", "IPC", "Scripting", "StateQuery", "WindowSet"],
             path: "Sources/LuaAPI"
+        ),
+        // Config file discovery, defaults, deprecation, watch reduction
+        // (`src/config.rs`, `src/manager.rs`, `src/ecs/triggers.rs`).
+        .target(
+            name: "ConfigFiles",
+            path: "Sources/ConfigFiles"
+        ),
+        // Script worker mailbox without the thread or interpreter
+        // (`src/lua/worker.rs`, `src/lua.rs`, `src/lua/world.rs` rules).
+        .target(
+            name: "ScriptHost",
+            dependencies: [
+                "Commands", "ScriptEvents", "Scripting", "StateQuery", "WindowSet",
+            ],
+            path: "Sources/ScriptHost"
         ),
     ]
 )
