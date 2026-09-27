@@ -374,16 +374,6 @@ pub struct OverlayManager {
     /// need it per tick (`update`, `sync_borders`, `show_drop_preview`),
     /// and each probe walks `NSScreen::screens` on the main thread.
     screen_h: Option<(Instant, f64)>,
-    /// Swift strangler backend (`swift-overlay` feature): when a slice's
-    /// symbols resolved, its `AppKit` work dispatches across instead of
-    /// running the Rust path below. Rust keeps all gating/dedup state.
-    #[cfg(feature = "swift-overlay")]
-    swift: Option<crate::overlay_bridge::SwiftOverlay>,
-    /// Scratch buffer for the Swift border sync: reused every tick so the
-    /// opt-in path stops allocating a `Vec` per frame like the Rust path
-    /// avoids doing (see `sync_borders`).
-    #[cfg(feature = "swift-overlay")]
-    swift_items: Vec<crate::overlay_bridge::SwiftBorderItem>,
 }
 
 impl OverlayManager {
@@ -396,20 +386,7 @@ impl OverlayManager {
             borders: HashMap::new(),
             borders_hidden: false,
             screen_h: None,
-            #[cfg(feature = "swift-overlay")]
-            swift: crate::overlay_bridge::SwiftOverlay::try_load()
-                .filter(crate::overlay_bridge::SwiftOverlay::usable),
-            #[cfg(feature = "swift-overlay")]
-            swift_items: Vec::new(),
         }
-    }
-
-    /// Whether any Swift slice is active (for diagnostics / A-B checks).
-    #[cfg(feature = "swift-overlay")]
-    pub fn swift_active(&self) -> bool {
-        self.swift
-            .as_ref()
-            .is_some_and(crate::overlay_bridge::SwiftOverlay::usable)
     }
 
     /// Primary-screen height, cached for [`SCREEN_HEIGHT_CACHE`]. Callers
@@ -445,31 +422,6 @@ impl OverlayManager {
         focused_abs_cg: Option<NSRect>,
         cutout_radius: f64,
     ) {
-        #[cfg(feature = "swift-overlay")]
-        if let Some(f) = self.swift.as_ref().and_then(|s| s.dim_update) {
-            // Swift owns screens, flip math, pool, and mask; Rust passes
-            // raw intent. Single cutout (focused window) or none.
-            let (has_cutout, cx, cy, cw, ch) = focused_abs_cg
-                .map_or((0, 0.0, 0.0, 0.0, 0.0), |r| {
-                    (1, r.origin.x, r.origin.y, r.size.width, r.size.height)
-                });
-            unsafe {
-                f(
-                    dim_opacity,
-                    dim_color.0,
-                    dim_color.1,
-                    dim_color.2,
-                    has_cutout,
-                    cx,
-                    cy,
-                    cw,
-                    ch,
-                    cutout_radius,
-                );
-            }
-            self.hidden = false;
-            return;
-        }
         let screens = NSScreen::screens(self.mtm);
         // Display add/remove rebuilds from scratch below; re-probe the
         // cached height on that tick so a new primary applies at once.
@@ -574,12 +526,6 @@ impl OverlayManager {
     /// borders (used when dimming is configured off but borders are on: no
     /// transparent fullscreen windows linger consuming backing stores).
     pub fn remove_dim_overlays(&mut self) {
-        #[cfg(feature = "swift-overlay")]
-        if let Some(f) = self.swift.as_ref().and_then(|s| s.dim_remove) {
-            unsafe { f() };
-            self.overlays.clear();
-            return;
-        }
         for (window, ..) in self.overlays.drain(..) {
             window.orderOut(None::<&AnyObject>);
         }
@@ -589,17 +535,8 @@ impl OverlayManager {
         if self.hidden {
             return;
         }
-        // Swift-owned dim surfaces hide across; Rust-owned fall through.
-        // `hide_borders` below dispatches the same way per slice.
-        #[cfg(feature = "swift-overlay")]
-        let mut rust_dims = true;
-        #[cfg(feature = "swift-overlay")]
-        if let Some(f) = self.swift.as_ref().and_then(|s| s.dim_hide) {
-            unsafe { f() };
-            self.overlays.clear();
-            rust_dims = false;
-        }
-        #[cfg(not(feature = "swift-overlay"))]
+        // Rust-owned dim surfaces hide here; `hide_borders` below hides
+        // the border pool the same way.
         let rust_dims = true;
         if rust_dims {
             for (window, ..) in &self.overlays {
@@ -615,12 +552,6 @@ impl OverlayManager {
     /// hide for the gesture while dim and the drop ghost keep painting.
     pub(crate) fn hide_borders(&mut self) {
         if self.borders_hidden {
-            return;
-        }
-        #[cfg(feature = "swift-overlay")]
-        if let Some(f) = self.swift.as_ref().and_then(|s| s.borders_hide) {
-            unsafe { f() };
-            self.borders_hidden = true;
             return;
         }
         for border in self.borders.values() {
@@ -645,32 +576,6 @@ impl OverlayManager {
         // with inactive borders on both sides grow with the window count.
         wanted.clear();
         wanted.extend(desired.iter().map(|(id, _, _)| *id));
-        #[cfg(feature = "swift-overlay")]
-        if let Some(f) = self.swift.as_ref().and_then(|s| s.borders_sync) {
-            // Swift owns presentation; `wanted` is still filled for the
-            // caller's radii prune. Items encode into the reused scratch
-            // buffer — no per-tick allocation on either side of the call.
-            use crate::overlay_bridge::SwiftBorderItem;
-            self.swift_items.clear();
-            self.swift_items
-                .extend(desired.iter().map(|(id, rect, params)| SwiftBorderItem {
-                    id: *id,
-                    _pad: 0,
-                    x: rect.origin.x,
-                    y: rect.origin.y,
-                    w: rect.size.width,
-                    h: rect.size.height,
-                    r: params.color.0,
-                    g: params.color.1,
-                    b: params.color.2,
-                    opacity: params.opacity,
-                    width: params.width,
-                    radius: params.radius,
-                }));
-            unsafe { f(self.swift_items.as_ptr(), self.swift_items.len()) };
-            self.borders_hidden = false;
-            return;
-        }
         self.borders.retain(|id, border| {
             let keep = wanted.contains(id);
             if !keep {
@@ -725,24 +630,6 @@ impl OverlayManager {
     /// rebuild views; only genuine rect/param changes rewrite layer
     /// properties. Reuses its window across ticks.
     pub fn show_drop_preview(&mut self, abs_cg: NSRect, border: &BorderParams) {
-        #[cfg(feature = "swift-overlay")]
-        if let Some(f) = self.swift.as_ref().and_then(|s| s.drop_show) {
-            unsafe {
-                f(
-                    abs_cg.origin.x,
-                    abs_cg.origin.y,
-                    abs_cg.size.width,
-                    abs_cg.size.height,
-                    border.color.0,
-                    border.color.1,
-                    border.color.2,
-                    border.opacity,
-                    border.width,
-                    border.radius,
-                );
-            }
-            return;
-        }
         let cocoa = cg_abs_to_cocoa(abs_cg, self.screen_height(false));
         if let Some((window, rect, params)) = &mut self.drop_preview {
             if nsrect_eq(*rect, cocoa) && *params == *border {
@@ -765,12 +652,6 @@ impl OverlayManager {
 
     /// Remove the drop-preview ghost, if shown.
     pub fn hide_drop_preview(&mut self) {
-        #[cfg(feature = "swift-overlay")]
-        if let Some(f) = self.swift.as_ref().and_then(|s| s.drop_hide) {
-            unsafe { f() };
-            self.drop_preview = None;
-            return;
-        }
         if let Some((window, _, _)) = self.drop_preview.take() {
             window.orderOut(None::<&AnyObject>);
         }
@@ -949,8 +830,6 @@ pub struct FlashMessageManager {
     /// per-tick fade (~60fps) rebuilds the view ~6 times instead of every
     /// tick. Same message + bucket + frame = no work beyond `orderFront`.
     shown: Option<(String, u8, NSRect)>,
-    #[cfg(feature = "swift-overlay")]
-    swift: Option<crate::overlay_bridge::SwiftOverlay>,
 }
 
 impl FlashMessageManager {
@@ -960,30 +839,11 @@ impl FlashMessageManager {
             window: None,
             screen_h: None,
             shown: None,
-            #[cfg(feature = "swift-overlay")]
-            swift: crate::overlay_bridge::SwiftOverlay::try_load()
-                .filter(crate::overlay_bridge::SwiftOverlay::usable),
         }
     }
 
     #[allow(clippy::cast_precision_loss)]
     pub fn show(&mut self, message: &str, opacity: f32, top_right_abs_cg: NSPoint) {
-        #[cfg(feature = "swift-overlay")]
-        if let Some(f) = self.swift.as_ref().and_then(|s| s.flash_show) {
-            // Swift owns sizing, window, fade dedup, and ordering; Rust
-            // passes raw intent (message bytes + anchor).
-            let bytes = message.as_bytes();
-            unsafe {
-                f(
-                    bytes.as_ptr().cast::<std::ffi::c_char>(),
-                    bytes.len(),
-                    opacity,
-                    top_right_abs_cg.x,
-                    top_right_abs_cg.y,
-                );
-            }
-            return;
-        }
         let is_badge = message.chars().count() <= 2;
         if self
             .screen_h
@@ -1064,10 +924,6 @@ impl FlashMessageManager {
     }
 
     pub fn remove(&mut self) {
-        #[cfg(feature = "swift-overlay")]
-        if let Some(f) = self.swift.as_ref().and_then(|s| s.flash_remove) {
-            unsafe { f() };
-        }
         if let Some(window) = self.window.take() {
             window.orderOut(None::<&AnyObject>);
         }

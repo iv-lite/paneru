@@ -218,6 +218,11 @@ let package = Package(
             path: "Tests/ScriptHostChecks"
         ),
         .executableTarget(
+            name: "PresenterChecks",
+            dependencies: ["Presenter", "Presentation", "Geometry"],
+            path: "Tests/PresenterChecks"
+        ),
+        .executableTarget(
             name: "ScriptingChecks",
             dependencies: ["Scripting"],
             path: "Tests/ScriptingChecks"
@@ -368,6 +373,13 @@ let package = Package(
                 "Commands", "ScriptEvents", "Scripting", "StateQuery", "WindowSet",
             ],
             path: "Sources/ScriptHost"
+        ),
+        // AppKit presenter absorbed from overlay-swift/ (borders, dim,
+        // flash, drop preview): direct calls replace the C ABI boundary.
+        .target(
+            name: "Presenter",
+            dependencies: ["Geometry", "Presentation"],
+            path: "Sources/Presenter"
         ),
     ]
 )

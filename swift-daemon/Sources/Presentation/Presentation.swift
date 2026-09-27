@@ -110,6 +110,18 @@ public struct BorderSyncPlan: Equatable, Sendable {
     /// Windows whose style changed (reskin only, no move).
     public var reskinned: [(WindowID, BorderStyle)]
 
+    public init(
+        removed: [WindowID] = [],
+        added: [(WindowID, CGRect, BorderStyle)] = [],
+        moved: [(WindowID, CGRect)] = [],
+        reskinned: [(WindowID, BorderStyle)] = []
+    ) {
+        self.removed = removed
+        self.added = added
+        self.moved = moved
+        self.reskinned = reskinned
+    }
+
     /// Whether anything needs doing at all.
     public var isEmpty: Bool {
         removed.isEmpty && added.isEmpty && moved.isEmpty && reskinned.isEmpty
