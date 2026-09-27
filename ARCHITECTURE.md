@@ -212,8 +212,9 @@ until cutover:
   propagation — shaped for the snapshot architecture (verified by
   `Tests/LuaBridgeChecks`, which execute real scripts).
 - **`Daemon`** (done): serial assembly wiring every module through the
-  pass list — ingest, layout, hand-owned commit, homing, border paint —
-  against injected frame providers (verified by `Tests/DaemonChecks`
+  pass list — virtual rows, command ingestion (focus/stack/virtual/switch,
+  swipe offsets), hand-owned commit, homing, border paint — against
+  injected frame providers (verified by `Tests/DaemonChecks`
   end-to-end frames).
 - **`Commands`** (done): full command vocabulary + argv encoding with
   round-trip checks (`Tests/CommandsChecks`).

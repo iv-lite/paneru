@@ -1,3 +1,4 @@
+import Commands
 import Foundation
 import Daemon
 import Geometry
@@ -41,7 +42,7 @@ do {
         frames: frames(slots: [0: IntPoint(0, 0), 1: IntPoint(0, 0), 2: IntPoint(0, 0)]),
         viewport: viewport, focusedStyle: style
     )
-    checkEqual(daemon.strips[1]?.allWindows, [0, 1, 2], "spawned windows strip left to right")
+    checkEqual(daemon.strips[1]?[0]?.allWindows, [0, 1, 2], "spawned windows strip left to right")
     checkEqual(r1.axJobs.map { $0.winID }.sorted(), [1, 2], "displaced windows get intents")
     check(!r1.quiescent, "first tick does work")
     check(r1.borderPlan.isEmpty, "nothing focused, no borders")
@@ -118,7 +119,7 @@ do {
         frames: frames(slots: [0: IntPoint(0, 0)]),
         viewport: viewport, focusedStyle: style
     )
-    checkEqual(daemon.strips[1]?.allWindows, [0], "disappeared window leaves the strip")
+    checkEqual(daemon.strips[1]?[0]?.allWindows, [0], "disappeared window leaves the strip")
     checkEqual(daemon.positions[1], nil, "disappeared window loses its slot")
     checkEqual(gone.focus, nil, "focus clears with its window")
     checkEqual(gone.borderPlan.removed, [1], "border orders out")
@@ -139,6 +140,62 @@ do {
     check(daemon.isUnacked(6), "issued truth is in flight")
     daemon.acknowledge(winID: 6, seq: job.seq, epoch: job.epoch)
     check(!daemon.isUnacked(6), "ack converges")
+}
+
+// Commands drive focus, stacking, virtual rows, and offsets.
+do {
+    var daemon = DaemonCore()
+    _ = daemon.tick(
+        events: [.appeared(id: 0, workspace: 1), .appeared(id: 1, workspace: 1), .appeared(id: 2, workspace: 1)],
+        frames: frames(slots: [0: IntPoint(0, 0), 1: IntPoint(0, 0), 2: IntPoint(0, 0)]),
+        viewport: viewport, focusedStyle: style
+    )
+    // Focus east from an anchor steps right (anchorless presses no-op).
+    let f1 = daemon.tick(
+        events: [.focus(id: 0), .command(.window(.focus(.east)))],
+        frames: frames(slots: [0: IntPoint(0, 0), 1: IntPoint(400, 0), 2: IntPoint(800, 0)]),
+        viewport: viewport, focusedStyle: style
+    )
+    checkEqual(f1.focus, 1, "focus east steps right from the anchor")
+    // East steps right again.
+    let f2 = daemon.tick(
+        events: [.command(.window(.focus(.east)))],
+        frames: frames(slots: [0: IntPoint(0, 0), 1: IntPoint(400, 0), 2: IntPoint(800, 0)]),
+        viewport: viewport, focusedStyle: style
+    )
+    checkEqual(f2.focus, 2, "focus east steps right")
+    // Stack onto the left; siblings share a column.
+    _ = daemon.tick(
+        events: [.command(.window(.stack(true)))],
+        frames: frames(slots: [0: IntPoint(0, 0), 1: IntPoint(400, 0), 2: IntPoint(800, 0)]),
+        viewport: viewport, focusedStyle: style
+    )
+    checkEqual(daemon.strips[1]?[0]?.allWindows, [0, 1, 2], "stack fuses the column")
+    // Move the focused column to row 1 (created on demand).
+    _ = daemon.tick(
+        events: [.command(.window(.virtualMoveNumber(1, .follow)))],
+        frames: frames(slots: [0: IntPoint(0, 0), 1: IntPoint(400, 0), 2: IntPoint(800, 0)]),
+        viewport: viewport, focusedStyle: style
+    )
+    checkEqual(daemon.strips[1]?[1]?.allWindows, [1, 2], "moved stack lands on row 1")
+    checkEqual(daemon.strips[1]?[0]?.allWindows, [0], "row 0 keeps the rest")
+    checkEqual(daemon.activeVirtual[1], 1, "move follows to the new row")
+    // VirtualAdd creates and selects row 2.
+    _ = daemon.tick(
+        events: [.command(.window(.virtualAdd))],
+        frames: frames(slots: [0: IntPoint(0, 0), 1: IntPoint(400, 0), 2: IntPoint(800, 0)]),
+        viewport: viewport, focusedStyle: style
+    )
+    checkEqual(daemon.activeVirtual[1], 2, "virtualadd selects the new row")
+    checkEqual(daemon.strips[1]?[2]?.allWindows, [], "new row starts empty")
+    // Swipe scrolls the active strip; a quiet tick rests after.
+    let swiped = daemon.tick(
+        events: [.swipe(delta: 0.5, fingers: 3)],
+        frames: frames(slots: [0: IntPoint(0, 0), 1: IntPoint(400, 0), 2: IntPoint(800, 0)]),
+        viewport: viewport, focusedStyle: style
+    )
+    checkEqual(daemon.offsets[1], -512, "swipe pans the offset")
+    check(!swiped.quiescent, "swipe tick works")
 }
 
 if failures == 0 {

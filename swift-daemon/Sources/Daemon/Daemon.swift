@@ -1,10 +1,13 @@
 import AXClient
+import Commands
 import CoreGraphics
 import EventCore
+import Focus
 import Geometry
 import Layout
 import Presentation
 import Scripting
+import Workspace
 
 // Serial daemon core: the modules wired into the ingest → layout → commit →
 // paint pass list, with no threads, no AppKit, and no AX. Live OS access
@@ -15,13 +18,20 @@ import Scripting
 // the presenter interpolates. Release homing therefore restores the slot
 // immediately (the animated glide lives in the presentation pass, which
 // reads the same `BorderSyncPlan`).
+//
+// Ingestion covers pointer/drag/focus lifecycle plus commands: focus,
+// stack/unstack, virtual switch/add/move, and swipe/scroll offsets.
+// Layout surgery ops (swap/center/resize/balance/…), floating tiers, mouse
+// moves, and quit/restart stay with the integrator — they either need live
+// sizes or are process control, not layout truth.
 
 // MARK: - Events
 
-/// One ingested input: pointer motion, focus changes, and window
-/// lifecycle. The tap ring and Mach queue both normalize into these.
+/// One ingested input: pointer motion, focus changes, window lifecycle,
+/// commands, and gestures. The tap ring, Mach queue, and replay files all
+/// normalize into these.
 public enum DaemonEvent: Equatable, Sendable {
-    /// A window appeared on a workspace.
+    /// A window appeared on a workspace (active virtual row).
     case appeared(id: WindowID, workspace: WorkspaceID)
     /// A window went away.
     case disappeared(id: WindowID)
@@ -31,6 +41,12 @@ public enum DaemonEvent: Equatable, Sendable {
     case dragMoved(id: WindowID, dx: Int32)
     /// Button released: held columns glide home.
     case released
+    /// A parsed command (hotkey, socket, script, replay).
+    case command(PaneruCommand)
+    /// Trackpad swipe: fractional viewport widths, signed by finger travel.
+    case swipe(delta: Double, fingers: Int)
+    /// Scroll-wheel tick in the same units.
+    case scroll(delta: Double)
 }
 
 // MARK: - Frame result
@@ -52,9 +68,11 @@ public struct FrameResult: Sendable {
 /// Serial owner of daemon state. All methods are synchronous and
 /// single-threaded by contract; the runtime calls `tick` once per frame.
 public struct DaemonCore: Sendable {
-    /// Strips by workspace.
-    public private(set) var strips: [WorkspaceID: LayoutStrip] = [:]
-    /// Scroll offsets by workspace.
+    /// Strips by workspace, then virtual row.
+    public private(set) var strips: [WorkspaceID: [UInt32: LayoutStrip]] = [:]
+    /// Active virtual row per workspace.
+    public private(set) var activeVirtual: [WorkspaceID: UInt32] = [:]
+    /// Scroll offsets by workspace (active row).
     public private(set) var offsets: [WorkspaceID: Int32] = [:]
     /// Slot truth: window origins. Sizes come from the frame provider.
     public private(set) var positions: [WindowID: IntPoint] = [:]
@@ -75,6 +93,22 @@ public struct DaemonCore: Sendable {
 
     public init() {}
 
+    /// The active strip, creating row 0 on demand.
+    public mutating func activeStrip() -> LayoutStrip {
+        let row = activeVirtual[activeWorkspace] ?? 0
+        if strips[activeWorkspace]?[row] == nil {
+            strips[activeWorkspace, default: [:]][row] = LayoutStrip(
+                id: activeWorkspace, virtualIndex: row
+            )
+        }
+        return strips[activeWorkspace]![row]!
+    }
+
+    private mutating func setActiveStrip(_ strip: LayoutStrip) {
+        let row = activeVirtual[activeWorkspace] ?? 0
+        strips[activeWorkspace, default: [:]][row] = strip
+    }
+
     /// Run one frame: ingest, layout, commit, paint. `frames` supplies live
     /// window rects (sizes); `viewport` bounds the paint pass.
     public mutating func tick(
@@ -83,7 +117,7 @@ public struct DaemonCore: Sendable {
         viewport: IntRect,
         focusedStyle: BorderStyle
     ) -> FrameResult {
-        ingest(events)
+        ingest(events, viewport: viewport)
         layoutPass()
         let jobs = commitPass(frames: frames)
         let plan = paintPass(frames: frames, viewport: viewport, focusedStyle: focusedStyle)
@@ -94,18 +128,21 @@ public struct DaemonCore: Sendable {
 
     // MARK: Passes
 
-    private mutating func ingest(_ events: [DaemonEvent]) {
+    private mutating func ingest(_ events: [DaemonEvent], viewport: IntRect) {
         for event in events {
             switch event {
             case .appeared(let id, let workspace):
-                var strip = strips[workspace] ?? LayoutStrip(id: workspace, virtualIndex: 0)
+                var strip = strips[workspace]?[activeVirtual[workspace] ?? 0]
+                    ?? LayoutStrip(id: workspace, virtualIndex: activeVirtual[workspace] ?? 0)
                 strip.append(id)
-                strips[workspace] = strip
+                strips[workspace, default: [:]][strip.virtualIndex] = strip
                 positions[id] = positions[id] ?? IntPoint(0, 0)
                 dirty.formUnion([.layout, .paint])
             case .disappeared(let id):
-                for ws in strips.keys {
-                    strips[ws]?.remove(id)
+                for ws in Array(strips.keys) {
+                    for row in Array((strips[ws] ?? [:]).keys) {
+                        strips[ws]?[row]?.remove(id)
+                    }
                 }
                 positions.removeValue(forKey: id)
                 if focus == id { focus = nil }
@@ -128,21 +165,157 @@ public struct DaemonCore: Sendable {
                 }
                 glideHome()
                 dirty.insert(.layout)
+            case .command(let command):
+                ingestCommand(command)
+            case .swipe(let delta, _), .scroll(let delta):
+                // Fractional viewport widths, natural direction (finger-left
+                // moves the strip left). Integer truncation matches the
+                // pixel-quantized model elsewhere.
+                let width = Double(max(viewport.width, 1))
+                let step = Int32((delta * width * -1.0).rounded())
+                let ws = activeWorkspace
+                offsets[ws, default: 0] += step
+                dirty.formUnion([.layout, .motion])
             }
         }
     }
 
+    /// Fold one parsed command into state. Focus, stack, and virtual ops
+    /// only; layout surgery, floating tiers, mouse, and process control
+    /// stay with the integrator (documented above).
+    private mutating func ingestCommand(_ command: PaneruCommand) {
+        switch command {
+        case .window(let op):
+            ingestWindowOperation(op)
+        case .mouse, .quit, .restart, .printState, .lua:
+            break
+        }
+    }
+
+    private mutating func ingestWindowOperation(_ op: WindowOperation) {
+        // NOTE: no shared writeback here on purpose. The stack branch mutates
+        // the entry row in place; the virtual branches switch rows and manage
+        // their own strips (a shared writeback would resurrect moved columns
+        // or clobber the new active row with a stale copy).
+        var strip = activeStrip()
+        switch op {
+        case .focus(let direction):
+            // No anchor, no step (mirrors the Rust caller, which skips
+            // anchorless presses; entry from the side below still applies
+            // when focus sits off the active strip).
+            guard let anchor = focus else { return }
+            switch sameStripStep(
+                direction: direction, focused: anchor,
+                activeStrip: strip, siblingStrips: []
+            ) {
+            case .focus(let target):
+                focus = target
+                dirty.formUnion([.focus, .paint])
+            case .fallThrough:
+                break
+            }
+        case .stack(let on):
+            guard let id = focus else { return }
+            if on {
+                _ = strip.stack(id)
+            } else {
+                _ = strip.unstack(id)
+            }
+            setActiveStrip(strip)
+            dirty.formUnion([.layout, .paint])
+        case .virtualWorkspace, .virtualNumber, .virtualAdd,
+             .focusOrVirtual:
+            ingestVirtualOperation(op)
+        case .virtualMove, .virtualMoveNumber:
+            ingestVirtualMove(op)
+        default:
+            break
+        }
+    }
+
+    /// Resolve a virtual-switch command against this workspace's rows.
+    private mutating func ingestVirtualOperation(_ op: WindowOperation) {
+        let ws = activeWorkspace
+        let rows = (strips[ws] ?? [:]).keys.sorted()
+        let currentRow = activeVirtual[ws] ?? 0
+        let currentPosition = rows.firstIndex(of: currentRow) ?? 0
+        // FocusOrVirtual needs the stack sibling first, like the Rust bind.
+        var neighbor: WindowID?
+        if case .focusOrVirtual(let direction) = op,
+           direction == .north || direction == .south,
+           let id = focus
+        {
+            neighbor = windowInDirection(direction, from: id, strip: activeStrip())
+        }
+        let outcome = resolveVirtualSwitch(
+            operation: op,
+            rowVirtualIndices: rows,
+            currentPosition: currentPosition,
+            activeStripEmpty: activeStrip().len == 0,
+            createAutomatically: false,
+            focusedNeighbor: neighbor
+        )
+        switch outcome {
+        case .stay:
+            break
+        case .select(let position):
+            if position < rows.count {
+                activeVirtual[ws] = rows[position]
+                dirty.formUnion([.layout, .paint])
+            }
+        case .create(let index):
+            strips[ws, default: [:]][index] = LayoutStrip(id: ws, virtualIndex: index)
+            activeVirtual[ws] = index
+            dirty.formUnion([.layout, .paint])
+        case .focusNeighbor(let id):
+            focus = id
+            dirty.formUnion([.focus, .paint])
+        }
+    }
+
+    /// Move the focused window's whole column to another virtual row,
+    /// creating the row when missing.
+    private mutating func ingestVirtualMove(_ op: WindowOperation) {
+        guard let id = focus else { return }
+        let ws = activeWorkspace
+        let currentRow = activeVirtual[ws] ?? 0
+        let targetRow: UInt32
+        switch op {
+        case .virtualMove(let direction, _):
+            let step: Int64 = (direction == .south || direction == .east) ? 1 : -1
+            let signed = Int64(currentRow) + step
+            guard signed >= 0 && signed <= Int64(UInt32.max) else { return }
+            targetRow = UInt32(signed)
+        case .virtualMoveNumber(let index, _):
+            targetRow = index
+        default:
+            return
+        }
+        var source = activeStrip()
+        guard let index = source.index(of: id),
+              let column = source.removeColumn(at: index)
+        else { return }
+        setActiveStrip(source)
+        var target = strips[ws]?[targetRow] ?? LayoutStrip(id: ws, virtualIndex: targetRow)
+        target.insertColumn(at: Int.max, column)
+        strips[ws, default: [:]][targetRow] = target
+        activeVirtual[ws] = targetRow
+        dirty.formUnion([.layout, .paint])
+    }
+
     /// Drives a held window's whole column by `dx` (stacked mates follow).
     private mutating func driveColumn(of id: WindowID, dx: Int32) {
-        for (ws, strip) in strips {
-            guard let index = strip.index(of: id) else { continue }
-            guard let column = strip.get(index) else { continue }
-            for member in column.windows {
-                if let pos = positions[member] {
-                    positions[member] = IntPoint(pos.x + dx, pos.y)
+        for ws in Array(strips.keys) {
+            for row in Array((strips[ws] ?? [:]).keys) {
+                guard let index = strips[ws]?[row]?.index(of: id),
+                      let column = strips[ws]?[row]?.get(index)
+                else { continue }
+                for member in column.windows {
+                    if let pos = positions[member] {
+                        positions[member] = IntPoint(pos.x + dx, pos.y)
+                    }
                 }
             }
-            _ = ws
         }
     }
 
@@ -159,11 +332,24 @@ public struct DaemonCore: Sendable {
 
     private mutating func layoutPass() {
         // Slot assignment lives in commit (it needs live widths); layout
-        // owns grouping integrity: drop empty trailing state, nothing more.
+        // owns grouping integrity: drop empty non-active rows (a fresh
+        // selection must survive the tick that created it).
         if dirty.contains(.layout) {
-            for ws in strips.keys where strips[ws]?.allWindows.isEmpty == true {
-                strips.removeValue(forKey: ws)
-                offsets.removeValue(forKey: ws)
+            let ws = activeWorkspace
+            let spare: UInt32? = activeVirtual[ws]
+            for workspace in Array(strips.keys) {
+                let keep: UInt32? = (workspace == ws) ? spare : nil
+                for row in Array((strips[workspace] ?? [:]).keys) {
+                    if Optional(row) != keep
+                        && strips[workspace]?[row]?.allWindows.isEmpty == true
+                    {
+                        strips[workspace]?.removeValue(forKey: row)
+                    }
+                }
+                if strips[workspace]?.isEmpty == true {
+                    strips.removeValue(forKey: workspace)
+                    offsets.removeValue(forKey: workspace)
+                }
             }
         }
     }
@@ -174,38 +360,40 @@ public struct DaemonCore: Sendable {
         // until release; everything else snaps to its slot.
         var heldMembers = Set<WindowID>()
         if let held {
-            for strip in strips.values {
+            for strip in strips.values.flatMap({ $0.values }) {
                 if let index = strip.index(of: held), let column = strip.get(index) {
                     heldMembers.formUnion(column.windows)
                 }
             }
         }
         // Recompute slot origins left to right per strip at its offset.
-        for (ws, strip) in strips {
+        for (ws, rows) in strips {
             let offset = offsets[ws] ?? 0
-            var x = offset
-            for column in strip.columns {
-                let width: Int32 = column.windows.compactMap { frames($0)?.width }.max() ?? 0
-                for member in column.windows {
-                    let slot = IntPoint(x, positions[member]?.y ?? 0)
-                    committedSlots[member] = slot
-                    if homing.contains(member) {
-                        enqueueMove(member, to: slot, epoch: epoch)
-                        homing.remove(member)
-                    } else if heldMembers.contains(member) {
-                        // Hand truth flows to the OS so mates follow; the
-                        // slot waits for release.
-                        if let hand = positions[member] {
-                            enqueueMove(member, to: hand, epoch: epoch)
-                        }
-                    } else {
-                        if positions[member] != slot {
+            for strip in rows.values {
+                var x = offset
+                for column in strip.columns {
+                    let width: Int32 = column.windows.compactMap { frames($0)?.width }.max() ?? 0
+                    for member in column.windows {
+                        let slot = IntPoint(x, positions[member]?.y ?? 0)
+                        committedSlots[member] = slot
+                        if homing.contains(member) {
                             enqueueMove(member, to: slot, epoch: epoch)
+                            homing.remove(member)
+                        } else if heldMembers.contains(member) {
+                            // Hand truth flows to the OS so mates follow; the
+                            // slot waits for release.
+                            if let hand = positions[member] {
+                                enqueueMove(member, to: hand, epoch: epoch)
+                            }
+                        } else {
+                            if positions[member] != slot {
+                                enqueueMove(member, to: slot, epoch: epoch)
+                            }
+                            positions[member] = slot
                         }
-                        positions[member] = slot
                     }
+                    x += width
                 }
-                x += width
             }
         }
         // Drain latest-per-window in stable order, stamping sequences.

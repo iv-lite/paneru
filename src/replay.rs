@@ -1,10 +1,10 @@
 //! Phase 0 replay harness: deterministic session capture for the Swift port.
 //!
 //! When `PANERU_REPLAY_RECORD` points at a file, [`ReplayPlugin`] appends one
-//! JSON record per input event (`t_ms` since Bevy epoch + stable payload).
-//! A future replayer feeds these files back into the daemon (or the Swift
-//! core) and diffs end window states — see the full plan in `ARCHITECTURE.md`
-//! (ported subsystems must hold the corpus green before the old code goes).
+//! JSON record per event (`frame` sequence + stable payload). The replayer
+//! feeds these files back into either core in file order and diffs window
+//! states — see `ARCHITECTURE.md` (ported subsystems must hold the corpus
+//! green before the old code goes).
 //!
 //! Format is versioned (`REPLAY_FORMAT_VERSION`); readers reject mismatches
 //! loudly instead of mis-replaying.
@@ -23,45 +23,58 @@ use bevy::time::Time;
 use serde::{Deserialize, Serialize};
 use tracing::{info, warn};
 
+use crate::commands::Command;
 use crate::errors::{Error, Result};
 use crate::events::{Event, InputEvent};
 
 /// Replay file format version. Bump on any record shape change.
-pub const REPLAY_FORMAT_VERSION: u32 = 1;
+///
+/// v2 widens v1 (input-only) with a frame sequence plus command and
+/// lifecycle coverage; v1 files are rejected, not silently reordered.
+pub const REPLAY_FORMAT_VERSION: u32 = 2;
 
 /// Env var selecting the record file. Unset (or empty) disables recording.
 pub const REPLAY_RECORD_ENV: &str = "PANERU_REPLAY_RECORD";
 
-/// One captured input event. Stable across runs: integer micros, `f64`
-/// payloads verbatim, modifiers as raw bits.
+/// One captured event. Stable across runs: integer frame sequence,
+/// `f64` payloads verbatim, modifiers as raw bits, commands nested.
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 pub struct ReplayRecord {
     /// Format version (always [`REPLAY_FORMAT_VERSION`] on write).
     pub v: u32,
+    /// Monotonic sequence assigned at record time. Replay consumes in file
+    /// order; the frame is the ordering key, `t_ms` stays metadata.
+    pub frame: u64,
     /// Bevy-epoch milliseconds when the event was observed.
     pub t_ms: u64,
-    /// Event kind (`mousedown`, `mouseup`, `mousedragged`, `mousemove`,
-    /// `swipe`, `verticalswipe`, `scroll`, `verticalscrolltick`,
-    /// `touchpaddown`, `touchpadup`).
+    /// Event kind (`mousedown`, …, `command`, `space_changed`,
+    /// `display_added`, `menu_opened`, `mission_control_exit`, …).
     pub kind: String,
     /// Primary payload: `[x, y, modifier_bits]` for pointer events,
-    /// `[delta, fingers]` for gestures, `[]` for bare markers.
+    /// `[delta, fingers]` for gestures, `[id]` for lifecycle events,
+    /// `[]` for bare markers.
     pub payload: Vec<f64>,
+    /// The issued command, for `Event::Command` records only.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub command: Option<Command>,
 }
 
 impl ReplayRecord {
     fn pointer(kind: &str, t_ms: u64, x: f64, y: f64, modifiers: u16) -> Self {
         Self {
             v: REPLAY_FORMAT_VERSION,
+            frame: 0,
             t_ms,
             kind: kind.to_string(),
             payload: vec![x, y, f64::from(modifiers)],
+            command: None,
         }
     }
 
     fn gesture(kind: &str, t_ms: u64, delta: f64, fingers: usize) -> Self {
         Self {
             v: REPLAY_FORMAT_VERSION,
+            frame: 0,
             t_ms,
             kind: kind.to_string(),
             #[allow(
@@ -69,22 +82,46 @@ impl ReplayRecord {
                 reason = "fingers < 10; f64 exact, replay compares verbatim"
             )]
             payload: vec![delta, fingers as f64],
+            command: None,
         }
     }
 
     fn marker(kind: &str, t_ms: u64) -> Self {
         Self {
             v: REPLAY_FORMAT_VERSION,
+            frame: 0,
             t_ms,
             kind: kind.to_string(),
             payload: Vec::new(),
+            command: None,
         }
     }
 
-    /// Build a record from an [`Event`]; `None` for non-input events (window
-    /// lifecycle, spaces, commands) which the replayer regenerates from the
-    /// harness instead of the log.
+    #[allow(
+        clippy::cast_precision_loss,
+        clippy::cast_possible_wrap,
+        reason = "ids are small non-negative AX/display/space ids"
+    )]
+    fn id(kind: &str, t_ms: u64, id: i64) -> Self {
+        Self {
+            v: REPLAY_FORMAT_VERSION,
+            frame: 0,
+            t_ms,
+            kind: kind.to_string(),
+            #[allow(
+                clippy::cast_precision_loss,
+                reason = "ids < 2^53; f64 exact, replay compares verbatim"
+            )]
+            payload: vec![id as f64],
+            command: None,
+        }
+    }
+
+    /// Build a record from an [`Event`]; `None` for events the replayer
+    /// regenerates from the harness instead of the log (window lifecycle
+    /// echoes, socket queries, process rosters).
     #[must_use]
+    #[allow(clippy::too_many_lines)]
     pub fn from_event(event: &Event, t_ms: u64) -> Option<Self> {
         match event {
             Event::MouseDown { point, modifiers } => Some(Self::pointer(
@@ -125,6 +162,57 @@ impl ReplayRecord {
             }
             Event::TouchpadDown => Some(Self::marker("touchpaddown", t_ms)),
             Event::TouchpadUp => Some(Self::marker("touchpadup", t_ms)),
+            Event::Command { command } => Some(Self {
+                v: REPLAY_FORMAT_VERSION,
+                frame: 0,
+                t_ms,
+                kind: "command".to_string(),
+                payload: Vec::new(),
+                command: Some(command.clone()),
+            }),
+            Event::SpaceCreated { space_id } => Some(Self::id(
+                "space_created",
+                t_ms,
+                i64::try_from(*space_id).unwrap_or(i64::MAX),
+            )),
+            Event::SpaceDestroyed { space_id } => Some(Self::id(
+                "space_destroyed",
+                t_ms,
+                i64::try_from(*space_id).unwrap_or(i64::MAX),
+            )),
+            Event::SpaceChanged => Some(Self::marker("space_changed", t_ms)),
+            Event::DisplayAdded { display_id } => {
+                Some(Self::id("display_added", t_ms, i64::from(*display_id)))
+            }
+            Event::DisplayRemoved { display_id } => {
+                Some(Self::id("display_removed", t_ms, i64::from(*display_id)))
+            }
+            Event::DisplayMoved { display_id } => {
+                Some(Self::id("display_moved", t_ms, i64::from(*display_id)))
+            }
+            Event::DisplayResized { display_id } => {
+                Some(Self::id("display_resized", t_ms, i64::from(*display_id)))
+            }
+            Event::DisplayConfigured { display_id } => {
+                Some(Self::id("display_configured", t_ms, i64::from(*display_id)))
+            }
+            Event::DisplayChanged => Some(Self::marker("display_changed", t_ms)),
+            Event::MissionControlShowAllWindows => {
+                Some(Self::marker("mission_control_show_all_windows", t_ms))
+            }
+            Event::MissionControlShowFrontWindows => {
+                Some(Self::marker("mission_control_show_front_windows", t_ms))
+            }
+            Event::MissionControlShowDesktop => {
+                Some(Self::marker("mission_control_show_desktop", t_ms))
+            }
+            Event::MissionControlExit => Some(Self::marker("mission_control_exit", t_ms)),
+            Event::MenuOpened { window_id } => {
+                Some(Self::id("menu_opened", t_ms, i64::from(*window_id)))
+            }
+            Event::MenuClosed { window_id } => {
+                Some(Self::id("menu_closed", t_ms, i64::from(*window_id)))
+            }
             _ => None,
         }
     }
@@ -136,6 +224,9 @@ impl ReplayRecord {
 pub struct ReplayRecorder {
     writer: Option<BufWriter<File>>,
     buffered: usize,
+    /// Monotonic sequence assigned per record; replay consumes in file
+    /// order with this as the ordering key.
+    next_frame: u64,
 }
 
 impl ReplayRecorder {
@@ -163,10 +254,11 @@ impl ReplayRecorder {
         }
         match File::create(&path) {
             Ok(file) => {
-                info!("replay: recording input events to {}", path.display());
+                info!("replay: recording session events to {}", path.display());
                 Self {
                     writer: Some(BufWriter::new(file)),
                     buffered: 0,
+                    next_frame: 0,
                 }
             }
             Err(err) => {
@@ -176,11 +268,14 @@ impl ReplayRecorder {
         }
     }
 
-    /// Serialize one record as a JSON line. Flushes every 64 records.
-    pub fn record(&mut self, record: &ReplayRecord) {
+    /// Serialize one record as a JSON line, stamping the next frame
+    /// sequence. Flushes every 64 records.
+    pub fn record(&mut self, record: &mut ReplayRecord) {
         let Some(writer) = self.writer.as_mut() else {
             return;
         };
+        record.frame = self.next_frame;
+        self.next_frame += 1;
         match serde_json::to_string(record) {
             Ok(line) => {
                 if writeln!(writer, "{line}").is_err() {
@@ -260,17 +355,45 @@ fn record_input_system(
     if !recorder.is_active() {
         return;
     }
-    #[allow(
-        clippy::cast_possible_truncation,
-        clippy::cast_sign_loss,
-        reason = "session clock fits u64 ms for millennia; replay orders verbatim"
-    )]
-    let t_ms = time.elapsed().as_millis() as u64;
+    let t_ms = elapsed_ms(&time);
     for InputEvent(event) in messages.read() {
-        if let Some(record) = ReplayRecord::from_event(event, t_ms) {
-            recorder.record(&record);
+        if let Some(mut record) = ReplayRecord::from_event(event, t_ms) {
+            recorder.record(&mut record);
         }
     }
+}
+
+/// Records commands and lifecycle events, which travel on `Message<Event>`
+/// rather than the input channel. Same envelope and frame sequence as
+/// [`record_input_system`].
+fn record_event_system(
+    mut messages: MessageReader<Event>,
+    time: Res<Time>,
+    mut recorder: ResMut<ReplayRecorder>,
+) {
+    if !recorder.is_active() {
+        return;
+    }
+    let t_ms = elapsed_ms(&time);
+    for event in messages.read() {
+        // Input events are recorded by `record_input_system`; recording them
+        // here too would double every pointer gesture in the corpus.
+        if event.is_input() {
+            continue;
+        }
+        if let Some(mut record) = ReplayRecord::from_event(event, t_ms) {
+            recorder.record(&mut record);
+        }
+    }
+}
+
+#[allow(
+    clippy::cast_possible_truncation,
+    clippy::cast_sign_loss,
+    reason = "session clock fits u64 ms for millennia; replay orders verbatim"
+)]
+fn elapsed_ms(time: &Time) -> u64 {
+    time.elapsed().as_millis() as u64
 }
 
 /// Env-gated recorder: zero overhead beyond one branch when
@@ -282,6 +405,7 @@ impl Plugin for ReplayPlugin {
         // Armed once at startup from `PANERU_REPLAY_RECORD`.
         app.insert_resource(ReplayRecorder::from_env());
         app.add_systems(Update, record_input_system.run_if(on_message::<InputEvent>));
+        app.add_systems(Update, record_event_system.run_if(on_message::<Event>));
     }
 }
 
@@ -324,11 +448,42 @@ mod tests {
     }
 
     #[test]
+    fn command_records_carry_the_command() {
+        use crate::commands::{Command, Direction, Operation};
+
+        let record = ReplayRecord::from_event(
+            &Event::Command {
+                command: Command::Window(Operation::Focus(Direction::East)),
+            },
+            7,
+        )
+        .expect("commands record");
+        assert_eq!(record.kind, "command");
+        assert_eq!(
+            record.command,
+            Some(Command::Window(Operation::Focus(Direction::East)))
+        );
+        let line = serde_json::to_string(&record).expect("json");
+        let back: ReplayRecord = serde_json::from_str(&line).expect("parse");
+        assert_eq!(back, record);
+    }
+
+    #[test]
+    fn recorder_stamps_monotonic_frames() {
+        let mut recorder = ReplayRecorder::default();
+        // Inactive recorder leaves frames alone.
+        let mut record = ReplayRecord::marker("space_changed", 0);
+        recorder.record(&mut record);
+        assert_eq!(record.frame, 0);
+        assert_eq!(recorder.next_frame, 0);
+    }
+
+    #[test]
     fn version_mismatch_is_rejected() {
         let path = scratch_path();
         std::fs::write(
             &path,
-            "{\"v\":999,\"t_ms\":0,\"kind\":\"x\",\"payload\":[]}\n",
+            "{\"v\":999,\"frame\":0,\"t_ms\":0,\"kind\":\"x\",\"payload\":[]}\n",
         )
         .expect("write");
         let err = read_records(&path).expect_err("must reject");
@@ -337,10 +492,32 @@ mod tests {
     }
 
     #[test]
-    fn non_input_events_record_nothing() {
+    fn v1_files_are_rejected() {
+        // v1 (input-only, no frame) must not silently reorder into a v2 corpus.
+        let path = scratch_path();
+        std::fs::write(
+            &path,
+            "{\"v\":1,\"t_ms\":0,\"kind\":\"mousedown\",\"payload\":[1.0,2.0,0.0]}\n",
+        )
+        .expect("write");
+        assert!(read_records(&path).is_err());
+        std::fs::remove_file(&path).expect("cleanup");
+    }
+
+    #[test]
+    fn lifecycle_and_commands_record() {
         assert!(
-            ReplayRecord::from_event(&Event::SpaceChanged, 0).is_none(),
-            "lifecycle events regenerate from the harness"
+            ReplayRecord::from_event(&Event::SpaceChanged, 0).is_some(),
+            "space changes record"
+        );
+        assert!(
+            ReplayRecord::from_event(&Event::MenuOpened { window_id: 3 }, 0)
+                .is_some_and(|record| record.payload == vec![3.0]),
+            "menu opens record the window id"
+        );
+        assert!(
+            ReplayRecord::from_event(&Event::WindowFocused { window_id: 1 }, 0).is_none(),
+            "window echoes regenerate from the harness"
         );
     }
 }

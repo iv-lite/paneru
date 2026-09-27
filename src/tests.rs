@@ -9,6 +9,7 @@ mod sync_invariant;
 mod tabs;
 mod termination;
 mod tiling;
+mod trace;
 
 pub(crate) use harness::*;
 pub(crate) use mocks::*;

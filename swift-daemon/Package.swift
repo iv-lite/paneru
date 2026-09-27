@@ -227,7 +227,8 @@ let package = Package(
             name: "Daemon",
             dependencies: [
                 "Geometry", "Layout", "AXClient", "EventCore",
-                "Presentation", "Scripting",
+                "Presentation", "Scripting", "Commands", "Focus",
+                "Workspace",
             ],
             path: "Sources/Daemon"
         ),

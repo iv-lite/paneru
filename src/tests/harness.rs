@@ -213,7 +213,6 @@ impl TestHarness {
             }
         }
     }
-
     pub(crate) fn run(&mut self, commands: Vec<Event>) {
         let updates_per_command = updates_per_command(self.command_window);
         for (iteration, command) in commands.into_iter().enumerate() {
@@ -232,6 +231,41 @@ impl TestHarness {
                 verifier(self.app.world_mut(), self.mock_state.clone());
             }
         }
+    }
+
+    /// Like [`Self::run`], but captures a [`super::trace::FrameSnapshot`]
+    /// after every command window and returns the trace. The Swift core
+    /// replays the same commands and diffs its own snapshots frame by
+    /// frame — the parity gate for cutover.
+    pub(crate) fn run_with_trace(
+        &mut self,
+        commands: Vec<Event>,
+    ) -> Vec<super::trace::FrameSnapshot> {
+        let updates_per_command = updates_per_command(self.command_window);
+        let mut trace = Vec::with_capacity(commands.len());
+        for (iteration, command) in commands.into_iter().enumerate() {
+            self.app.world_mut().write_message::<Event>(command);
+
+            for _ in 0..updates_per_command {
+                self.app.update();
+
+                for event in self.mock_state.drain_events() {
+                    self.app.world_mut().write_message::<Event>(event);
+                }
+            }
+
+            if let Some(verifier) = self.verifiers.get_mut(&iteration) {
+                verifier(self.app.world_mut(), self.mock_state.clone());
+            }
+
+            let table = super::trace::window_table(self.app.world_mut());
+            trace.push(super::trace::capture_frame(
+                self.app.world_mut(),
+                &table,
+                iteration as u64,
+            ));
+        }
+        trace
     }
 }
 
