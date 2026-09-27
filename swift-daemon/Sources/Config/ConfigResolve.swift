@@ -233,11 +233,6 @@ public func parseMenubarOrientation(_ raw: String?) -> MenuBarOrientation? {
     }
 }
 
-/// Descriptor presentation: symbol, text, both, or hidden.
-public enum DescriptorStyle: String, Equatable, Sendable {
-    case symbol, text, both, hidden
-}
-
 public func parseDescriptorStyle(_ raw: String?) -> DescriptorStyle? {
     raw.flatMap(DescriptorStyle.init(rawValue:))
 }

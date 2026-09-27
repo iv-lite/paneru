@@ -89,6 +89,41 @@ do {
 
 do {
     checkEqual(
+        buildDescriptor(style: nil, text: "VW", symbol: "fish.fill"),
+        [.symbol("fish.fill")], "nil style defaults to symbol"
+    )
+    checkEqual(
+        buildDescriptor(style: .text, text: "VW", symbol: "fish.fill"),
+        [.text("VW")], "text shows the word"
+    )
+    checkEqual(
+        buildDescriptor(style: .both, text: "VW", symbol: "fish.fill"),
+        [.symbol("fish.fill"), .text("VW")], "both pairs symbol then text"
+    )
+    checkEqual(
+        buildDescriptor(style: .hidden, text: "VW", symbol: "fish.fill"),
+        nil, "hidden shows nothing"
+    )
+    checkEqual(
+        orderCells(
+            descriptor: [.text("VW")], indicator: [.text("2")],
+            orientation: .default
+        ), [.text("VW"), .text("2")], "default leads with the descriptor"
+    )
+    checkEqual(
+        orderCells(
+            descriptor: [.text("VW")], indicator: [.text("2")],
+            orientation: .flipped
+        ), [.text("2"), .text("VW")], "flipped trails it"
+    )
+    checkEqual(
+        orderCells(descriptor: nil, indicator: [.text("2")], orientation: .default),
+        [.text("2")], "missing descriptors vanish"
+    )
+}
+
+do {
+    checkEqual(
         normalizedWidthPercentages([2.0, 0.5, 1.5, 0.5, 0.001, .nan, -1.0]),
         [50, 150, 200], "widths normalize, round, sort, dedupe"
     )

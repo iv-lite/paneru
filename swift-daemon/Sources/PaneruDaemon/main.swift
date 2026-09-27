@@ -269,7 +269,10 @@ tap.tuning = TapTuning(
     scrollVertical: tapModifiers(resolved.swipeScrollVerticalModifiers)
 )
 // Config bindings resolve through the table; scripted binds arrive with
-// the Lua host (slice 7) and focused passthrough with slice 4.
+// the Lua host (slice 7); passthrough chords deliver natively.
+tap.passthrough = { code, mods in
+    tapPassthrough.contains("\(code):\(keyModifiers(mods).rawValue)")
+}
 tap.configured = { code, mods in
     findBinding(code: code, held: keyModifiers(mods), in: bindings)?
         .toArgv()?.joined(separator: " ")
@@ -338,6 +341,8 @@ func viewport() -> IntRect {
 
 var tickCount = 0
 var copiedRuleSent: String?
+/// Focused passthrough chords as `code:mask` strings.
+var tapPassthrough: Set<String> = []
 
 func tick() {
     tickCount += 1
@@ -425,11 +430,31 @@ func tick() {
             activeCharacter: resolved.menubarActiveCharacter,
             inactiveCharacter: resolved.menubarInactiveCharacter
         ) ?? [],
+        descriptor: buildDescriptor(
+            style: resolved.menubarDescriptorStyle,
+            text: resolved.menubarDescriptorText,
+            symbol: resolved.menubarDescriptorSymbol
+        ),
+        orientation: resolved.menubarOrientation,
         widths: [],
         focusedWidthRatio: nil,
         hasFocusedWindow: result.focus != nil,
         fontSize: resolved.menubarFontSize
     )
+    // Focused passthrough: the focused window's rules name chords the
+    // tap must deliver natively.
+    if let focused = result.focus,
+       let meta = core.windowMetadata[focused]
+    {
+        let rules = matchWindowRules(
+            title: meta.title, bundleID: meta.bundleID, in: windowRules
+        )
+        tapPassthrough = Set(rules.flatMap { rule in
+            rule.passthrough.map { pair in "\(pair.0):\(pair.1.rawValue)" }
+        })
+    } else if result.focus == nil {
+        tapPassthrough = []
+    }
 }
 
 Timer.scheduledTimer(withTimeInterval: 1.0 / 60.0, repeats: true) { _ in

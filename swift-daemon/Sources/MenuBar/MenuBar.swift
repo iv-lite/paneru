@@ -110,6 +110,50 @@ public func indicatorCellBold(format: IndicatorFormat, isActive: Bool) -> Bool {
     isActive && format != .unicode
 }
 
+// MARK: - Descriptor model
+
+/// Descriptor presentation style (TOML spellings are the raw values).
+public enum DescriptorStyle: String, Equatable, Sendable {
+    case symbol, text, both, hidden
+}
+
+/// One prefix cell: text or a system-symbol name (rendered live).
+public enum DescriptorCell: Equatable, Sendable {
+    case text(String)
+    case symbol(String)
+}
+
+/// Which prefix shows. Nil style means the default symbol; hidden (or an
+/// empty pairing) means none.
+public func buildDescriptor(
+    style: DescriptorStyle?, text: String, symbol: String
+) -> [DescriptorCell]? {
+    switch style ?? .symbol {
+    case .symbol:
+        return [.symbol(symbol)]
+    case .text:
+        return [.text(text)]
+    case .both:
+        return [.symbol(symbol), .text(text)]
+    case .hidden:
+        return nil
+    }
+}
+
+/// Prefix and indicator in orientation order.
+public func orderCells(
+    descriptor: [DescriptorCell]?,
+    indicator: [DescriptorCell],
+    orientation: MenuBarOrientation
+) -> [DescriptorCell] {
+    switch orientation {
+    case .default:
+        return (descriptor ?? []) + indicator
+    case .flipped:
+        return indicator + (descriptor ?? [])
+    }
+}
+
 // MARK: - Pure menu model
 
 /// Width presets as menu percentages: finite positives only, rounded,
@@ -289,7 +333,9 @@ public final class MenuBarController {
     /// Refresh enablement, checkmarks, and the indicator image. Skips the
     /// bitmap when content is unchanged.
     public func update(
-        cells: [String], widths: [Int],
+        cells: [String], descriptor: [DescriptorCell]? = nil,
+        orientation: MenuBarOrientation = .default,
+        widths: [Int],
         focusedWidthRatio: Double?, hasFocusedWindow: Bool,
         fontSize: Double = 13
     ) {
@@ -313,18 +359,74 @@ public final class MenuBarController {
         guard content != current else { return }
         current = content
         guard let button = statusItem.button else { return }
-        button.image = indicatorImage(cells: cells, fontSize: fontSize)
+        button.image = indicatorImage(
+            cells: cells, descriptor: descriptor,
+            orientation: orientation, fontSize: fontSize
+        )
         button.imagePosition = .imageOnly
         button.toolTip = MenuBarStrings.tooltip
         statusItem.length = NSStatusItem.variableLength
     }
 
-    /// Baked bitmap for space-joined cells at the button's scale.
-    private func indicatorImage(cells: [String], fontSize: Double) -> NSImage? {
-        let text = cells.joined(separator: " ")
+    /// The pre-grant menu: setup instructions, settings shortcut, quit.
+    public func rebuildAccessibilityMenu() {
+        dispatchPrecondition(condition: .onQueue(.main))
+        menu.removeAllItems()
+        widthItems = []
+        managedItems = []
+        func add(
+            _ title: String, action: Selector?, enabled: Bool = true
+        ) {
+            let item = menu.addItem(
+                withTitle: title, action: action, keyEquivalent: ""
+            )
+            if action != nil { item.target = target }
+            item.isEnabled = enabled
+        }
+        add(MenuBarStrings.accessibilityRequired, action: nil, enabled: false)
+        add(MenuBarStrings.grantAccess, action: nil, enabled: false)
+        menu.addItem(.separator())
+        add(
+            MenuBarStrings.showInstructions,
+            action: #selector(MenuActionTarget.showAccessibilityInstructions(_:))
+        )
+        add(
+            MenuBarStrings.openSettings,
+            action: #selector(MenuActionTarget.openAccessibilitySettings(_:))
+        )
+        menu.addItem(.separator())
+        add(MenuBarStrings.quit, action: #selector(MenuActionTarget.quitPaneru(_:)))
+    }
+
+    /// Baked bitmap for descriptor plus space-joined cells at the
+    /// button's scale. Symbols draw from their system image at 14pt.
+    private func indicatorImage(
+        cells: [String], descriptor: [DescriptorCell]?,
+        orientation: MenuBarOrientation, fontSize: Double
+    ) -> NSImage? {
+        let ordered = orderCells(
+            descriptor: descriptor,
+            indicator: cells.map(DescriptorCell.text),
+            orientation: orientation
+        )
         let font = NSFont.systemFont(ofSize: CGFloat(fontSize))
         let attrs = [NSAttributedString.Key.font: font]
-        let size = (text as NSString).size(withAttributes: attrs)
+        var parts: [String] = []
+        var symbolName: String?
+        for cell in ordered {
+            switch cell {
+            case .text(let text): parts.append(text)
+            case .symbol(let name):
+                if symbolName == nil { symbolName = name }
+            }
+        }
+        let text = parts.joined(separator: " ")
+        let textSize = (text as NSString).size(withAttributes: attrs)
+        let symbolWidth: CGFloat = symbolName == nil ? 0 : 14 + 5
+        let size = NSSize(
+            width: textSize.width + symbolWidth,
+            height: max(textSize.height, symbolName == nil ? 0 : 14)
+        )
         guard size.width > 0, size.height > 0 else { return nil }
         let scale = statusItem.button?.window?.backingScaleFactor
             ?? NSScreen.main?.backingScaleFactor ?? 1
@@ -338,7 +440,17 @@ public final class MenuBarController {
         rep.size = size
         NSGraphicsContext.saveGraphicsState()
         NSGraphicsContext.current = NSGraphicsContext(bitmapImageRep: rep)
-        (text as NSString).draw(at: NSPoint(x: 0, y: 0), withAttributes: attrs)
+        if let symbolName,
+           let symbol = NSImage(systemSymbolName: symbolName, accessibilityDescription: nil)
+        {
+            symbol.size = NSSize(width: 14, height: 14)
+            symbol.draw(
+                in: NSRect(x: 0, y: (size.height - 14) / 2, width: 14, height: 14)
+            )
+        }
+        (text as NSString).draw(
+            at: NSPoint(x: symbolWidth, y: 0), withAttributes: attrs
+        )
         NSGraphicsContext.restoreGraphicsState()
         let image = NSImage(size: size)
         image.addRepresentation(rep)
