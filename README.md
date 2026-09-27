@@ -172,7 +172,40 @@ $ brew install paneru
 
 ### Installing with Nix
 
-See [`nix/README.md`](/nix/README.md).
+Nix packaging was removed: the Swift daemon replaces `nix run` and the
+NixOS/darwin modules (see below).
+
+### Installing the Swift daemon
+
+The Swift daemon (`paneru-swift`) is the native port: same tiling core,
+AppKit presentation, XPC command/query/subscribe server, Lua binds and
+event handlers, and a launchd agent — no Rust toolchain needed.
+
+```shell
+$ git clone https://github.com/karinushka/paneru.git
+$ cd paneru
+$ swift-daemon/install-service.sh install
+```
+
+The script builds the release binary, installs it to `~/.local/bin`,
+ad-hoc signs it with a stable identifier (so the Accessibility grant
+survives rebuilds), renders the agent plist, and bootstraps it with
+`launchctl`. Then grant Accessibility (System Settings → Privacy &
+Security → Accessibility) — the daemon exits loudly without it — and it
+tiles on the next login too (`RunAtLoad`).
+
+Start, stop, and remove:
+
+```shell
+$ swift-daemon/install-service.sh start
+$ swift-daemon/install-service.sh stop
+$ swift-daemon/install-service.sh uninstall
+```
+
+Logs land in `/tmp/com.github.karinushka.paneru.swift_<uid>.out.log`
+(and `.err.log`). The agent runs beside the Rust one under its own
+label and Mach port, so both can be installed during the transition;
+quit the Rust daemon before trying the Swift one over the same windows.
 
 ### Configuration
 

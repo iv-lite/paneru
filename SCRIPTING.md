@@ -81,7 +81,7 @@ Editing and saving `init.lua` hot-reloads the whole configuration (including men
 **Notes:**
 - Float-valued options (border `width`/`opacity`, window `width`, …) should be written with a decimal point (`12.0`, not `12`).
 - A reload that *removes* a previous `paneru.setup` call keeps the last config it produced rather than reverting to TOML.
-- With Nix modules, set `services.paneru.config` to this `init.lua` (Lua source or a path). See [`nix/README.md`](nix/README.md).
+- Point `services.paneru.config` (or `PANERU_LUA`) at this `init.lua` (Lua source or a path).
 
 ---
 
