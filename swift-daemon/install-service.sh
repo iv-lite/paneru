@@ -28,13 +28,19 @@ bootstrapped() {
 }
 
 do_install() {
+    # One product per invocation: swift build silently honors only the
+    # last --product flag. Bin dir resolves via --show-bin-path so the
+    # script tracks whatever layout the active toolchain uses.
     swift build -c release --package-path "$ROOT/swift-daemon" \
-        --product paneru-swift --product RenderPlist
+        --product paneru-swift
+    swift build -c release --package-path "$ROOT/swift-daemon" \
+        --product RenderPlist
+    BIN_PATH="$(swift build -c release --package-path "$ROOT/swift-daemon" \
+        --show-bin-path)"
     mkdir -p "$BIN_DIR" "$HOME/Library/LaunchAgents"
-    install -m755 \
-        "$ROOT/swift-daemon/.build/release/paneru-swift" "$BIN"
+    install -m755 "$BIN_PATH/paneru-swift" "$BIN"
     codesign --force --sign - --identifier "$IDENTIFIER" "$BIN"
-    "$ROOT/swift-daemon/.build/release/RenderPlist" \
+    "$BIN_PATH/RenderPlist" \
         "$LABEL" "$BIN" "$OUT_LOG" "$ERR_LOG" "$XDG_HOME" > "$PLIST"
     touch "$OUT_LOG" "$ERR_LOG"
     echo "installed $BIN and $PLIST"
