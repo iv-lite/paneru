@@ -125,6 +125,16 @@ let package = Package(
             path: "Tests/CommandsChecks"
         ),
         .executableTarget(
+            name: "FocusChecks",
+            dependencies: ["Focus", "Commands", "Geometry", "Layout"],
+            path: "Tests/FocusChecks"
+        ),
+        .executableTarget(
+            name: "WorkspaceChecks",
+            dependencies: ["Workspace", "Commands", "Geometry", "Layout"],
+            path: "Tests/WorkspaceChecks"
+        ),
+        .executableTarget(
             name: "ConfigChecks",
             dependencies: ["Config"],
             path: "Tests/ConfigChecks"
@@ -170,6 +180,19 @@ let package = Package(
         .target(
             name: "Commands",
             path: "Sources/Commands"
+        ),
+        // Same-strip focus stepping + history (`src/commands.rs` focus half,
+        // `src/ecs/focus.rs` history).
+        .target(
+            name: "Focus",
+            dependencies: ["Commands", "Geometry", "Layout"],
+            path: "Sources/Focus"
+        ),
+        // Virtual-workspace switch resolution (`src/ecs/workspace.rs`).
+        .target(
+            name: "Workspace",
+            dependencies: ["Commands", "Geometry", "Layout"],
+            path: "Sources/Workspace"
         ),
         // Resolved daemon configuration (`src/config.rs` getters).
         .target(
