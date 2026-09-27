@@ -117,7 +117,14 @@ public struct DaemonCore: Sendable {
         viewport: IntRect,
         focusedStyle: BorderStyle
     ) -> FrameResult {
+        let prevFocus = focus
         ingest(events, viewport: viewport)
+        // Focus arrival reveals: scroll the minimal shortfall so the
+        // focused window is fully visible (mirrors ensure_visible; the
+        // strip never chases anything else).
+        if focus != prevFocus, let id = focus {
+            revealFocus(id, frames: frames, viewport: viewport)
+        }
         layoutPass()
         let jobs = commitPass(frames: frames)
         let plan = paintPass(frames: frames, viewport: viewport, focusedStyle: focusedStyle)
@@ -329,6 +336,28 @@ public struct DaemonCore: Sendable {
 
     /// Last committed slot per window: what release homing restores.
     private var committedSlots: [WindowID: IntPoint] = [:]
+
+    /// Scroll the minimal shortfall to reveal the focused window.
+    /// Uses last committed slots (layout is unchanged by focus itself).
+    private mutating func revealFocus(
+        _ id: WindowID, frames: (WindowID) -> IntRect?, viewport: IntRect
+    ) {
+        guard let slot = committedSlots[id] else { return }
+        let width = frames(id)?.width ?? 0
+        let offset = offsets[activeWorkspace] ?? 0
+        let view = IntRect(
+            min: IntPoint(viewport.min.x, 0),
+            max: IntPoint(viewport.max.x, viewport.height)
+        )
+        let next = originExposing(
+            layout: IntPoint(slot.x, 0), size: IntSize(width, 0),
+            origin: IntPoint(offset, 0), viewport: view
+        )
+        offsets[activeWorkspace] = next.x
+        if next.x != offset {
+            dirty.formUnion([.layout, .motion])
+        }
+    }
 
     private mutating func layoutPass() {
         // Slot assignment lives in commit (it needs live widths); layout

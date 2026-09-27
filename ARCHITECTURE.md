@@ -213,9 +213,15 @@ until cutover:
   `Tests/LuaBridgeChecks`, which execute real scripts).
 - **`Daemon`** (done): serial assembly wiring every module through the
   pass list — virtual rows, command ingestion (focus/stack/virtual/switch,
-  swipe offsets), hand-owned commit, homing, border paint — against
-  injected frame providers (verified by `Tests/DaemonChecks`
-  end-to-end frames).
+  swipe offsets), focus-reveal scrolling, hand-owned commit, homing,
+  border paint — against injected frame providers (verified by
+  `Tests/DaemonChecks` end-to-end frames).
+- **Frame parity gate** (done): Rust `trace.jsonl` corpora replayed
+  through `DaemonCore` and diffed at rest (`Tests/FrameParityChecks`,
+  gated in CI by the `parity` job). Mapping rules: one tick per command
+  window, `MenuOpened` → focus, rest-state comparison with settle drain,
+  x-only positions (menubar-y convention differs), borders excluded from
+  quiescence.
 - **`Commands`** (done): full command vocabulary + argv encoding with
   round-trip checks (`Tests/CommandsChecks`).
 - **`Config`** (done): resolved defaults/clamps/hex parsing
@@ -254,11 +260,16 @@ until cutover:
   linkage, launchd XPC service registration, then retirement of `src/`. Each lands with
   parity tests before the Rust counterpart is touched.
 
-Supporting seams already in the Rust daemon: `src/replay.rs` (Phase 0
-session capture behind `PANERU_REPLAY_RECORD`), snapshot-only Lua boundary
-(`BatchSnapshot` per worker message, acked store writes only),
-`manager::capabilities` (SkyLight `dlsym` probe at startup), and the
-quiet-frame quiescence invariant (`test_settled_world_is_quiescent`).
+Supporting seams already in the Rust daemon: `src/replay.rs` (v2 session
+capture behind `PANERU_REPLAY_RECORD`: frame sequence plus commands,
+spaces, displays, menus — not just pointer input), snapshot-only Lua
+boundary (`BatchSnapshot` per worker message, acked store writes only),
+`manager::capabilities` (SkyLight `dlsym` probe at startup), the
+quiet-frame quiescence invariant (`test_settled_world_is_quiescent`),
+`src/tests/trace.rs` (per-frame `FrameSnapshot` exporter +
+`run_with_trace`, JSONL corpora via `PANERU_TRACE_OUT`), and the
+`PANERU_SWIFT_DAEMON` cutover gate in `main.rs` (unset/`0` runs Rust;
+`1`/`shadow` fail loudly until shipped).
 
 ## 9. Testing Strategy
 1.  **Pure Unit Tests:** Located in `src/tests.rs` and alongside modules. These test layout math and configuration parsing without requiring a macOS environment.

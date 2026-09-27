@@ -48,6 +48,39 @@ jobs:
       - name: Show sccache stats
         run: sccache --show-stats
 
+  # Frame-parity gate for the Swift port: dumps the Rust trace corpus,
+  # runs every Swift checks runner, then diffs Swift replay rest-states
+  # against the Rust frames. Fails the workflow on first mismatch, so no
+  # Rust subsystem is deleted while the corpus is red.
+  parity:
+    runs-on: macos-latest
+    timeout-minutes: 30
+    needs: test
+    env:
+      PANERU_TRACE_OUT: ${{ runner.temp }}/paneru-corpus
+      PANERU_TRACE_DIR: ${{ runner.temp }}/paneru-corpus
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+        with:
+          shared-key: "paneru-build"
+          cache-on-failure: true
+      - name: Dump Rust trace corpus
+        run: PANERU_TRACE_OUT="$PANERU_TRACE_OUT" cargo test --all-targets trace
+      - name: Run Swift checks runners
+        run: |
+          for checks in GeometryChecks LayoutChecks AXClientChecks EventCoreChecks \
+            PresentationChecks ScriptingChecks IPCChecks ServiceChecks \
+            LuaBridgeChecks DaemonChecks XPCChecks FocusChecks WorkspaceChecks \
+            CommandsChecks ConfigChecks AnimationChecks ScrollChecks SessionChecks \
+            ScriptEventsChecks KeyChordsChecks DisplaysChecks SnippetChecks \
+            ProviderChecks WorkerChecks; do
+            swift run --package-path swift-daemon "$checks"
+          done
+      - name: Diff frame parity
+        run: swift run --package-path swift-daemon FrameParityChecks
+
   # Builds the release binary concurrently with `test` instead of waiting
   # for it: wall time becomes max(tests, build) rather than tests + build.
   # Publishing stays gated on green tests in the `publish` job below, so a

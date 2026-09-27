@@ -120,6 +120,11 @@ let package = Package(
             path: "Tests/DaemonChecks"
         ),
         .executableTarget(
+            name: "FrameParityChecks",
+            dependencies: ["Daemon", "Commands", "Geometry", "Presentation"],
+            path: "Tests/FrameParityChecks"
+        ),
+        .executableTarget(
             name: "AnimationChecks",
             dependencies: ["Animation", "Geometry"],
             path: "Tests/AnimationChecks"
