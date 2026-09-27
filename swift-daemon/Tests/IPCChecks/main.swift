@@ -97,6 +97,29 @@ do {
     checkEqual(IPCResponse.error("no such window"), .error("no such window"), "error wraps message")
 }
 
+// Request decoding round-trips the encoder; foreign input decodes nil.
+do {
+    for request in [
+        IPCRequest.command(argv: ["window", "focus", "east"]),
+        IPCRequest.query(.active),
+        IPCRequest.windowSet,
+        IPCRequest.windowSetApply("[{}]"),
+        IPCRequest.subscribe,
+    ] {
+        let data = encodeRequest(request)!
+        checkEqual(decodeRequest(data), request, "requests round-trip")
+    }
+    checkEqual(decodeRequest(Data("bogus".utf8)), nil, "garbage decodes nil")
+    checkEqual(
+        decodeRequest(Data(#"{"type":"query","kind":"bogus"}"#.utf8)), nil,
+        "unknown kinds decode nil"
+    )
+    checkEqual(
+        decodeRequest(Data(#"{"type":"scriptState","request":"get","key":"k"}"#.utf8)),
+        .scriptState(.get(key: "k")), "store reads decode"
+    )
+}
+
 if failures == 0 {
     print("IPCChecks: all checks passed")
 } else {

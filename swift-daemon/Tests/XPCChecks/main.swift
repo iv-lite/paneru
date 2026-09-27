@@ -59,6 +59,51 @@ do {
     withExtendedLifetime((listener, client)) {}
 }
 
+// Registry: filtered publish, removal, registration order.
+do {
+    let registry = SubscriptionRegistry()
+    var first: [[String]] = []
+    var second: [[String]] = []
+    let all = registry.add { first.append($0) }
+    let filtered = registry.add(filter: ["window_focused"]) { second.append($0) }
+    checkEqual(registry.count, 2, "two subscribers register")
+    registry.publish([
+        (name: "window_focused", json: #"{"event":"window_focused"}"#),
+        (name: "display_changed", json: #"{"event":"display_changed"}"#),
+    ])
+    checkEqual(first.count, 1, "unfiltered takes the batch")
+    checkEqual(first.first?.count, 2, "unfiltered takes every event")
+    checkEqual(second.count, 1, "filtered takes its batch")
+    checkEqual(
+        second.first, [#"{"event":"window_focused"}"#],
+        "filtered takes name hits only"
+    )
+    registry.remove(filtered)
+    checkEqual(registry.count, 1, "removal drops the id")
+    registry.remove("no-such-id")
+    checkEqual(registry.count, 1, "unknown removals ignore")
+    registry.publish([])
+    checkEqual(first.count, 1, "empty publishes send nothing")
+    withExtendedLifetime(all) {}
+}
+
+// Subscribe round-trips an id; unsubscribe drops it server-side.
+do {
+    let (listener, client) = pair()
+    var removed: [String] = []
+    listener.server.onSubscribe = { "sub-1" }
+    listener.server.onUnsubscribe = { removed.append($0) }
+    checkEqual(client.subscribeSync(), "sub-1", "subscribe answers an id")
+    client.unsubscribe("sub-1")
+    // Unsubscribe is one-way; give the daemon a beat, then check.
+    let deadline = Date().addingTimeInterval(2)
+    while removed.isEmpty, Date() < deadline {
+        _ = RunLoop.current.run(mode: .default, before: Date().addingTimeInterval(0.05))
+    }
+    checkEqual(removed, ["sub-1"], "unsubscribe lands server-side")
+    withExtendedLifetime((listener, client)) {}
+}
+
 if failures == 0 {
     print("XPCChecks: all checks passed")
 } else {

@@ -140,6 +140,12 @@ public struct ScriptStateWrite: Equatable, Sendable {
     public var value: ScriptValue?
     public var expected: Expected
 
+    public init(key: String, value: ScriptValue?, expected: Expected) {
+        self.key = key
+        self.value = value
+        self.expected = expected
+    }
+
     public static func set(_ key: String, _ value: ScriptValue) -> ScriptStateWrite {
         ScriptStateWrite(key: key, value: value, expected: .anything)
     }

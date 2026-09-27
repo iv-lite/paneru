@@ -23,6 +23,7 @@ import MenuBar
 import PaneruXPC
 import Presentation
 import Presenter
+import StateQuery
 
 // MARK: - Startup
 
@@ -325,6 +326,65 @@ let menubar = MenuBarController { command in
     }
 }
 
+// MARK: - Query snapshot
+
+/// One roster frame as a query frame.
+func queryFrame(id: WindowID) -> QueryFrame? {
+    guard let frame = roster[CGWindowID(id)]?.frame else { return nil }
+    return QueryFrame(
+        x: frame.min.x, y: frame.min.y,
+        width: frame.width, height: frame.height
+    )
+}
+
+/// The query document from core strips plus live roster frames.
+func buildQueryState() -> QueryState {
+    let ws = core.activeWorkspace
+    let rows = (core.strips[ws] ?? [:]).keys.sorted()
+    let workspaces = rows.map { row in
+        let windows = (core.strips[ws]?[row]?.allWindows ?? []).map { id in
+            QueryWindow(
+                windowID: id,
+                bundleID: core.windowMetadata[id]?.bundleID ?? "",
+                appName: core.windowMetadata[id]?.appName ?? "",
+                title: core.windowMetadata[id]?.title ?? "",
+                focused: core.focus == id,
+                floating: core.unmanaged.contains(id),
+                displayID: 0,
+                frame: queryFrame(id: id),
+                visible: true
+            )
+        }
+        return QueryWorkspace(
+            number: row, active: (core.activeVirtual[ws] ?? 0) == row,
+            windows: windows
+        )
+    }
+    return QueryState(
+        version: 1,
+        timestamp: UInt64(Date().timeIntervalSince1970 * 1000),
+        active: ActiveState(
+            displayID: 0,
+            virtualWorkspaceNumber: core.activeVirtual[ws],
+            focusedWindowID: core.focus,
+            focusedBundleID: core.focus.flatMap { core.windowMetadata[$0]?.bundleID },
+            focusedAppName: core.focus.flatMap { core.windowMetadata[$0]?.appName },
+            focusedWindowTitle: core.focus.flatMap { core.windowMetadata[$0]?.title }
+        ),
+        virtualWorkspaces: workspaces
+    )
+}
+
+func answerQueryDocument(_ data: Data) -> Data {
+    guard case .query(let kind) = decodeRequest(data) else {
+        return Data(xpcError("expected a query request").utf8)
+    }
+    guard let json = QueryPayload.slice(kind: kind, state: buildQueryState()).toJSONData() else {
+        return Data(xpcError("could not render query").utf8)
+    }
+    return json
+}
+
 // MARK: - Tick
 
 func viewport() -> IntRect {
@@ -345,6 +405,19 @@ var tickCount = 0
 var copiedRuleSent: String?
 /// Focused passthrough chords as `code:mask` strings.
 var tapPassthrough: Set<String> = []
+var prevTickFocus: WindowID?
+var prevTickRow: UInt32?
+var prevTickRoster = 0
+
+/// Render one event for subscribers, if it serializes.
+func eventJSON(_ event: StateEvent) -> (name: String, json: String)? {
+    guard let name = event.eventName,
+          let object = event.toJSON(),
+          let data = try? JSONSerialization.data(withJSONObject: object),
+          let string = String(data: data, encoding: .utf8)
+    else { return nil }
+    return (name, string)
+}
 
 func tick() {
     tickCount += 1
@@ -457,6 +530,41 @@ func tick() {
     } else if result.focus == nil {
         tapPassthrough = []
     }
+    // Subscription events, edge-triggered only.
+    var fired: [(name: String, json: String)] = []
+    let tickRow = core.activeVirtual[core.activeWorkspace]
+    let tickActive = ActiveState(
+        displayID: 0, virtualWorkspaceNumber: tickRow,
+        focusedWindowID: result.focus,
+        focusedBundleID: result.focus.flatMap { core.windowMetadata[$0]?.bundleID },
+        focusedAppName: result.focus.flatMap { core.windowMetadata[$0]?.appName },
+        focusedWindowTitle: result.focus.flatMap { core.windowMetadata[$0]?.title }
+    )
+    if result.focus != prevTickFocus {
+        let event = StateEvent.windowFocused(
+            windowID: result.focus,
+            bundleID: result.focus.flatMap { core.windowMetadata[$0]?.bundleID },
+            title: result.focus.flatMap { core.windowMetadata[$0]?.title },
+            virtualWorkspaceNumber: tickRow
+        )
+        if let rendered = eventJSON(event) { fired.append(rendered) }
+        prevTickFocus = result.focus
+    }
+    if tickRow != prevTickRow {
+        if let rendered = eventJSON(.virtualWorkspaceChanged(active: tickActive)) {
+            fired.append(rendered)
+        }
+        prevTickRow = tickRow
+    }
+    if roster.count != prevTickRoster {
+        if let rendered = eventJSON(.windowsChanged(
+            virtualWorkspaceNumber: tickRow, active: tickActive
+        )) {
+            fired.append(rendered)
+        }
+        prevTickRoster = roster.count
+    }
+    subscriptions.publish(fired)
 }
 
 Timer.scheduledTimer(withTimeInterval: 1.0 / 60.0, repeats: true) { _ in
@@ -466,27 +574,64 @@ Timer.scheduledTimer(withTimeInterval: 1.0 / 60.0, repeats: true) { _ in
 // Command server: Mach service accepting argv commands into `pending`.
 // Queries answer in slice 6; without launchd holding the port this only
 // serves direct (NSXPCConnection) clients.
-final class CommandListener: NSObject, NSXPCListenerDelegate {
-    let server = PaneruXPCServer()
+let subscriptions = SubscriptionRegistry()
 
-    override init() {
-        super.init()
-        server.onCommand = { argv in
-            do {
-                pending.append(.command(try parseCommand(argv)))
-                return "ok"
-            } catch {
-                return xpcError("\(error)")
-            }
+/// One exported object per connection, so pushes route back down the
+/// connection they subscribed on. Dead connections prune their ids.
+final class ConnectionHandler: NSObject, PaneruXPCProtocol {
+    var connection: NSXPCConnection?
+    var ids: [String] = []
+
+    func runCommand(_ argv: [String], withReply reply: @escaping (String) -> Void) {
+        do {
+            pending.append(.command(try parseCommand(argv)))
+            reply("ok")
+        } catch {
+            reply(xpcError("\(error)"))
         }
     }
 
+    func answerQuery(_ requestJSON: Data, withReply reply: @escaping (Data) -> Void) {
+        reply(answerQueryDocument(requestJSON))
+    }
+
+    func subscribe(withReply reply: @escaping (String) -> Void) {
+        guard let connection else {
+            reply(xpcError("no connection"))
+            return
+        }
+        let token = subscriptions.add { batch in
+            (connection.remoteObjectProxy as? PaneruXPCClientProtocol)?
+                .deliverEvents(batch)
+        }
+        ids.append(token)
+        reply(token)
+    }
+
+    func unsubscribe(_ id: String) {
+        subscriptions.remove(id)
+        ids.removeAll { $0 == id }
+    }
+}
+
+final class CommandListener: NSObject, NSXPCListenerDelegate {
     func listener(
         _ listener: NSXPCListener,
         shouldAcceptNewConnection connection: NSXPCConnection
     ) -> Bool {
+        let handler = ConnectionHandler()
+        handler.connection = connection
         connection.exportedInterface = NSXPCInterface(with: PaneruXPCProtocol.self)
-        connection.exportedObject = server
+        connection.exportedObject = handler
+        connection.remoteObjectInterface = NSXPCInterface(with: PaneruXPCClientProtocol.self)
+        // Prune everything this connection owns on death.
+        let prune = { [weak handler] in
+            for id in handler?.ids ?? [] {
+                subscriptions.remove(id)
+            }
+        }
+        connection.interruptionHandler = prune
+        connection.invalidationHandler = prune
         connection.resume()
         return true
     }

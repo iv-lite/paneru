@@ -118,6 +118,71 @@ private enum CodingKeys: String, CodingKey {
     case type, argv, kind, json, ops, request, response, key, write, value, outcome
 }
 
+/// Decode a request produced by `encodeRequest`. Nil for anything
+/// else shaped (foreign or corrupt input answers an error, never a
+/// guess).
+public func decodeRequest(_ data: Data) -> IPCRequest? {
+    guard let object = try? JSONSerialization.jsonObject(with: data) as? [String: Any],
+          let type = object["type"] as? String
+    else { return nil }
+    switch type {
+    case "command":
+        guard let argv = object["argv"] as? [String] else { return nil }
+        return .command(argv: argv)
+    case "query":
+        guard let kind = object["kind"] as? String,
+              let parsed = QueryKind.parse(kind) else { return nil }
+        return .query(parsed)
+    case "windowSet":
+        return .windowSet
+    case "windowSetApply":
+        guard let ops = object["ops"] as? String else { return nil }
+        return .windowSetApply(ops)
+    case "scriptState":
+        guard let kind = object["request"] as? String,
+              let key = object["key"] as? String
+        else { return nil }
+        switch kind {
+        case "get":
+            return .scriptState(.get(key: key))
+        case "write":
+            guard let raw = object["write"] as? [String: Any] else { return nil }
+            let value: ScriptValue?
+            if raw["value"] is NSNull {
+                value = nil
+            } else if let json = raw["value"] {
+                value = ScriptValue(json: json)
+            } else {
+                return nil
+            }
+            let expected: Expected
+            switch raw["expected"] as? String {
+            case "anything":
+                expected = .anything
+            case "exactly":
+                if let json = raw["expectedValue"], !(json is NSNull) {
+                    expected = .exactly(ScriptValue(json: json))
+                } else if raw["expectedValue"] is NSNull {
+                    expected = .exactly(nil)
+                } else {
+                    return nil
+                }
+            default:
+                return nil
+            }
+            return .scriptState(.write(ScriptStateWrite(
+                key: key, value: value, expected: expected
+            )))
+        default:
+            return nil
+        }
+    case "subscribe":
+        return .subscribe
+    default:
+        return nil
+    }
+}
+
 /// Deterministic JSON bytes for one request (sorted keys).
 public func encodeRequest(_ request: IPCRequest) -> Data? {
     var object: [String: Any] = [:]
