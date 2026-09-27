@@ -48,50 +48,48 @@ public func launchctlSummary(domainTarget: String, service: String) -> String {
 
 // MARK: - Agent plist
 
-/// The launchd agent plist: Mach service plus program arguments, kept
-/// beside the label so install and the listener agree.
+/// The launchd agent plist: Mach service plus program path. `Program`
+/// (single path, no args) matches the shipped Rust agent and
+/// `Service.launchAgentPlist`, which stays the reference renderer —
+/// this model exists so live code builds specs without importing
+/// `Service`.
 public struct AgentPlist: Equatable, Sendable {
     public var label: String
-    public var programArguments: [String]
+    public var program: String
     public var machServiceName: String
     public var runAtLoad: Bool
 
     public init(
-        label: String, programArguments: [String],
+        label: String, program: String,
         machServiceName: String, runAtLoad: Bool = true
     ) {
         self.label = label
-        self.programArguments = programArguments
+        self.program = program
         self.machServiceName = machServiceName
         self.runAtLoad = runAtLoad
     }
 
     /// Rendered plist XML for writing to `~/Library/LaunchAgents/`.
     public func xml() -> String {
-        let args = programArguments
-            .map { "        <string>\($0)</string>" }
-            .joined(separator: "\n")
-        return """
-            <?xml version="1.0" encoding="UTF-8"?>
-            <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
-            <plist version="1.0">
+        """
+        <?xml version="1.0" encoding="UTF-8"?>
+        <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+        <plist version="1.0">
+        <dict>
+            <key>Label</key>
+            <string>\(label)</string>
+            <key>Program</key>
+            <string>\(program)</string>
+            <key>MachServices</key>
             <dict>
-                <key>Label</key>
-                <string>\(label)</string>
-                <key>ProgramArguments</key>
-                <array>
-            \(args)
-                </array>
-                <key>MachServices</key>
-                <dict>
-                    <key>\(machServiceName)</key>
-                    <true/>
-                </dict>
-                <key>RunAtLoad</key>
-                <\(runAtLoad)/>
+                <key>\(machServiceName)</key>
+                <true/>
             </dict>
-            </plist>
-            """
+            <key>RunAtLoad</key>
+            <\(runAtLoad)/>
+        </dict>
+        </plist>
+        """
     }
 
     /// Destination under the user's LaunchAgents.

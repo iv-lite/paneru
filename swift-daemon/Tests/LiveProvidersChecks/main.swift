@@ -93,13 +93,14 @@ do {
 do {
     let plist = AgentPlist(
         label: "com.example.paneru",
-        programArguments: ["/opt/paneru/bin/paneru", "daemon"],
+        program: "/opt/paneru/bin/paneru-swift",
         machServiceName: "com.example.paneru"
     )
     let xml = plist.xml()
     check(xml.contains("<string>com.example.paneru</string>"), "labels render")
     check(xml.contains("<key>MachServices</key>"), "mach services render")
-    check(xml.contains("/opt/paneru/bin/paneru"), "arguments render")
+    check(xml.contains("<key>Program</key>"), "single program path renders")
+    check(xml.contains("/opt/paneru/bin/paneru-swift"), "program renders")
     checkEqual(
         plist.installPath(home: "/home/u"),
         "/home/u/Library/LaunchAgents/com.example.paneru.plist",

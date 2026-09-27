@@ -245,6 +245,12 @@ let package = Package(
             dependencies: ["LiveProviders", "Geometry"],
             path: "Tests/LiveProvidersChecks"
         ),
+        // Plist renderer for the install script (stdout).
+        .executableTarget(
+            name: "RenderPlist",
+            dependencies: ["Service"],
+            path: "Sources/RenderPlist"
+        ),
         .executableTarget(
             name: "ScriptingChecks",
             dependencies: ["Scripting"],
