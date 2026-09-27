@@ -213,6 +213,23 @@ do {
     checkEqual(mostVisibleWindow(frames: [(2, IntRect(10, 10, 10, 20))], viewport: viewport), nil, "degenerate never wins")
 }
 
+// Same-column swaps exchange stack members; column and bounds errors fail.
+do {
+    var strip = LayoutStrip(id: 1, virtualIndex: 0)
+    strip.append(0)
+    strip.append(1)
+    strip.append(2)
+    _ = strip.stack(0)
+    _ = strip.stack(1)
+    _ = strip.stack(2)
+    checkEqual(strip.allWindows, [0, 1, 2], "stack fuses three")
+    check(strip.swapStackItems(at: 0, 0, 2), "stack swap succeeds")
+    checkEqual(strip.allWindows, [2, 1, 0], "members exchange in place")
+    check(!strip.swapStackItems(at: 0, 0, 0), "self swap is a no-op")
+    check(!strip.swapStackItems(at: 0, 0, 5), "out-of-range fails")
+    check(!strip.swapStackItems(at: 4, 0, 1), "out-of-range column fails")
+}
+
 if failures == 0 {
     print("LayoutChecks: all checks passed")
 } else {

@@ -20,10 +20,17 @@ import Workspace
 // reads the same `BorderSyncPlan`).
 //
 // Ingestion covers pointer/drag/focus lifecycle plus commands: focus,
-// stack/unstack, virtual switch/add/move, and swipe/scroll offsets.
-// Layout surgery ops (swap/center/resize/balance/…), floating tiers, mouse
-// moves, and quit/restart stay with the integrator — they either need live
-// sizes or are process control, not layout truth.
+// stack/unstack, swap, center, resize (width/height/width-set/full-width),
+// equalize, balance, manage, snap, virtual switch/add/move, and
+// swipe/scroll offsets. The viewport passed to `tick` plays the role of
+// the Rust `actual_bounds` (padding already applied); vertical placement
+// stays with the layout pass, so center/resize/snap shift the strip offset
+// on x and enqueue size intents, leaving y to the next layout.
+// Deferred to the integrator: cross-display fall-through (swap north/south
+// with no neighbour, toNext/PreviousDisplay — no display strips modelled),
+// floating focus/raise tiers (need FocusHistory plus AX raise), copyRule
+// (clipboard plus app bundle ids), mouse moves, and quit/restart
+// (process control).
 
 // MARK: - Events
 
@@ -94,6 +101,22 @@ public struct DaemonCore: Sendable {
     private var borders: [WindowID: BorderEntry] = [:]
     /// Coalescing inbox for this tick's AX intents.
     private var inbox: [WindowID: AXWriteJob] = [:]
+    /// Floating (unmanaged) windows: out of every strip, positioned by
+    /// hand or the OS. Toggling back re-appends to the active strip.
+    public private(set) var unmanaged: Set<WindowID> = []
+    /// Full-width marker: width ratio (of the viewport) to restore when
+    /// the toggle flips off. Mirrors `FullWidthMarker`.
+    private var fullWidth: [WindowID: Double] = [:]
+    /// Width presets as viewport fractions. Mirrors Config's
+    /// `default_preset_column_widths`.
+    public var presetWidths: [Double] = [0.25, 0.33333, 0.50, 0.66667, 0.75, 1.0, 1.5, 2.0]
+    /// Stack-height presets as viewport fractions. Mirrors Config's
+    /// `default_preset_stack_heights`.
+    public var presetHeights: [Double] = [0.25, 0.33333, 0.50, 0.66667, 0.75]
+    /// Whether resize runs past the last preset back to the first.
+    public var resizeCycle = true
+    /// Minimum stack-member height. Mirrors `MIN_WINDOW_HEIGHT`.
+    private let minWindowHeight: Int32 = 200
 
     public init() {}
 
@@ -123,7 +146,10 @@ public struct DaemonCore: Sendable {
     ) -> FrameResult {
         let prevFocus = focus
         gestureFresh = false
-        ingest(events, viewport: viewport)
+        // One frame clock for ingest and commit alike: surgery intents
+        // enqueued during ingest carry this tick's epoch.
+        let epoch = ax.beginFrame()
+        ingest(events, frames: frames, viewport: viewport, epoch: epoch)
         // Focus arrival reveals: scroll the minimal shortfall so the
         // focused window is fully visible (mirrors ensure_visible; the
         // strip never chases anything else).
@@ -131,7 +157,7 @@ public struct DaemonCore: Sendable {
             revealFocus(id, frames: frames, viewport: viewport)
         }
         layoutPass()
-        let jobs = commitPass(frames: frames, viewport: viewport)
+        let jobs = commitPass(frames: frames, viewport: viewport, epoch: epoch)
         let plan = paintPass(frames: frames, viewport: viewport, focusedStyle: focusedStyle)
         let quiet = dirty.isQuiescent && jobs.isEmpty && plan.isEmpty
         dirty = []
@@ -140,7 +166,10 @@ public struct DaemonCore: Sendable {
 
     // MARK: Passes
 
-    private mutating func ingest(_ events: [DaemonEvent], viewport: IntRect) {
+    private mutating func ingest(
+        _ events: [DaemonEvent], frames: (WindowID) -> IntRect?,
+        viewport: IntRect, epoch: UInt64
+    ) {
         for event in events {
             switch event {
             case .appeared(let id, let workspace):
@@ -178,7 +207,7 @@ public struct DaemonCore: Sendable {
                 glideHome()
                 dirty.insert(.layout)
             case .command(let command):
-                ingestCommand(command)
+                ingestCommand(command, frames: frames, viewport: viewport, epoch: epoch)
             case .swipe(let delta, _), .scroll(let delta):
                 // Fractional viewport widths, natural direction (finger-left
                 // moves the strip left). Integer truncation matches the
@@ -193,19 +222,26 @@ public struct DaemonCore: Sendable {
         }
     }
 
-    /// Fold one parsed command into state. Focus, stack, and virtual ops
-    /// only; layout surgery, floating tiers, mouse, and process control
-    /// stay with the integrator (documented above).
-    private mutating func ingestCommand(_ command: PaneruCommand) {
+    /// Fold one parsed command into state. Focus, stack, surgery, virtual,
+    /// and gesture ops only; floating focus/raise tiers, cross-display
+    /// moves, mouse, copyRule, and process control stay with the
+    /// integrator (documented above).
+    private mutating func ingestCommand(
+        _ command: PaneruCommand, frames: (WindowID) -> IntRect?,
+        viewport: IntRect, epoch: UInt64
+    ) {
         switch command {
         case .window(let op):
-            ingestWindowOperation(op)
+            ingestWindowOperation(op, frames: frames, viewport: viewport, epoch: epoch)
         case .mouse, .quit, .restart, .printState, .lua:
             break
         }
     }
 
-    private mutating func ingestWindowOperation(_ op: WindowOperation) {
+    private mutating func ingestWindowOperation(
+        _ op: WindowOperation, frames: (WindowID) -> IntRect?,
+        viewport: IntRect, epoch: UInt64
+    ) {
         // NOTE: no shared writeback here on purpose. The stack branch mutates
         // the entry row in place; the virtual branches switch rows and manage
         // their own strips (a shared writeback would resurrect moved columns
@@ -241,7 +277,30 @@ public struct DaemonCore: Sendable {
             ingestVirtualOperation(op)
         case .virtualMove, .virtualMoveNumber:
             ingestVirtualMove(op)
-        default:
+        case .swap(let direction):
+            swapWindows(direction)
+        case .center:
+            centerWindow(frames: frames, viewport: viewport, epoch: epoch)
+        case .resize(let direction):
+            resizeWindow(direction, ratio: nil, frames: frames, viewport: viewport, epoch: epoch)
+        case .setWidth(let ratio):
+            resizeWindow(.grow, ratio: ratio, frames: frames, viewport: viewport, epoch: epoch)
+        case .resizeVertical(let direction):
+            resizeWindowVertical(direction, frames: frames, viewport: viewport, epoch: epoch)
+        case .fullWidth:
+            toggleFullWidth(frames: frames, viewport: viewport, epoch: epoch)
+        case .equalize:
+            equalizeColumn(frames: frames, viewport: viewport, epoch: epoch)
+        case .balance:
+            balanceStrip(frames: frames, epoch: epoch)
+        case .manage:
+            toggleManaged()
+        case .snap:
+            snapWindow(frames: frames, viewport: viewport)
+        case .toNextDisplay, .toPreviousDisplay, .focusUnmanaged,
+             .focusManaged, .raiseFloating, .toggleFloatingLayer, .copyRule:
+            // Integrator-owned: cross-display strips, FocusHistory plus AX
+            // raise, and clipboard/app identities are outside the core.
             break
         }
     }
@@ -314,6 +373,274 @@ public struct DaemonCore: Sendable {
         strips[ws, default: [:]][targetRow] = target
         activeVirtual[ws] = targetRow
         dirty.formUnion([.layout, .paint])
+    }
+
+    // MARK: - Layout surgery ops
+
+    /// Swap the focused window toward `direction`, bubbling whole columns;
+    /// same-column swaps exchange stack members. No visibility scroll here:
+    /// `committedSlots` are pre-swap, and the next focus arrival reveals —
+    /// the strip itself never chases anything else.
+    private mutating func swapWindows(_ direction: Direction) {
+        guard let id = focus else { return }
+        var strip = activeStrip()
+        guard let index = strip.index(of: id),
+              let other = windowInDirection(direction, from: id, strip: strip),
+              let newIndex = strip.index(of: other)
+        else { return }
+        if index == newIndex {
+            if case .stack(let items) = strip.get(index),
+               let posA = items.firstIndex(where: { $0.contains(id) }),
+               let posB = items.firstIndex(where: { $0.contains(other) })
+            {
+                strip.swapStackItems(at: index, posA, posB)
+            }
+        } else if index < newIndex {
+            for idx in index..<newIndex { strip.swap(idx, idx + 1) }
+        } else {
+            for idx in (newIndex..<index).reversed() { strip.swap(idx, idx + 1) }
+        }
+        setActiveStrip(strip)
+        dirty.formUnion([.layout, .paint])
+    }
+
+    /// Center the focused window on the viewport (x only; y stays with the
+    /// layout pass) by shifting the strip, or enqueue a direct move for a
+    /// window outside the strip. Mouse warp stays host-side.
+    private mutating func centerWindow(
+        frames: (WindowID) -> IntRect?, viewport: IntRect, epoch: UInt64
+    ) {
+        guard let id = focus, let frame = frames(id) else { return }
+        let centerX = viewport.min.x + viewport.width / 2
+        var origin = frame.min
+        origin.x = centerX - frame.width / 2
+        if activeStrip().contains(id) {
+            offsets[activeWorkspace, default: 0] += origin.x - frame.min.x
+        } else {
+            enqueueMove(id, to: origin, epoch: epoch)
+        }
+        dirty.formUnion([.layout, .motion, .paint])
+    }
+
+    /// Grow/shrink through `presetWidths`, or jump to an explicit ratio.
+    /// The frame recenters on its own center and clamps into the viewport
+    /// (x applied via the strip offset, y via the layout pass); stacked
+    /// siblings share the new width. Clears the full-width marker.
+    private mutating func resizeWindow(
+        _ direction: ResizeDirection, ratio setWidth: Double?,
+        frames: (WindowID) -> IntRect?, viewport: IntRect, epoch: UInt64
+    ) {
+        guard let id = focus, let frame = frames(id) else { return }
+        let vw = max(viewport.width, 1)
+        let current = Double(frame.width) / Double(vw)
+        let fallback = presetWidths.first ?? 0.5
+        let next: Double
+        if let ratio = setWidth, ratio.isFinite, ratio > 0 {
+            next = ratio
+        } else {
+            switch direction {
+            case .grow:
+                next = presetWidths.first(where: { $0 > current + 0.05 })
+                    ?? (resizeCycle ? fallback : presetWidths.last ?? fallback)
+            case .shrink:
+                next = presetWidths.reversed().first(where: { $0 < current - 0.05 })
+                    ?? (resizeCycle ? presetWidths.last ?? fallback : fallback)
+            }
+        }
+        fullWidth.removeValue(forKey: id)
+        let newWidth = roundPx(next * Double(vw))
+        let size = IntSize(newWidth, frame.height)
+        let center = IntPoint(
+            (frame.min.x + frame.max.x) / 2, (frame.min.y + frame.max.y) / 2
+        )
+        let origin = clampOriginToViewport(
+            origin: IntPoint(center.x - newWidth / 2, center.y - frame.height / 2),
+            size: size, viewport: viewport
+        )
+        let strip = activeStrip()
+        if strip.contains(id) {
+            offsets[activeWorkspace, default: 0] += origin.x - frame.min.x
+        } else {
+            enqueueMove(id, to: origin, epoch: epoch)
+        }
+        enqueueResize(id, to: size, epoch: epoch)
+        if let index = strip.index(of: id),
+           case .stack(let items) = strip.get(index),
+           let pos = items.firstIndex(where: { $0.contains(id) })
+        {
+            for sibling in items[pos].windows where sibling != id {
+                if let siblingFrame = frames(sibling) {
+                    enqueueResize(
+                        sibling, to: IntSize(newWidth, siblingFrame.height), epoch: epoch
+                    )
+                }
+            }
+        }
+        dirty.formUnion([.layout, .motion, .paint])
+    }
+
+    /// Cycle the focused stack member's height through `presetHeights`,
+    /// keeping the pair total so the height survives binpacking. Stacks
+    /// only; the neighbour below absorbs, or above when last.
+    private mutating func resizeWindowVertical(
+        _ direction: ResizeDirection, frames: (WindowID) -> IntRect?,
+        viewport: IntRect, epoch: UInt64
+    ) {
+        guard let id = focus else { return }
+        let strip = activeStrip()
+        guard let index = strip.index(of: id),
+              case .stack(let items) = strip.get(index),
+              let pos = items.firstIndex(where: { $0.contains(id) })
+        else { return }
+        let neighbour: Int
+        if pos + 1 < items.count {
+            neighbour = pos + 1
+        } else if pos > 0 {
+            neighbour = pos - 1
+        } else {
+            return
+        }
+        guard let top = items[pos].top, let other = items[neighbour].top,
+              let frame = frames(top), let otherFrame = frames(other)
+        else { return }
+        let pair = frame.height + otherFrame.height
+        guard pair >= 2 * minWindowHeight else { return }
+        let vh = max(viewport.height, 1)
+        let current = Double(frame.height) / Double(vh)
+        let fallback = presetHeights.first ?? 0.5
+        let next: Double
+        switch direction {
+        case .grow:
+            next = presetHeights.first(where: { $0 > current + 0.05 })
+                ?? (resizeCycle ? fallback : presetHeights.last ?? fallback)
+        case .shrink:
+            next = presetHeights.reversed().first(where: { $0 < current - 0.05 })
+                ?? (resizeCycle ? presetHeights.last ?? fallback : fallback)
+        }
+        let newHeight = min(max(roundPx(next * Double(vh)), minWindowHeight), pair - minWindowHeight)
+        for member in items[pos].windows {
+            if let memberFrame = frames(member) {
+                enqueueResize(member, to: IntSize(memberFrame.width, newHeight), epoch: epoch)
+            }
+        }
+        for member in items[neighbour].windows {
+            if let memberFrame = frames(member) {
+                enqueueResize(
+                    member, to: IntSize(memberFrame.width, pair - newHeight), epoch: epoch
+                )
+            }
+        }
+        dirty.formUnion([.layout, .motion, .paint])
+    }
+
+    /// Toggle full-viewport sizing, remembering the width ratio for the way
+    /// back. Turning on first unstacks, then parks the strip so the window
+    /// lands on the viewport's left edge.
+    private mutating func toggleFullWidth(
+        frames: (WindowID) -> IntRect?, viewport: IntRect, epoch: UInt64
+    ) {
+        guard let id = focus else { return }
+        if let ratio = fullWidth[id] {
+            fullWidth.removeValue(forKey: id)
+            let width = roundPx(ratio * Double(max(viewport.width, 1)))
+            enqueueResize(id, to: IntSize(width, viewport.height), epoch: epoch)
+        } else {
+            var strip = activeStrip()
+            if strip.contains(id) {
+                _ = strip.unstack(id)
+                setActiveStrip(strip)
+            }
+            let ratio = frames(id)
+                .map { Double($0.width) / Double(max(viewport.width, 1)) } ?? 0.5
+            fullWidth[id] = ratio
+            if let frame = frames(id) {
+                if strip.contains(id) {
+                    offsets[activeWorkspace, default: 0] += viewport.min.x - frame.min.x
+                } else {
+                    enqueueMove(id, to: viewport.min, epoch: epoch)
+                }
+            }
+            enqueueResize(
+                id, to: IntSize(viewport.width, viewport.height), epoch: epoch
+            )
+        }
+        dirty.formUnion([.layout, .motion, .paint])
+    }
+
+    /// Share the viewport height equally across the focused stack.
+    private mutating func equalizeColumn(
+        frames: (WindowID) -> IntRect?, viewport: IntRect, epoch: UInt64
+    ) {
+        guard let id = focus else { return }
+        let strip = activeStrip()
+        guard let index = strip.index(of: id),
+              case .stack(let items) = strip.get(index),
+              !items.isEmpty
+        else { return }
+        let height = viewport.height / Int32(items.count)
+        for item in items {
+            for member in item.windows {
+                if let frame = frames(member) {
+                    enqueueResize(member, to: IntSize(frame.width, height), epoch: epoch)
+                }
+            }
+        }
+        dirty.formUnion([.layout, .motion, .paint])
+    }
+
+    /// Match every column's width to the focused window's, dropping
+    /// full-width markers on the way.
+    private mutating func balanceStrip(
+        frames: (WindowID) -> IntRect?, epoch: UInt64
+    ) {
+        guard let id = focus, let focusedWidth = frames(id)?.width else { return }
+        let strip = activeStrip()
+        for column in strip.columns {
+            if case .fullscreen = column { continue }
+            for member in column.windows {
+                fullWidth.removeValue(forKey: member)
+                if let frame = frames(member) {
+                    enqueueResize(
+                        member, to: IntSize(focusedWidth, frame.height), epoch: epoch
+                    )
+                }
+            }
+        }
+        dirty.formUnion([.layout, .motion, .paint])
+    }
+
+    /// Toggle floating: out of the strip when unmanaged, re-appended (and
+    /// retiled) when managed again.
+    private mutating func toggleManaged() {
+        guard let id = focus else { return }
+        var strip = activeStrip()
+        if unmanaged.contains(id) {
+            unmanaged.remove(id)
+            if !strip.contains(id) {
+                strip.append(id)
+                setActiveStrip(strip)
+            }
+        } else {
+            unmanaged.insert(id)
+            if strip.contains(id) {
+                strip.remove(id)
+                setActiveStrip(strip)
+            }
+        }
+        dirty.formUnion([.layout, .motion, .paint])
+    }
+
+    /// Slide the strip so the focused window is fully visible, snapping to
+    /// the nearest edge. No resize; y stays with the layout pass.
+    private mutating func snapWindow(frames: (WindowID) -> IntRect?, viewport: IntRect) {
+        guard let id = focus,
+              let frame = frames(id),
+              activeStrip().contains(id)
+        else { return }
+        let size = IntSize(frame.width, frame.height)
+        let origin = clampOriginToViewport(origin: frame.min, size: size, viewport: viewport)
+        offsets[activeWorkspace, default: 0] += origin.x - frame.min.x
+        dirty.formUnion([.layout, .motion, .paint])
     }
 
     /// Drives a held window's whole column by `dx` (stacked mates follow).
@@ -390,9 +717,8 @@ public struct DaemonCore: Sendable {
     }
 
     private mutating func commitPass(
-        frames: (WindowID) -> IntRect?, viewport: IntRect
+        frames: (WindowID) -> IntRect?, viewport: IntRect, epoch: UInt64
     ) -> [AXWriteJob] {
-        let epoch = ax.beginFrame()
         // Members of the held column, if any: the hand owns their truth
         // until release; everything else snaps to its slot.
         var heldMembers = Set<WindowID>()
@@ -465,6 +791,16 @@ public struct DaemonCore: Sendable {
             dirty.subtract(.motion)
         }
         return ordered
+    }
+
+    /// Size twin of `enqueueMove`: coalesces into the same per-window job
+    /// (origin and size travel together through one drain).
+    private mutating func enqueueResize(_ id: WindowID, to size: IntSize, epoch: UInt64) {
+        var job = inbox[id] ?? AXWriteJob(winID: id)
+        job.size = size
+        job.epoch = epoch
+        job.priority = (id == focus)
+        inbox[id] = job
     }
 
     private mutating func enqueueMove(_ id: WindowID, to slot: IntPoint, epoch: UInt64) {

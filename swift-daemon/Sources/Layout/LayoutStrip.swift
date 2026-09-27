@@ -307,6 +307,20 @@ public struct LayoutStrip: Equatable, Sendable {
         columns.swapAt(left, right)
     }
 
+    /// Swap two members of one stack column in place (same-column swap).
+    /// False unless the column is a stack and both positions are in range.
+    @discardableResult
+    public mutating func swapStackItems(at index: Int, _ posA: Int, _ posB: Int) -> Bool {
+        guard columns.indices.contains(index),
+              case .stack(var items) = columns[index],
+              items.indices.contains(posA), items.indices.contains(posB),
+              posA != posB
+        else { return false }
+        items.swapAt(posA, posB)
+        columns[index] = .stack(items)
+        return true
+    }
+
     /// Remove a whole column preserving grouping. Nil when out of bounds.
     public mutating func removeColumn(at index: Int) -> LayoutColumn? {
         guard columns.indices.contains(index) else { return nil }

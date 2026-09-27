@@ -198,6 +198,148 @@ do {
     check(!swiped.quiescent, "swipe tick works")
 }
 
+// Surgery ops: swap bubbles columns, center shifts the strip offset,
+// resize/equalize/balance enqueue size intents, manage toggles the strip.
+do {
+    var daemon = DaemonCore()
+    _ = daemon.tick(
+        events: [.appeared(id: 0, workspace: 1), .appeared(id: 1, workspace: 1), .appeared(id: 2, workspace: 1), .focus(id: 0)],
+        frames: frames(slots: [0: IntPoint(0, 0), 1: IntPoint(0, 0), 2: IntPoint(0, 0)]),
+        viewport: viewport, focusedStyle: style
+    )
+    let settled: [Int32: IntPoint] = [
+        0: IntPoint(0, 0), 1: IntPoint(400, 0), 2: IntPoint(800, 0),
+    ]
+    // Swap east bubbles the focused column right, twice, then back west.
+    _ = daemon.tick(
+        events: [.command(.window(.swap(.east)))],
+        frames: frames(slots: settled), viewport: viewport, focusedStyle: style
+    )
+    checkEqual(daemon.strips[1]?[0]?.allWindows, [1, 0, 2], "swap east bubbles right")
+    _ = daemon.tick(
+        events: [.command(.window(.swap(.east)))],
+        frames: frames(slots: settled), viewport: viewport, focusedStyle: style
+    )
+    checkEqual(daemon.strips[1]?[0]?.allWindows, [1, 2, 0], "swap east bubbles again")
+    _ = daemon.tick(
+        events: [.command(.window(.swap(.west)))],
+        frames: frames(slots: settled), viewport: viewport, focusedStyle: style
+    )
+    checkEqual(daemon.strips[1]?[0]?.allWindows, [1, 0, 2], "swap west bubbles back")
+    checkEqual(daemon.focus, 0, "swap keeps focus")
+    // Center shifts the strip so the focused 400-wide window centers.
+    let centered = daemon.tick(
+        events: [.command(.window(.center))],
+        frames: frames(slots: settled), viewport: viewport, focusedStyle: style
+    )
+    checkEqual(daemon.offsets[1], 312, "center parks the strip at 512-200")
+    check(!centered.quiescent, "center tick works")
+    // Resize grow steps 400/1024 through the presets to one half.
+    let grown = daemon.tick(
+        events: [.command(.window(.resize(.grow)))],
+        frames: frames(slots: settled), viewport: viewport, focusedStyle: style
+    )
+    let growJob = grown.axJobs.first(where: { $0.winID == 0 })
+    checkEqual(growJob?.size, IntSize(512, 700), "grow reaches the one-half preset")
+    // Explicit width jumps straight there.
+    let set = daemon.tick(
+        events: [.command(.window(.setWidth(0.75)))],
+        frames: frames(slots: settled), viewport: viewport, focusedStyle: style
+    )
+    checkEqual(
+        set.axJobs.first(where: { $0.winID == 0 })?.size, IntSize(768, 700),
+        "setWidth jumps to three quarters"
+    )
+    // Full width toggles on and back off to the remembered ratio.
+    let full = daemon.tick(
+        events: [.command(.window(.fullWidth))],
+        frames: frames(slots: settled), viewport: viewport, focusedStyle: style
+    )
+    checkEqual(
+        full.axJobs.first(where: { $0.winID == 0 })?.size, IntSize(1024, 768),
+        "fullWidth fills the viewport"
+    )
+    let unfull = daemon.tick(
+        events: [.command(.window(.fullWidth))],
+        frames: frames(slots: settled), viewport: viewport, focusedStyle: style
+    )
+    checkEqual(
+        unfull.axJobs.first(where: { $0.winID == 0 })?.size, IntSize(400, 768),
+        "fullWidth off restores the remembered width"
+    )
+    // Manage floats the window out of the strip and tiles it back.
+    _ = daemon.tick(
+        events: [.command(.window(.manage))],
+        frames: frames(slots: settled), viewport: viewport, focusedStyle: style
+    )
+    checkEqual(daemon.unmanaged, [0], "manage floats the window")
+    checkEqual(daemon.strips[1]?[0]?.allWindows, [1, 2], "floated window leaves the strip")
+    _ = daemon.tick(
+        events: [.command(.window(.manage))],
+        frames: frames(slots: settled), viewport: viewport, focusedStyle: style
+    )
+    checkEqual(daemon.unmanaged, [], "manage again recovers")
+    checkEqual(daemon.strips[1]?[0]?.allWindows, [1, 2, 0], "recovered window appends")
+    // Snap clamps a half-hidden frame back by the shortfall.
+    _ = daemon.tick(
+        events: [.command(.window(.snap))],
+        frames: frames(slots: [0: IntPoint(-100, 0), 1: IntPoint(400, 0), 2: IntPoint(800, 0)]),
+        viewport: viewport, focusedStyle: style
+    )
+    checkEqual(daemon.offsets[1], 312 + 100, "snap scrolls by the left shortfall")
+}
+
+// Vertical resize and equalize share heights across one stack.
+do {
+    var daemon = DaemonCore()
+    _ = daemon.tick(
+        events: [.appeared(id: 0, workspace: 1), .appeared(id: 1, workspace: 1), .focus(id: 1)],
+        frames: frames(slots: [0: IntPoint(0, 0), 1: IntPoint(0, 0)]),
+        viewport: viewport, focusedStyle: style
+    )
+    _ = daemon.tick(
+        events: [.command(.window(.stack(true)))],
+        frames: frames(slots: [0: IntPoint(0, 0), 1: IntPoint(400, 0)]),
+        viewport: viewport, focusedStyle: style
+    )
+    // Shrink from 700/768 through the height presets to three quarters.
+    let shrunk = daemon.tick(
+        events: [.command(.window(.resizeVertical(.shrink)))],
+        frames: frames(slots: [0: IntPoint(0, 0), 1: IntPoint(400, 0)]),
+        viewport: viewport, focusedStyle: style
+    )
+    checkEqual(
+        shrunk.axJobs.first(where: { $0.winID == 1 })?.size, IntSize(400, 576),
+        "vertical shrink takes three quarters"
+    )
+    checkEqual(
+        shrunk.axJobs.first(where: { $0.winID == 0 })?.size, IntSize(400, 824),
+        "the neighbour absorbs the pair remainder"
+    )
+    // Equalize splits the viewport height across both members.
+    let level = daemon.tick(
+        events: [.command(.window(.equalize))],
+        frames: frames(slots: [0: IntPoint(0, 0), 1: IntPoint(400, 0)]),
+        viewport: viewport, focusedStyle: style
+    )
+    for id in [0, 1] {
+        checkEqual(
+            level.axJobs.first(where: { $0.winID == id })?.size, IntSize(400, 384),
+            "equalize halves the viewport for \(id)"
+        )
+    }
+    // Balance matches every column to the focused width.
+    let balanced = daemon.tick(
+        events: [.command(.window(.balance))],
+        frames: frames(slots: [0: IntPoint(0, 0), 1: IntPoint(400, 0)]),
+        viewport: viewport, focusedStyle: style
+    )
+    check(
+        balanced.axJobs.contains { $0.winID == 0 && $0.size == IntSize(400, 700) },
+        "balance rewrites every column to the focused width"
+    )
+}
+
 if failures == 0 {
     print("DaemonChecks: all checks passed")
 } else {
