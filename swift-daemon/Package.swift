@@ -160,6 +160,21 @@ let package = Package(
             path: "Tests/KeyChordsChecks"
         ),
         .executableTarget(
+            name: "SnippetChecks",
+            dependencies: ["Snippets"],
+            path: "Tests/SnippetChecks"
+        ),
+        .executableTarget(
+            name: "ProviderChecks",
+            dependencies: ["Providers", "Geometry"],
+            path: "Tests/ProviderChecks"
+        ),
+        .executableTarget(
+            name: "WorkerChecks",
+            dependencies: ["Workers", "AXClient", "Geometry"],
+            path: "Tests/WorkerChecks"
+        ),
+        .executableTarget(
             name: "DisplaysChecks",
             dependencies: ["Displays", "Geometry"],
             path: "Tests/DisplaysChecks"
@@ -250,6 +265,25 @@ let package = Package(
         .target(
             name: "KeyChords",
             path: "Sources/KeyChords"
+        ),
+        // Copy-Window-Rule snippet builder (`src/config/snippet.rs`).
+        .target(
+            name: "Snippets",
+            path: "Sources/Snippets"
+        ),
+        // Live-window provider protocols + scriptable mock
+        // (`manager::WindowApi` surface).
+        .target(
+            name: "Providers",
+            dependencies: ["Geometry"],
+            path: "Sources/Providers"
+        ),
+        // Worker shells: write drain + read pool over injected gateways
+        // (`ax_writer::run`, `ax_reads::serve` control flow).
+        .target(
+            name: "Workers",
+            dependencies: ["AXClient", "Geometry"],
+            path: "Sources/Workers"
         ),
         // Display model: identity, insets, viewport derivation
         // (`src/manager/display.rs`, `ecs::DockPosition`).

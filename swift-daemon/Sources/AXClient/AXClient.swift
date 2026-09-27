@@ -81,6 +81,13 @@ public struct AXWriteAck: Equatable, Sendable {
     public var seq: UInt64
     public var epoch: UInt64
     public var ok: Bool
+
+    public init(winID: WindowID, seq: UInt64, epoch: UInt64, ok: Bool) {
+        self.winID = winID
+        self.seq = seq
+        self.epoch = epoch
+        self.ok = ok
+    }
 }
 
 // MARK: - Drain coalescing

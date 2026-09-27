@@ -242,6 +242,9 @@ until cutover:
 - **`Displays`** (done): display identity, dock location, menubar/notch
   rules, viewport derivation — from `src/manager/display.rs` (verified by
   `Tests/DisplaysChecks`).
+- **`Snippets`** (done): Copy-Window-Rule builder in TOML/Lua dialects
+  with verbatim documents — from `src/config/snippet.rs` (verified by
+  `Tests/SnippetChecks`).
 - **`PaneruXPC`** (done): XPC transport replacing the raw Mach bootstrap —
   `@objc` protocol, error-string convention, client + loopback listener —
   verified by in-process round trips (`Tests/XPCChecks`, no bundle or
