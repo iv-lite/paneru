@@ -155,6 +155,16 @@ let package = Package(
             path: "Tests/ConfigChecks"
         ),
         .executableTarget(
+            name: "KeyChordsChecks",
+            dependencies: ["KeyChords"],
+            path: "Tests/KeyChordsChecks"
+        ),
+        .executableTarget(
+            name: "DisplaysChecks",
+            dependencies: ["Displays", "Geometry"],
+            path: "Tests/DisplaysChecks"
+        ),
+        .executableTarget(
             name: "SessionChecks",
             dependencies: ["Session"],
             path: "Tests/SessionChecks"
@@ -235,6 +245,18 @@ let package = Package(
         .target(
             name: "Config",
             path: "Sources/Config"
+        ),
+        // Key-chord resolution (`resolve_chord`, modifier + keycode tables).
+        .target(
+            name: "KeyChords",
+            path: "Sources/KeyChords"
+        ),
+        // Display model: identity, insets, viewport derivation
+        // (`src/manager/display.rs`, `ecs::DockPosition`).
+        .target(
+            name: "Displays",
+            dependencies: ["Geometry"],
+            path: "Sources/Displays"
         ),
         // Session restore planning + state model (`src/ecs/restore.rs`,
         // `src/ecs/state.rs` shapes).

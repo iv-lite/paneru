@@ -236,6 +236,12 @@ until cutover:
 - **`ScriptEvents`** (done): script-visible event taxonomy with handler
   table shapes — from `src/lua/convert.rs` (verified by
   `Tests/ScriptEventsChecks`).
+- **`KeyChords`** (done): modifier bits, ANSI/literal keycode tables, and
+  chord resolution — from `src/config.rs` (verified by
+  `Tests/KeyChordsChecks`).
+- **`Displays`** (done): display identity, dock location, menubar/notch
+  rules, viewport derivation — from `src/manager/display.rs` (verified by
+  `Tests/DisplaysChecks`).
 - **`PaneruXPC`** (done): XPC transport replacing the raw Mach bootstrap —
   `@objc` protocol, error-string convention, client + loopback listener —
   verified by in-process round trips (`Tests/XPCChecks`, no bundle or
