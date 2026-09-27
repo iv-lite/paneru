@@ -21,6 +21,14 @@ let package = Package(
             path: "Sources/CTapShim",
             publicHeadersPath: "include"
         ),
+        // PUC-Rio Lua 5.5.0, vendored for offline builds (see VENDORED.md).
+        // Plain C, no codegen: compiles straight into the package.
+        .target(
+            name: "CLua",
+            path: "Sources/CLua",
+            publicHeadersPath: "include",
+            cSettings: [.headerSearchPath("include")]
+        ),
         .target(
             name: "Geometry",
             path: "Sources/Geometry"
@@ -54,6 +62,13 @@ let package = Package(
         .target(
             name: "Scripting",
             path: "Sources/Scripting"
+        ),
+        // Live Lua bridge over the vendored PUC-Rio interpreter:
+        // snapshot in, command strings out.
+        .target(
+            name: "LuaBridge",
+            dependencies: ["CLua", "Scripting"],
+            path: "Sources/LuaBridge"
         ),
         // Dependency-free check runners (this toolchain ships neither
         // XCTest nor swift-testing): `swift run --package-path
@@ -94,9 +109,19 @@ let package = Package(
             path: "Tests/ServiceChecks"
         ),
         .executableTarget(
+            name: "DaemonChecks",
+            dependencies: ["Daemon", "Geometry", "Presentation"],
+            path: "Tests/DaemonChecks"
+        ),
+        .executableTarget(
             name: "ScriptingChecks",
             dependencies: ["Scripting"],
             path: "Tests/ScriptingChecks"
+        ),
+        .executableTarget(
+            name: "LuaBridgeChecks",
+            dependencies: ["LuaBridge", "Scripting"],
+            path: "Tests/LuaBridgeChecks"
         ),
         // Daemon↔client protocol shapes (`crates/shared_types/wire.rs`).
         .target(
@@ -108,6 +133,15 @@ let package = Package(
         .target(
             name: "Service",
             path: "Sources/Service"
+        ),
+        // Serial daemon assembly wiring every module through the pass list.
+        .target(
+            name: "Daemon",
+            dependencies: [
+                "Geometry", "Layout", "AXClient", "EventCore",
+                "Presentation", "Scripting",
+            ],
+            path: "Sources/Daemon"
         ),
     ]
 )

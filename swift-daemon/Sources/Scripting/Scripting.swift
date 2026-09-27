@@ -158,6 +158,9 @@ public struct ScriptState: Equatable, Sendable {
         entries[key]
     }
 
+    /// All entries, for pushing a snapshot across a bridge.
+    public var fields: [String: ScriptValue] { entries }
+
     public var isEmpty: Bool { entries.isEmpty }
 
     /// Applies `write` if what it expected to find is what is there.

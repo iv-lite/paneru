@@ -207,8 +207,16 @@ until cutover:
   plist document, env fallbacks, start ladder — from
   `src/platform/service.rs` and `assets/launchd.plist` (verified by
   `Tests/ServiceChecks`).
-- **Next:** daemon assembly (actors wiring the modules to AX/AppKit),
-  LuaJIT linkage, XPC cutover, then retirement of `src/`. Each lands with
+- **`LuaBridge`** (done): live Lua execution over vendored PUC-Rio 5.5 —
+  snapshot tables in, handler calls, command-string outbox drains, error
+  propagation — shaped for the snapshot architecture (verified by
+  `Tests/LuaBridgeChecks`, which execute real scripts).
+- **`Daemon`** (done): serial assembly wiring every module through the
+  pass list — ingest, layout, hand-owned commit, homing, border paint —
+  against injected frame providers (verified by `Tests/DaemonChecks`
+  end-to-end frames).
+- **Next:** live AX/AppKit providers behind the protocols, LuaJIT
+  linkage, XPC cutover, then retirement of `src/`. Each lands with
   parity tests before the Rust counterpart is touched.
 
 Supporting seams already in the Rust daemon: `src/replay.rs` (Phase 0
