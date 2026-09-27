@@ -11,6 +11,7 @@ let package = Package(
         .library(name: "PaneruDaemon", targets: [
             "Geometry", "Layout", "AXClient", "EventCore",
             "Presentation", "Scripting", "IPC", "Service",
+            "Commands",
         ]),
     ],
     targets: [
@@ -119,6 +120,11 @@ let package = Package(
             path: "Tests/XPCChecks"
         ),
         .executableTarget(
+            name: "CommandsChecks",
+            dependencies: ["Commands"],
+            path: "Tests/CommandsChecks"
+        ),
+        .executableTarget(
             name: "ScriptingChecks",
             dependencies: ["Scripting"],
             path: "Tests/ScriptingChecks"
@@ -153,6 +159,12 @@ let package = Package(
         .target(
             name: "PaneruXPC",
             path: "Sources/PaneruXPC"
+        ),
+        // Command vocabulary + argv encoding (`crates/shared_types/commands.rs`,
+        // `argv.rs`).
+        .target(
+            name: "Commands",
+            path: "Sources/Commands"
         ),
     ]
 )
