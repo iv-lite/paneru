@@ -26,6 +26,43 @@ public struct LuaBridgeError: Error, Equatable, CustomStringConvertible {
 public let luaStateGlobal = "paneru_state"
 /// Name of the global array scripts append command strings to.
 public let luaOutboxGlobal = "paneru_outbox"
+/// Name of the global array flash calls accumulate in.
+public let luaFlashesGlobal = "paneru_flashes"
+
+/// `luaRegistryIndex` is a C macro (unimportable); this is its value
+/// (`-(INT_MAX/2 + 1000)`).
+private let luaRegistryIndex: Int32 = -1_073_742_823
+
+/// The `paneru` table scripts program against. Binds record
+/// `{chord, handler}` rows for the host to publish; `run`/`command`
+/// append to the outbox; `flash` accumulates flashes. `on`, `match`,
+/// `query`, and `state` arrive with later slices — calling them now is
+/// a loud error, not a silent nil.
+public let luaPrelude = """
+    paneru = { _binds = {} }
+    function paneru.bind(chord, handler)
+      if type(handler) ~= "function" and type(handler) ~= "string" then
+        error("paneru.bind: handler must be a function or command string")
+      end
+      table.insert(paneru._binds, { chord = chord, handler = handler })
+    end
+    function paneru.run(cmd)
+      table.insert(paneru_outbox, cmd)
+    end
+    paneru.command = paneru.run
+    function paneru.flash(message, duration)
+      table.insert(paneru_flashes, { message = message, duration = duration or 2.0 })
+    end
+    function paneru.log(message) end
+    function paneru.on(name, handler)
+      if type(handler) ~= "function" then
+        error("paneru.on: handler must be a function")
+      end
+      paneru._handlers = paneru._handlers or {}
+      paneru._handlers[name] = paneru._handlers[name] or {}
+      table.insert(paneru._handlers[name], handler)
+    end
+    """
 
 public final class LuaBridge {
     private let state: OpaquePointer
@@ -40,6 +77,9 @@ public final class LuaBridge {
         // The outbox array every handler appends to.
         lua_createtable(state, 0, 0)
         lua_setglobal(state, luaOutboxGlobal)
+        // The flash array `paneru.flash` accumulates in.
+        lua_createtable(state, 0, 0)
+        lua_setglobal(state, luaFlashesGlobal)
     }
 
     deinit {
@@ -118,8 +158,182 @@ public final class LuaBridge {
         return out
     }
 
-    // MARK: - Values
+    /// Install the `paneru` table. Idempotent: reloading re-runs it over
+    /// whatever the user script defined.
+    public func installPrelude() throws {
+        try load(luaPrelude)
+    }
 
+    // MARK: - Binds
+
+    /// One recorded `paneru.bind` row: chord plus either a registry ref
+    /// (function) or a command line (string).
+    public struct PendingBind: Equatable, Sendable {
+        public var chord: String
+        public var ref: Int32?
+        public var command: String?
+
+        public init(chord: String, ref: Int32? = nil, command: String? = nil) {
+            self.chord = chord
+            self.ref = ref
+            self.command = command
+        }
+    }
+
+    /// Read `paneru._binds` in order, referencing functions in the
+    /// registry. The host releases refs via `releaseRef` on reload.
+    public func listBinds() -> [PendingBind] {
+        var out: [PendingBind] = []
+        guard lua_getglobal(state, "paneru") == LUA_TTABLE else {
+            pop(1)
+            return out
+        }
+        lua_getfield(state, -1, "_binds")
+        guard lua_type(state, -1) == LUA_TTABLE else {
+            pop(2)
+            return out
+        }
+        let count = Int(lua_rawlen(state, -1))
+        if count > 0 {
+            for i in 1...count {
+                lua_geti(state, -1, Int64(i))
+                var chord: String?
+                var ref: Int32?
+                var command: String?
+                if lua_type(state, -1) == LUA_TTABLE {
+                    lua_getfield(state, -1, "chord")
+                    if lua_type(state, -1) == LUA_TSTRING,
+                       let cstr = lua_tolstring(state, -1, nil)
+                    {
+                        chord = String(cString: cstr)
+                    }
+                    pop(1)
+                    lua_getfield(state, -1, "handler")
+                    let kind = lua_type(state, -1)
+                    if kind == LUA_TFUNCTION {
+                        ref = luaL_ref(state, luaRegistryIndex)
+                    } else {
+                        if kind == LUA_TSTRING,
+                           let cstr = lua_tolstring(state, -1, nil)
+                        {
+                            command = String(cString: cstr)
+                        }
+                        pop(1)
+                    }
+                }
+                pop(1)
+                if let chord {
+                    out.append(PendingBind(chord: chord, ref: ref, command: command))
+                }
+            }
+        }
+        pop(2)
+        return out
+    }
+
+    /// Release one registry ref taken by `listBinds`.
+    public func releaseRef(_ ref: Int32) {
+        luaL_unref(state, luaRegistryIndex, ref)
+    }
+
+    /// Call a referenced bind function with no arguments (binds take
+    /// none in this slice). Errors throw with the interpreter message.
+    public func callFunctionRef(_ ref: Int32) throws {
+        guard lua_rawgeti(state, luaRegistryIndex, Int64(ref)) == LUA_TFUNCTION else {
+            pop(1)
+            throw LuaBridgeError("bind ref \(ref) is not a function")
+        }
+        try pcall(nargs: 0, nresults: 0)
+    }
+
+    /// Call a referenced handler with one string argument (the event
+    /// name; details ride `paneru_state`).
+    public func callHandlerRef(_ ref: Int32, arg: String) throws {
+        guard lua_rawgeti(state, luaRegistryIndex, Int64(ref)) == LUA_TFUNCTION else {
+            pop(1)
+            throw LuaBridgeError("handler ref \(ref) is not a function")
+        }
+        lua_pushstring(state, arg)
+        try pcall(nargs: 1, nresults: 0)
+    }
+
+    /// Event-handler refs by event name, in registration order.
+    public func listHandlers() -> [(name: String, ref: Int32)] {
+        var out: [(name: String, ref: Int32)] = []
+        guard lua_getglobal(state, "paneru") == LUA_TTABLE else {
+            pop(1)
+            return out
+        }
+        lua_getfield(state, -1, "_handlers")
+        guard lua_type(state, -1) == LUA_TTABLE else {
+            pop(2)
+            return out
+        }
+        lua_pushnil(state)
+        while lua_next(state, -2) != 0 {
+            var name: String?
+            if lua_type(state, -2) == LUA_TSTRING,
+               let cstr = lua_tolstring(state, -2, nil)
+            {
+                name = String(cString: cstr)
+            }
+            if let name, lua_type(state, -1) == LUA_TTABLE {
+                let count = Int(lua_rawlen(state, -1))
+                if count > 0 {
+                    for i in 1...count {
+                        lua_geti(state, -1, Int64(i))
+                        if lua_type(state, -1) == LUA_TFUNCTION {
+                            out.append((name, luaL_ref(state, luaRegistryIndex)))
+                        } else {
+                            pop(1)
+                        }
+                    }
+                }
+            }
+            pop(1)
+        }
+        pop(2)
+        return out
+    }
+
+    /// Drain accumulated flashes in order, resetting for the next batch.
+    public func drainFlashes() -> [(message: String, duration: Double)] {
+        var out: [(message: String, duration: Double)] = []
+        guard lua_getglobal(state, luaFlashesGlobal) == LUA_TTABLE else {
+            pop(1)
+            return out
+        }
+        let count = Int(lua_rawlen(state, -1))
+        if count > 0 {
+            for i in 1...count {
+                lua_geti(state, -1, Int64(i))
+                var message: String?
+                var duration = 2.0
+                if lua_type(state, -1) == LUA_TTABLE {
+                    lua_getfield(state, -1, "message")
+                    if let cstr = lua_tolstring(state, -1, nil) {
+                        message = String(cString: cstr)
+                    }
+                    pop(1)
+                    lua_getfield(state, -1, "duration")
+                    if lua_type(state, -1) == LUA_TNUMBER {
+                        duration = lua_tonumberx(state, -1, nil)
+                    }
+                    pop(1)
+                }
+                pop(1)
+                if let message {
+                    out.append((message, duration))
+                }
+            }
+        }
+        pop(1)
+        lua_createtable(state, 0, 0)
+        lua_setglobal(state, luaFlashesGlobal)
+        return out
+    }
+
+    // MARK: - Values
     private func pushScriptValue(_ value: ScriptValue) {
         switch value {
         case .null:

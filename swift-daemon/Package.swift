@@ -233,8 +233,9 @@ let package = Package(
             name: "paneru-swift",
             dependencies: [
                 "Commands", "Config", "ConfigFiles", "Daemon", "Geometry",
-                "IPC", "KeyChords", "LiveProviders", "MenuBar",
-                "PaneruXPC", "Presentation", "Presenter", "StateQuery",
+                "IPC", "KeyChords", "Layout", "LiveProviders", "LuaBridge",
+                "MenuBar", "PaneruXPC", "Presentation", "Presenter",
+                "ScriptEvents", "ScriptHost", "Scripting", "StateQuery",
                 "WindowSet",
             ],
             path: "Sources/PaneruDaemon"

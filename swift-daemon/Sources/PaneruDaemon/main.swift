@@ -14,16 +14,23 @@ import Config
 import ConfigFiles
 import CoreGraphics
 import Daemon
+import Darwin
 import Foundation
 import Geometry
 import IPC
 import KeyChords
+import Layout
 import LiveProviders
+import LuaBridge
 import MenuBar
 import PaneruXPC
 import Presentation
 import Presenter
+import ScriptEvents
+import ScriptHost
+import Scripting
 import StateQuery
+import WindowSet
 
 // MARK: - Startup
 
@@ -194,6 +201,7 @@ func syncRoster() {
             continue
         case .tile, .float:
             roster[wid] = window
+            windowPIDs[windowID(wid)] = info.ownerPID
             pending.append(.appeared(id: windowID(wid), workspace: 1))
             if rules.contains(where: { $0.floating }) {
                 pending.append(.command(.layout([
@@ -211,6 +219,7 @@ func syncRoster() {
     }
     for wid in known.subtracting(current) {
         roster.removeValue(forKey: wid)
+        windowPIDs.removeValue(forKey: windowID(wid))
         dontFocus.remove(windowID(wid))
         pending.append(.disappeared(id: windowID(wid)))
     }
@@ -271,8 +280,17 @@ tap.tuning = TapTuning(
     scrollTarget: tapModifiers(resolved.swipeScrollModifiers),
     scrollVertical: tapModifiers(resolved.swipeScrollVerticalModifiers)
 )
-// Config bindings resolve through the table; scripted binds arrive with
-// the Lua host (slice 7); passthrough chords deliver natively.
+// Config bindings resolve through the table; scripted binds dispatch
+// through the mailbox; passthrough chords deliver natively.
+tap.scripted = { code, mods in
+    keybindEntries.first {
+        $0.code == code && $0.mods.isSubset(of: keyModifiers(mods))
+    }?.id
+}
+tap.configured = { code, mods in
+    findBinding(code: code, held: keyModifiers(mods), in: bindings)?
+        .toArgv()?.joined(separator: " ")
+}
 tap.passthrough = { code, mods in
     tapPassthrough.contains("\(code):\(keyModifiers(mods).rawValue)")
 }
@@ -385,6 +403,272 @@ func answerQueryDocument(_ data: Data) -> Data {
     return json
 }
 
+// MARK: - Script host
+
+var mailbox = ScriptMailbox()
+var scriptStore = ScriptState()
+var luaBridge: LuaBridge?
+var scriptPath: String?
+var scriptHandlers: [(name: String, ref: Int32)] = []
+var bindRefs: [UInt32: Int32] = [:]
+var keybindEntries: [(code: UInt8, mods: KeyModifiers, id: UInt32)] = []
+var needScriptReload = false
+var scriptWatcher: DispatchSourceFileSystemObject?
+
+/// Publish one loaded script: keybinds, binds, handlers.
+func publishScript(_ bridge: LuaBridge) {
+    bindRefs = [:]
+    keybindEntries = []
+    scriptHandlers = []
+    mailbox = ScriptMailbox()
+    var keybinds: [PublishedKeybind] = []
+    for pending in bridge.listBinds() {
+        guard let (code, mods) = try? resolveChord(pending.chord) else {
+            print("lua: bad chord '\(pending.chord)' (skipped)")
+            continue
+        }
+        if let command = pending.command {
+            let id = mailbox.registerBind(.stringCommand(command))
+            keybindEntries.append((code, mods, id))
+            keybinds.append(PublishedKeybind(
+                keycode: code, modifiers: UInt32(mods.rawValue), id: id
+            ))
+        } else if let ref = pending.ref {
+            let id = mailbox.registerBind(.function(id: 0))
+            bindRefs[id] = ref
+            keybindEntries.append((code, mods, id))
+            keybinds.append(PublishedKeybind(
+                keycode: code, modifiers: UInt32(mods.rawValue), id: id
+            ))
+        }
+    }
+    mailbox.keybinds = keybinds
+    scriptHandlers = bridge.listHandlers()
+    mailbox.hasHandlers = !scriptHandlers.isEmpty
+    print("lua: \(keybinds.count) binds, \(scriptHandlers.count) handlers")
+}
+
+/// Load (or reload) the script file. Failures keep the old runtime.
+func loadScript(from path: String) {
+    let bridge = LuaBridge()
+    do {
+        try bridge.installPrelude()
+        try bridge.load(String(contentsOfFile: path))
+    } catch {
+        print("lua: \(error) (keeping previous runtime)")
+        mailbox.applyReload(success: false, error: "\(error)")
+        return
+    }
+    luaBridge = bridge
+    publishScript(bridge)
+    mailbox.applyReload(success: true, keybinds: mailbox.keybinds)
+    print("lua: loaded \(path)")
+}
+
+func watchScript(_ path: String) {
+    let fd = open(path, O_EVTONLY)
+    guard fd >= 0 else { return }
+    let source = DispatchSource.makeFileSystemObjectSource(
+        fileDescriptor: fd, eventMask: .write, queue: .main
+    )
+    source.setEventHandler { needScriptReload = true }
+    source.setCancelHandler { close(fd) }
+    source.resume()
+    scriptWatcher = source
+}
+
+/// The script tree for handlers: core strips plus unmanaged floats.
+func scriptWindowSet(viewport: IntRect) -> WindowSet {
+    let ws = core.activeWorkspace
+    let frame = WSFrame(
+        x: viewport.min.x, y: viewport.min.y,
+        width: viewport.width, height: viewport.height
+    )
+    func wsWindow(_ id: WindowID) -> WSWindow {
+        WSWindow(id: id)
+    }
+    func wsColumn(_ column: LayoutColumn) -> WSColumn {
+        switch column {
+        case .single(let id):
+            return .single(wsWindow(id))
+        case .fullscreen(let id):
+            return WSColumn(
+                kind: .fullscreen, widthRatio: 1.0, windows: [wsWindow(id)]
+            )
+        case .tabs(let ids):
+            return WSColumn(
+                kind: .tabs, widthRatio: 0.5,
+                windows: ids.map(wsWindow)
+            )
+        case .stack(let items):
+            // Tab groups flatten: membership survives, grouping does not.
+            return WSColumn(
+                kind: .stack, widthRatio: 0.5,
+                windows: items.flatMap { $0.windows.map(wsWindow) }
+            )
+        }
+    }
+    let rows = (core.strips[ws] ?? [:]).keys.sorted()
+    let workspaces = rows.map { row in
+        WSWorkspace(
+            number: row, nativeID: 0,
+            active: (core.activeVirtual[ws] ?? 0) == row,
+            columns: (core.strips[ws]?[row]?.columns ?? []).map(wsColumn),
+            floating: row == (core.activeVirtual[ws] ?? 0)
+                ? core.unmanaged.sorted().map(wsWindow) : []
+        )
+    }
+    return WindowSet(displays: [
+        WSDisplay(id: 0, frame: frame, active: true, workspaces: workspaces),
+    ])
+}
+
+/// Daemon events with a script analog. Commands ride the lua-command
+/// path instead (no loops); drags have no payload yet.
+func scriptEvents(for events: [DaemonEvent]) -> [ScriptEvent] {
+    var out: [ScriptEvent] = []
+    for event in events {
+        switch event {
+        case .focus(let id):
+            if let id { out.append(.windowFocused(windowID: id)) }
+        case .appeared(let id, _):
+            let meta = core.windowMetadata[id]
+            let frame = roster[CGWindowID(id)]?.frame
+            out.append(.windowSpawned(WindowSpawnPayload(
+                windowID: id, pid: windowPIDs[id] ?? 0,
+                appName: meta?.appName ?? "",
+                bundleID: meta?.bundleID ?? "",
+                title: meta?.title ?? "",
+                frame: FrameRect(
+                    x: Int32(frame?.min.x ?? 0), y: Int32(frame?.min.y ?? 0),
+                    width: Int32(frame?.width ?? 0),
+                    height: Int32(frame?.height ?? 0)
+                ),
+                floating: core.unmanaged.contains(id), managed: true
+            )))
+        case .disappeared(let id):
+            out.append(.windowDestroyed(windowID: id))
+        case .swipe(let delta, let fingers):
+            out.append(.swipe(delta: delta, fingers: fingers))
+        case .scroll(let delta):
+            out.append(.scroll(delta: delta))
+        case .command, .dragMoved, .released:
+            break
+        }
+    }
+    return out
+}
+
+func parseScriptCommand(_ line: String) -> PaneruCommand? {
+    let argv = line.split(whereSeparator: { $0.isWhitespace }).map(String.init)
+    guard !argv.isEmpty else { return nil }
+    do {
+        return try parseCommand(argv)
+    } catch {
+        print("lua: bad command '\(line)': \(error)")
+        return nil
+    }
+}
+
+/// One frame of script hosting: reloads, bind dispatch, events, store,
+/// outbox. Runs before the core tick consumes `pending`.
+func drainLuaFrame(viewport: IntRect) {
+    guard let bridge = luaBridge else { return }
+    if needScriptReload, let path = scriptPath {
+        needScriptReload = false
+        loadScript(from: path)
+        watchScript(path)
+    }
+    // Store writes first (PreUpdate order); acks fold into the overlay.
+    _ = mailbox.serveWrites { write in
+        scriptStore.apply(write).mapError { ScriptFailure($0.message) }
+    }
+    // Lua commands in `pending` dispatch through binds, never the core.
+    var kept: [DaemonEvent] = []
+    kept.reserveCapacity(pending.count)
+    for event in pending {
+        guard case .command(.lua(let id)) = event else {
+            kept.append(event)
+            continue
+        }
+        switch mailbox.dispatchBind(id) {
+        case .function:
+            guard let ref = bindRefs[id] else {
+                print("lua: bind \(id) has no function ref")
+                continue
+            }
+            mailbox.enter()
+            bridge.pushStore(scriptStore)
+            do {
+                try bridge.callFunctionRef(ref)
+                mailbox.finishDispatch(
+                    commands: bridge.drainCommands().compactMap(parseScriptCommand),
+                    flashes: bridge.drainFlashes().map { ($0.message, $0.duration) }
+                )
+            } catch {
+                print("lua: bind \(id): \(error)")
+            }
+            mailbox.exit()
+        case .stringCommand(let line):
+            if let command = parseScriptCommand(line) {
+                kept.append(.command(command))
+            }
+        case .missing:
+            print("lua: bind \(id) has no handler")
+        }
+    }
+    pending = kept
+    // Events share one snapshot across every handler in the frame.
+    if mailbox.hasHandlers {
+        let events = scriptEvents(for: pending)
+        if !events.isEmpty {
+            let snapshot = ScriptSnapshot(
+                state: .success(buildQueryState()),
+                windowSet: .success(scriptWindowSet(viewport: viewport)),
+                scriptState: .success(scriptStore)
+            )
+            mailbox.enqueue(.events(events, snapshot: snapshot))
+        }
+    }
+    while let message = mailbox.dequeue() {
+        guard case .events(let events, let snapshot) = message else {
+            continue
+        }
+        mailbox.attach(snapshot)
+        for event in events {
+            for handler in scriptHandlers
+                where handler.name == event.eventName
+            {
+                mailbox.enter()
+                bridge.pushStore(scriptStore)
+                do {
+                    try bridge.callHandlerRef(handler.ref, arg: handler.name)
+                    mailbox.finishDispatch(
+                        commands: bridge.drainCommands().compactMap(parseScriptCommand),
+                        flashes: bridge.drainFlashes().map { ($0.message, $0.duration) }
+                    )
+                } catch {
+                    print("lua: handler \(handler.name): \(error)")
+                }
+                mailbox.exit()
+            }
+        }
+    }
+    // Outbox exactly once: commands join `pending`, flashes present.
+    for message in mailbox.drainOutbox() {
+        switch message {
+        case .command(let command):
+            pending.append(.command(command))
+        case .flash(let text, let duration):
+            pendingFlashes.append((text, duration))
+        case .configChanged:
+            break
+        }
+    }
+}
+
+var pendingFlashes: [(String, Double)] = []
+
 // MARK: - Tick
 
 func viewport() -> IntRect {
@@ -405,6 +689,8 @@ var tickCount = 0
 var copiedRuleSent: String?
 /// Focused passthrough chords as `code:mask` strings.
 var tapPassthrough: Set<String> = []
+/// Owner pid per adopted window (for spawn payloads).
+var windowPIDs: [WindowID: pid_t] = [:]
 var prevTickFocus: WindowID?
 var prevTickRow: UInt32?
 var prevTickRoster = 0
@@ -422,9 +708,11 @@ func eventJSON(_ event: StateEvent) -> (name: String, json: String)? {
 func tick() {
     tickCount += 1
     syncRoster()
+    let view = viewport()
+    // Script hosting runs before the core consumes `pending`.
+    drainLuaFrame(viewport: view)
     let events = pending
     pending.removeAll()
-    let view = viewport()
     let result = core.tick(
         events: events,
         frames: { roster[CGWindowID(bitPattern: $0)]?.frame },
@@ -454,6 +742,14 @@ func tick() {
         NSPasteboard.general.setString(rule, forType: .string)
         copiedRuleSent = rule
     }
+    // Script flashes present top-right (durations are advisory here).
+    for flash in pendingFlashes {
+        Presenter.showFlash(
+            message: flash.0, opacity: 1,
+            topRight: CGPoint(x: Double(view.max.x), y: Double(view.min.y))
+        )
+    }
+    pendingFlashes.removeAll()
     // Throttled frame refresh: job targets already re-read above.
     if tickCount % 3 == 0 {
         for window in roster.values {
@@ -569,6 +865,37 @@ func tick() {
 
 Timer.scheduledTimer(withTimeInterval: 1.0 / 60.0, repeats: true) { _ in
     tick()
+}
+
+// Script file: discovered, or created from the default (so the watcher
+// always has a concrete path, mirroring `ensure_lua_file`).
+switch ensureLua(discoveredTOML: discoveredTOML.path, discoveredLua: discoveredLua.path) {
+case .use(let path):
+    scriptPath = path
+case .tomlActive:
+    break
+case .createDefault:
+    do {
+        let path = try defaultWritePath(env, file: "init.lua")
+        let url = URL(fileURLWithPath: path)
+        try FileManager.default.createDirectory(
+            at: url.deletingLastPathComponent(),
+            withIntermediateDirectories: true
+        )
+        if !FileManager.default.fileExists(atPath: path) {
+            try defaultLuaScript.write(toFile: path, atomically: true, encoding: .utf8)
+            print("config: created default Lua script at \(path)")
+        }
+        scriptPath = path
+    } catch {
+        print("config: warning: could not ensure init.lua: \(error)")
+    }
+}
+if let scriptPath {
+    loadScript(from: scriptPath)
+    watchScript(scriptPath)
+} else {
+    print("lua: disabled (TOML owns this launch)")
 }
 
 // Command server: Mach service accepting argv commands into `pending`.

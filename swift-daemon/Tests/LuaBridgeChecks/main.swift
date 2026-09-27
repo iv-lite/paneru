@@ -90,6 +90,68 @@ do {
     checkEqual(try! lua.call("echo", args: ["ok"]), .str("ok"), "bridge survives errors")
 }
 
+// Prelude binds record rows; functions run by ref; flashes drain.
+do {
+    let lua = LuaBridge()
+    try! lua.installPrelude()
+    try! lua.load("""
+        paneru.bind("alt-b", "window balance")
+        paneru.bind("alt-j", function() paneru.run("window focus east") end)
+        paneru.flash("hello", 1.5)
+        """)
+    let binds = lua.listBinds()
+    checkEqual(binds.count, 2, "both binds record")
+    checkEqual(binds[0].chord, "alt-b", "chords record in order")
+    checkEqual(binds[0].command, "window balance", "string binds record")
+    checkEqual(binds[1].command, nil, "function binds hold no string")
+    guard let ref = binds[1].ref else {
+        check(false, "function binds hold a ref")
+        exit(1)
+    }
+    try! lua.callFunctionRef(ref)
+    checkEqual(lua.drainCommands(), ["window focus east"], "refs run their function")
+    check(lua.drainCommands().isEmpty, "command drains reset")
+    let flashes = lua.drainFlashes()
+    checkEqual(flashes.count, 1, "flashes accumulate")
+    checkEqual(flashes[0].message, "hello", "flash messages drain")
+    checkEqual(flashes[0].duration, 1.5, "flash durations drain")
+    check(lua.drainFlashes().isEmpty, "flash drains reset")
+    lua.releaseRef(ref)
+    do {
+        try lua.load("""
+            paneru.bind("alt-x", 42)
+            """)
+        check(false, "bad handlers throw")
+    } catch let err as LuaBridgeError {
+        check(err.message.contains("paneru.bind"), "bad handlers name the call")
+    }
+}
+
+// Event handlers list by name and run with the event name.
+do {
+    let lua = LuaBridge()
+    try! lua.installPrelude()
+    try! lua.load("""
+        paneru.on("window_focused", function(e) paneru.run("seen " .. e) end)
+        paneru.on("window_focused", function(e) paneru.run("again " .. e) end)
+        """)
+    let handlers = lua.listHandlers()
+    checkEqual(handlers.count, 2, "both handlers list")
+    check(
+        handlers.allSatisfy { $0.name == "window_focused" },
+        "handlers key by event name"
+    )
+    for handler in handlers {
+        try! lua.callHandlerRef(handler.ref, arg: handler.name)
+        lua.releaseRef(handler.ref)
+    }
+    checkEqual(
+        lua.drainCommands(),
+        ["seen window_focused", "again window_focused"],
+        "handlers run in registration order with the name"
+    )
+}
+
 if failures == 0 {
     print("LuaBridgeChecks: all checks passed")
 } else {
