@@ -7,6 +7,8 @@ import Geometry
 import Layout
 import Presentation
 import Scripting
+import Snippets
+import WindowSet
 import Workspace
 
 // Serial daemon core: the modules wired into the ingest → layout → commit →
@@ -21,17 +23,15 @@ import Workspace
 //
 // Ingestion covers pointer/drag/focus lifecycle plus commands: focus,
 // stack/unstack, swap, center, resize (width/height/width-set/full-width),
-// equalize, balance, manage, snap, virtual switch/add/move, and
-// swipe/scroll offsets. The viewport passed to `tick` plays the role of
-// the Rust `actual_bounds` (padding already applied); vertical placement
-// stays with the layout pass, so center/resize/snap shift the strip offset
-// on x and enqueue size intents, leaving y to the next layout.
-// Deferred to the integrator: cross-display fall-through (swap north/south
-// with no neighbour, toNext/PreviousDisplay — no display strips modelled),
-// floating focus/raise tiers (need FocusHistory plus AX raise), copyRule
-// (clipboard plus app bundle ids), LayoutOp replay (needs the display/
-// workspace address mapping), mouse moves, and quit/restart
-// (process control).
+// equalize, balance, manage, snap, cross-workspace moves, floating tiers,
+// copyRule, LayoutOp replay, virtual switch/add/move, and swipe/scroll
+// offsets. The viewport passed to `tick` plays the role of the Rust
+// `actual_bounds` (padding already applied); vertical placement stays with
+// the layout pass, so center/resize/snap shift the strip offset on x and
+// enqueue size intents, leaving y to the next layout. Physical displays
+// collapse onto workspaces; raise intents and the clipboard copy hand off
+// to the host. Mouse moves and quit/restart (process control) stay with
+// the integrator.
 
 // MARK: - Events
 
@@ -71,6 +71,21 @@ public struct FrameResult: Sendable {
     public var quiescent: Bool
 }
 
+// MARK: - Metadata
+
+/// Host-supplied window identity for rule building.
+public struct WindowMetadata: Equatable, Sendable {
+    public var appName: String
+    public var bundleID: String
+    public var title: String
+
+    public init(appName: String = "", bundleID: String = "", title: String = "") {
+        self.appName = appName
+        self.bundleID = bundleID
+        self.title = title
+    }
+}
+
 // MARK: - Core
 
 /// Serial owner of daemon state. All methods are synchronous and
@@ -108,6 +123,14 @@ public struct DaemonCore: Sendable {
     /// Full-width marker: width ratio (of the viewport) to restore when
     /// the toggle flips off. Mirrors `FullWidthMarker`.
     private var fullWidth: [WindowID: Double] = [:]
+    /// Window metadata for rule building (copyRule). Populated by the
+    /// host; the core never reads the OS itself.
+    public var windowMetadata: [WindowID: WindowMetadata] = [:]
+    /// Last rule text built by copyRule; the host copies it onward.
+    public private(set) var lastCopiedRule: String?
+    /// Windows the host must raise after this tick (raise intents; the
+    /// AX raise itself stays host-side). Cleared every tick.
+    public private(set) var raised: [WindowID] = []
     /// Width presets as viewport fractions. Mirrors Config's
     /// `default_preset_column_widths`.
     public var presetWidths: [Double] = [0.25, 0.33333, 0.50, 0.66667, 0.75, 1.0, 1.5, 2.0]
@@ -147,6 +170,7 @@ public struct DaemonCore: Sendable {
     ) -> FrameResult {
         let prevFocus = focus
         gestureFresh = false
+        raised = []
         // One frame clock for ingest and commit alike: surgery intents
         // enqueued during ingest carry this tick's epoch.
         let epoch = ax.beginFrame()
@@ -223,10 +247,8 @@ public struct DaemonCore: Sendable {
         }
     }
 
-    /// Fold one parsed command into state. Focus, stack, surgery, virtual,
-    /// and gesture ops only; floating focus/raise tiers, cross-display
-    /// moves, mouse, copyRule, LayoutOp replay, and process control stay
-    /// with the integrator (documented above).
+    /// Fold one parsed command into state. Window ops only; mouse moves
+    /// and quit/restart stay with the integrator (documented above).
     private mutating func ingestCommand(
         _ command: PaneruCommand, frames: (WindowID) -> IntRect?,
         viewport: IntRect, epoch: UInt64
@@ -234,7 +256,9 @@ public struct DaemonCore: Sendable {
         switch command {
         case .window(let op):
             ingestWindowOperation(op, frames: frames, viewport: viewport, epoch: epoch)
-        case .mouse, .quit, .restart, .printState, .lua, .layout:
+        case .layout(let ops):
+            ingestLayoutOps(ops, frames: frames, viewport: viewport, epoch: epoch)
+        case .mouse, .quit, .restart, .printState, .lua:
             break
         }
     }
@@ -298,11 +322,36 @@ public struct DaemonCore: Sendable {
             toggleManaged()
         case .snap:
             snapWindow(frames: frames, viewport: viewport)
-        case .toNextDisplay, .toPreviousDisplay, .focusUnmanaged,
-             .focusManaged, .raiseFloating, .toggleFloatingLayer, .copyRule:
-            // Integrator-owned: cross-display strips, FocusHistory plus AX
-            // raise, and clipboard/app identities are outside the core.
-            break
+        case .toNextDisplay(let follow):
+            moveFocusedToWorkspace(activeWorkspace + 1, row: 0, follow: follow)
+        case .toPreviousDisplay(let follow):
+            if activeWorkspace > 1 {
+                moveFocusedToWorkspace(activeWorkspace - 1, row: 0, follow: follow)
+            }
+        case .focusUnmanaged:
+            if let target = unmanaged.sorted().first {
+                focus = target
+                dirty.formUnion([.focus, .paint])
+            }
+        case .focusManaged:
+            if let target = activeStrip().first()?.top {
+                focus = target
+                dirty.formUnion([.focus, .paint])
+            }
+        case .raiseFloating:
+            if let target = unmanaged.sorted().first {
+                raised = unmanaged.sorted()
+                focus = target
+                dirty.formUnion([.focus, .paint])
+            }
+        case .toggleFloatingLayer:
+            if let target = unmanaged.sorted().first {
+                raised = unmanaged.sorted().filter { $0 != target }
+                focus = target
+                dirty.formUnion([.focus, .paint])
+            }
+        case .copyRule:
+            copyFocusedRule()
         }
     }
 
@@ -642,6 +691,146 @@ public struct DaemonCore: Sendable {
         let origin = clampOriginToViewport(origin: frame.min, size: size, viewport: viewport)
         offsets[activeWorkspace, default: 0] += origin.x - frame.min.x
         dirty.formUnion([.layout, .motion, .paint])
+    }
+
+    /// Move the focused window's whole column to another workspace row,
+    /// following it or staying behind. Physical displays collapse onto
+    /// workspaces until the multi-display model ports.
+    private mutating func moveFocusedToWorkspace(
+        _ workspace: WorkspaceID, row: UInt32, follow: MoveFocus
+    ) {
+        guard let id = focus else { return }
+        var source = activeStrip()
+        guard let index = source.index(of: id),
+              let column = source.removeColumn(at: index)
+        else { return }
+        setActiveStrip(source)
+        var target = strips[workspace]?[row]
+            ?? LayoutStrip(id: workspace, virtualIndex: row)
+        target.insertColumn(at: Int.max, column)
+        strips[workspace, default: [:]][row] = target
+        if follow == .follow {
+            activeWorkspace = workspace
+            activeVirtual[workspace] = row
+        }
+        dirty.formUnion([.layout, .paint])
+    }
+
+    /// Build a `[windows]` rule for the focused window into
+    /// `lastCopiedRule`; the host copies it onward to the clipboard.
+    private mutating func copyFocusedRule() {
+        guard let id = focus else { return }
+        let meta = windowMetadata[id] ?? WindowMetadata()
+        lastCopiedRule = windowRuleSnippet(
+            .toml,
+            subject: RuleSubject(
+                appName: meta.appName, bundleID: meta.bundleID, title: meta.title
+            )
+        )
+        dirty.formUnion([.paint])
+    }
+
+    /// Replay script-built layout ops as tick intents: focus, frames,
+    /// widths, float state, moves, views, stacks, swaps. Unknown windows
+    /// and impossible placements drop; the log never throws.
+    private mutating func ingestLayoutOps(
+        _ ops: [LayoutOp], frames: (WindowID) -> IntRect?,
+        viewport: IntRect, epoch: UInt64
+    ) {
+        for op in ops {
+            switch op {
+            case .focus(let id):
+                if activeStrip().contains(id) || unmanaged.contains(id) {
+                    focus = id
+                    dirty.formUnion([.focus, .paint])
+                }
+            case .setFrame(let id, let frame):
+                enqueueMove(
+                    id,
+                    to: IntPoint(frame.x, frame.y), epoch: epoch
+                )
+                enqueueResize(
+                    id,
+                    to: IntSize(frame.width, frame.height), epoch: epoch
+                )
+                dirty.formUnion([.layout, .motion, .paint])
+            case .setWidth(let id, let ratio):
+                if let current = frames(id) {
+                    let width = roundPx(ratio * Double(max(viewport.width, 1)))
+                    enqueueResize(
+                        id, to: IntSize(width, current.height), epoch: epoch
+                    )
+                    dirty.formUnion([.layout, .motion, .paint])
+                }
+            case .setFloating(let id, let floating):
+                var strip = activeStrip()
+                if floating {
+                    unmanaged.insert(id)
+                    if strip.contains(id) {
+                        strip.remove(id)
+                        setActiveStrip(strip)
+                    }
+                } else if unmanaged.remove(id) != nil,
+                          !strip.contains(id)
+                {
+                    strip.append(id)
+                    setActiveStrip(strip)
+                }
+                dirty.formUnion([.layout, .motion, .paint])
+            case .setManaged:
+                break
+            case .moveToWorkspace(let id, let row, let follow):
+                let ws = activeWorkspace
+                var source = activeStrip()
+                guard let index = source.index(of: id),
+                      let column = source.removeColumn(at: index)
+                else { continue }
+                setActiveStrip(source)
+                var target = strips[ws]?[row]
+                    ?? LayoutStrip(id: ws, virtualIndex: row)
+                target.insertColumn(at: Int.max, column)
+                strips[ws, default: [:]][row] = target
+                if follow {
+                    activeVirtual[ws] = row
+                }
+                dirty.formUnion([.layout, .paint])
+            case .view(let row):
+                let ws = activeWorkspace
+                if strips[ws]?[row] != nil {
+                    activeVirtual[ws] = row
+                    dirty.formUnion([.layout, .paint])
+                }
+            case .stack(let id, let onto, let tabs):
+                var strip = activeStrip()
+                guard strip.contains(onto), strip.contains(id) else { continue }
+                strip.remove(id)
+                guard let shifted = strip.index(of: onto) else { continue }
+                if strip.appendToColumn(at: shifted, id, tabs: tabs) {
+                    setActiveStrip(strip)
+                    dirty.formUnion([.layout, .paint])
+                }
+            case .unstack(let id):
+                var strip = activeStrip()
+                if strip.contains(id) {
+                    _ = strip.unstack(id)
+                    setActiveStrip(strip)
+                    dirty.formUnion([.layout, .paint])
+                }
+            case .swap(let first, let second):
+                var strip = activeStrip()
+                guard let a = strip.index(of: first),
+                      let b = strip.index(of: second),
+                      a != b
+                else { continue }
+                if a < b {
+                    for idx in a..<b { strip.swap(idx, idx + 1) }
+                } else {
+                    for idx in (b..<a).reversed() { strip.swap(idx, idx + 1) }
+                }
+                setActiveStrip(strip)
+                dirty.formUnion([.layout, .paint])
+            }
+        }
     }
 
     /// Drives a held window's whole column by `dx` (stacked mates follow).

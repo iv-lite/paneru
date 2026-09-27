@@ -153,12 +153,16 @@ func syncRoster() {
                 max: IntPoint(Int32(raw.maxX.rounded()), Int32(raw.maxY.rounded()))
             )
         )
-        // Window rules: manage forces adoption past role rejection;
-        // dont_focus suppresses focus arrival below. Floating, width,
-        // and index need targeted core ops — slice 2 wires them.
+        // Window rules: manage forces adoption past role rejection and
+        // dont_focus suppresses focus arrival. Floating and width replay
+        // focus-free through LayoutOps; index waits on a strip-position
+        // API in the core.
         let title = window.title ?? ""
-        let bundle = NSRunningApplication(processIdentifier: info.ownerPID)?
-            .bundleIdentifier ?? ""
+        let runningApp = NSRunningApplication(processIdentifier: info.ownerPID)
+        let bundle = runningApp?.bundleIdentifier ?? ""
+        core.windowMetadata[windowID(wid)] = WindowMetadata(
+            appName: runningApp?.localizedName ?? "", bundleID: bundle, title: title
+        )
         let rules = matchWindowRules(title: title, bundleID: bundle, in: windowRules)
         if rules.contains(where: { $0.dontFocus }) {
             dontFocus.insert(windowID(wid))
@@ -170,6 +174,18 @@ func syncRoster() {
         case .tile, .float:
             roster[wid] = window
             pending.append(.appeared(id: windowID(wid), workspace: 1))
+            if rules.contains(where: { $0.floating }) {
+                pending.append(.command(.layout([
+                    .setFloating(window: windowID(wid), floating: true),
+                ])))
+            }
+            for rule in rules {
+                if let ratio = rule.width {
+                    pending.append(.command(.layout([
+                        .setWidth(window: windowID(wid), ratio: ratio),
+                    ])))
+                }
+            }
         }
     }
     for wid in known.subtracting(current) {
@@ -271,6 +287,7 @@ func viewport() -> IntRect {
 }
 
 var tickCount = 0
+var copiedRuleSent: String?
 
 func tick() {
     tickCount += 1
@@ -294,6 +311,18 @@ func tick() {
             _ = window.resize(to: size, origin: job.origin)
         }
         core.acknowledge(winID: job.winID, seq: job.seq, epoch: job.epoch)
+    }
+    // Raise intents go straight to AX.
+    for id in core.raised {
+        if let window = roster[CGWindowID(id)] {
+            window.raise()
+        }
+    }
+    // Clipboard delivery for copyRule, edge-triggered.
+    if let rule = core.lastCopiedRule, rule != copiedRuleSent {
+        NSPasteboard.general.clearContents()
+        NSPasteboard.general.setString(rule, forType: .string)
+        copiedRuleSent = rule
     }
     // Throttled frame refresh: job targets already re-read above.
     if tickCount % 3 == 0 {

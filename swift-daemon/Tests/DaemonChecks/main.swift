@@ -3,6 +3,7 @@ import Foundation
 import Daemon
 import Geometry
 import Presentation
+import WindowSet
 
 // End-to-end frames through `DaemonCore` with a mock frame provider:
 // spawn → focus → drag → release → quiescence, plus disappear and ack
@@ -337,6 +338,124 @@ do {
     check(
         balanced.axJobs.contains { $0.winID == 0 && $0.size == IntSize(400, 700) },
         "balance rewrites every column to the focused width"
+    )
+}
+
+// Tiers, cross-workspace moves, copyRule, and LayoutOp replay.
+do {
+    var daemon = DaemonCore()
+    _ = daemon.tick(
+        events: [.appeared(id: 0, workspace: 1), .appeared(id: 1, workspace: 1), .appeared(id: 2, workspace: 1), .focus(id: 2)],
+        frames: frames(slots: [0: IntPoint(0, 0), 1: IntPoint(400, 0), 2: IntPoint(800, 0)]),
+        viewport: viewport, focusedStyle: style
+    )
+    _ = daemon.tick(
+        events: [.command(.window(.manage))],
+        frames: frames(slots: [0: IntPoint(0, 0), 1: IntPoint(400, 0), 2: IntPoint(800, 0)]),
+        viewport: viewport, focusedStyle: style
+    )
+    checkEqual(daemon.unmanaged, [2], "focused window floats")
+    _ = daemon.tick(
+        events: [.command(.window(.focusUnmanaged))],
+        frames: frames(slots: [0: IntPoint(0, 0), 1: IntPoint(400, 0), 2: IntPoint(800, 0)]),
+        viewport: viewport, focusedStyle: style
+    )
+    checkEqual(daemon.focus, 2, "unmanaged focus lands on floats")
+    _ = daemon.tick(
+        events: [.command(.window(.focusManaged))],
+        frames: frames(slots: [0: IntPoint(0, 0), 1: IntPoint(400, 0), 2: IntPoint(800, 0)]),
+        viewport: viewport, focusedStyle: style
+    )
+    checkEqual(daemon.focus, 0, "managed focus lands on the strip head")
+    let raised = daemon.tick(
+        events: [.command(.window(.raiseFloating))],
+        frames: frames(slots: [0: IntPoint(0, 0), 1: IntPoint(400, 0), 2: IntPoint(800, 0)]),
+        viewport: viewport, focusedStyle: style
+    )
+    checkEqual(daemon.raised, [2], "raise hands every float to the host")
+    checkEqual(raised.focus, 2, "raise focuses the float")
+    // Cross-workspace move follows or stays.
+    _ = daemon.tick(
+        events: [.focus(id: 1), .command(.window(.toNextDisplay(.follow)))],
+        frames: frames(slots: [0: IntPoint(0, 0), 1: IntPoint(400, 0), 2: IntPoint(800, 0)]),
+        viewport: viewport, focusedStyle: style
+    )
+    checkEqual(daemon.strips[2]?[0]?.allWindows, [1], "moved column lands on workspace 2")
+    checkEqual(daemon.strips[1]?[0]?.allWindows, [0], "source strip keeps the rest")
+    checkEqual(daemon.activeWorkspace, 2, "follow switches workspaces")
+    _ = daemon.tick(
+        events: [.command(.window(.toPreviousDisplay(.stay)))],
+        frames: frames(slots: [0: IntPoint(0, 0), 1: IntPoint(400, 0), 2: IntPoint(800, 0)]),
+        viewport: viewport, focusedStyle: style
+    )
+    checkEqual(daemon.strips[1]?[0]?.allWindows, [0, 1], "staying sends the column back")
+    checkEqual(daemon.activeWorkspace, 2, "stay keeps the workspace")
+    // CopyRule builds from host metadata.
+    daemon.windowMetadata[1] = WindowMetadata(
+        appName: "Term", bundleID: "com.example.term", title: "shell"
+    )
+    _ = daemon.tick(
+        events: [.focus(id: 1), .command(.window(.copyRule))],
+        frames: frames(slots: [0: IntPoint(0, 0), 1: IntPoint(400, 0), 2: IntPoint(800, 0)]),
+        viewport: viewport, focusedStyle: style
+    )
+    check(
+        daemon.lastCopiedRule?.contains("com.example.term") == true,
+        "copyRule renders the focused bundle"
+    )
+}
+
+// LayoutOp replay: float toggles, swaps, moves, views, stacks.
+do {
+    var daemon = DaemonCore()
+    _ = daemon.tick(
+        events: [.appeared(id: 0, workspace: 1), .appeared(id: 1, workspace: 1), .focus(id: 0)],
+        frames: frames(slots: [0: IntPoint(0, 0), 1: IntPoint(400, 0)]),
+        viewport: viewport, focusedStyle: style
+    )
+    _ = daemon.tick(
+        events: [.command(.layout([.setFloating(window: 0, floating: true)]))],
+        frames: frames(slots: [0: IntPoint(0, 0), 1: IntPoint(400, 0)]),
+        viewport: viewport, focusedStyle: style
+    )
+    checkEqual(daemon.unmanaged, [0], "replay floats out of the strip")
+    checkEqual(daemon.strips[1]?[0]?.allWindows, [1], "strip loses the float")
+    _ = daemon.tick(
+        events: [.command(.layout([.setFloating(window: 0, floating: false)]))],
+        frames: frames(slots: [0: IntPoint(0, 0), 1: IntPoint(400, 0)]),
+        viewport: viewport, focusedStyle: style
+    )
+    checkEqual(daemon.strips[1]?[0]?.allWindows, [1, 0], "replay sinks back appended")
+    _ = daemon.tick(
+        events: [.command(.layout([.swap(0, 1)]))],
+        frames: frames(slots: [0: IntPoint(0, 0), 1: IntPoint(400, 0)]),
+        viewport: viewport, focusedStyle: style
+    )
+    checkEqual(daemon.strips[1]?[0]?.allWindows, [0, 1], "replay swaps columns")
+    _ = daemon.tick(
+        events: [.command(.layout([
+            .moveToWorkspace(window: 0, workspace: 5, follow: false),
+            .view(workspace: 5),
+        ]))],
+        frames: frames(slots: [0: IntPoint(0, 0), 1: IntPoint(400, 0)]),
+        viewport: viewport, focusedStyle: style
+    )
+    checkEqual(daemon.strips[1]?[5]?.allWindows, [0], "replay moves whole columns")
+    checkEqual(daemon.activeVirtual[1], 5, "replay views the target row")
+    _ = daemon.tick(
+        events: [.command(.layout([.setWidth(window: 1, ratio: 0.5)]))],
+        frames: frames(slots: [0: IntPoint(0, 0), 1: IntPoint(400, 0)]),
+        viewport: viewport, focusedStyle: style
+    )
+    // Window 1 sits parked on hidden row 0; the size intent still issues.
+    let replayed = daemon.tick(
+        events: [.command(.layout([.setFrame(window: 1, frame: WSFrame(x: 0, y: 0, width: 512, height: 700))]))],
+        frames: frames(slots: [0: IntPoint(0, 0), 1: IntPoint(400, 0)]),
+        viewport: viewport, focusedStyle: style
+    )
+    checkEqual(
+        replayed.axJobs.first(where: { $0.winID == 1 })?.size, IntSize(512, 700),
+        "replay frames land as size intents"
     )
 }
 

@@ -307,6 +307,28 @@ public struct LayoutStrip: Equatable, Sendable {
         columns.swapAt(left, right)
     }
 
+    /// Append a window to one column, converting it to a stack (or tabs).
+    /// False unless the column exists.
+    @discardableResult
+    public mutating func appendToColumn(at index: Int, _ id: WindowID, tabs: Bool) -> Bool {
+        guard columns.indices.contains(index) else { return false }
+        switch columns[index] {
+        case .single(let mine):
+            columns[index] = tabs ? .tabs([mine, id]) : .stack([.single(mine), .single(id)])
+        case .tabs(var ids):
+            ids.append(id)
+            columns[index] = tabs ? .tabs(ids) : .stack(ids.map { .single($0) })
+        case .stack(var items):
+            items.append(.single(id))
+            columns[index] = tabs
+                ? .tabs(items.flatMap { $0.windows })
+                : .stack(items)
+        case .fullscreen:
+            return false
+        }
+        return true
+    }
+
     /// Swap two members of one stack column in place (same-column swap).
     /// False unless the column is a stack and both positions are in range.
     @discardableResult

@@ -116,7 +116,7 @@ let package = Package(
         ),
         .executableTarget(
             name: "DaemonChecks",
-            dependencies: ["Daemon", "Geometry", "Presentation"],
+            dependencies: ["Daemon", "Geometry", "Presentation", "WindowSet"],
             path: "Tests/DaemonChecks"
         ),
         .executableTarget(
@@ -287,7 +287,7 @@ let package = Package(
             dependencies: [
                 "Geometry", "Layout", "AXClient", "EventCore",
                 "Presentation", "Scripting", "Commands", "Focus",
-                "Workspace",
+                "Workspace", "WindowSet", "Snippets",
             ],
             path: "Sources/Daemon"
         ),
