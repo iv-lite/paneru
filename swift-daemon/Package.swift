@@ -233,8 +233,8 @@ let package = Package(
             name: "PaneruDaemon",
             dependencies: [
                 "Commands", "Config", "ConfigFiles", "Daemon", "Geometry",
-                "KeyChords", "LiveProviders", "MenuBar", "Presentation",
-                "Presenter",
+                "IPC", "KeyChords", "LiveProviders", "MenuBar",
+                "PaneruXPC", "Presentation", "Presenter",
             ],
             path: "Sources/PaneruDaemon"
         ),

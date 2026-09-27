@@ -16,9 +16,11 @@ import CoreGraphics
 import Daemon
 import Foundation
 import Geometry
+import IPC
 import KeyChords
 import LiveProviders
 import MenuBar
+import PaneruXPC
 import Presentation
 import Presenter
 
@@ -460,5 +462,39 @@ func tick() {
 Timer.scheduledTimer(withTimeInterval: 1.0 / 60.0, repeats: true) { _ in
     tick()
 }
+
+// Command server: Mach service accepting argv commands into `pending`.
+// Queries answer in slice 6; without launchd holding the port this only
+// serves direct (NSXPCConnection) clients.
+final class CommandListener: NSObject, NSXPCListenerDelegate {
+    let server = PaneruXPCServer()
+
+    override init() {
+        super.init()
+        server.onCommand = { argv in
+            do {
+                pending.append(.command(try parseCommand(argv)))
+                return "ok"
+            } catch {
+                return xpcError("\(error)")
+            }
+        }
+    }
+
+    func listener(
+        _ listener: NSXPCListener,
+        shouldAcceptNewConnection connection: NSXPCConnection
+    ) -> Bool {
+        connection.exportedInterface = NSXPCInterface(with: PaneruXPCProtocol.self)
+        connection.exportedObject = server
+        connection.resume()
+        return true
+    }
+}
+
+let commandListener = CommandListener()
+let machListener = NSXPCListener(machServiceName: paneruServiceNameResolved())
+machListener.delegate = commandListener
+machListener.resume()
 print("paneru-swift running (60Hz tick, menubar commands live)")
 RunLoop.main.run()
