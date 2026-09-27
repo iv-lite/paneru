@@ -19,6 +19,16 @@ public typealias WindowID = Int32
 /// Workspace identity. Mirrors `platform::WorkspaceId` (`u64`).
 public typealias WorkspaceID = UInt64
 
+/// Sliver kept visible for parked (inactive-row) windows so macOS never
+/// relocates them to another display. Mirrors `layout::PARKED_STRIP_SLIVER`.
+public let parkedStripSliver: Int32 = 10
+
+/// Where an inactive row's windows sit: viewport max minus the sliver.
+/// Mirrors the workspace-switch parking in `ecs/workspace.rs`.
+public func parkedOrigin(viewport: IntRect) -> IntPoint {
+    IntPoint(viewport.max.x - parkedStripSliver, viewport.max.y - parkedStripSliver)
+}
+
 // MARK: - Integer primitives
 
 /// Integer point. Mirrors `manager::Origin` (`IVec2`).

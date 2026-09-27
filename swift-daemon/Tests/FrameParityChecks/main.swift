@@ -135,7 +135,24 @@ private func runScenario(
     }
 }
 
-private func checkParity(name: String, rust: [TraceFrame], swift: [SwiftFrame]) {
+private func checkParity(
+    name: String, rust: [TraceFrame], swift: [SwiftFrame], finalOnly: Bool = false
+) {
+    if finalOnly {
+        guard let r = rust.last, let s = swift.last else {
+            check(false, "\(name): empty trace")
+            return
+        }
+        checkEqual(s.strips, r.strips, "\(name) final: strips")
+        var expectedX: [String: Int32] = [:]
+        for (id, xy) in r.positions {
+            expectedX[id] = xy.first
+        }
+        checkEqual(s.xPositions, expectedX, "\(name) final: x positions")
+        checkEqual(s.focus, r.focus, "\(name) final: focus")
+        checkEqual(s.quiet, r.quiescent, "\(name) final: quiescence")
+        return
+    }
     checkEqual(rust.count, swift.count, "\(name): frame counts agree")
     for (i, (r, s)) in zip(rust, swift).enumerated() {
         checkEqual(s.strips, r.strips, "\(name) frame \(i): strips")
@@ -186,6 +203,34 @@ if let rust = loadCorpus(traceDir, "tiling") {
         [],
     ])
     checkParity(name: "tiling", rust: rust, swift: swift)
+}
+
+// virtual: menu, focus-last, move-to-row-1, print — 2 windows.
+// Discrete commands; rest states must match every frame.
+if let rust = loadCorpus(traceDir, "virtual") {
+    ran += 1
+    let swift = runScenario(workspace: 2, windows: [0, 1], ticks: [
+        [.focus(id: 0)],
+        [.command(.window(.focus(.last)))],
+        [.command(.window(.virtualMoveNumber(1, .follow)))],
+        [],
+    ])
+    checkParity(name: "virtual", rust: rust, swift: swift)
+}
+
+// drag: menu, press, drag +100px, release, prints — 2 windows.
+// Mid-drag truths differ by design (native OS drag vs synthetic column
+// drive), so only the settled final frame is compared.
+if let rust = loadCorpus(traceDir, "drag") {
+    ran += 1
+    let swift = runScenario(workspace: 2, windows: [0, 1], ticks: [
+        [.focus(id: 0)],
+        [],
+        [.dragMoved(id: 0, dx: 100)],
+        [.released],
+        [], [], [], [], [], [],
+    ])
+    checkParity(name: "drag", rust: rust, swift: swift, finalOnly: true)
 }
 
 if ran == 0 {

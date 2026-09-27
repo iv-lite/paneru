@@ -148,7 +148,10 @@ pub(crate) fn window_table(world: &mut World) -> Vec<(Entity, WinID)> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::commands::{Command, Direction, Operation};
+    use crate::commands::{Command, Direction, MoveFocus, Operation};
+    use objc2_core_foundation::CGPoint;
+
+    use crate::platform::Modifiers;
 
     /// Scenario builders shared by the corpus tests and the JSONL dump:
     /// each returns the commands whose per-window snapshots form one corpus
@@ -178,6 +181,50 @@ mod tests {
                 command: Command::PrintState,
             },
         ]
+    }
+
+    fn virtual_commands() -> Vec<Event> {
+        // Numbered move targets self-create (no VirtualAdd needed): the
+        // focused window lands on row 1 and focus follows it there.
+        vec![
+            Event::MenuOpened { window_id: 0 },
+            Event::Command {
+                command: Command::Window(Operation::Focus(Direction::Last)),
+            },
+            Event::Command {
+                command: Command::Window(Operation::VirtualMoveNumber(1, MoveFocus::Follow)),
+            },
+            Event::Command {
+                command: Command::PrintState,
+            },
+        ]
+    }
+
+    fn drag_commands() -> Vec<Event> {
+        let point = |x: f64| CGPoint::new(x, 30.0);
+        // Trailing prints let the 1s post-release homing grace expire, so
+        // the final snapshot is quiescent like the other corpora.
+        let mut commands = vec![
+            Event::MenuOpened { window_id: 0 },
+            Event::MouseDown {
+                point: point(200.0),
+                modifiers: Modifiers::empty(),
+            },
+            Event::MouseDragged {
+                point: point(300.0),
+                modifiers: Modifiers::empty(),
+            },
+            Event::MouseUp {
+                point: point(300.0),
+                modifiers: Modifiers::empty(),
+            },
+        ];
+        for _ in 0..6 {
+            commands.push(Event::Command {
+                command: Command::PrintState,
+            });
+        }
+        commands
     }
 
     fn dump_corpus(name: &str, snapshots: &[FrameSnapshot]) {
@@ -239,5 +286,42 @@ mod tests {
             // Frame indexes count command windows from zero.
             assert!(back.frame < snapshots.len() as u64);
         }
+    }
+
+    #[test]
+    fn virtual_trace_moves_across_rows() {
+        let mut harness = TestHarness::new().with_windows(2);
+        let snapshots = harness.run_with_trace(virtual_commands());
+        let last = snapshots.last().expect("non-empty trace");
+        let row0 = format!("{TEST_WORKSPACE_ID}:0");
+        let row1 = format!("{TEST_WORKSPACE_ID}:1");
+        assert_eq!(
+            last.strips.get(&row1),
+            Some(&vec![vec![1]]),
+            "moved window lands on row 1: {last:?}"
+        );
+        assert_eq!(
+            last.strips.get(&row0),
+            Some(&vec![vec![0]]),
+            "row 0 keeps the rest: {last:?}"
+        );
+        assert_eq!(last.focus, Some(1), "focus follows the move");
+        assert!(last.quiescent, "trace must settle: {last:?}");
+        dump_corpus("virtual", &snapshots);
+    }
+
+    #[test]
+    fn drag_trace_settles_home() {
+        let mut harness = TestHarness::new().with_windows(2);
+        let snapshots = harness.run_with_trace(drag_commands());
+        let last = snapshots.last().expect("non-empty trace");
+        let key = format!("{TEST_WORKSPACE_ID}:0");
+        assert_eq!(
+            last.strips.get(&key),
+            Some(&vec![vec![0], vec![1]]),
+            "drag changes no grouping: {last:?}"
+        );
+        assert!(last.quiescent, "release must settle: {last:?}");
+        dump_corpus("drag", &snapshots);
     }
 }

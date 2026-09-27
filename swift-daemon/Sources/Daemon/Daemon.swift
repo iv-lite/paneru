@@ -82,6 +82,10 @@ public struct DaemonCore: Sendable {
     public private(set) var dirty: DirtyFlags = []
     /// Held drag target, if any.
     private var held: WindowID?
+    /// This tick saw fresh swipe/scroll input: motion stays flagged past
+    /// commit (the inertia tail), so the tick reads active like the Rust
+    /// `Scrolling` state does. Cleared on ticks without gesture input.
+    private var gestureFresh = false
     /// Members owed one home intent after release (positions already
     /// restored by `glideHome`, so the commit would otherwise see no diff
     /// while the OS window still sits at the hand position).
@@ -118,6 +122,7 @@ public struct DaemonCore: Sendable {
         focusedStyle: BorderStyle
     ) -> FrameResult {
         let prevFocus = focus
+        gestureFresh = false
         ingest(events, viewport: viewport)
         // Focus arrival reveals: scroll the minimal shortfall so the
         // focused window is fully visible (mirrors ensure_visible; the
@@ -126,7 +131,7 @@ public struct DaemonCore: Sendable {
             revealFocus(id, frames: frames, viewport: viewport)
         }
         layoutPass()
-        let jobs = commitPass(frames: frames)
+        let jobs = commitPass(frames: frames, viewport: viewport)
         let plan = paintPass(frames: frames, viewport: viewport, focusedStyle: focusedStyle)
         let quiet = dirty.isQuiescent && jobs.isEmpty && plan.isEmpty
         dirty = []
@@ -182,6 +187,7 @@ public struct DaemonCore: Sendable {
                 let step = Int32((delta * width * -1.0).rounded())
                 let ws = activeWorkspace
                 offsets[ws, default: 0] += step
+                gestureFresh = true
                 dirty.formUnion([.layout, .motion])
             }
         }
@@ -383,7 +389,9 @@ public struct DaemonCore: Sendable {
         }
     }
 
-    private mutating func commitPass(frames: (WindowID) -> IntRect?) -> [AXWriteJob] {
+    private mutating func commitPass(
+        frames: (WindowID) -> IntRect?, viewport: IntRect
+    ) -> [AXWriteJob] {
         let epoch = ax.beginFrame()
         // Members of the held column, if any: the hand owns their truth
         // until release; everything else snaps to its slot.
@@ -396,9 +404,24 @@ public struct DaemonCore: Sendable {
             }
         }
         // Recompute slot origins left to right per strip at its offset.
+        // Rows that are not showing park at the sliver instead of their
+        // slots (mirrors workspace-switch parking; the OS must hold them
+        // there so macOS never relocates them).
+        let parked = parkedOrigin(viewport: viewport)
         for (ws, rows) in strips {
+            let shownRow = activeVirtual[ws] ?? 0
             let offset = offsets[ws] ?? 0
-            for strip in rows.values {
+            for (rowIndex, strip) in rows {
+                guard rowIndex == shownRow else {
+                    for member in strip.allWindows {
+                        committedSlots[member] = parked
+                        if positions[member] != parked {
+                            enqueueMove(member, to: parked, epoch: epoch)
+                        }
+                        positions[member] = parked
+                    }
+                    continue
+                }
                 var x = offset
                 for column in strip.columns {
                     let width: Int32 = column.windows.compactMap { frames($0)?.width }.max() ?? 0
@@ -437,7 +460,10 @@ public struct DaemonCore: Sendable {
                 ax.recordSent(ordered[i].winID, target: origin)
             }
         }
-        dirty.subtract([.layout, .motion])
+        dirty.subtract([.layout])
+        if !gestureFresh {
+            dirty.subtract(.motion)
+        }
         return ordered
     }
 
