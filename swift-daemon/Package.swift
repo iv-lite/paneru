@@ -8,7 +8,10 @@ let package = Package(
     name: "PaneruDaemon",
     platforms: [.macOS(.v13)],
     products: [
-        .library(name: "PaneruDaemon", targets: ["Geometry", "Layout"]),
+        .library(name: "PaneruDaemon", targets: [
+            "Geometry", "Layout", "AXClient", "EventCore",
+            "Presentation", "Scripting", "IPC", "Service",
+        ]),
     ],
     targets: [
         // Real-time tap sidecar (C only: no Swift on the tap thread).
@@ -40,6 +43,18 @@ let package = Package(
             name: "EventCore",
             path: "Sources/EventCore"
         ),
+        // Overlay decision layer: sync plans, rest-equality, flash layout
+        // (`src/overlay.rs`, `overlay-swift/Flash.swift`).
+        .target(
+            name: "Presentation",
+            path: "Sources/Presentation"
+        ),
+        // Script-state store model (`crates/shared_types/script_state.rs`,
+        // `script_value.rs`). LuaJIT itself links at packaging time.
+        .target(
+            name: "Scripting",
+            path: "Sources/Scripting"
+        ),
         // Dependency-free check runners (this toolchain ships neither
         // XCTest nor swift-testing): `swift run --package-path
         // swift-daemon <Name>`. Fail nonzero on first mismatch.
@@ -62,6 +77,37 @@ let package = Package(
             name: "EventCoreChecks",
             dependencies: ["EventCore"],
             path: "Tests/EventCoreChecks"
+        ),
+        .executableTarget(
+            name: "PresentationChecks",
+            dependencies: ["Presentation"],
+            path: "Tests/PresentationChecks"
+        ),
+        .executableTarget(
+            name: "IPCChecks",
+            dependencies: ["IPC", "Scripting"],
+            path: "Tests/IPCChecks"
+        ),
+        .executableTarget(
+            name: "ServiceChecks",
+            dependencies: ["Service"],
+            path: "Tests/ServiceChecks"
+        ),
+        .executableTarget(
+            name: "ScriptingChecks",
+            dependencies: ["Scripting"],
+            path: "Tests/ScriptingChecks"
+        ),
+        // Daemon↔client protocol shapes (`crates/shared_types/wire.rs`).
+        .target(
+            name: "IPC",
+            dependencies: ["Scripting"],
+            path: "Sources/IPC"
+        ),
+        // Launchd agent model (`src/platform/service.rs`, `assets/launchd.plist`).
+        .target(
+            name: "Service",
+            path: "Sources/Service"
         ),
     ]
 )

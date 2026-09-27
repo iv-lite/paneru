@@ -189,9 +189,27 @@ until cutover:
   paint`), `DirtyFlags`, pump cadence, and scheduling predicates
   (`adoptionDistrusted`, `overlayTracksLive`, `driveTrust`), ported verbatim
   from `src/ecs/systems.rs` (verified by `Tests/EventCoreChecks`).
-- **Next:** `Presentation`, `Scripting`, `IPC`,
-  `Service` per the phase plan. Each lands with parity tests before the Rust
-  counterpart is touched.
+- **`Presentation`** (done): AppKit-free overlay decisions — border sync
+  plans (O(changed) routing), 0.5px rest equality, dim equality, flash
+  sizing/buckets/dedup — from `src/overlay.rs` and
+  `overlay-swift/Flash.swift` (verified by `Tests/PresentationChecks`).
+  Menubar rendering stays out (needs live AppKit).
+- **`Scripting`** (done): script-state store model — `ScriptValue`
+  (bitwise float equality), CAS writes, capacity/key rules — from
+  `crates/shared_types/script_state.rs` and `script_value.rs` (verified by
+  `Tests/ScriptingChecks`). LuaJIT itself links at packaging time.
+- **`IPC`** (done): Codable protocol shapes — service identity, query-kind
+  tokens, script-state requests, request/response envelope — from
+  `crates/shared_types/wire.rs`, JSON-encoded with pinned field names for
+  the compat shim (verified by `Tests/IPCChecks`). The `Command`/
+  `WindowSet` trees ride as argv/JSON until they port.
+- **`Service`** (done): launchd agent model — plist path, key-faithful
+  plist document, env fallbacks, start ladder — from
+  `src/platform/service.rs` and `assets/launchd.plist` (verified by
+  `Tests/ServiceChecks`).
+- **Next:** daemon assembly (actors wiring the modules to AX/AppKit),
+  LuaJIT linkage, XPC cutover, then retirement of `src/`. Each lands with
+  parity tests before the Rust counterpart is touched.
 
 Supporting seams already in the Rust daemon: `src/replay.rs` (Phase 0
 session capture behind `PANERU_REPLAY_RECORD`), snapshot-only Lua boundary
