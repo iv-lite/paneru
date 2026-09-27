@@ -227,6 +227,16 @@ let package = Package(
             dependencies: ["MenuBar"],
             path: "Tests/MenuBarChecks"
         ),
+        // Runnable Swift daemon (first slice): tick loop over live
+        // providers, borders via Presenter, commands via the menubar.
+        .executableTarget(
+            name: "PaneruDaemon",
+            dependencies: [
+                "Commands", "ConfigFiles", "Daemon", "Geometry",
+                "LiveProviders", "MenuBar", "Presentation", "Presenter",
+            ],
+            path: "Sources/PaneruDaemon"
+        ),
         .executableTarget(
             name: "LiveProvidersChecks",
             dependencies: ["LiveProviders", "Geometry"],

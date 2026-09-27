@@ -256,9 +256,76 @@ until cutover:
   `@objc` protocol, error-string convention, client + loopback listener —
   verified by in-process round trips (`Tests/XPCChecks`, no bundle or
   launchd needed).
-- **Next:** live AX/AppKit providers behind the protocols, LuaJIT
-  linkage, launchd XPC service registration, then retirement of `src/`. Each lands with
-  parity tests before the Rust counterpart is touched.
+- **`Providers`** (done): live-window protocol seam plus scriptable mock
+  (`Tests/ProviderChecks`).
+- **`Workers`** (done): write-drain/read-pool shells over injected
+  gateways (`Tests/WorkerChecks`).
+- **`Daemon` surgery** (done): swap, center, resize (width/height/set),
+  full-width toggle, equalize, balance, manage, snap in the tick with
+  size intents (`Tests/DaemonChecks` surgery frames).
+- **`WindowSet`** (done): script-side predicted tree + `LayoutOp` replay
+  log from `crates/shared_types/windowset.rs`, value semantics with
+  always-recorded ops (`Tests/WindowSetChecks`); `PaneruCommand.layout`
+  carries replays (never parsed, never encoded).
+- **`StateQuery`** (done): query documents, `on_screen` sort, six
+  `StateEvent` variants, `flattenTag`, per-kind `QueryPayload` slices —
+  from `crates/shared_types/state.rs` and `json.rs`
+  (`Tests/StateQueryChecks`). Nil spells null; key order is
+  encoder-defined, not part of the contract.
+- **`LuaAPI`** (done): live-runtime-free client surface — `paneru.match`
+  predicate, opts tables, command triage, fixed verbs, query/subscribe
+  parsing, CAS mutate loop, windows commit rule — from `crates/lua`
+  (`Tests/LuaAPIChecks`). Regexes run on ICU, not Rust syntax.
+- **`ConfigFiles`** (done): TOML/Lua discovery order, default-write
+  paths, Lua-suppresses-TOML ensure, 16-key deprecation table, watch
+  event reducers (`Tests/ConfigFilesChecks`).
+- **`ScriptHost`** (done): worker mailbox without thread or interpreter —
+  ordered inbox, FIFO outbox, store-write round trip with read overlay,
+  dispatch world, commit rules, 1-based binds, reload outcomes
+  (`Tests/ScriptHostChecks`).
+- **`Presenter`** (done): `overlay-swift/` absorbed — borders, dim,
+  flash, drop-preview managers moved verbatim into `swift-daemon`,
+  driven by direct calls; the C ABI, version gate, `dlopen` bridge
+  (`src/overlay_bridge.rs`), and the `swift-overlay` feature are deleted.
+  Plan merge is pure and pinned (`Tests/PresenterChecks`); the managers
+  stay main-thread-live.
+- **`MenuBar`** (done): indicator labels (default/roman/unicode/marked),
+  mono/multi/paged assembly, width normalization, enablement, exact menu
+  titles, plus the live `NSStatusItem` shell with baked-bitmap redraw
+  (`Tests/MenuBarChecks`).
+- **`LiveProviders`** (done): permissioned-host layer — AX
+  reads/writes/observers with 0.25s timeouts and the enhanced-UI dance,
+  HID head-insert tap with scroll/swipe/keypress handling and the health
+  ladder, writer coalescing, launchctl/XPC shells. Compiles here; pure
+  halves pinned (`Tests/LiveProvidersChecks`), live calls prove on the
+  host.
+- **`PaneruDaemon`** (done, first slice): runnable binary wiring it
+  together — grant check, config discovery report, live roster with role
+  qualification, per-app observers, tap, 60Hz tick, job application,
+  borders via `Presenter`, commands via the menubar. Options run on
+  defaults, no socket server or Lua runtime yet.
+- **Next:** host proving (below), then socket/XPC command server, Lua
+  runtime host, full TOML options, launchd service bundle — then
+  retirement of `src/` batch by batch. Nothing in `src/` is deleted
+  before its Swift owner proves live; `nix/` still ships the Rust daemon
+  until the Swift service bundle replaces it.
+
+### Host proving runbook (permissioned Mac)
+
+1. `swift build --package-path swift-daemon --target PaneruDaemon`
+2. Grant Accessibility, then run the binary beside (not instead of) the
+   Rust daemon: it tiles adoptable windows, draws the focus border, and
+   serves menubar commands. Quit the Rust daemon first if both fight
+   over the same windows.
+3. Prove each live seam and record gaps: AX reads/writes
+   (`LiveProviders/LiveAX.swift`), tap install + gestures
+   (`LiveTap.swift`), borders/dim/flash/drop (`Presenter/`), menubar
+   (`MenuBar/MenuBar.swift`).
+4. Widen the parity corpora through proven behavior and keep
+   `FrameParityChecks` green.
+5. Only then: flip `PANERU_SWIFT_DAEMON`, retire `src/` batches, remove
+   `nix/` once the Swift service bundle replaces `nix run` and the
+   darwin/home-manager modules (README documents the new install first).
 
 Supporting seams already in the Rust daemon: `src/replay.rs` (v2 session
 capture behind `PANERU_REPLAY_RECORD`: frame sequence plus commands,
