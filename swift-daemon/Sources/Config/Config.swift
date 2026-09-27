@@ -7,6 +7,9 @@
 // default/clamp chain the Rust getters implement. Bindings and per-window
 // rules ride the `Commands` module and a future rules slice.
 
+import KeyChords
+import MenuBar
+
 // MARK: - Small enums
 
 /// Swipe direction. Mirrors `config::swipe::SwipeGestureDirection`.
@@ -49,7 +52,7 @@ public struct DaemonOptions: Sendable {
     public var gapVertical: UInt16?
     public var dimInactiveColor: String?
     public var dimInactiveOpacity: Double?
-    public var dimOpacityNight: Double?
+    public var dimNightOpacity: Double?
     public var borderActive: Bool?
     public var borderInactive: Bool?
     public var borderColor: String?
@@ -64,6 +67,7 @@ public struct DaemonOptions: Sendable {
     public var swipeContinuous: Bool?
     public var swipeDeceleration: Double?
     public var swipeScrollModifier: String?
+    public var swipeScrollVerticalModifier: String?
     public var maximizeTiledWindows: Bool?
     public var menubarHeight: UInt16?
     public var windowHiddenRatio: Double?
@@ -84,7 +88,15 @@ public struct DaemonOptions: Sendable {
     public var presetStackHeights: [Double]?
     public var workspaceMenuStatus: Bool?
     public var workspacePopupStatus: Bool?
-    public var menubarOrientationDefault: Bool?
+    public var menubarOrientation: MenuBarOrientation?
+    public var menubarIndicatorStyle: IndicatorStyle?
+    public var menubarIndicatorFormat: IndicatorFormat?
+    public var menubarActiveCharacter: String?
+    public var menubarInactiveCharacter: String?
+    public var menubarFontSize: Double?
+    public var menubarDescriptorStyle: DescriptorStyle?
+    public var menubarDescriptorText: String?
+    public var menubarDescriptorSymbol: String?
 
     public init() {}
 }
@@ -132,6 +144,9 @@ public struct ResolvedConfig: Equatable, Sendable {
     public var dimOpacity: Float = 0
     public var dimColor = (0.0, 0.0, 0.0)
     public var dimAlpha = 1.0
+    /// Dim is configured only when a dim color is present.
+    public var dimActive = false
+    public var dimNightOpacity: Double?
     public var swipeFingers: Int?
     public var swipeDirection = SwipeDirection.natural
     public var swipeVertical = true
@@ -156,6 +171,30 @@ public struct ResolvedConfig: Equatable, Sendable {
     public var presetStackHeights = defaultPresetStackHeights
     public var workspaceMenuStatus = true
     public var workspacePopupStatus = true
+
+    public init() {}
+    public var menubarOrientation = MenuBarOrientation.default
+    public var menubarIndicatorStyle = IndicatorStyle.mono
+    public var menubarIndicatorFormat = IndicatorFormat.default
+    public var menubarActiveCharacter = defaultActiveCharacter
+    public var menubarInactiveCharacter = defaultInactiveCharacter
+    public var menubarFontSize = 13.0
+    public var menubarDescriptorStyle = DescriptorStyle.symbol
+    public var menubarDescriptorText = "VW"
+    public var menubarDescriptorSymbol = "fish.fill"
+    public var swipeScrollModifiers: KeyModifiers?
+    public var swipeScrollVerticalModifiers: KeyModifiers?
+    public var mouseResizeModifiers: KeyModifiers?
+    public var mouseDragDisplayModifiers: KeyModifiers?
+
+    /// Effective dim ratio: zero without a dim color; night prefers its
+    /// own opacity, falling back to day. Mirrors `window_dim_ratio`.
+    public func windowDimRatio(isDark: Bool) -> Double {
+        guard dimActive else { return 0.0 }
+        let day = Double(dimOpacity) * dimAlpha
+        let ratio = isDark ? (dimNightOpacity ?? day) : day
+        return min(max(ratio, 0.0), 1.0)
+    }
 
     public static func == (lhs: ResolvedConfig, rhs: ResolvedConfig) -> Bool {
         lhs.focusFollowsMouse == rhs.focusFollowsMouse
@@ -194,6 +233,21 @@ public struct ResolvedConfig: Equatable, Sendable {
             && lhs.restoreStartupGraceMs == rhs.restoreStartupGraceMs
             && lhs.presetColumnWidths == rhs.presetColumnWidths
             && lhs.presetStackHeights == rhs.presetStackHeights
+            && lhs.menubarOrientation == rhs.menubarOrientation
+            && lhs.menubarIndicatorStyle == rhs.menubarIndicatorStyle
+            && lhs.menubarIndicatorFormat == rhs.menubarIndicatorFormat
+            && lhs.menubarActiveCharacter == rhs.menubarActiveCharacter
+            && lhs.menubarInactiveCharacter == rhs.menubarInactiveCharacter
+            && lhs.menubarFontSize == rhs.menubarFontSize
+            && lhs.menubarDescriptorStyle == rhs.menubarDescriptorStyle
+            && lhs.menubarDescriptorText == rhs.menubarDescriptorText
+            && lhs.menubarDescriptorSymbol == rhs.menubarDescriptorSymbol
+            && lhs.swipeScrollModifiers == rhs.swipeScrollModifiers
+            && lhs.swipeScrollVerticalModifiers == rhs.swipeScrollVerticalModifiers
+            && lhs.mouseResizeModifiers == rhs.mouseResizeModifiers
+            && lhs.mouseDragDisplayModifiers == rhs.mouseDragDisplayModifiers
+            && lhs.dimActive == rhs.dimActive
+            && lhs.dimNightOpacity == rhs.dimNightOpacity
     }
 }
 
@@ -242,7 +296,9 @@ extension DaemonOptions {
             out.dimColor = parseHexColor(dimInactiveColor!)
             out.dimAlpha = parseHexAlpha(dimInactiveColor!)
             out.dimOpacity = Float(min(max(dimInactiveOpacity ?? 0, 0), 1))
+            out.dimActive = true
         }
+        if let v = dimNightOpacity { out.dimNightOpacity = v }
         if let v = swipeFingers { out.swipeFingers = v }
         if let v = swipeDirection { out.swipeDirection = v }
         if let v = swipeVertical { out.swipeVertical = v }
@@ -267,6 +323,19 @@ extension DaemonOptions {
         if let v = presetStackHeights { out.presetStackHeights = v }
         if let v = workspaceMenuStatus { out.workspaceMenuStatus = v }
         if let v = workspacePopupStatus { out.workspacePopupStatus = v }
+        if let v = menubarOrientation { out.menubarOrientation = v }
+        if let v = menubarIndicatorStyle { out.menubarIndicatorStyle = v }
+        if let v = menubarIndicatorFormat { out.menubarIndicatorFormat = v }
+        if let v = menubarActiveCharacter { out.menubarActiveCharacter = v }
+        if let v = menubarInactiveCharacter { out.menubarInactiveCharacter = v }
+        if let v = menubarFontSize { out.menubarFontSize = min(max(v, 1.0), 24.0) }
+        if let v = menubarDescriptorStyle { out.menubarDescriptorStyle = v }
+        if let v = menubarDescriptorText { out.menubarDescriptorText = v }
+        if let v = menubarDescriptorSymbol { out.menubarDescriptorSymbol = v }
+        out.swipeScrollModifiers = parseModifierField(swipeScrollModifier)
+        out.swipeScrollVerticalModifiers = parseModifierField(swipeScrollVerticalModifier)
+        out.mouseResizeModifiers = parseModifierField(mouseResizeModifier)
+        out.mouseDragDisplayModifiers = parseModifierField(mouseDragDisplayModifier)
         return out
     }
 }

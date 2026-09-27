@@ -156,7 +156,7 @@ let package = Package(
         ),
         .executableTarget(
             name: "ConfigChecks",
-            dependencies: ["Config"],
+            dependencies: ["Config", "KeyChords"],
             path: "Tests/ConfigChecks"
         ),
         .executableTarget(
@@ -320,7 +320,7 @@ let package = Package(
         // Resolved daemon configuration (`src/config.rs` getters).
         .target(
             name: "Config",
-            dependencies: ["Commands", "KeyChords"],
+            dependencies: ["Commands", "KeyChords", "MenuBar"],
             path: "Sources/Config"
         ),
         // Key-chord resolution (`resolve_chord`, modifier + keycode tables).

@@ -68,6 +68,7 @@ if let note { print("config: \(note)") }
 // the daemon stays up on defaults.
 var bindings: [ResolvedBinding] = []
 var windowRules: [WindowRule] = []
+var resolved = ResolvedConfig()
 if case .toml(let path) = source,
    let text = try? String(contentsOfFile: path, encoding: .utf8)
 {
@@ -78,6 +79,9 @@ if case .toml(let path) = source,
     } catch {
         print("config: warning: \(error) (running empty)")
     }
+    // Scalar options decode beside the tables; sensitivity/continuous/
+    // deceleration resolve for the scroll-physics consumer (not yet).
+    resolved = decodeOptions(parseOptionSections(text)).resolved()
 }
 
 /// NX tap bits onto config bits: the orders differ, so map explicitly.
@@ -98,6 +102,10 @@ func keyModifiers(_ tap: TapModifiers) -> KeyModifiers {
 // MARK: - State
 
 var core = DaemonCore()
+// Resize presets follow the resolved config.
+core.presetWidths = resolved.presetColumnWidths
+core.presetHeights = resolved.presetStackHeights
+core.resizeCycle = resolved.windowResizeCycle
 var apps: [pid_t: LiveApp] = [:]
 var roster: [CGWindowID: LiveWindow] = [:]
 var observers: [pid_t: LiveObserver] = [:]
@@ -106,7 +114,17 @@ var pending: [DaemonEvent] = []
 var dontFocus: Set<WindowID> = []
 var borderRects: [WindowID: CGRect] = [:]
 var borderStyles: [WindowID: BorderStyle] = [:]
-let focusedStyle = BorderStyle(r: 1, g: 1, b: 1, opacity: 1, width: 2, radius: 8)
+let focusedStyle = BorderStyle(
+    r: resolved.borderColor.0, g: resolved.borderColor.1, b: resolved.borderColor.2,
+    opacity: resolved.borderOpacity * resolved.borderAlpha,
+    width: resolved.borderWidth,
+    radius: {
+        switch resolved.borderRadius {
+        case .auto: return 10.0
+        case .value(let v): return v
+        }
+    }()
+)
 
 func windowID(_ wid: CGWindowID) -> WindowID {
     WindowID(truncatingIfNeeded: wid)
@@ -222,8 +240,34 @@ func observeFired(app: LiveApp) {
 
 // MARK: - Input
 
+/// Config modifier bits onto NX tap bits (either side counts).
+func tapModifiers(_ held: KeyModifiers?) -> TapModifiers {
+    var mods = TapModifiers()
+    guard let held else { return mods }
+    if held.contains(.leftAlt) || held.contains(.rightAlt) {
+        mods.formUnion([.leftAlternate, .rightAlternate])
+    }
+    if held.contains(.leftShift) || held.contains(.rightShift) {
+        mods.formUnion([.leftShift, .rightShift])
+    }
+    if held.contains(.leftCmd) || held.contains(.rightCmd) {
+        mods.formUnion([.leftCommand, .rightCommand])
+    }
+    if held.contains(.leftCtrl) || held.contains(.rightCtrl) {
+        mods.formUnion([.leftControl, .rightControl])
+    }
+    return mods
+}
+
 let tap = LiveTap()
 tap.sink = { pending.append(tapEvent($0)) }
+// Scroll modifiers from config; plain scrolling when unset.
+tap.tuning = TapTuning(
+    swipeFingers: resolved.swipeFingers,
+    swipeVertical: resolved.swipeVertical,
+    scrollTarget: tapModifiers(resolved.swipeScrollModifiers),
+    scrollVertical: tapModifiers(resolved.swipeScrollVerticalModifiers)
+)
 // Config bindings resolve through the table; scripted binds arrive with
 // the Lua host (slice 7) and focused passthrough with slice 4.
 tap.configured = { code, mods in
@@ -280,10 +324,16 @@ let menubar = MenuBarController { command in
 
 func viewport() -> IntRect {
     let bounds = CGDisplayBounds(CGMainDisplayID())
-    return IntRect(
+    var view = IntRect(
         min: IntPoint(Int32(bounds.minX.rounded()), Int32(bounds.minY.rounded())),
         max: IntPoint(Int32(bounds.maxX.rounded()), Int32(bounds.maxY.rounded()))
     )
+    // Padding plus menubar reserve, like `actual_bounds`.
+    view.min.x += resolved.paddingLeft
+    view.min.y += resolved.paddingTop + (resolved.menubarHeight ?? 0)
+    view.max.x -= resolved.paddingRight
+    view.max.y -= resolved.paddingBottom
+    return view
 }
 
 var tickCount = 0
@@ -349,6 +399,18 @@ func tick() {
         plan: result.borderPlan,
         currentRects: borderRects, currentStyles: borderStyles
     ))
+    // Dim the world behind the focused window when configured.
+    let dimRatio = resolved.windowDimRatio(isDark: false)
+    if resolved.dimActive, dimRatio > 0 {
+        Presenter.updateDim(
+            opacity: Float(dimRatio),
+            r: resolved.dimColor.0, g: resolved.dimColor.1, b: resolved.dimColor.2,
+            cutout: result.focus.flatMap { roster[CGWindowID($0)]?.frame }.map(cgRect),
+            cutoutRadius: focusedStyle.radius
+        )
+    } else {
+        Presenter.hideDim()
+    }
     // Menubar: rows of the active workspace, current row marked.
     let ws = core.activeWorkspace
     let rows = (core.strips[ws] ?? [:]).keys.sorted()
@@ -356,13 +418,17 @@ func tick() {
     let position = rows.firstIndex(of: currentRow).map(UInt32.init) ?? 0
     menubar.update(
         cells: buildIndicatorCells(
-            style: .multi, format: .default,
+            style: resolved.menubarIndicatorStyle,
+            format: resolved.menubarIndicatorFormat,
             current: rows.isEmpty ? nil : position,
-            all: rows.indices.map { UInt32($0) }
+            all: rows.indices.map { UInt32($0) },
+            activeCharacter: resolved.menubarActiveCharacter,
+            inactiveCharacter: resolved.menubarInactiveCharacter
         ) ?? [],
         widths: [],
         focusedWidthRatio: nil,
-        hasFocusedWindow: result.focus != nil
+        hasFocusedWindow: result.focus != nil,
+        fontSize: resolved.menubarFontSize
     )
 }
 

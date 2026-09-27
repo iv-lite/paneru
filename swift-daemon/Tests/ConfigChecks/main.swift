@@ -1,5 +1,6 @@
 import Foundation
 import Config
+import KeyChords
 
 // Parity ports of the default/clamp rules in `src/config.rs` getters.
 // Expectations copied verbatim.
@@ -144,6 +145,91 @@ if failures == 0 {
 } else {
     print("ConfigChecks: \(failures) failure(s)")
     exit(1)
+}
+
+// Option sections decode; modifiers resolve; night dim falls back.
+do {
+    let text = """
+        [options]
+        swipe_sensitivity = 0.5
+        border_radius = auto
+
+        [padding]
+        top = 10
+        bottom = 10
+
+        [gaps]
+        horizontal = 4
+
+        [swipe]
+        scroll_modifier = "alt"
+        continuous = false
+
+        [swipe.gesture]
+        fingers_count = 4
+        direction = "reversed"
+
+        [decorations.active.border]
+        enabled = true
+        color = "#ff0000"
+        width = 3.0
+
+        [decorations.inactive.dim]
+        color = "#000000"
+        opacity = 0.3
+        opacity_night = 0.6
+
+        [decorations.menubar]
+        orientation = "flipped"
+        indicator_style = "multi"
+        indicator_format = "roman"
+        font_size = 30.0
+        """
+    let sections = parseOptionSections(text)
+    checkEqual(sections["padding"]?["top"], "10", "padding decodes")
+    checkEqual(sections["swipe.gesture"]?["fingers_count"], "4", "dotted sections stay flat")
+    let options = decodeOptions(sections)
+    checkEqual(options.swipeSensitivity, 0.5, "flat legacy keys decode")
+    checkEqual(options.gapHorizontal, 4, "gaps decode")
+    checkEqual(options.swipeFingers, 4, "gesture table decodes")
+    checkEqual(options.swipeDirection, .reversed, "gesture direction decodes")
+    checkEqual(options.swipeContinuous, false, "swipe table decodes")
+    checkEqual(options.swipeScrollModifier, "alt", "scroll modifier decodes")
+    checkEqual(options.borderColor, "#ff0000", "decoration color decodes")
+    checkEqual(options.menubarOrientation, .flipped, "orientation decodes")
+    checkEqual(options.menubarIndicatorStyle, .multi, "indicator style decodes")
+    checkEqual(options.menubarFontSize, 30.0, "font size decodes raw")
+    let resolved = options.resolved()
+    checkEqual(resolved.swipeSensitivity, 0.5, "sensitivity applies")
+    checkEqual(resolved.swipeFingers, 4, "fingers apply")
+    checkEqual(
+        resolved.swipeScrollModifiers, KeyModifiers(arrayLiteral: .leftAlt, .rightAlt),
+        "scroll modifiers default-resolve"
+    )
+    check(abs(resolved.windowDimRatio(isDark: false) - 0.3) < 0.001, "day dim applies")
+    check(abs(resolved.windowDimRatio(isDark: true) - 0.6) < 0.001, "night prefers its opacity")
+    checkEqual(resolved.menubarFontSize, 24.0, "font clamps to 24")
+    let color = resolved.borderColor
+    check(
+        color.0 == 255.0 && color.1 == 0.0 && color.2 == 0.0,
+        "hex parses (got \(color))"
+    )
+    // No dim color means no dim, even with an opacity set.
+    var bare = DaemonOptions()
+    bare.dimInactiveOpacity = 0.5
+    checkEqual(bare.resolved().windowDimRatio(isDark: false), 0.0, "color gates dim")
+    checkEqual(bare.resolved().dimActive, false, "inactive flags honestly")
+    // Invalid modifiers unset instead of failing the table.
+    var bad = DaemonOptions()
+    bad.mouseResizeModifier = "bogus-mod"
+    checkEqual(bad.resolved().mouseResizeModifiers, nil, "bad modifiers unset")
+    var good = DaemonOptions()
+    good.mouseDragDisplayModifier = "cmd"
+    check(
+        good.resolved().mouseDragDisplayModifiers?
+            .isSuperset(of: KeyModifiers(arrayLiteral: .leftCmd, .rightCmd)) == true,
+        "mouse modifiers resolve"
+    )
 }
 
 // [bindings]: command keys split on `_`, chords resolve, misses fall
