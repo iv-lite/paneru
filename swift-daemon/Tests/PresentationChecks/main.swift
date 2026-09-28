@@ -119,6 +119,30 @@ do {
     check(flashNeedsUpdate(shown: shown, msg: "hi", bucket: 9, frame: rect(0, 0, 10, 10)), "bucket move reshows")
 }
 
+// Row-switch toast: 1-based number on real changes when enabled.
+do {
+    checkEqual(
+        switchFlashMessage(current: 1, previous: 0, enabled: true), "2",
+        "row numbers render 1-based"
+    )
+    checkEqual(
+        switchFlashMessage(current: 0, previous: 0, enabled: true), nil,
+        "same row never flashes"
+    )
+    checkEqual(
+        switchFlashMessage(current: 1, previous: nil, enabled: true), nil,
+        "startup stays quiet"
+    )
+    checkEqual(
+        switchFlashMessage(current: 1, previous: 0, enabled: false), nil,
+        "disabled flag suppresses"
+    )
+    checkEqual(
+        switchFlashMessage(current: nil, previous: 0, enabled: true), nil,
+        "missing row never flashes"
+    )
+}
+
 if failures == 0 {
     print("PresentationChecks: all checks passed")
 } else {

@@ -186,7 +186,7 @@ let package = Package(
         ),
         .executableTarget(
             name: "SessionChecks",
-            dependencies: ["Session"],
+            dependencies: ["Session", "Geometry"],
             path: "Tests/SessionChecks"
         ),
         .executableTarget(
@@ -234,9 +234,9 @@ let package = Package(
             dependencies: [
                 "Commands", "Config", "ConfigFiles", "Daemon", "Displays",
                 "Geometry", "IPC", "KeyChords", "Layout", "LiveProviders",
-                "LuaBridge", "MenuBar", "PaneruXPC", "Presentation",
-                "Presenter", "ScriptEvents", "ScriptHost", "Scripting",
-                "Scroll", "StateQuery", "WindowSet",
+                "LuaAPI", "LuaBridge", "MenuBar", "PaneruXPC", "Presentation",
+                "Presenter",                 "ScriptEvents", "ScriptHost", "Scripting",
+                "Scroll", "Session", "StateQuery", "WindowSet",
             ],
             path: "Sources/PaneruDaemon"
         ),
@@ -373,6 +373,7 @@ let package = Package(
         // `src/ecs/state.rs` shapes).
         .target(
             name: "Session",
+            dependencies: ["Geometry"],
             path: "Sources/Session"
         ),
         // Script-side predicted layout tree + replay log
@@ -393,7 +394,7 @@ let package = Package(
         // (`crates/lua/src/lib.rs`, `client.rs` truth tables).
         .target(
             name: "LuaAPI",
-            dependencies: ["Commands", "IPC", "Scripting", "StateQuery", "WindowSet"],
+            dependencies: ["Commands", "Geometry", "IPC", "Scripting", "StateQuery", "WindowSet"],
             path: "Sources/LuaAPI"
         ),
         // Config file discovery, defaults, deprecation, watch reduction

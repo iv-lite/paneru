@@ -169,8 +169,8 @@ do {
     check(lua.readSetup() == nil, "failed setup leaves nil")
 }
 
-// `paneru.match` marks filters; `on` with a match skips loudly instead
-// of failing the script, and plain handlers still register.
+// `paneru.match` marks filters; `on` rows carry the spec for the host
+// to compile, and plain handlers register filter-free.
 do {
     let lua = LuaBridge()
     try! lua.installPrelude()
@@ -179,8 +179,19 @@ do {
         paneru.on("window_focused", function(e) end)
         """)
     let handlers = lua.listHandlers()
-    checkEqual(handlers.count, 1, "match-filtered handlers skip")
-    checkEqual(handlers.first?.name, "window_focused", "plain handlers register")
+    checkEqual(handlers.count, 2, "filtered handlers register")
+    let filtered = handlers.first { $0.name == "window_spawned" }!
+    guard case .map(let spec) = filtered.filter,
+          case .str(let bundle) = spec["bundle"]
+    else {
+        check(false, "match spec round-trips")
+        exit(1)
+    }
+    checkEqual(bundle, "x", "match fields survive")
+    checkEqual(
+        handlers.first { $0.name == "window_focused" }?.filter, nil,
+        "plain handlers carry no filter"
+    )
     for handler in handlers {
         lua.releaseRef(handler.ref)
     }
@@ -190,6 +201,57 @@ do {
     } catch let err as LuaBridgeError {
         check(err.message.contains("paneru.match"), "match errors name the call")
     }
+}
+
+// Dispatch passes (event, ws) and returns the ws op log: chaining
+// verbs accumulate rows the host replays, other returns commit nothing.
+do {
+    let lua = LuaBridge()
+    try! lua.installPrelude()
+    try! lua.load("""
+        paneru.on("window_spawned", function(event, ws)
+          return ws:manage(event.window_id):sink(event.window_id):width(event.window_id, 0.5)
+        end)
+        """)
+    let handlers = lua.listHandlers()
+    checkEqual(handlers.count, 1, "dispatch handler registers")
+    let rows = try! lua.callHandlerDispatch(
+        ref: handlers[0].ref,
+        eventJSON: """
+            {"type": "window_spawned", "window_id": 7, "bundle_id": "b"}
+            """
+    )
+    checkEqual(rows.count, 3, "three verbs record three rows")
+    check(rows[0]["manage"] == .int(7), "manage records the id")
+    check(rows[1]["sink"] == .int(7), "sink records the id")
+    if case .map(let width) = rows[2]["width"],
+       width["id"] == .int(7), width["ratio"] == .float(0.5)
+    {
+        check(true, "width records id and ratio")
+    } else {
+        check(false, "width records id and ratio (got \(rows))")
+    }
+    lua.releaseRef(handlers[0].ref)
+    // Nil returns commit nothing; errors propagate with the message.
+    try! lua.load("""
+        paneru.on("noop", function(event, ws) end)
+        paneru.on("bang", function(event, ws) error("kaput") end)
+        """)
+    let more = lua.listHandlers()
+    let noop = more.first { $0.name == "noop" }!
+    checkEqual(
+        try! lua.callHandlerDispatch(ref: noop.ref, eventJSON: "{}"), [],
+        "nil returns commit nothing"
+    )
+    lua.releaseRef(noop.ref)
+    let bang = more.first { $0.name == "bang" }!
+    do {
+        _ = try lua.callHandlerDispatch(ref: bang.ref, eventJSON: "{}")
+        check(false, "handler errors throw")
+    } catch let err as LuaBridgeError {
+        check(err.message.contains("kaput"), "handler errors carry the message")
+    }
+    lua.releaseRef(bang.ref)
 }
 
 // `paneru.exec` runs subprocesses synchronously, returning
@@ -258,6 +320,10 @@ do {
     check(
         handlers.allSatisfy { $0.name == "window_focused" },
         "handlers key by event name"
+    )
+    check(
+        handlers.allSatisfy { $0.filter == nil },
+        "plain handlers carry no filter"
     )
     for handler in handlers {
         try! lua.callHandlerRef(handler.ref, arg: handler.name)

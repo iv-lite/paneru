@@ -188,6 +188,34 @@ do {
         viewport: viewport, focusedStyle: style
     )
     checkEqual(daemon.activeVirtual[1], 2, "virtualadd selects the new row")
+    // Dynamic rows only with the flag (default off stays put).
+    do {
+        var plain = DaemonCore()
+        _ = plain.tick(
+            events: [.appeared(id: 0, workspace: 1)],
+            frames: frames(slots: [0: IntPoint(0, 0)]),
+            viewport: viewport, focusedStyle: style
+        )
+        _ = plain.tick(
+            events: [.command(.window(.virtualWorkspace(.south)))],
+            frames: frames(slots: [0: IntPoint(0, 0)]),
+            viewport: viewport, focusedStyle: style
+        )
+        checkEqual(plain.activeVirtual[1], 0, "south past last stays without the flag")
+        var auto = DaemonCore()
+        auto.createWorkspaceAutomatically = true
+        _ = auto.tick(
+            events: [.appeared(id: 0, workspace: 1)],
+            frames: frames(slots: [0: IntPoint(0, 0)]),
+            viewport: viewport, focusedStyle: style
+        )
+        _ = auto.tick(
+            events: [.command(.window(.virtualWorkspace(.south)))],
+            frames: frames(slots: [0: IntPoint(0, 0)]),
+            viewport: viewport, focusedStyle: style
+        )
+        checkEqual(auto.activeVirtual[1], 1, "south past last creates with the flag")
+    }
     checkEqual(daemon.strips[1]?[2]?.allWindows, [], "new row starts empty")
     // Swipe scrolls the active strip; a quiet tick rests after.
     let swiped = daemon.tick(
@@ -616,6 +644,25 @@ do {
     )
     checkEqual(daemon.activeWorkspace, 1, "lone display holds")
     checkEqual(daemon.takeMouseWarp(), nil, "lone hops warp nothing")
+}
+
+// Restore placement relocates whole columns into planned slots,
+// creating rows; active rows the user already switched to are kept.
+do {
+    var daemon = DaemonCore()
+    _ = daemon.tick(
+        events: [.appeared(id: 0, workspace: 1), .appeared(id: 1, workspace: 1)],
+        frames: frames(slots: [0: IntPoint(0, 0), 1: IntPoint(0, 0)]),
+        viewport: viewport, focusedStyle: style
+    )
+    daemon.restorePlace(1, workspace: 2, row: 3, column: 5)
+    checkEqual(daemon.strips[1]?[0]?.allWindows, [0], "source keeps the rest")
+    checkEqual(daemon.strips[2]?[3]?.allWindows, [1], "target gains the column")
+    checkEqual(daemon.activeVirtual[2], 3, "unset rows follow the plan")
+    daemon.restorePlace(9, workspace: 2, row: 0, column: 0)
+    checkEqual(daemon.strips[2]?[3]?.allWindows, [1], "unknown windows are no-ops")
+    daemon.restoreActiveRow(3, workspace: 2)
+    checkEqual(daemon.activeVirtual[2], 3, "saved active rows select unconditionally")
 }
 
 // Surgery ops: swap bubbles columns, center shifts the strip offset,

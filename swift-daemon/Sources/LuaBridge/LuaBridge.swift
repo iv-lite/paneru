@@ -77,17 +77,35 @@ public let luaPrelude = """
       return { _match = t }
     end
     function paneru.on(name, a, b)
-      local handler = b or a
-      if b ~= nil and type(a) == "table" then
-        print("paneru: on('" .. tostring(name) .. "') with match() skipped (full windowset API not yet)")
-        return
+      local handler, filter = b or a, nil
+      if b ~= nil then
+        if type(a) ~= "table" or a._match == nil then
+          error("paneru.on: filter must use paneru.match")
+        end
+        filter = a._match
       end
       if type(handler) ~= "function" then
         error("paneru.on: handler must be a function")
       end
       paneru._handlers = paneru._handlers or {}
       paneru._handlers[name] = paneru._handlers[name] or {}
-      table.insert(paneru._handlers[name], handler)
+      table.insert(paneru._handlers[name], { filter = filter, fn = handler })
+    end
+    function paneru._makews()
+      local ws = { _ops = {} }
+      function ws:manage(id)
+        table.insert(self._ops, { manage = id })
+        return self
+      end
+      function ws:sink(id)
+        table.insert(self._ops, { sink = id })
+        return self
+      end
+      function ws:width(id, ratio)
+        table.insert(self._ops, { width = { id = id, ratio = ratio } })
+        return self
+      end
+      return ws
     end
     """
 
@@ -412,9 +430,27 @@ public final class LuaBridge {
         try pcall(nargs: 1, nresults: 0)
     }
 
-    /// Event-handler refs by event name, in registration order.
-    public func listHandlers() -> [(name: String, ref: Int32)] {
-        var out: [(name: String, ref: Int32)] = []
+    /// One recorded `paneru.on` row: event name, registry ref, and the
+    /// optional `paneru.match` spec table (as captured values for the
+    /// host to compile — matching itself stays host-side).
+    public struct HandlerRegistration: Equatable, Sendable {
+        public var name: String
+        public var ref: Int32
+        public var filter: ScriptValue?
+
+        public init(name: String, ref: Int32, filter: ScriptValue? = nil) {
+            self.name = name
+            self.ref = ref
+            self.filter = filter
+        }
+    }
+
+    /// Event-handler registrations by event name, in registration order.
+    /// Rows hold `{filter, fn}` (see the prelude); a missing filter is
+    /// an unfiltered handler. Functions move to the registry; the host
+    /// releases refs via `releaseRef` on reload.
+    public func listHandlers() -> [HandlerRegistration] {
+        var out: [HandlerRegistration] = []
         guard lua_getglobal(state, "paneru") == LUA_TTABLE else {
             pop(1)
             return out
@@ -437,11 +473,27 @@ public final class LuaBridge {
                 if count > 0 {
                     for i in 1...count {
                         lua_geti(state, -1, Int64(i))
-                        if lua_type(state, -1) == LUA_TFUNCTION {
-                            out.append((name, luaL_ref(state, luaRegistryIndex)))
-                        } else {
+                        if lua_type(state, -1) == LUA_TTABLE {
+                            var filter: ScriptValue?
+                            var ref: Int32?
+                            lua_getfield(state, -1, "filter")
+                            if lua_type(state, -1) == LUA_TTABLE {
+                                filter = readTable(at: -1).flatMap { value in
+                                    if case .map = value { return value } else { return nil }
+                                }
+                            }
                             pop(1)
+                            lua_getfield(state, -1, "fn")
+                            if lua_type(state, -1) == LUA_TFUNCTION {
+                                ref = luaL_ref(state, luaRegistryIndex)
+                            } else {
+                                pop(1)
+                            }
+                            if let ref {
+                                out.append(HandlerRegistration(name: name, ref: ref, filter: filter))
+                            }
                         }
+                        pop(1)
                     }
                 }
             }
@@ -449,6 +501,99 @@ public final class LuaBridge {
         }
         pop(2)
         return out
+    }
+
+    /// Push an event table decoded from its JSON document. False when the
+    /// document does not decode (the caller then falls back or skips).
+    @discardableResult
+    private func pushEventTable(_ json: String) -> Bool {
+        guard let data = json.data(using: .utf8),
+              let object = try? JSONSerialization.jsonObject(with: data)
+        else { return false }
+        pushScriptValue(ScriptValue(json: object))
+        return true
+    }
+
+    /// Make a fresh `ws` proxy table (`paneru._makews`), leaving it on
+    /// top of the stack. Goes through a registry ref (`lua_remove` is a
+    /// C macro Swift cannot import).
+    private func pushWSProxy() throws {
+        guard lua_getglobal(state, "paneru") == LUA_TTABLE else {
+            pop(1)
+            throw LuaBridgeError("paneru table missing for ws proxy")
+        }
+        lua_getfield(state, -1, "_makews")
+        guard lua_type(state, -1) == LUA_TFUNCTION else {
+            pop(2)
+            throw LuaBridgeError("paneru._makews missing for ws proxy")
+        }
+        let maker = luaL_ref(state, luaRegistryIndex)
+        pop(1)
+        guard lua_rawgeti(state, luaRegistryIndex, Int64(maker)) == LUA_TFUNCTION else {
+            pop(1)
+            luaL_unref(state, luaRegistryIndex, maker)
+            throw LuaBridgeError("paneru._makews missing for ws proxy")
+        }
+        luaL_unref(state, luaRegistryIndex, maker)
+        // Failure leaves the caller's frames intact (the error message
+        // is already popped); the caller rebalances.
+        try pcall(nargs: 0, nresults: 1)
+    }
+
+    /// Read a `_ops` op-row array as captured value maps. Non-map rows
+    /// are skipped; the host drops malformed rows without failing the
+    /// dispatch (replay convention: the log never throws).
+    private func readOpRows(at index: Int32) -> [[String: ScriptValue]] {
+        var out: [[String: ScriptValue]] = []
+        let abs = index < 0 ? lua_gettop(state) + index + 1 : index
+        lua_getfield(state, abs, "_ops")
+        guard lua_type(state, -1) == LUA_TTABLE else {
+            pop(1)
+            return out
+        }
+        let count = Int(lua_rawlen(state, -1))
+        if count > 0 {
+            for i in 1...count {
+                lua_geti(state, -1, Int64(i))
+                if case .map(let row) = readValue(at: -1) {
+                    out.append(row)
+                }
+                pop(1)
+            }
+        }
+        pop(1)
+        return out
+    }
+
+    /// Invoke a handler as `(eventTable, wsProxy)`: pushes both, calls
+    /// with two arguments, and returns the `_ops` rows the returned (or
+    /// mutated) proxy accumulated — empty when the handler returned
+    /// nothing usable. Errors throw with the interpreter message; the
+    /// stack is left balanced either way.
+    public func callHandlerDispatch(ref: Int32, eventJSON: String) throws -> [[String: ScriptValue]] {
+        guard lua_rawgeti(state, luaRegistryIndex, Int64(ref)) == LUA_TFUNCTION else {
+            pop(1)
+            throw LuaBridgeError("handler ref \(ref) is not a function")
+        }
+        guard pushEventTable(eventJSON) else {
+            pop(1)
+            throw LuaBridgeError("handler event does not decode")
+        }
+        do {
+            try pushWSProxy()
+        } catch {
+            pop(2)
+            throw error
+        }
+        do {
+            try pcall(nargs: 2, nresults: 1)
+        } catch {
+            lua_settop(state, 0)
+            throw error
+        }
+        defer { pop(1) }
+        guard lua_type(state, -1) == LUA_TTABLE else { return [] }
+        return readOpRows(at: -1)
     }
 
     /// Drain accumulated flashes in order, resetting for the next batch.

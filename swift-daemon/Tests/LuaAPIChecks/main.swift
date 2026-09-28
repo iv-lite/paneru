@@ -187,6 +187,58 @@ do {
     )
 }
 
+// `compileMatchFilter` lifts captured match tables; `decodeWSOpRows`
+// turns ws-proxy op rows into layout ops, dropping malformed rows.
+do {
+    check(try compileMatchFilter(nil) == nil, "absent specs stay unfiltered")
+    let matcher = try! compileMatchFilter(.map([
+        "bundle": .str("org.mozilla.firefox"), "managed": .bool(true),
+    ]))!
+    check(
+        try! matcher.matches(MatchWindow(bundleID: "org.mozilla.firefox", managed: true)),
+        "compiled specs match"
+    )
+    check(
+        (try? matcher.matches(MatchWindow(bundleID: "other", managed: true))) == false,
+        "compiled specs reject"
+    )
+    check(
+        throwsMessage { _ = try compileMatchFilter(.str("nope")) }?
+            .contains("expected a table") == true,
+        "non-map specs throw"
+    )
+    check(
+        throwsMessage { _ = try compileMatchFilter(.map(["bogus": .int(1)])) }?
+            .contains("unknown field") == true,
+        "unknown fields throw"
+    )
+    check(
+        throwsMessage { _ = try compileMatchFilter(.map(["title": .int(1)])) }?
+            .contains("must be a string") == true,
+        "mistyped fields throw"
+    )
+    let ops = decodeWSOpRows([
+        ["manage": .int(3)],
+        ["sink": .int(4)],
+        ["width": .map(["id": .int(5), "ratio": .float(0.5)])],
+        ["width": .map(["id": .int(6), "ratio": .int(1)])],
+        ["bogus": .int(9)],
+        ["manage": .str("nope")],
+        [:],
+    ])
+    checkEqual(
+        ops,
+        [
+            .setManaged(window: 3, managed: true),
+            .setFloating(window: 4, floating: false),
+            .setWidth(window: 5, ratio: 0.5),
+            .setWidth(window: 6, ratio: 1.0),
+        ],
+        "ws rows decode in order, malformed rows drop"
+    )
+    check(decodeWSOpRows([]).isEmpty, "empty rows decode empty")
+}
+
 if failures == 0 {
     print("LuaAPIChecks: all checks passed")
 } else {

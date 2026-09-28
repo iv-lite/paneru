@@ -208,6 +208,21 @@ public func flashBucket(opacity: Double) -> UInt8 {
     UInt8((min(max(opacity, 0), 1) * 10).rounded())
 }
 
+/// Virtual-switch toast message: the 1-based row number, shown when the
+/// active row actually changes (creation counts — a fresh row is a
+/// switch onto it) and the popup is enabled. Mirrors Rust
+/// `flash_message(format!("{}", index + 1), 1.0)` on every virtual
+/// switch path. `previous == nil` (no earlier row) never flashes, so
+/// startup stays quiet.
+public func switchFlashMessage(
+    current: UInt32?, previous: UInt32?, enabled: Bool
+) -> String? {
+    guard enabled, let current, let previous, current != previous else {
+        return nil
+    }
+    return String(current + 1)
+}
+
 /// Same message + bucket + frame means no work beyond ordering front.
 /// Mirrors the `shown` dedup in both flash implementations.
 public func flashNeedsUpdate(

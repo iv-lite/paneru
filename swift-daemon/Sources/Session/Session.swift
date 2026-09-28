@@ -1,4 +1,5 @@
 import Foundation
+import Geometry
 
 // Startup session restore: the persistable state model plus the planner
 // that matches saved windows against live ones. Ports `src/ecs/state.rs`
@@ -516,4 +517,50 @@ private extension SavedColumn {
             }
         }
     }
+}
+
+// MARK: - Display remap
+
+/// Remap a saved workspace's display onto a live display id: stable UUID
+/// first, then the numeric display id, then geometry overlap of the saved
+/// bounds center, else nil (the caller falls back to the active
+/// display). Mirrors Rust's UUID → numeric → active pick. Live UUIDs are
+/// currently unresolved, so the UUID arm only fires when the host starts
+/// supplying them.
+public func remapDisplay(
+    displayUUID: String?, displayID: UInt32?,
+    boundsCenter: (Int32, Int32)?,
+    displays: [(id: UInt32, uuid: String?, frame: IntRect)]
+) -> UInt32? {
+    if let displayUUID, !displayUUID.isEmpty,
+       let hit = displays.first(where: { $0.uuid == displayUUID })
+    {
+        return hit.id
+    }
+    if let displayID, displays.contains(where: { $0.id == displayID }) {
+        return displayID
+    }
+    if let center = boundsCenter {
+        if let hit = displays.first(where: { rectContains($0.frame, center) }) {
+            return hit.id
+        }
+        var best: (id: UInt32, distance: Int64)?
+        for display in displays {
+            let cx = min(max(Int64(center.0), Int64(display.frame.min.x)), Int64(display.frame.min.x) + Int64(display.frame.width))
+            let cy = min(max(Int64(center.1), Int64(display.frame.min.y)), Int64(display.frame.min.y) + Int64(display.frame.height))
+            let dx = Int64(center.0) - cx
+            let dy = Int64(center.1) - cy
+            let distance = dx * dx + dy * dy
+            if best.map({ distance < $0.distance }) ?? true {
+                best = (display.id, distance)
+            }
+        }
+        return best?.id
+    }
+    return nil
+}
+
+private func rectContains(_ rect: IntRect, _ point: (Int32, Int32)) -> Bool {
+    point.0 >= rect.min.x && point.0 < rect.min.x + rect.width
+        && point.1 >= rect.min.y && point.1 < rect.min.y + rect.height
 }

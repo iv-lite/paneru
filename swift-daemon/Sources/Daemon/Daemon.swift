@@ -78,11 +78,22 @@ public struct WindowMetadata: Equatable, Sendable {
     public var appName: String
     public var bundleID: String
     public var title: String
+    /// AX identity for restore fallback matching (best-effort; nil when
+    /// the host never probed it).
+    public var role: String?
+    public var subrole: String?
+    public var identifier: String?
 
-    public init(appName: String = "", bundleID: String = "", title: String = "") {
+    public init(
+        appName: String = "", bundleID: String = "", title: String = "",
+        role: String? = nil, subrole: String? = nil, identifier: String? = nil
+    ) {
         self.appName = appName
         self.bundleID = bundleID
         self.title = title
+        self.role = role
+        self.subrole = subrole
+        self.identifier = identifier
     }
 }
 
@@ -144,6 +155,10 @@ public struct DaemonCore: Sendable {
     /// `continuous_swipe`; only gesture travel clamps — programmatic
     /// moves (center/snap/reveal) own out-of-range offsets.
     public var continuousSwipe = true
+    /// Create virtual rows on demand when switching past the last one.
+    /// Mirrors `create_workspace_automatically` (and the legacy
+    /// `create_virtual_workspace_automatically` spelling).
+    public var createWorkspaceAutomatically = false
     /// Workspace ring in spatial display order (host-owned): cross-display
     /// moves resolve neighbors here. Empty keeps the legacy `±1` fallback
     /// the single-display checks pin.
@@ -613,7 +628,7 @@ public struct DaemonCore: Sendable {
             rowVirtualIndices: rows,
             currentPosition: currentPosition,
             activeStripEmpty: activeStrip().len == 0,
-            createAutomatically: false,
+            createAutomatically: createWorkspaceAutomatically,
             focusedNeighbor: neighbor
         )
         switch outcome {
@@ -1623,6 +1638,52 @@ public struct DaemonCore: Sendable {
         var target = strips[workspace]?[row] ?? LayoutStrip(id: workspace, virtualIndex: row)
         target.insertColumn(at: Int.max, column)
         strips[workspace, default: [:]][row] = target
+        dirty.formUnion([.layout, .paint])
+    }
+
+    /// Place an adopted window per a restore plan: relocate its whole
+    /// column into (workspace, row) at `column` (clamped to the live
+    /// strip), creating the row. Groups land as adjacent singles when
+    /// their mates have not arrived yet — order is preserved, grouping
+    /// flattens (documented v1 limit). Unknown windows are no-ops. The
+    /// workspace's active row follows only when unset, so a row the user
+    /// already switched to keeps focus.
+    public mutating func restorePlace(
+        _ id: WindowID, workspace: WorkspaceID, row: UInt32, column: Int
+    ) {
+        var sourceWS: WorkspaceID?
+        var sourceRow: UInt32?
+        var sourceIndex: Int?
+        for (ws, rows) in strips {
+            for (r, strip) in rows {
+                if let index = strip.index(of: id) {
+                    sourceWS = ws
+                    sourceRow = r
+                    sourceIndex = index
+                }
+            }
+        }
+        guard let sourceWS, let sourceRow, let sourceIndex,
+              var source = strips[sourceWS]?[sourceRow],
+              let moving = source.removeColumn(at: sourceIndex)
+        else { return }
+        strips[sourceWS]?[sourceRow] = source
+        var target = strips[workspace]?[row]
+            ?? LayoutStrip(id: workspace, virtualIndex: row)
+        target.insertColumn(at: min(max(column, 0), target.len), moving)
+        strips[workspace, default: [:]][row] = target
+        if activeVirtual[workspace] == nil {
+            activeVirtual[workspace] = row
+        }
+        dirty.formUnion([.layout, .paint])
+    }
+
+    /// Startup restore selects the saved active row (the host applies
+    /// the planner's `activeVirtualByWorkspace` mapping at grace
+    /// expiry, after all arrivals). Unconditional: inside the startup
+    /// window the saved state wins over live switches.
+    public mutating func restoreActiveRow(_ row: UInt32, workspace: WorkspaceID) {
+        activeVirtual[workspace] = row
         dirty.formUnion([.layout, .paint])
     }
 

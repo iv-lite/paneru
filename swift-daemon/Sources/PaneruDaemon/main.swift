@@ -23,6 +23,7 @@ import IPC
 import KeyChords
 import Layout
 import LiveProviders
+import LuaAPI
 import LuaBridge
 import MenuBar
 import PaneruXPC
@@ -32,6 +33,7 @@ import ScriptEvents
 import ScriptHost
 import Scripting
 import Scroll
+import Session
 import StateQuery
 import WindowSet
 import Darwin
@@ -157,6 +159,15 @@ func parseTuningLayers(_ text: String) -> (DaemonOptions, [ResolvedBinding], [Wi
     return (decodeOptions(parseOptionSections(text)), tableBindings, tableRules)
 }
 
+/// Restore plan + saved state while the startup grace window is open
+/// (nil = inactive). Declared with the other top-level state.
+var restorePlanner: RestorePlanner?
+var restoreState: PaneruSessionState?
+var restoreDeadline = Date.distantPast
+/// Adopted windows awaiting restore placement (CGWindowID refs).
+/// Drained after the core tick ingests their `.appeared` events.
+var restorePending = Set<Int>()
+
 var tuningPath: String? = fallbackTOMLPath()
 if let path = tuningPath {
     // Stored, not applied: `rebuildBaseConfig` below folds it once the
@@ -187,7 +198,7 @@ func logEffectiveTuning() {
     let vscroll = resolved.swipeScrollVerticalModifiers.map { "0x\(String($0.rawValue, radix: 16))" } ?? "off"
     let vw = viewport()
     print("config: tuning fingers=\(fingers) scroll=\(scroll) scroll_vertical=\(vscroll) padding=\(resolved.paddingLeft),\(resolved.paddingTop) border=\(resolved.borderWidth)px viewport=\(vw.min.x),\(vw.min.y) \(vw.width)x\(vw.height)")
-    print("config: tuning gaps=\(resolved.gapHorizontal),\(resolved.gapVertical) borderActive=\(resolved.borderActive) dimActive=\(resolved.dimActive) continuous=\(resolved.swipeContinuous) ffm=\(resolved.focusFollowsMouse) mff=\(resolved.mouseFollowsFocus) restore=\(resolved.restoreEnabled)/\(resolved.restoreStartupGraceMs)/\(resolved.restoreMissingWindows) presets=\(resolved.presetColumnWidths.map { String($0) }.joined(separator: ","))")
+    print("config: tuning gaps=\(resolved.gapHorizontal),\(resolved.gapVertical) borderActive=\(resolved.borderActive) dimActive=\(resolved.dimActive) continuous=\(resolved.swipeContinuous) ffm=\(resolved.focusFollowsMouse) mff=\(resolved.mouseFollowsFocus) restore=\(resolved.restoreEnabled)/\(resolved.restoreStartupGraceMs)/\(resolved.restoreMissingWindows) presets=\(resolved.presetColumnWidths.map { String($0) }.joined(separator: ",")) popup=\(resolved.workspacePopupStatus)")
 }
 // Called below after MARK-State: top-level storage in the main file
 // initializes in source order, so this must not run before every
@@ -238,8 +249,9 @@ core.presetHeights = resolved.presetStackHeights
 core.resizeCycle = resolved.windowResizeCycle
 core.continuousSwipe = resolved.swipeContinuous
 core.windowHiddenRatio = resolved.windowHiddenRatio
+core.createWorkspaceAutomatically = resolved.createWorkspaceAutomatically
 var apps: [pid_t: LiveApp] = [:]
-var roster: [CGWindowID: LiveWindow] = [:]
+var roster: [CGWindowID: LiveProviders.LiveWindow] = [:]
 var observers: [pid_t: LiveObserver] = [:]
 var pending: [DaemonEvent] = []
 /// Windows whose rules suppress focus arrival.
@@ -309,6 +321,8 @@ struct AdoptedWindow: Sendable {
     var bundleID: String
     var role: String
     var subrole: String
+    /// AXIdentifier for restore fallback matching (best-effort).
+    var identifier: String
     /// Native-fullscreen windows never relocate (Rust
     /// `NativeFullscreenMarker`); they float unmanaged instead.
     var isFullscreen: Bool
@@ -342,7 +356,10 @@ func adoptNewcomers(_ adopted: [(AdoptedWindow, AXUIElement)]) {
         let bundle = runningApp?.bundleIdentifier ?? ""
         let appName = runningApp?.localizedName ?? ""
         core.windowMetadata[windowID(wid)] = WindowMetadata(
-            appName: appName, bundleID: bundle, title: probe.title
+            appName: appName, bundleID: bundle, title: probe.title,
+            role: probe.role.isEmpty ? nil : probe.role,
+            subrole: probe.subrole.isEmpty ? nil : probe.subrole,
+            identifier: probe.identifier.isEmpty ? nil : probe.identifier
         )
         let rules = matchWindowRules(title: probe.title, bundleID: bundle, in: windowRules)
         if rules.contains(where: { $0.dontFocus }) {
@@ -392,6 +409,15 @@ func adoptNewcomers(_ adopted: [(AdoptedWindow, AXUIElement)]) {
                         .setWidth(window: windowID(wid), ratio: ratio),
                     ])))
                 }
+            }
+            // Restore placement defers past this tick's `.appeared`
+            // ingest (placing now gets undone when the event lands —
+            // see the post-tick drain). Floats and fullscreen floats
+            // keep their adoption spots (membership only).
+            if qualified == .tile, !rules.contains(where: { $0.floating }),
+               !probe.isFullscreen, restorePlanner != nil
+            {
+                restorePending.insert(Int(wid))
             }
             // Spawn pin: a declarative spawn handler — when the landing
             // frame meets the rule's minimum size, force the width ratio
@@ -444,6 +470,13 @@ func applyFullscreenFlips(_ flips: [(WindowID, Bool)]) {
             )
             if !rules.contains(where: { $0.floating }) {
                 pending.append(.command(.layout([.setFloating(window: id, floating: false)])))
+                // Re-tiled inside the restore window: like a fresh
+                // adoption, it may still have a saved slot waiting
+                // (first probes often misreport fullscreen, e.g. on
+                // Electron launchers, so the adopt-time skip fired).
+                if restorePlanner != nil {
+                    restorePending.insert(Int(CGWindowID(bitPattern: id)))
+                }
             }
         }
     }
@@ -490,6 +523,7 @@ func syncRoster() {
                         ),
                         title: probe.title ?? "", appName: "", bundleID: "",
                         role: probe.role ?? "", subrole: probe.subrole ?? "",
+                        identifier: probe.identifier ?? "main",
                         isFullscreen: probe.isFullscreen
                     ),
                     element
@@ -767,16 +801,45 @@ var scriptStore = ScriptState()
 var luaBridge: LuaBridge?
 var scriptPath: String?
 var scriptHandlers: [(name: String, ref: Int32)] = []
+/// Compiled `paneru.match` filters by handler registry ref. Reset with
+/// the handlers on every publish.
+var handlerMatchers: [Int32: WindowMatcher] = [:]
 var bindRefs: [UInt32: Int32] = [:]
 var keybindEntries: [(code: UInt8, mods: KeyModifiers, id: UInt32)] = []
 var needScriptReload = false
 var scriptWatcher: DispatchSourceFileSystemObject?
 
-/// Publish one loaded script: keybinds, binds, handlers.
-func publishScript(_ bridge: LuaBridge) {
+/// Publish one loaded script: keybinds, binds, handlers. Match-filter
+/// compile failures and unknown event names throw per handler: a bad
+/// filter fails the load (keeping old runtime, like Rust), while a
+/// typo'd event name warns and skips just that handler (a dead silent
+/// handler is worse than a loud skip on a live WM).
+func publishScript(_ bridge: LuaBridge) throws {
+    var matchers: [Int32: WindowMatcher] = [:]
+    var registrations = bridge.listHandlers()
+    var kept: [LuaBridge.HandlerRegistration] = []
+    kept.reserveCapacity(registrations.count)
+    for reg in registrations {
+        guard ScriptEvent.isKnown(reg.name) else {
+            print("lua: unknown event '\(reg.name)' (handler skipped)")
+            bridge.releaseRef(reg.ref)
+            continue
+        }
+        do {
+            if let matcher = try compileMatchFilter(reg.filter) {
+                matchers[reg.ref] = matcher
+            }
+        } catch {
+            for done in kept { bridge.releaseRef(done.ref) }
+            throw error
+        }
+        kept.append(reg)
+    }
+    registrations = kept
     bindRefs = [:]
     keybindEntries = []
     scriptHandlers = []
+    handlerMatchers = [:]
     mailbox = ScriptMailbox()
     var keybinds: [PublishedKeybind] = []
     for pending in bridge.listBinds() {
@@ -800,7 +863,8 @@ func publishScript(_ bridge: LuaBridge) {
         }
     }
     mailbox.keybinds = keybinds
-    scriptHandlers = bridge.listHandlers()
+    scriptHandlers = registrations.map { (name: $0.name, ref: $0.ref) }
+    handlerMatchers = matchers
     mailbox.hasHandlers = !scriptHandlers.isEmpty
     print("lua: \(keybinds.count) binds, \(scriptHandlers.count) handlers")
 }
@@ -818,6 +882,9 @@ func loadScript(from path: String) {
         } else {
             document = nil
         }
+        // Match filters compile before anything publishes: a bad spec
+        // fails the load (old runtime kept), like Rust.
+        try publishScript(bridge)
     } catch {
         print("lua: \(error) (keeping previous runtime)")
         mailbox.applyReload(success: false, error: "\(error)")
@@ -841,7 +908,6 @@ func loadScript(from path: String) {
         refreshDerivedConfig()
         print("lua: setup dropped (running fallback config)")
     }
-    publishScript(bridge)
     mailbox.applyReload(success: true, keybinds: mailbox.keybinds)
     print("lua: loaded \(path)")
 }
@@ -929,6 +995,7 @@ func refreshDerivedConfig() {
     core.resizeCycle = resolved.windowResizeCycle
     core.continuousSwipe = resolved.swipeContinuous
     core.windowHiddenRatio = resolved.windowHiddenRatio
+    core.createWorkspaceAutomatically = resolved.createWorkspaceAutomatically
     focusedStyle = makeFocusedStyle(resolved)
     tap.tuning = TapTuning(
         swipeFingers: resolved.swipeFingers,
@@ -1049,6 +1116,34 @@ func scriptEvents(for events: [DaemonEvent]) -> [ScriptEvent] {
     return out
 }
 
+/// Window identity for `paneru.match` filtering: spawn payloads carry
+/// it directly, other window events resolve through host metadata.
+/// Events without identity never match a filtered handler (unfiltered
+/// handlers fire as before).
+func matchWindow(for event: ScriptEvent) -> MatchWindow? {
+    switch event {
+    case .windowSpawned(let payload):
+        return MatchWindow(
+            appName: payload.appName, bundleID: payload.bundleID,
+            title: payload.title, floating: payload.floating,
+            managed: payload.managed
+        )
+    case .windowDestroyed(let id), .windowFocused(let id),
+         .windowMoved(let id), .windowResized(let id),
+         .windowMinimized(let id), .windowDeminimized(let id),
+         .windowTitleChanged(let id), .menuOpened(let id),
+         .menuClosed(let id):
+        let meta = core.windowMetadata[id]
+        return MatchWindow(
+            appName: meta?.appName, bundleID: meta?.bundleID,
+            title: meta?.title, floating: core.unmanaged.contains(id),
+            managed: workspaceOfWindow(id) != nil
+        )
+    default:
+        return nil
+    }
+}
+
 func parseScriptCommand(_ line: String) -> PaneruCommand? {
     let argv = line.split(whereSeparator: { $0.isWhitespace }).map(String.init)
     guard !argv.isEmpty else { return nil }
@@ -1129,15 +1224,36 @@ func drainLuaFrame() {
         }
         mailbox.attach(snapshot)
         for event in events {
+            // The event table handlers receive (nil when it does not
+            // serialize — then filtered handlers cannot match either).
+            let eventTable: String? = {
+                guard let data = try? JSONSerialization.data(
+                    withJSONObject: event.eventJSON()
+                ) else { return nil }
+                return String(data: data, encoding: .utf8)
+            }()
             for handler in scriptHandlers
                 where handler.name == event.eventName
             {
+                if let matcher = handlerMatchers[handler.ref] {
+                    guard let subject = matchWindow(for: event),
+                          (try? matcher.matches(subject)) == true
+                    else { continue }
+                }
+                guard let eventTable else { continue }
                 mailbox.enter()
                 bridge.pushStore(scriptStore)
                 do {
-                    try bridge.callHandlerRef(handler.ref, arg: handler.name)
+                    let rows = try bridge.callHandlerDispatch(
+                        ref: handler.ref, eventJSON: eventTable
+                    )
+                    var commands = bridge.drainCommands().compactMap(parseScriptCommand)
+                    let ops = decodeWSOpRows(rows)
+                    if !ops.isEmpty {
+                        commands.append(.layout(ops))
+                    }
                     mailbox.finishDispatch(
-                        commands: bridge.drainCommands().compactMap(parseScriptCommand),
+                        commands: commands,
                         flashes: bridge.drainFlashes().map { ($0.message, $0.duration) }
                     )
                 } catch {
@@ -1320,6 +1436,8 @@ var windowPIDs: [WindowID: pid_t] = [:]
 var prevTickFocus: WindowID?
 var prevTickRow: UInt32?
 var prevTickRoster = 0
+/// Row-switch toast lifetime: re-armed per switch, removal after 1.0s.
+var switchFlashTimer: Timer?
 
 /// State snapshot path for hand-run diagnostics.
 let stateFilePath = "/tmp/paneru-swift-state.json"
@@ -1408,6 +1526,15 @@ func tick() {
             reloadTuning()
         }
     }
+    // Restore grace expiry: saved active rows apply once (all
+    // arrivals are in), then the plan drops — unlaunched windows stay
+    // wherever later spawns put them. No file rewrite yet.
+    if restorePlanner != nil, Date() > restoreDeadline {
+        applyRestoreActiveRows()
+        restorePlanner = nil
+        restoreState = nil
+        print("restore: grace expired (running live)")
+    }
     // One viewport per workspace (display); the active display's rect
     // feeds the script snapshot, exactly as before.
     let viewports = workspaceViewports()
@@ -1447,6 +1574,13 @@ func tick() {
     // Cursor warp requests (display hops) go straight to the tap layer.
     if let warp = core.takeMouseWarp() {
         warpMouse(to: CGPoint(x: Double(warp.x), y: Double(warp.y)))
+    }
+    // Restore placement runs after the core ingests this frame's
+    // `.appeared` events (placing earlier gets undone when they land)
+    // and after this frame's move jobs apply, so the plan wins.
+    // Unready windows (event still queued) retry on later ticks.
+    if !restorePending.isEmpty {
+        restorePending = restorePending.filter { !restoreAdopted(ref: $0) }
     }
     // Clipboard delivery for copyRule, edge-triggered.
     if let rule = core.lastCopiedRule, rule != copiedRuleSent {
@@ -1599,7 +1733,8 @@ func tick() {
     var fired: [(name: String, json: String)] = []
     let tickRow = core.activeVirtual[core.activeWorkspace]
     let tickActive = ActiveState(
-        displayID: 0, virtualWorkspaceNumber: tickRow,
+        displayID: workspaceDisplay[core.activeWorkspace],
+        virtualWorkspaceNumber: tickRow,
         focusedWindowID: result.focus,
         focusedBundleID: result.focus.flatMap { core.windowMetadata[$0]?.bundleID },
         focusedAppName: result.focus.flatMap { core.windowMetadata[$0]?.appName },
@@ -1618,6 +1753,24 @@ func tick() {
     if tickRow != prevTickRow {
         if let rendered = eventJSON(.virtualWorkspaceChanged(active: tickActive)) {
             fired.append(rendered)
+        }
+        // Row-switch toast (badge with the 1-based row number, 1.0s),
+        // gated on the popup flag. Lifetime managed below: a new switch
+        // re-arms instead of stacking toasts.
+        if let message = switchFlashMessage(
+            current: tickRow, previous: prevTickRow,
+            enabled: resolved.workspacePopupStatus
+        ),
+           let anchor = viewports[core.activeWorkspace]
+        {
+            switchFlashTimer?.invalidate()
+            Presenter.showFlash(
+                message: message, opacity: 1,
+                topRight: CGPoint(x: Double(anchor.max.x), y: Double(anchor.min.y))
+            )
+            switchFlashTimer = Timer.scheduledTimer(withTimeInterval: 1.0, repeats: false) { _ in
+                Presenter.removeFlash()
+            }
         }
         prevTickRow = tickRow
     }
@@ -1668,6 +1821,162 @@ if let scriptPath {
 }
 if let tuningPath {
     watchTuning(tuningPath)
+}
+
+// Saved-state restore arms here (after config resolves): newcomers
+// inside the grace window slot into their saved strips.
+loadRestoreState()
+
+// MARK: - Session restore
+
+/// Saved-state restore: load once at startup, match newcomers inside
+/// the grace window, drop the plan at expiry. Read-only against
+/// Rust-written state files (this daemon never writes them yet);
+/// floats restore membership only, tiled strips restore structure.
+/// (Globals live above with the other top-level state.)
+
+/// `$XDG_DATA_HOME/paneru/state.json`, else `~/.local/share/...`.
+func sessionStatePath() -> String {
+    let base = ProcessInfo.processInfo.environment["XDG_DATA_HOME"]
+        ?? (home + "/.local/share")
+    return base + "/paneru/state.json"
+}
+
+/// Load the saved state when restore is enabled. Failures (missing
+/// file, version gate, corrupt JSON) warn and run fresh.
+func loadRestoreState() {
+    guard resolved.restoreEnabled else { return }
+    let path = sessionStatePath()
+    guard let data = try? Data(contentsOf: URL(fileURLWithPath: path)) else { return }
+    do {
+        let state = try decodeSessionState(data)
+        restoreState = state
+        restorePlanner = RestorePlanner(state: state)
+        let graceMs = resolved.restoreStartupGraceMs
+        restoreDeadline = Date().addingTimeInterval(Double(graceMs) / 1000.0)
+        print("restore: loaded \(path) (\(state.workspaces.count) workspaces, grace \(graceMs)ms)")
+    } catch {
+        print("restore: warning: \(error) (starting fresh)")
+    }
+}
+
+/// Snapshot the adopted roster for the restore planner. Refs are window
+/// ids (stable across calls, so consumed tracking lines up).
+func restoreSnapshot() -> [Session.LiveWindow] {
+    roster.map { (wid, window) in
+        let id = windowID(wid)
+        let meta = core.windowMetadata[id]
+        let frame = window.frame
+        var live = Session.LiveWindow(
+            ref: Int(wid), winID: id,
+            pid: windowPIDs[id] ?? 0,
+            bundleID: meta?.bundleID ?? "", title: meta?.title ?? "",
+            frameCenter: (
+                frame.min.x + frame.width / 2, frame.min.y + frame.height / 2
+            )
+        )
+        // Probed AX identity refines fallback matching; struct defaults
+        // cover windows adopted before probing existed.
+        if let role = meta?.role { live.role = role }
+        if let subrole = meta?.subrole { live.subrole = subrole }
+        if let identifier = meta?.identifier { live.identifier = identifier }
+        return live
+    }
+}
+
+/// Place one adopted window per the restore plan (inside the grace
+/// window only): match it, remap its saved display, and slot it into
+/// the planned (workspace, row, column). Unmatched windows keep their
+/// normal adoption spot. Returns false when the window is not in the
+/// core yet (its `.appeared` is still queued behind the event cap) so
+/// the post-tick drain retries; everything else is final. `ref` is the
+/// CGWindowID int, matching the planner's live refs.
+@discardableResult
+func restoreAdopted(ref: Int) -> Bool {
+    guard let planner = restorePlanner, Date() < restoreDeadline else { return true }
+    let id = WindowID(truncatingIfNeeded: ref)
+    guard workspaceOfWindow(id) != nil else { return false }
+    let plan = planner.plan(current: restoreSnapshot())
+    for strip in plan.strips {
+        for (columnIndex, column) in strip.columns.enumerated() {
+            let members: [Int]
+            switch column {
+            case .single(let ref): members = [ref]
+            case .fullscreen(let ref): members = [ref]
+            case .tabs(let refs): members = refs
+            case .stack(let items):
+                members = items.flatMap { item in
+                    switch item {
+                    case .single(let ref): return [ref]
+                    case .tabs(let refs): return refs
+                    }
+                }
+            }
+            guard members.contains(ref) else { continue }
+            let ws = restoreWorkspace(for: strip)
+            core.restorePlace(id, workspace: ws, row: strip.virtualIndex, column: columnIndex)
+            print("restore: placed window \(id) ws=\(ws) row=\(strip.virtualIndex)")
+            return true
+        }
+    }
+    return true
+}
+
+/// Select the plan's saved active rows (one per workspace with a
+/// surviving strip), remapped onto live workspaces. Runs once at grace
+/// expiry, when the roster is complete; the saved state wins over any
+/// live row switches inside the startup window.
+func applyRestoreActiveRows() {
+    guard let planner = restorePlanner else { return }
+    let plan = planner.plan(current: restoreSnapshot())
+    var remapped: [WorkspaceID: UInt32] = [:]
+    for strip in plan.strips {
+        if let row = plan.activeVirtualByWorkspace[strip.workspaceID] {
+            remapped[restoreWorkspace(for: strip)] = row
+        }
+    }
+    for (workspace, row) in remapped {
+        core.restoreActiveRow(row, workspace: workspace)
+    }
+    if !remapped.isEmpty {
+        let detail = remapped.map { "ws=\($0.key) row=\($0.value)" }.sorted().joined(separator: " ")
+        print("restore: active rows \(detail)")
+    }
+}
+
+/// Remap a planned strip's saved display onto a live workspace: stable
+/// UUID, then numeric id, then saved-bounds geometry, else the active
+/// workspace. Live UUIDs are unresolved, so numeric/geometry do the
+/// work today (mirrors Rust's UUID → numeric → active pick).
+func restoreWorkspace(for strip: PlannedStrip) -> WorkspaceID {
+    let liveFrames: [IntRect] = displayScreens.map { entry in
+        IntRect(
+            min: IntPoint(Int32(entry.frame.origin.x.rounded()), Int32(entry.frame.origin.y.rounded())),
+            max: IntPoint(Int32(entry.frame.maxX.rounded()), Int32(entry.frame.maxY.rounded()))
+        )
+    }
+    let liveIDs = displayScreens.map { $0.id }
+    if let displayID = strip.displayID,
+       let index = liveIDs.firstIndex(of: displayID)
+    {
+        return WorkspaceID(index + 1)
+    }
+    if let saved = restoreState?.workspaces.first(where: {
+        $0.workspaceID == strip.workspaceID
+    }),
+       let display = restoreState?.displays.first(where: {
+           ($0.uuid != nil && $0.uuid == saved.displayUUID)
+               || $0.displayID == saved.displayID
+       })
+    {
+        let center = display.bounds.center
+        if let index = displayIndexForPoint(
+            IntPoint(center.0, center.1), in: liveFrames
+        ) {
+            return WorkspaceID(index + 1)
+        }
+    }
+    return core.activeWorkspace
 }
 
 // Command server: Mach service accepting argv commands into `pending`.

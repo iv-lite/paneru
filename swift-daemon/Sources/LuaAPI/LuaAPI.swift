@@ -11,6 +11,7 @@
 
 import Commands
 import Foundation
+import Geometry
 import IPC
 import Scripting
 import StateQuery
@@ -300,4 +301,74 @@ public func windowSetCommit(ops: [LayoutOp]) -> Bool {
     // Empty ops commit nothing and report false; anything else sends the
     // replay and reports true.
     !ops.isEmpty
+}
+
+// MARK: - Match filters and ws op rows (embedded `on` dispatch)
+
+/// Compile a captured `paneru.match` spec into a `WindowMatcher`. Nil
+/// spec means unfiltered. Unknown fields and bad patterns throw, like
+/// the Rust call site (the host fails the load and keeps old runtime).
+public func compileMatchFilter(_ value: ScriptValue?) throws -> WindowMatcher? {
+    guard let value else { return nil }
+    guard case .map(let fields) = value else {
+        throw MatchError("paneru.match: expected a table")
+    }
+    func str(_ key: String) throws -> String? {
+        switch fields[key] {
+        case nil, .null: return nil
+        case .str(let s): return s
+        default: throw MatchError("paneru.match: '\(key)' must be a string")
+        }
+    }
+    func flag(_ key: String) throws -> Bool? {
+        switch fields[key] {
+        case nil, .null: return nil
+        case .bool(let b): return b
+        default: throw MatchError("paneru.match: '\(key)' must be a boolean")
+        }
+    }
+    let known: Set<String> = ["app", "bundle", "title", "floating", "managed"]
+    let extra = fields.keys.filter { !known.contains($0) }.sorted()
+    return try WindowMatcher(
+        app: str("app"), bundle: str("bundle"), title: str("title"),
+        floating: flag("floating"), managed: flag("managed"),
+        extraKeys: extra
+    )
+}
+
+/// Decode one ws-proxy `_ops` row batch into layout ops. Malformed rows
+/// (wrong shapes, non-integral ids, non-numeric ratios) drop silently —
+/// replay convention: the log never throws.
+public func decodeWSOpRows(_ rows: [[String: ScriptValue]]) -> [LayoutOp] {
+    var out: [LayoutOp] = []
+    for row in rows {
+        if row.count == 1, let id = windowID(row["manage"]) {
+            out.append(.setManaged(window: id, managed: true))
+        } else if row.count == 1, let id = windowID(row["sink"]) {
+            out.append(.setFloating(window: id, floating: false))
+        } else if row.count == 1,
+                  case .map(let spec) = row["width"],
+                  let id = windowID(spec["id"]),
+                  let ratio = ratio(spec["ratio"])
+        {
+            out.append(.setWidth(window: id, ratio: ratio))
+        }
+    }
+    return out
+}
+
+private func windowID(_ value: ScriptValue?) -> WindowID? {
+    switch value {
+    case .int(let i): return WindowID(exactly: i)
+    case .float(let f) where f.rounded() == f: return WindowID(exactly: Int64(f))
+    default: return nil
+    }
+}
+
+private func ratio(_ value: ScriptValue?) -> Double? {
+    switch value {
+    case .int(let i): return Double(i)
+    case .float(let f): return f
+    default: return nil
+    }
 }

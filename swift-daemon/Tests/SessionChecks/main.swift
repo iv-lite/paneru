@@ -1,4 +1,5 @@
 import Foundation
+import Geometry
 import Session
 
 // Parity checks for restore planning (`src/ecs/restore.rs`): hard and
@@ -195,6 +196,40 @@ do {
     check(text.contains("\"active_virtual_index\""), "nested snake_case keys")
     let back = try! decodeSessionState(data)
     checkEqual(back, original, "state round-trips")
+}
+
+// Display remap: stable UUID beats numeric id, numeric beats geometry,
+// geometry containment beats nearest, nothing matches is nil (caller
+// falls back to the active display).
+do {
+    let displays: [(id: UInt32, uuid: String?, frame: IntRect)] = [
+        (id: 1, uuid: "uuid-1", frame: IntRect(0, 0, 1024, 768)),
+        (id: 2, uuid: "uuid-2", frame: IntRect(1024, 0, 2048, 768)),
+    ]
+    checkEqual(
+        remapDisplay(displayUUID: "uuid-2", displayID: 1, boundsCenter: (100, 100), displays: displays),
+        2 as UInt32?, "UUID wins over numeric and geometry"
+    )
+    checkEqual(
+        remapDisplay(displayUUID: "gone", displayID: 1, boundsCenter: (1500, 100), displays: displays),
+        1 as UInt32?, "numeric id covers unknown UUIDs"
+    )
+    checkEqual(
+        remapDisplay(displayUUID: nil, displayID: 9, boundsCenter: (1500, 100), displays: displays),
+        2 as UInt32?, "geometry containment covers unknown ids"
+    )
+    checkEqual(
+        remapDisplay(displayUUID: nil, displayID: nil, boundsCenter: (3000, 100), displays: displays),
+        2 as UInt32?, "nearest display covers outside points"
+    )
+    checkEqual(
+        remapDisplay(displayUUID: nil, displayID: nil, boundsCenter: nil, displays: displays),
+        nil, "no inputs remaps to nothing"
+    )
+    checkEqual(
+        remapDisplay(displayUUID: nil, displayID: 9, boundsCenter: nil, displays: displays),
+        nil, "unknown id without geometry remaps to nothing"
+    )
 }
 
 if failures == 0 {
