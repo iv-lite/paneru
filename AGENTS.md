@@ -2,6 +2,14 @@
 
 This document provides project-specific guidance for AI agents contributing to Paneru. It builds upon the core philosophy and technical architecture of the codebase.
 
+## 0. Required Skills (load first)
+
+Always load these before any Paneru work — they are normative and override conflicting defaults:
+
+* `paneru-rust` — for any change under `src/`, `crates/`, `Cargo.toml`, `build.rs`. Bevy-first ECS, idle-when-static systems, main-thread macOS bridge, `LayoutStrip`, harness tests, `cargo fmt --check` + `clippy --all-targets -- -D warnings` + `cargo test --all-targets` gate.
+* `paneru-swift` — for any change under `swift-daemon/`, `src/overlay.rs`. NOTE: the skill text still describes the deleted `overlay-swift/` C ABI (`overlay-swift/ABI.swift`, `PANERU_SWIFT_OVERLAY`, `OVERLAY_ABI_VERSION`); current Swift truth is `swift-daemon/Sources/{Daemon,Layout,Presenter,LiveProviders}/` per `ARCHITECTURE.md §8`. Follow the repo, not the stale skill paths.
+* If a task touches both Rust truth and Swift presentation, load both and keep ECS gating/rect math in Rust.
+
 ## 1. Bevy ECS Architecture & Patterns (Bevy First)
 
 Paneru is built on Bevy and strictly follows Data-Driven Design (ECS). **Always prioritize Bevy ECS rules over conventional Rust patterns**:
