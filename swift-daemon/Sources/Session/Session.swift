@@ -296,6 +296,8 @@ public struct LiveWindow: Equatable, Sendable {
     public static func == (lhs: LiveWindow, rhs: LiveWindow) -> Bool {
         lhs.ref == rhs.ref && lhs.winID == rhs.winID && lhs.pid == rhs.pid
             && lhs.bundleID == rhs.bundleID && lhs.title == rhs.title
+            && lhs.identifier == rhs.identifier && lhs.role == rhs.role
+            && lhs.subrole == rhs.subrole
     }
 
     fileprivate func hardKey() -> HardKey {

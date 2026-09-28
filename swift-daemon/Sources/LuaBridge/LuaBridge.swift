@@ -206,9 +206,11 @@ private func paneruExecImpl(_ state: OpaquePointer?) -> Int32 {
 public final class LuaBridge {
     private let state: OpaquePointer
 
-    public init() {
+    /// Failable: allocation failure returns nil (the host keeps its
+    /// previous runtime) instead of aborting the daemon.
+    public init?() {
         guard let state = luaL_newstate() else {
-            fatalError("luaL_newstate returned nil")
+            return nil
         }
         self.state = state
         // `luaL_openlibs` is a macro; this is its expansion (all libs).

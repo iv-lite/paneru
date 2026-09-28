@@ -303,6 +303,13 @@ public struct LayoutStrip: Equatable, Sendable {
         }
     }
 
+    /// Remove a set of windows, collapsing columns like `remove(_:)` does
+    /// per window. Audit dedup (cross-strip duplicates) builds on this:
+    /// callers keep the first occurrence and remove the rest.
+    public mutating func removeAll(_ ids: Set<WindowID>) {
+        for id in ids { remove(id) }
+    }
+
     public mutating func swap(_ left: Int, _ right: Int) {
         columns.swapAt(left, right)
     }

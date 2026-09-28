@@ -122,7 +122,9 @@ do {
         viewport: viewport, focusedStyle: style
     )
     checkEqual(daemon.strips[1]?[0]?.allWindows, [0], "disappeared window leaves the strip")
-    checkEqual(daemon.positions[1], IntPoint(400, 0), "slots survive for space returns")
+    // Model truth survives for space returns: the committed slot is the
+    // glide target (positions walk the eased curve toward it).
+    checkEqual(daemon.committedSlot(of: 1), IntPoint(400, 0), "slots survive for space returns")
     checkEqual(gone.focus, nil, "focus clears with its window")
     checkEqual(gone.borderPlan.removed, [1], "border orders out")
 }
@@ -315,10 +317,12 @@ do {
     )
     checkEqual(daemon.strips[1]?[0]?.allWindows, [0], "ws1 adopts its spawn")
     checkEqual(daemon.strips[2]?[0]?.allWindows, [1], "ws2 adopts its spawn")
-    // Each strip tiles from its own origin: ws2 slots start at 1024.
+    // Each strip tiles from its own origin: ws2 slots start at 1024
+    // (positions glide there over the next ticks).
+    checkEqual(daemon.committedSlot(of: 1), IntPoint(1024, 0), "ws2 places from its own origin")
     check(
-        placed.axJobs.contains { $0.winID == 1 && $0.origin == IntPoint(1024, 0) },
-        "ws2 places from its own origin"
+        placed.axJobs.contains { $0.winID == 1 },
+        "ws2 spawn issues a glide intent"
     )
     check(
         !placed.axJobs.contains { $0.winID == 0 && $0.origin != IntPoint(0, 0) },
@@ -382,11 +386,19 @@ do {
         viewport: viewport, focusedStyle: style
     )
     check(
-        placed.axJobs.contains { $0.winID == 0 && $0.origin == IntPoint(0, 468) },
+        placed.axJobs.contains { $0.winID == 0 },
+        "seam spawn issues a glide intent"
+    )
+    checkEqual(
+        daemon.committedSlot(of: 0), IntPoint(0, 468),
         "seam spawns pull into the viewport"
     )
     check(
-        placed.axJobs.contains { $0.winID == 1 && $0.origin == IntPoint(400, 0) },
+        placed.axJobs.contains { $0.winID == 1 },
+        "oversize spawn issues a glide intent"
+    )
+    checkEqual(
+        daemon.committedSlot(of: 1), IntPoint(400, 0),
         "oversize windows top-align"
     )
 }
@@ -1253,6 +1265,152 @@ do {
         replayed.axJobs.first(where: { $0.winID == 1 })?.size, IntSize(512, 700),
         "replay frames land as size intents"
     )
+}
+
+// Stacked windows split the viewport height (binpack) with resize
+// intents; singles keep preserved-y slots.
+do {
+    var daemon = DaemonCore()
+    _ = daemon.tick(
+        events: [.appeared(id: 0, workspace: 1), .appeared(id: 1, workspace: 1), .focus(id: 1)],
+        frames: frames(slots: [0: IntPoint(0, 0), 1: IntPoint(0, 0)]),
+        viewport: viewport, focusedStyle: style
+    )
+    let stacked = daemon.tick(
+        events: [.command(.window(.stack(true)))],
+        frames: frames(slots: [0: IntPoint(0, 0), 1: IntPoint(0, 700)]),
+        viewport: viewport, focusedStyle: style
+    )
+    // Two 700px windows on a 768 viewport split 384/384.
+    checkEqual(
+        daemon.committedSlot(of: 0), IntPoint(0, 0),
+        "stack top anchors at the viewport top"
+    )
+    checkEqual(
+        daemon.committedSlot(of: 1), IntPoint(0, 384),
+        "stack second targets half height"
+    )
+    checkEqual(
+        stacked.axJobs.first(where: { $0.winID == 0 })?.size, IntSize(400, 384),
+        "stack top gets a resize intent"
+    )
+    checkEqual(
+        stacked.axJobs.first(where: { $0.winID == 1 })?.size, IntSize(400, 384),
+        "stack second gets a resize intent"
+    )
+    // Positions walk the eased curve, then rest exactly on the slots.
+    for _ in 0..<25 {
+        _ = daemon.tick(
+            events: [],
+            frames: frames(slots: [0: IntPoint(0, 0), 1: IntPoint(0, 700)]),
+            viewport: viewport, focusedStyle: style
+        )
+    }
+    checkEqual(daemon.positions[0], IntPoint(0, 0), "glide lands the stack top")
+    checkEqual(daemon.positions[1], IntPoint(0, 384), "glide lands the stack second")
+    let rested = daemon.tick(
+        events: [],
+        frames: frames(slots: [0: IntPoint(0, 0), 1: IntPoint(0, 384)]),
+        viewport: viewport, focusedStyle: style
+    )
+    check(rested.axJobs.isEmpty, "landed glides go silent")
+}
+
+// Over-viewport windows shrink to the viewport (one-shot size intent);
+// fitting windows record and rest with no AX traffic.
+do {
+    var daemon = DaemonCore()
+    _ = daemon.tick(
+        events: [.appeared(id: 0, workspace: 1)],
+        frames: frames(slots: [0: IntPoint(0, 0)]),
+        viewport: viewport, focusedStyle: style
+    )
+    let huge: (Int32) -> IntRect? = { id in
+        guard id == 0 else { return nil }
+        return IntRect(min: IntPoint(0, 0), max: IntPoint(2000, 2000))
+    }
+    let clamped = daemon.tick(
+        events: [], frames: huge, viewport: viewport, focusedStyle: style
+    )
+    checkEqual(
+        clamped.axJobs.first(where: { $0.winID == 0 })?.size, IntSize(1024, 768),
+        "oversize window shrinks to the viewport"
+    )
+    let settled = daemon.tick(
+        events: [], frames: huge, viewport: viewport, focusedStyle: style
+    )
+    check(
+        settled.axJobs.allSatisfy { $0.winID != 0 || $0.size == nil },
+        "converged sizes never re-send"
+    )
+}
+
+// Audit dedups cross-row membership: a window restored from a parked
+// row while its `.appeared` also appends elsewhere keeps one home.
+do {
+    var daemon = DaemonCore()
+    _ = daemon.tick(
+        events: [.appeared(id: 0, workspace: 1)],
+        frames: frames(slots: [0: IntPoint(0, 0)]),
+        viewport: viewport, focusedStyle: style
+    )
+    _ = daemon.tick(
+        events: [.disappeared(id: 0)],
+        frames: frames(slots: [:]),
+        viewport: viewport, focusedStyle: style
+    )
+    _ = daemon.tick(
+        events: [.command(.window(.virtualAdd))],
+        frames: frames(slots: [:]),
+        viewport: viewport, focusedStyle: style
+    )
+    _ = daemon.tick(
+        events: [.appeared(id: 0, workspace: 1)],
+        frames: frames(slots: [0: IntPoint(0, 0)]),
+        viewport: viewport, focusedStyle: style
+    )
+    let before = daemon.strips[1]?.values.flatMap { $0.allWindows }.filter { $0 == 0 }.count ?? 0
+    daemon.auditPass()
+    let after = daemon.strips[1]?.values.flatMap { $0.allWindows }.filter { $0 == 0 }.count ?? 0
+    check(before >= 1, "returning window is present")
+    checkEqual(after, 1, "audit leaves exactly one membership")
+}
+
+// Eased glides traverse real distance and terminate on the slot;
+// disabling animations snaps immediately.
+do {
+    var daemon = DaemonCore()
+    daemon.animationsEnabled = false
+    _ = daemon.tick(
+        events: [.appeared(id: 0, workspace: 1), .appeared(id: 1, workspace: 1)],
+        frames: frames(slots: [0: IntPoint(0, 0), 1: IntPoint(0, 0)]),
+        viewport: viewport, focusedStyle: style
+    )
+    checkEqual(daemon.positions[1], IntPoint(400, 0), "disabled animations snap to the slot")
+}
+do {
+    var daemon = DaemonCore()
+    _ = daemon.tick(
+        events: [.appeared(id: 0, workspace: 1), .appeared(id: 1, workspace: 1)],
+        frames: frames(slots: [0: IntPoint(0, 0), 1: IntPoint(0, 0)]),
+        viewport: viewport, focusedStyle: style
+    )
+    let first = daemon.tick(
+        events: [],
+        frames: frames(slots: [0: IntPoint(0, 0), 1: IntPoint(0, 0)]),
+        viewport: viewport, focusedStyle: style
+    )
+    let step = daemon.positions[1] ?? IntPoint(0, 0)
+    check(step != IntPoint(0, 0) && step != IntPoint(400, 0), "glide leaves with a partial step")
+    check(first.axJobs.contains { $0.winID == 1 }, "glide drives intents mid-flight")
+    for _ in 0..<30 {
+        _ = daemon.tick(
+            events: [],
+            frames: frames(slots: [0: IntPoint(0, 0), 1: IntPoint(0, 0)]),
+            viewport: viewport, focusedStyle: style
+        )
+    }
+    checkEqual(daemon.positions[1], IntPoint(400, 0), "glide terminates exactly on the slot")
 }
 
 if failures == 0 {

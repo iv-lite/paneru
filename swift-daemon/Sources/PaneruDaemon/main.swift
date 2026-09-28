@@ -10,6 +10,7 @@
 // presents — enough to prove live parity on a permissioned host.
 import AppKit
 import ApplicationServices
+import AXClient
 import Commands
 import Config
 import ConfigFiles
@@ -169,6 +170,11 @@ var restoreDeadline = Date.distantPast
 /// Adopted windows awaiting restore placement (CGWindowID refs).
 /// Drained after the core tick ingests their `.appeared` events.
 var restorePending = Set<Int>()
+/// Grace starts on first arrival, not process start: set when the first
+/// window enters `restorePending` (see `adoptNewcomers`), so slow AX
+/// probing no longer burns the window before anything is matchable —
+/// mirroring Rust, which starts grace on the first restore trigger.
+var restoreGraceStarted = false
 
 var tuningPath: String? = fallbackTOMLPath()
 if let path = tuningPath {
@@ -191,6 +197,23 @@ if let path = tuningPath {
 /// use): reads-before-declaration crashed this process at startup.
 var displayScreens: [(id: UInt32, frame: NSRect)] = []
 var workspaceDisplay: [WorkspaceID: UInt32] = [:]
+/// Stable display UUIDs by display id (EDID identity, surviving reboots
+/// and numeric-id rotation). Populated beside `displayScreens`; session
+/// save/restore keys off these first, numeric ids second — mirroring
+/// Rust's UUID → numeric → active pick (`src/ecs/restore.rs`).
+var displayUUIDs: [UInt32: String] = [:]
+/// Usable (visible-frame) rects by display id, flipped to top-left
+/// AX space like `displayScreens`. `visibleFrame` excludes the menu bar,
+/// notch, and Dock — viewports build on these so tiles never slide under
+/// chrome; routing still uses the full frames.
+var displayUsable: [UInt32: NSRect] = [:]
+
+/// Stable UUID string for a display id, nil when unreadable.
+func displayUUID(for id: UInt32) -> String? {
+    guard let unmanaged = CGDisplayCreateUUIDFromDisplayID(id) else { return nil }
+    let uuid = unmanaged.takeRetainedValue()
+    return CFUUIDCreateString(nil, uuid) as String?
+}
 /// SLS connection for strip-per-Space layouts (nil = unavailable:
 /// single layout per display, exactly as before). Resolved once at
 /// startup; separate-spaces mode is required, anything else keeps
@@ -261,6 +284,11 @@ core.resizeCycle = resolved.windowResizeCycle
 core.continuousSwipe = resolved.swipeContinuous
 core.windowHiddenRatio = resolved.windowHiddenRatio
 core.createWorkspaceAutomatically = resolved.createWorkspaceAutomatically
+core.gapHorizontal = resolved.gapHorizontal
+core.gapVertical = resolved.gapVertical
+core.centerSingleColumn = resolved.centerSingleColumn
+core.animationsEnabled = resolved.animationsEnabled
+core.glideBaseMs = resolved.animationDurationMs
 var apps: [pid_t: LiveApp] = [:]
 var roster: [CGWindowID: LiveProviders.LiveWindow] = [:]
 var observers: [pid_t: LiveObserver] = [:]
@@ -433,6 +461,13 @@ func adoptNewcomers(_ adopted: [(AdoptedWindow, AXUIElement)]) {
                !probe.isFullscreen, restorePlanner != nil
             {
                 restorePending.insert(Int(wid))
+                // First arrival arms the grace window (process-start
+                // probing no longer consumes it).
+                if !restoreGraceStarted {
+                    restoreGraceStarted = true
+                    let graceMs = resolved.restoreStartupGraceMs
+                    restoreDeadline = Date().addingTimeInterval(Double(graceMs) / 1000.0)
+                }
             }
             // Spawn pin: a declarative spawn handler — when the landing
             // frame meets the rule's minimum size, force the width ratio
@@ -672,6 +707,7 @@ func syncRoster() {
         dontFocus.remove(id)
         fullscreenFloated.remove(id)
         minimizedWindows.remove(id)
+        radiusCache.removeValue(forKey: id)
         focusHistory.forget(id)
         stableFrames.removeValue(forKey: wid)
         pending.append(.disappeared(id: id))
@@ -912,12 +948,7 @@ let menubar = MenuBarController { command in
     case .copyRule:
         pending.append(.command(.window(.copyRule)))
     case .quit:
-        // Clean exit persists like Rust's `AppExit` save (a SIGTERM
-        // keeps Rust semantics too: the crash loses at most one
-        // 30s interval by design) and clears the crash mark.
-        saveSessionState()
-        clearSessionRunning(statePath: sessionStatePath())
-        exit(0)
+        cleanExit()
     case .openAccessibilitySettings, .showAccessibilityInstructions:
         break
     }
@@ -1113,7 +1144,11 @@ func publishScript(_ bridge: LuaBridge) throws {
 /// Load (or reload) the script file. Failures keep the old runtime,
 /// including the previously loaded `paneru.setup` layer.
 func loadScript(from path: String) {
-    let bridge = LuaBridge()
+    guard let bridge = LuaBridge() else {
+        print("lua: warning: could not allocate Lua state (keeping previous runtime)")
+        mailbox.applyReload(success: false, error: "could not allocate Lua state")
+        return
+    }
     let document: SetupDocument?
     do {
         try bridge.installPrelude()
@@ -1237,6 +1272,11 @@ func refreshDerivedConfig() {
     core.continuousSwipe = resolved.swipeContinuous
     core.windowHiddenRatio = resolved.windowHiddenRatio
     core.createWorkspaceAutomatically = resolved.createWorkspaceAutomatically
+    core.gapHorizontal = resolved.gapHorizontal
+    core.gapVertical = resolved.gapVertical
+    core.centerSingleColumn = resolved.centerSingleColumn
+    core.animationsEnabled = resolved.animationsEnabled
+    core.glideBaseMs = resolved.animationDurationMs
     focusedStyle = makeFocusedStyle(resolved)
     tap.tuning = TapTuning(
         swipeFingers: resolved.swipeFingers,
@@ -1550,25 +1590,32 @@ func displayID(of screen: NSScreen) -> UInt32? {
 func refreshDisplays() {
     let screens = NSScreen.screens
     var cocoa: [(id: UInt32, frame: NSRect)] = []
+    var usableCocoa: [(id: UInt32, frame: NSRect)] = []
     for screen in screens {
         guard let id = displayID(of: screen) else { continue }
         cocoa.append((id, screen.frame))
+        usableCocoa.append((id, screen.visibleFrame))
     }
     let top = cocoa.map { $0.frame.maxY }.max() ?? 0
+    func flip(_ rect: NSRect) -> NSRect {
+        NSRect(
+            x: rect.origin.x,
+            y: top - (rect.origin.y + rect.size.height),
+            width: rect.size.width,
+            height: rect.size.height
+        )
+    }
     var entries: [(id: UInt32, frame: NSRect)] = []
     for entry in cocoa {
-        entries.append((
-            id: entry.id,
-            frame: NSRect(
-                x: entry.frame.origin.x,
-                y: top - (entry.frame.origin.y + entry.frame.size.height),
-                width: entry.frame.size.width,
-                height: entry.frame.size.height
-            )
-        ))
+        entries.append((id: entry.id, frame: flip(entry.frame)))
+    }
+    var usableEntries: [(id: UInt32, frame: NSRect)] = []
+    for entry in usableCocoa {
+        usableEntries.append((id: entry.id, frame: flip(entry.frame)))
     }
     if entries.count == displayScreens.count,
-       zip(entries, displayScreens).allSatisfy({ $0.id == $1.id && $0.frame == $1.frame })
+       zip(entries, displayScreens).allSatisfy({ $0.id == $1.id && $0.frame == $1.frame }),
+       usableEntries.allSatisfy({ entry in displayUsable[entry.id] == entry.frame })
     {
         return
     }
@@ -1585,6 +1632,19 @@ func refreshDisplays() {
     for (index, entry) in displayScreens.enumerated() {
         workspaceDisplay[WorkspaceID(index + 1)] = entry.id
     }
+    displayUsable = Dictionary(
+        uniqueKeysWithValues: usableEntries.map { ($0.id, $0.frame) }
+    )
+    // Stable UUIDs refresh with the set (cheap: one CoreGraphics call per
+    // display, only when the set changed).
+    for entry in displayScreens where displayUUIDs[entry.id] == nil {
+        displayUUIDs[entry.id] = displayUUID(for: entry.id)
+    }
+    for id in Array(displayUUIDs.keys)
+        where !displayScreens.contains(where: { $0.id == id })
+    {
+        displayUUIDs.removeValue(forKey: id)
+    }
 }
 
 /// Workspace ring in spatial display order (1-based, main first).
@@ -1592,17 +1652,20 @@ func displayWorkspaceRing() -> [WorkspaceID] {
     (1...max(displayScreens.count, 1)).map { WorkspaceID($0) }
 }
 
-/// Per-workspace viewports: padding plus menubar reserve per display,
-/// like `actual_bounds`. Orphan workspaces (unplugged displays) fall
-/// back to the main viewport so their parked windows stay reachable.
+/// Per-workspace viewports: padding over the usable (visible-frame)
+/// rect per display, like `actual_bounds`. Usable frames already
+/// exclude menubar/notch/Dock, so no extra reserve applies on top.
+/// Orphan workspaces (unplugged displays) fall back to the main
+/// viewport so their parked windows stay reachable.
 func workspaceViewports() -> [WorkspaceID: IntRect] {
     refreshDisplays()
     var out: [WorkspaceID: IntRect] = [:]
     let mainFrame = displayScreens.first?.frame
     for (ws, id) in workspaceDisplay {
-        let frame = displayScreens.first { $0.id == id }?.frame ?? mainFrame
+        let frame = displayUsable[id]
+            ?? displayScreens.first { $0.id == id }?.frame ?? mainFrame
         if let frame {
-            out[ws] = viewportForScreen(frame)
+            out[ws] = viewportForScreen(frame, menubarReserve: displayUsable[id] == nil)
         }
     }
     if out.isEmpty {
@@ -1613,14 +1676,16 @@ func workspaceViewports() -> [WorkspaceID: IntRect] {
     return out
 }
 
-/// One display's usable rect: padding plus menubar reserve.
-func viewportForScreen(_ bounds: NSRect) -> IntRect {
+/// One display's usable rect: padding over the visible frame (which
+/// already excludes menubar, notch, and Dock). Callers passing a full
+/// screen frame set `menubarReserve` to keep the legacy reserve.
+func viewportForScreen(_ bounds: NSRect, menubarReserve: Bool = false) -> IntRect {
     var view = IntRect(
         min: IntPoint(Int32(bounds.minX.rounded()), Int32(bounds.minY.rounded())),
         max: IntPoint(Int32(bounds.maxX.rounded()), Int32(bounds.maxY.rounded()))
     )
     view.min.x += resolved.paddingLeft
-    view.min.y += resolved.paddingTop + (resolved.menubarHeight ?? 0)
+    view.min.y += resolved.paddingTop + (menubarReserve ? (resolved.menubarHeight ?? 0) : 0)
     view.max.x -= resolved.paddingRight
     view.max.y -= resolved.paddingBottom
     return view
@@ -1671,6 +1736,13 @@ func workspaceOfWindow(_ id: WindowID) -> WorkspaceID? {
 }
 
 var tickCount = 0
+/// Quiescence of the last full tick: gates the idle backoff (quiet ticks
+/// skip the scan/present work). Starts false so boot runs fully.
+var lastQuiescent = false
+/// Set by the SIGTERM/SIGINT sources below; the next tick saves and exits.
+/// (Polled, never written, from the tick — the sources themselves only flip
+/// this flag on the main queue, where the tick also runs.)
+var terminationRequested = false
 var copiedRuleSent: String?
 /// Focused passthrough chords as `code:mask` strings.
 var tapPassthrough: Set<String> = []
@@ -1678,7 +1750,7 @@ var tapPassthrough: Set<String> = []
 var windowPIDs: [WindowID: pid_t] = [:]
 var prevTickFocus: WindowID?
 var prevTickRow: UInt32?
-var prevTickRoster = 0
+var prevTickRosterSig = 0
 /// Last keybind fire (any resolved key command) and last focus seen
 /// by the mouse-follow drain: arrivals within the key window count as
 /// keyboard-caused and always recenter.
@@ -1835,8 +1907,86 @@ func dimCutoutEqual(_ a: CGRect?, _ b: CGRect?) -> Bool {
 /// stay queued for the next frame (lifecycle heals via roster sync).
 let maxEventsPerTick = 256
 
+/// Worker-completion mailbox: the AX worker appends under lock, the tick
+/// drains on main (the core is main-thread-owned and never crosses the
+/// queue). Plain data only — never windows or elements.
+let ackBox = NSLock()
+var pendingAcks: [AXWriteAck] = []
+
+/// Per-window detected corner radii (SLS, macOS 26+): probed on demand,
+/// coarse-cleared past the cap like the read side. Configured numeric
+/// radii bypass the cache entirely; `auto` resolves per window.
+var radiusCache: [WindowID: Double] = [:]
+
+/// Resolved corner radius for one window: configured value, else the
+/// SLS-detected corner, else the 10.0 default — mirroring Rust
+/// `border_radius_for` (per-window, not the old global constant).
+func borderRadiusFor(_ id: WindowID?) -> Double {
+    switch resolved.borderRadius {
+    case .value(let v): return v
+    case .auto:
+        if let id, let cached = radiusCache[id] { return cached }
+        if let id, let cid = skyCID,
+           let detected = skyWindowCornerRadius(cid: cid, wid: CGWindowID(bitPattern: id))
+        {
+            if radiusCache.count > 1024 { radiusCache.removeAll() }
+            radiusCache[id] = detected
+            return detected
+        }
+        return 10.0
+    }
+}
+
+/// Shared clean-exit path (Rust `AppExit` save): persist the live layout,
+/// clear the crash mark, then exit. Serves menubar quit, `.quit`/`.restart`
+/// commands, and SIGTERM/SIGINT delivery alike — every controlled shutdown
+/// leaves a fresh snapshot behind instead of a stale 30s-dirty write.
+func cleanExit() -> Never {
+    saveSessionState()
+    clearSessionRunning(statePath: sessionStatePath())
+    exit(0)
+}
+
 func tick() {
     tickCount += 1
+    // Process control lands here, never in the core (which ignores
+    // `.quit`/`.restart` by contract): a pending quit/restart — or a
+    // caught termination signal — saves and exits before any AX work.
+    if terminationRequested {
+        terminationRequested = false
+        cleanExit()
+    }
+    if pending.contains(where: {
+        if case .command(.quit) = $0 { return true }
+        if case .command(.restart) = $0 { return true }
+        return false
+    }) {
+        cleanExit()
+    }
+    // Worker completions land here (main thread): the async AX writes
+    // dispatched below acknowledge through the box, so unacked state
+    // tracks real flight and the stall watchdog means something.
+    ackBox.lock()
+    let acks = pendingAcks
+    pendingAcks.removeAll(keepingCapacity: true)
+    ackBox.unlock()
+    for ack in acks {
+        core.acknowledge(winID: ack.winID, seq: ack.seq, epoch: ack.epoch)
+    }
+    // Idle backoff: a fully quiet tick skips the scan/present work and
+    // just advances the clock; every 30th tick still runs full (display
+    // and state cadences). Mirrors the Rust idle/low-power sleep
+    // ladder; the 60Hz timer stays, so wakeups are a frame away.
+    if lastQuiescent, pending.isEmpty, !rosterDirty, !needTuningReload,
+       restorePlanner == nil, restorePending.isEmpty, dragGrabbed == nil,
+       !terminationRequested, tickCount % 30 != 0
+    {
+        tickCount += 1
+        return
+    }
+    // Per-window border radius for this frame (previous focus — the plan
+    // diffs styles, so a change reskins on the next present).
+    focusedStyle.radius = borderRadiusFor(prevTickFocus)
     // Roster sync runs on signal +1Hz backstop, never unconditionally:
     // a full pass costs a WindowServer round trip plus AX per newcomer.
     if rosterDirty || Date().timeIntervalSince(lastRosterSync) >= rosterSyncInterval {
@@ -1862,7 +2012,11 @@ func tick() {
         let hadPlan = restoreState != nil
         restorePlanner = nil
         restoreState = nil
-        if hadPlan, resolved.restoreMissingWindows == .close {
+        restoreGraceStarted = false
+        // Crash-gated prune (Rust `tick_restore_grace`): a previous
+        // unclean run preserves the file instead of cementing the
+        // degraded post-crash layout as the next boot's baseline.
+        if hadPlan, resolved.restoreMissingWindows == .close, !didCrashLastRun {
             saveSessionState()
             print("restore: pruned missing windows (re-saved)")
         }
@@ -1896,21 +2050,53 @@ func tick() {
         frames: { roster[CGWindowID(bitPattern: $0)]?.frame },
         viewports: viewports, focusedStyle: focusedStyle
     )
-    // Apply jobs to live windows, refreshing the targets.
+    // AX writes ride the serial worker, never the tick (the runloop also
+    // owns the event tap — blocking it on AX round trips stalls all
+    // input). Latest-per-window coalescing, then one dispatch; skipped
+    // jobs (minimized/missing) ack immediately so unacked state never
+    // leaks across the stall watchdog. Completions ack next tick via
+    // the box (see top of tick).
+    var latest: [WindowID: AXWriteJob] = [:]
     for job in result.axJobs {
-        let wid = CGWindowID(job.winID)
-        guard let window = roster[wid] else { continue }
+        coalesceJobs(&latest, job)
+    }
+    var batch: [(LiveProviders.LiveWindow, AXWriteJob)] = []
+    batch.reserveCapacity(latest.count)
+    for job in drainOrder(latest) {
+        guard let window = roster[CGWindowID(job.winID)] else {
+            core.acknowledge(winID: job.winID, seq: job.seq, epoch: job.epoch)
+            continue
+        }
         // Minimized windows hold no on-screen frame: AX writes would
-        // fail against the dock tile, so skip like roster-misses (the
-        // unacked job simply doesn't complete; deminimize resumes).
-        guard !minimizedWindows.contains(job.winID) else { continue }
-        if let origin = job.origin {
-            _ = window.reposition(to: origin)
+        // fail against the dock tile, so skip (the intent simply never
+        // issues; deminimize resumes via fresh intents).
+        guard !minimizedWindows.contains(job.winID) else {
+            core.acknowledge(winID: job.winID, seq: job.seq, epoch: job.epoch)
+            continue
         }
-        if let size = job.size {
-            _ = window.resize(to: size, origin: job.origin)
+        batch.append((window, job))
+    }
+    if !batch.isEmpty {
+        axWorker.async {
+            for (window, job) in batch {
+                if let origin = job.origin {
+                    _ = window.reposition(to: origin)
+                }
+                if let size = job.size {
+                    _ = window.resize(to: size, origin: job.origin)
+                }
+                ackBox.lock()
+                pendingAcks.append(AXWriteAck(
+                    winID: job.winID, seq: job.seq, epoch: job.epoch, ok: true
+                ))
+                ackBox.unlock()
+            }
         }
-        core.acknowledge(winID: job.winID, seq: job.seq, epoch: job.epoch)
+    }
+    // Stuck-writer watchdog: past the degrade threshold the core repairs
+    // only the focused window (see `pollWriterStall`).
+    if let gap = core.pollWriterStall() {
+        print("ax: writer stall (gap \(gap) epochs, focused-only repair)")
     }
     // Raise intents go straight to AX.
     for id in core.raised {
@@ -2051,16 +2237,17 @@ func tick() {
     // `.appeared` events (placing earlier gets undone when they land)
     // and after this frame's move jobs apply, so the plan wins.
     // Unready windows (event still queued) retry on later ticks.
-    if !restorePending.isEmpty {
-        restorePending = restorePending.filter { !restoreAdopted(ref: $0) }
-    }
+    drainRestorePending()
     // Session persistence marks dirty on any live change (Rust
     // `Changed<…>` gate, simplified): a busy tick, a focus or row
-    // move, or a roster size change. The 30s cadence by the tap
-    // ladder does the write; a crash loses at most one interval.
+    // move, or a roster membership change — by content signature, not
+    // just count, so same-count swaps still persist. The 30s cadence
+    // by the tap ladder does the write; a crash loses at most one
+    // interval.
+    let rosterSig = roster.keys.sorted().reduce(0) { ($0 &* 31) &+ Int($1) }
     if !result.quiescent || result.focus != prevTickFocus
         || core.activeVirtual[core.activeWorkspace] != prevTickRow
-        || roster.count != prevTickRoster
+        || rosterSig != prevTickRosterSig
     {
         stateDirty = true
     }
@@ -2081,12 +2268,27 @@ func tick() {
         )
     }
     pendingFlashes.removeAll()
-    // Frame refresh at ~2Hz on the AX worker: job targets already
-    // re-read above, and each read is two AX round trips per window.
-    // The cached frame is lock-guarded, so the worker can refresh while
-    // the next tick reads. Nothing periodic does AX on main anymore.
+    // Frame refresh on the AX worker, staggered halves (~1Hz per
+    // window instead of a 2Hz full-roster hammer): each read is two AX
+    // round trips per window. The cached frame is lock-guarded, so the
+    // worker refreshes while the next tick reads. Nothing periodic does
+    // AX on main anymore.
     if tickCount % 30 == 0 {
-        let windows = Array(roster.values)
+        let takeEven = tickCount % 60 == 0
+        let windows: [LiveProviders.LiveWindow] = roster.keys.sorted().enumerated().compactMap {
+            (index, wid) in
+            guard (index % 2 == 0) == takeEven else { return nil }
+            return roster[wid]
+        }
+        // Detected corners only change on theme/scale switches: re-probe
+        // the focused window on the refresh cadence so borders track.
+        if tickCount % 300 == 0, let focus = result.focus,
+           case .auto = resolved.borderRadius, let cid = skyCID
+        {
+            if let detected = skyWindowCornerRadius(cid: cid, wid: CGWindowID(bitPattern: focus)) {
+                radiusCache[focus] = detected
+            }
+        }
         axWorker.async {
             for window in windows {
                 _ = window.updateFrame()
@@ -2262,15 +2464,16 @@ func tick() {
         }
         prevTickRow = tickRow
     }
-    if roster.count != prevTickRoster {
+    if rosterSig != prevTickRosterSig {
         if let rendered = eventJSON(.windowsChanged(
             virtualWorkspaceNumber: tickRow, active: tickActive
         )) {
             fired.append(rendered)
         }
-        prevTickRoster = roster.count
+        prevTickRosterSig = rosterSig
     }
     subscriptions.publish(fired)
+    lastQuiescent = result.quiescent
 }
 
 Timer.scheduledTimer(withTimeInterval: 1.0 / 60.0, repeats: true) { _ in
@@ -2317,9 +2520,12 @@ loadRestoreState()
 
 // Crash marker: a leftover means the previous run never saved
 // cleanly (its snapshot may lag up to one interval). Gated on
-// restore like the saves themselves.
+// restore like the saves themselves. `didCrashLastRun` gates the
+// grace-expiry prune: unclean runs preserve the file.
+var didCrashLastRun = false
 if resolved.restoreEnabled {
     if sessionCrashedPreviously(statePath: sessionStatePath()) {
+        didCrashLastRun = true
         print("restore: previous run ended uncleanly (state may lag up to one interval)")
     }
     markSessionRunning(statePath: sessionStatePath())
@@ -2402,7 +2608,8 @@ func extractSessionState() -> PaneruSessionState {
         let onDisplay = workspaceDisplay
             .filter { $0.value == entry.id }.map { $0.key }.sorted()
         return SavedDisplay(
-            displayID: entry.id, uuid: nil, bounds: savedRect(entry.frame),
+            displayID: entry.id, uuid: displayUUIDs[entry.id],
+            bounds: savedRect(entry.frame),
             active: onDisplay.contains(core.activeWorkspace),
             workspaceIDs: onDisplay
         )
@@ -2455,7 +2662,7 @@ func extractSessionState() -> PaneruSessionState {
         // restore ignores the id for mapping either way.
         return SavedWorkspace(
             workspaceID: core.spaceOfWorkspace[ws] ?? ws,
-            displayID: displayID, displayUUID: nil,
+            displayID: displayID, displayUUID: displayID.flatMap { displayUUIDs[$0] },
             activeVirtualIndex: core.activeVirtual[ws], strips: strips
         )
     }
@@ -2513,25 +2720,51 @@ func restoreSnapshot() -> [Session.LiveWindow] {
 @discardableResult
 func restoreAdopted(ref: Int) -> Bool {
     guard let planner = restorePlanner, Date() < restoreDeadline else { return true }
+    return restoreAdopted(ref: ref, plan: planner.plan(current: restoreSnapshot()))
+}
+
+/// Drain every pending adoption against ONE plan: the previous per-window
+/// re-plan scattered tabs/stacks (each call re-ran `plan()` with its own
+/// consumed set), while a single plan accumulates consumption across the
+/// whole batch — mirroring Rust's single-plan `consumed_entities`.
+func drainRestorePending() {
+    guard let planner = restorePlanner, !restorePending.isEmpty else { return }
+    guard Date() < restoreDeadline else {
+        restorePending.removeAll()
+        return
+    }
+    let plan = planner.plan(current: restoreSnapshot())
+    var remaining = Set<Int>()
+    for ref in restorePending {
+        if !restoreAdopted(ref: ref, plan: plan) {
+            remaining.insert(ref)
+        }
+    }
+    restorePending = remaining
+}
+
+/// Members of a planned column, flattened (stack items concatenate).
+func restoreColumnMembers(_ column: PlannedColumn) -> [Int] {
+    switch column {
+    case .single(let ref): return [ref]
+    case .fullscreen(let ref): return [ref]
+    case .tabs(let refs): return refs
+    case .stack(let items):
+        return items.flatMap { item in
+            switch item {
+            case .single(let ref): return [ref]
+            case .tabs(let refs): return refs
+            }
+        }
+    }
+}
+
+func restoreAdopted(ref: Int, plan: RestorePlan) -> Bool {
     let id = WindowID(truncatingIfNeeded: ref)
     guard workspaceOfWindow(id) != nil else { return false }
-    let plan = planner.plan(current: restoreSnapshot())
     for strip in plan.strips {
         for (columnIndex, column) in strip.columns.enumerated() {
-            let members: [Int]
-            switch column {
-            case .single(let ref): members = [ref]
-            case .fullscreen(let ref): members = [ref]
-            case .tabs(let refs): members = refs
-            case .stack(let items):
-                members = items.flatMap { item in
-                    switch item {
-                    case .single(let ref): return [ref]
-                    case .tabs(let refs): return refs
-                    }
-                }
-            }
-            guard members.contains(ref) else { continue }
+            guard restoreColumnMembers(column).contains(ref) else { continue }
             let ws = restoreWorkspace(for: strip)
             core.restorePlace(id, workspace: ws, row: strip.virtualIndex, column: columnIndex)
             print("restore: placed window \(id) ws=\(ws) row=\(strip.virtualIndex)")
@@ -2565,17 +2798,15 @@ func applyRestoreActiveRows() {
 
 /// Remap a planned strip's saved display onto a live workspace: stable
 /// UUID, then numeric id, then saved-bounds geometry, else the active
-/// workspace. Live UUIDs are unresolved, so numeric/geometry do the
-/// work today (mirrors Rust's UUID → numeric → active pick).
+/// workspace. Live UUIDs now resolve (see `displayUUIDs`), so the UUID
+/// arm fires across reboots — mirroring Rust's UUID → numeric → active
+/// pick (`src/ecs/restore.rs:select_display`).
 func restoreWorkspace(for strip: PlannedStrip) -> WorkspaceID {
     let live = axDisplayFrames()
-    let liveFrames = live.map { $0.frame }
-    let liveIDs = live.map { $0.id }
-    if let displayID = strip.displayID,
-       let index = liveIDs.firstIndex(of: displayID)
-    {
-        return WorkspaceID(index + 1)
+    let liveEntries = live.map { entry in
+        (id: entry.id, uuid: displayUUIDs[entry.id], frame: entry.frame)
     }
+    var center: (Int32, Int32)?
     if let saved = restoreState?.workspaces.first(where: {
         $0.workspaceID == strip.workspaceID
     }),
@@ -2584,10 +2815,16 @@ func restoreWorkspace(for strip: PlannedStrip) -> WorkspaceID {
                || $0.displayID == saved.displayID
        })
     {
-        let center = display.bounds.center
-        if let index = displayIndexForPoint(
-            IntPoint(center.0, center.1), in: liveFrames
-        ) {
+        center = display.bounds.center
+    }
+    if let mapped = remapDisplay(
+        displayUUID: strip.displayUUID, displayID: strip.displayID,
+        boundsCenter: center, displays: liveEntries
+    ) {
+        for (ws, id) in workspaceDisplay where id == mapped {
+            return ws
+        }
+        if let index = live.map({ $0.id }).firstIndex(of: mapped) {
             return WorkspaceID(index + 1)
         }
     }
@@ -2664,5 +2901,16 @@ let commandListener = CommandListener()
 let machListener = NSXPCListener(machServiceName: paneruServiceNameResolved())
 machListener.delegate = commandListener
 machListener.resume()
+// Controlled shutdown on launchd stop / Ctrl-C (Rust `Event::Exit`
+// semantics): ignore the default disposition and save on the main queue,
+// where session state and the crash mark are safe to touch.
+signal(SIGTERM, SIG_IGN)
+signal(SIGINT, SIG_IGN)
+let terminationSourceTERM = DispatchSource.makeSignalSource(signal: SIGTERM, queue: .main)
+terminationSourceTERM.setEventHandler { terminationRequested = true }
+terminationSourceTERM.resume()
+let terminationSourceINT = DispatchSource.makeSignalSource(signal: SIGINT, queue: .main)
+terminationSourceINT.setEventHandler { terminationRequested = true }
+terminationSourceINT.resume()
 print("paneru-swift running (60Hz tick, menubar commands live)")
 RunLoop.main.run()

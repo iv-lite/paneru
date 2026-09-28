@@ -305,6 +305,63 @@ do {
     try? FileManager.default.removeItem(atPath: dir)
 }
 
+// UUID-first display remap: a stable UUID beats a rotated numeric id,
+// then numeric, then geometry, else nil (caller falls back to active).
+do {
+    let frame = IntRect(min: IntPoint(0, 0), max: IntPoint(1920, 1080))
+    let live = [
+        (id: UInt32(99), uuid: Optional("uuid-a"), frame: frame),
+        (
+            id: UInt32(100), uuid: Optional("uuid-b"),
+            frame: IntRect(min: IntPoint(1920, 0), max: IntPoint(3840, 1080))
+        ),
+    ]
+    checkEqual(
+        remapDisplay(
+            displayUUID: "uuid-b", displayID: 99,
+            boundsCenter: nil, displays: live
+        ),
+        100, "UUID wins over a stale numeric id"
+    )
+    checkEqual(
+        remapDisplay(
+            displayUUID: nil, displayID: 99,
+            boundsCenter: nil, displays: live
+        ),
+        99, "numeric id matches when UUID is absent"
+    )
+    checkEqual(
+        remapDisplay(
+            displayUUID: "uuid-gone", displayID: 4242,
+            boundsCenter: (2000, 500), displays: live
+        ),
+        100, "geometry contains the saved center"
+    )
+    checkEqual(
+        remapDisplay(
+            displayUUID: nil, displayID: nil,
+            boundsCenter: nil, displays: live
+        ),
+        nil, "nothing known yields nil (caller uses active)"
+    )
+}
+
+// LiveWindow equality covers AX identity: same title but different
+// role/subrole/identifier are distinct windows, not duplicates.
+do {
+    let base = live(ref: 0, winID: 7)
+    var otherRole = base
+    otherRole.role = "AXDialog"
+    check(base != otherRole, "role distinguishes live windows")
+    var otherSubrole = base
+    otherSubrole.subrole = "AXFloatingWindow"
+    check(base != otherSubrole, "subrole distinguishes live windows")
+    var otherIdentifier = base
+    otherIdentifier.identifier = "other"
+    check(base != otherIdentifier, "identifier distinguishes live windows")
+    checkEqual(base, base, "identical live windows compare equal")
+}
+
 if failures == 0 {
     print("SessionChecks: all checks passed")
 } else {

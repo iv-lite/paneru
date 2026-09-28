@@ -36,6 +36,14 @@ do {
     check(parsed[1].spaces == [21], "bad id64 entries drop")
 }
 
+// Corner-radius probe never traps: a real Double or nil (missing
+// symbols on older OS, unknown window) — never a crash.
+do {
+    let cid = skyConnection() ?? 0
+    let radius = skyWindowCornerRadius(cid: cid, wid: 0)
+    check(radius == nil || (radius ?? -1) >= 0, "radius reads nil or non-negative")
+}
+
 if failures == 0 {
     print("SkyBridgeChecks: all checks passed")
 } else {

@@ -68,6 +68,10 @@ public enum LayoutOp: Equatable, Sendable {
 private struct LayoutOpKey: CodingKey {
     var stringValue: String
     init?(stringValue: String) { self.stringValue = stringValue }
+    /// Non-failable construction for statically known tags (the failable
+    /// protocol initializer stores its input unconditionally, so it cannot
+    /// actually fail — this spelling keeps that invariant without `!`).
+    init(verbatim stringValue: String) { self.stringValue = stringValue }
     var intValue: Int? { nil }
     init?(intValue: Int) { nil }
 }
@@ -88,53 +92,53 @@ extension LayoutOp: Codable {
         var container = encoder.container(keyedBy: LayoutOpKey.self)
         switch self {
         case .focus(let w):
-            try container.encode(w, forKey: LayoutOpKey(stringValue: Tag.focus.rawValue)!)
+            try container.encode(w, forKey: LayoutOpKey(verbatim: Tag.focus.rawValue))
         case .swap(let a, let b):
-            try container.encode([a, b], forKey: LayoutOpKey(stringValue: Tag.swap.rawValue)!)
+            try container.encode([a, b], forKey: LayoutOpKey(verbatim: Tag.swap.rawValue))
         case .moveToWorkspace(let w, let ws, let follow):
             struct MoveBody: Encodable { var window: WindowID; var workspace: UInt32; var follow: Bool }
             try container.encode(
                 MoveBody(window: w, workspace: ws, follow: follow),
-                forKey: LayoutOpKey(stringValue: Tag.moveToWorkspace.rawValue)!
+                forKey: LayoutOpKey(verbatim: Tag.moveToWorkspace.rawValue)
             )
         case .view(let ws):
             struct ViewBody: Encodable { var workspace: UInt32 }
             try container.encode(
                 ViewBody(workspace: ws),
-                forKey: LayoutOpKey(stringValue: Tag.view.rawValue)!
+                forKey: LayoutOpKey(verbatim: Tag.view.rawValue)
             )
         case .setFloating(let w, let floating):
             struct FloatingBody: Encodable { var window: WindowID; var floating: Bool }
             try container.encode(
                 FloatingBody(window: w, floating: floating),
-                forKey: LayoutOpKey(stringValue: Tag.setFloating.rawValue)!
+                forKey: LayoutOpKey(verbatim: Tag.setFloating.rawValue)
             )
         case .setManaged(let w, let managed):
             struct ManagedBody: Encodable { var window: WindowID; var managed: Bool }
             try container.encode(
                 ManagedBody(window: w, managed: managed),
-                forKey: LayoutOpKey(stringValue: Tag.setManaged.rawValue)!
+                forKey: LayoutOpKey(verbatim: Tag.setManaged.rawValue)
             )
         case .setWidth(let w, let ratio):
             struct WidthBody: Encodable { var window: WindowID; var ratio: Double }
             try container.encode(
                 WidthBody(window: w, ratio: ratio),
-                forKey: LayoutOpKey(stringValue: Tag.setWidth.rawValue)!
+                forKey: LayoutOpKey(verbatim: Tag.setWidth.rawValue)
             )
         case .setFrame(let w, let frame):
             struct FrameBody: Encodable { var window: WindowID; var frame: WSFrame }
             try container.encode(
                 FrameBody(window: w, frame: frame),
-                forKey: LayoutOpKey(stringValue: Tag.setFrame.rawValue)!
+                forKey: LayoutOpKey(verbatim: Tag.setFrame.rawValue)
             )
         case .stack(let w, let onto, let tabs):
             struct StackBody: Encodable { var window: WindowID; var onto: WindowID; var tabs: Bool }
             try container.encode(
                 StackBody(window: w, onto: onto, tabs: tabs),
-                forKey: LayoutOpKey(stringValue: Tag.stack.rawValue)!
+                forKey: LayoutOpKey(verbatim: Tag.stack.rawValue)
             )
         case .unstack(let w):
-            try container.encode(w, forKey: LayoutOpKey(stringValue: Tag.unstack.rawValue)!)
+            try container.encode(w, forKey: LayoutOpKey(verbatim: Tag.unstack.rawValue))
         }
     }
 
@@ -538,9 +542,7 @@ public struct WindowSet: Sendable {
     public func swap(_ first: WindowID, _ second: WindowID) -> WindowSet {
         var copy = self
         copy.record(.swap(first, second))
-        guard copy.window(first) != nil, copy.window(second) != nil else { return copy }
-        let left = copy.window(first)!
-        let right = copy.window(second)!
+        guard let left = copy.window(first), let right = copy.window(second) else { return copy }
         copy.forEachWindow { record in
             if record.id == first {
                 let keep = record.focused

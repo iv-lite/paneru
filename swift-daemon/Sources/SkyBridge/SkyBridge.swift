@@ -88,6 +88,34 @@ public func skyManagedSpaces() -> [(displayUUID: String, spaces: [SpaceID])]? {
     return parseManagedSpaces(array)
 }
 
+/// Detected corner radius of one window via the SkyLight iterator, if
+/// the OS exposes one (macOS 26+). Mirrors Rust
+/// `sls_window_corner_radius`: query the window id → advance once →
+/// first corner as i64 → Double. Every symbol resolves dynamically;
+/// anything missing (older OS, no connection) yields nil and the
+/// caller falls back to the configured/default radius.
+public func skyWindowCornerRadius(cid: Int32, wid: UInt32) -> Double? {
+    typealias QueryFn = @convention(c) (Int32, CFArray, Int) -> Unmanaged<AnyObject>?
+    typealias CopyFn = @convention(c) (AnyObject) -> Unmanaged<AnyObject>?
+    typealias AdvanceFn = @convention(c) (AnyObject) -> Bool
+    typealias RadiiFn = @convention(c) (AnyObject) -> Unmanaged<CFArray>?
+    guard let query: QueryFn = skySymbol("SLSWindowQueryWindows"),
+          let copy: CopyFn = skySymbol("SLSWindowQueryResultCopyWindows"),
+          let advance: AdvanceFn = skySymbol("SLSWindowIteratorAdvance"),
+          let radiiOf: RadiiFn = skySymbol("SLSWindowIteratorGetCornerRadii")
+    else { return nil }
+    var id = Int32(bitPattern: wid)
+    guard let num = CFNumberCreate(kCFAllocatorDefault, .sInt32Type, &id) else { return nil }
+    let ids = [num] as CFArray
+    guard let queryResult = query(cid, ids, 1)?.takeRetainedValue(),
+          let iterator = copy(queryResult)?.takeRetainedValue(),
+          advance(iterator),
+          let radii = radiiOf(iterator)?.takeRetainedValue() as NSArray?,
+          let first = radii.firstObject as? NSNumber
+    else { return nil }
+    return first.doubleValue
+}
+
 /// Parse one `SLSCopyManagedDisplaySpaces` dump: display UUIDs with
 /// their space ids (negative or missing `id64` entries drop — they
 /// never match a live space).

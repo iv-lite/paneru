@@ -305,7 +305,7 @@ let package = Package(
         .target(
             name: "Daemon",
             dependencies: [
-                "Geometry", "Layout", "AXClient", "EventCore",
+                "Geometry", "Layout", "AXClient", "Animation", "EventCore",
                 "Presentation", "Scripting", "Commands", "Focus",
                 "Workspace", "WindowSet", "Snippets",
             ],

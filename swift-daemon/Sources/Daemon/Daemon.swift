@@ -1,4 +1,5 @@
 import AXClient
+import Animation
 import Commands
 import CoreGraphics
 import EventCore
@@ -217,6 +218,45 @@ public struct DaemonCore: Sendable {
     /// shortfall (legacy), 1 only when fully hidden (quiet clicks —
     /// a clicked window is visible by definition).
     public var windowHiddenRatio = 0.0
+    /// Gaps (px) between columns and stacked items. Mirrors resolved
+    /// `gapHorizontal`/`gapVertical` (Rust default 8); the core default
+    /// is 0 so unit checks pin gap-free geometry unless they opt in.
+    public var gapHorizontal: Int32 = 0
+    public var gapVertical: Int32 = 0
+    /// Center a lone column in the viewport (Rust `center_single_column`).
+    public var centerSingleColumn = false
+    /// Minimum stacked-item height for `binpackHeights` (Rust 200px).
+    public var stackMinHeight: Int32 = 200
+    /// Model truth for sizes (origins live in `positions`): the last
+    /// size intent per window. One-shot — a target change re-sends, an
+    /// OS-clamped window rests instead of spamming AX every tick.
+    private var sizes: [WindowID: IntSize] = [:]
+    /// Glide legs for eased motion (Rust `PositionDrive`): per-window
+    /// tween from drive-start to slot. `positions` walks the eased curve
+    /// instead of snapping, so siblings land together and AX converges
+    /// without pop-and-redrive flapping. Epoch-clocked (≈16ms each).
+    private struct GlideLeg: Equatable {
+        var start: IntPoint
+        var target: IntPoint
+        var bornMs: UInt64
+        var durationMs: UInt64
+    }
+    private var glides: [WindowID: GlideLeg] = [:]
+    /// Burst phase: legs born inside the join window share the deadline
+    /// (Rust `BurstClock`), so one focus/swap/reveal lands lockstep.
+    private var glideBurstOpenedMs: UInt64?
+    private var glideBurstDeadlineMs: UInt64?
+    /// Eased glides on/off (Rust `animations` switch). Off (or a zero
+    /// base duration) snaps exactly like before.
+    public var animationsEnabled = true
+    /// Base glide duration in ms (Rust `animation_duration_ms`, 250):
+    /// proportional pacing shrinks/grows per distance (80…320ms).
+    public var glideBaseMs: UInt64 = 250
+    /// Stuck-writer degrade (Rust `ax_writer` ladder): while the oldest
+    /// traveling epoch lags past the degrade threshold, the commit
+    /// redrive repairs only the focused window instead of hammering
+    /// every stuck app each cooldown. Polled via `pollWriterStall`.
+    public private(set) var writerDegraded = false
 
     public init() {}
 
@@ -228,7 +268,10 @@ public struct DaemonCore: Sendable {
                 id: activeWorkspace, virtualIndex: row
             )
         }
-        return strips[activeWorkspace]![row]!
+        guard let strip = strips[activeWorkspace]?[row] else {
+            return LayoutStrip(id: activeWorkspace, virtualIndex: row)
+        }
+        return strip
     }
 
     private mutating func setActiveStrip(_ strip: LayoutStrip) {
@@ -285,6 +328,11 @@ public struct DaemonCore: Sendable {
         // looking at that display). Focus arrival retargets naturally;
         // yanking active away breaks stay semantics.
         sweepParkedRows(epoch: epoch)
+        // 5s membership audit (300 epochs at 60Hz): dedup + prune only,
+        // mirroring Rust's `audit_window_positions` cadence.
+        if epoch % 300 == 0 {
+            auditPass()
+        }
         let jobs = commitPass(frames: frames, viewports: viewports, epoch: epoch)
         // Offset clock for the reveal gate: only actual strip travel
         // stands the next reveal down.
@@ -350,9 +398,9 @@ public struct DaemonCore: Sendable {
                 // whole (order, stacks, positions) instead of appending
                 // scrambled. Newcomers from other rows merge at the end.
                 if let row = parkedRow(containing: id, in: workspace, epoch: epoch) {
-                    var restored = parkedRows[workspace]![row]!.strip
-                    parkedRows[workspace]!.removeValue(forKey: row)
-                    if parkedRows[workspace]!.isEmpty {
+                    guard var restored = parkedRows[workspace]?[row]?.strip else { continue }
+                    parkedRows[workspace]?.removeValue(forKey: row)
+                    if parkedRows[workspace]?.isEmpty == true {
                         parkedRows.removeValue(forKey: workspace)
                     }
                     if let current = strips[workspace]?[row] {
@@ -1274,6 +1322,7 @@ public struct DaemonCore: Sendable {
     private mutating func glideHome() {
         for (id, slot) in committedSlots {
             positions[id] = slot
+            glides.removeValue(forKey: id)
         }
     }
 
@@ -1378,6 +1427,8 @@ public struct DaemonCore: Sendable {
                             where !inAnyStrip(member)
                         {
                             positions.removeValue(forKey: member)
+                            sizes.removeValue(forKey: member)
+                            glides.removeValue(forKey: member)
                         }
                     }
                     parkedRows[ws]?.removeValue(forKey: row)
@@ -1390,6 +1441,37 @@ public struct DaemonCore: Sendable {
             if parkedRows[ws] == nil {
                 parkedOffsets.removeValue(forKey: ws)
             }
+        }
+    }
+
+    /// Periodic audit backstop (Rust `audit_window_positions`, 5s): drop
+    /// cross-strip duplicates (first occurrence wins, later ones collapse
+    /// like removals) and prune rows left empty outside the active
+    /// selection. Drift and re-homing stay with the commit redrive;
+    /// this only repairs membership the event path cannot produce.
+    public mutating func auditPass() {
+        var seen = Set<WindowID>()
+        var changed = false
+        for ws in strips.keys.sorted() {
+            for row in (strips[ws] ?? [:]).keys.sorted() {
+                guard var strip = strips[ws]?[row] else { continue }
+                var dupes = Set<WindowID>()
+                for member in strip.allWindows {
+                    if seen.contains(member) {
+                        dupes.insert(member)
+                    } else {
+                        seen.insert(member)
+                    }
+                }
+                if !dupes.isEmpty {
+                    strip.removeAll(dupes)
+                    strips[ws]?[row] = strip
+                    changed = true
+                }
+            }
+        }
+        if changed {
+            dirty.formUnion([.layout, .paint])
         }
     }
 
@@ -1446,7 +1528,6 @@ public struct DaemonCore: Sendable {
             let home = viewport(for: ws, in: viewports)
             let parked = parkedOrigin(viewport: home)
             let shownRow = activeVirtual[ws] ?? 0
-            let offset = offsets[ws] ?? 0
             for (rowIndex, strip) in rows {
                 guard rowIndex == shownRow else {
                     for member in strip.allWindows {
@@ -1461,82 +1542,33 @@ public struct DaemonCore: Sendable {
                 // Slots anchor at the workspace viewport's origin: each
                 // display tiles its own strip (offsets stay viewport-
                 // relative, 0 == left edge, on every screen).
-                var x = home.min.x + offset
-                for column in strip.columns {
-                    let width: Int32 = column.windows.compactMap { frames($0)?.width }.max() ?? 0
-                    for member in column.windows {
-                        // Clamp the preserved y into the owner viewport: a
-                        // window spawning near a horizontal seam otherwise
-                        // keeps its neighbor-display height forever,
-                        // straddling the seam (e.g. its titlebar bleeding
-                        // onto the adjacent display's bottom edge).
-                        // Oversize windows top-align.
-                        let height = frames(member)?.height ?? 0
-                        let keptY = positions[member]?.y ?? home.min.y
-                        let slotY = min(max(keptY, home.min.y), max(home.min.y, home.max.y - height))
-                        let slot = IntPoint(x, slotY)
-                        committedSlots[member] = slot
-                        if homing.contains(member) {
-                            enqueueMove(member, to: slot, epoch: epoch)
-                            homing.remove(member)
-                        } else if heldMembers.contains(member) {
-                            // Hand truth flows to the OS so mates follow; the
-                            // slot waits for release.
-                            if let hand = positions[member] {
-                                enqueueMove(member, to: hand, epoch: epoch)
-                            }
-                        } else if positions[member] != slot {
-                            enqueueMove(member, to: slot, epoch: epoch)
-                            positions[member] = slot
-                        } else {
-                            // Verify against live truth: manual moves,
-                            // failed writes, and app snap-backs leave the
-                            // OS window off-slot while the model claims
-                            // convergence (a one-shot intent never
-                            // retries). Re-drive drifted windows whose
-                            // correction is due — `invalidateSent` exists
-                            // precisely so drift re-sends even when the
-                            // target matches the last intent. Cooldown
-                            // keeps mid-glide frames from spamming AX.
-                            if let live = frames(member),
-                               abs(live.min.x - slot.x) > axDeadbandPx
-                                || abs(live.min.y - slot.y) > axDeadbandPx
-                            {
-                                // Stuck windows (the OS clamps or rejects
-                                // the placement: success status, zero
-                                // movement) stop retrying once the live
-                                // frame goes static across attempts — the
-                                // window rests where the OS holds it
-                                // instead of jumping forever. Any live
-                                // movement (or new intent) re-arms.
-                                if redriveLastLive[member] == live {
-                                    redriveStreak[member] = 5
-                                }
-                                // Exponential backoff per chronically
-                                // unwritable window (apps that snap back
-                                // every push): 0.5s, 1s, 2s, 4s, then 8s
-                                // nudges instead of a 2Hz hammer. Converged
-                                // frames reset the streak outright.
-                                let streak = redriveStreak[member, default: 0]
-                                let cooldown = redriveCooldownEpochs
-                                    << min(streak, 4)
-                                let last = lastRedrive[member]
-                                if last == nil || epoch >= last! + cooldown {
-                                    ax.invalidateSent(member)
-                                    positions[member] = IntPoint(live.min.x, live.min.y)
-                                    enqueueMove(member, to: slot, epoch: epoch)
-                                    positions[member] = slot
-                                    lastRedrive[member] = epoch
-                                    redriveLastLive[member] = live
-                                    redriveStreak[member] = min(streak + 1, 5)
-                                }
-                            } else {
-                                redriveStreak[member] = 0
-                                redriveLastLive.removeValue(forKey: member)
-                            }
-                        }
+                let colWidths: [Int32] = strip.columns.map { column in
+                    column.windows.compactMap { frames($0)?.width }.max() ?? 0
+                }
+                // NOTE: no fill clamp here. Offsets legitimately rest
+                // outside the fill range (continuous-swipe snap bounds,
+                // reveal composition across row switches) — clamping to
+                // fill on quiet ticks destroys carried offsets the checks
+                // pin. Swipe travel clamps gestures (`clampSwipeTravel`);
+                // center/snap ops position intentionally.
+                var x = home.min.x + (offsets[ws] ?? 0)
+                for (index, column) in strip.columns.enumerated() {
+                    // A lone column centers when configured (Rust
+                    // `center_single_column`); offsets still apply.
+                    let colX: Int32
+                    if centerSingleColumn, strip.columns.count == 1,
+                       colWidths[index] < home.width
+                    {
+                        colX = home.min.x + (home.width - colWidths[index]) / 2
+                            + (offsets[ws] ?? 0)
+                    } else {
+                        colX = x
                     }
-                    x += width
+                    layoutColumn(
+                        column, x: colX, home: home,
+                        epoch: epoch, frames: frames, heldMembers: heldMembers
+                    )
+                    x += colWidths[index] + gapHorizontal
                 }
             }
         }
@@ -1557,6 +1589,285 @@ public struct DaemonCore: Sendable {
             dirty.subtract(.motion)
         }
         return ordered
+    }
+
+    /// Tile one column: multi-item stacks split the viewport height
+    /// across items (Rust `relative_positions` + `binpack_heights`);
+    /// singles, tabs, single-item stacks, and fullscreen keep
+    /// preserved-y slots. Every member also gets its size clamped to
+    /// the viewport (Rust `clamp_managed_windows_to_viewport`).
+    private mutating func layoutColumn(
+        _ column: LayoutColumn, x: Int32, home: IntRect,
+        epoch: UInt64, frames: (WindowID) -> IntRect?,
+        heldMembers: Set<WindowID>
+    ) {
+        switch column {
+        case .stack(let items) where items.count > 1:
+            layoutStackItems(
+                items, x: x, home: home, epoch: epoch,
+                frames: frames, heldMembers: heldMembers
+            )
+        default:
+            for member in column.windows {
+                let slot = preservedSlot(member, x: x, home: home, frames: frames)
+                committedSlots[member] = slot
+                applyMove(
+                    member, to: slot, epoch: epoch,
+                    frames: frames, heldMembers: heldMembers
+                )
+                clampMemberSize(member, home: home, epoch: epoch, frames: frames)
+            }
+        }
+    }
+
+    /// Split the viewport height over stacked items (tab-group members
+    /// share one item frame), issuing move + resize intents per member.
+    /// Falls back to preserved-y slots when even minimums don't fit.
+    private mutating func layoutStackItems(
+        _ items: [StackItem], x: Int32, home: IntRect, epoch: UInt64,
+        frames: (WindowID) -> IntRect?, heldMembers: Set<WindowID>
+    ) {
+        let desired = items.map { item in
+            item.windows.compactMap { frames($0)?.height }.max()
+                ?? home.height / Int32(max(items.count, 1))
+        }
+        let gapTotal = Int32(items.count - 1) * gapVertical
+        guard let assigned = binpackHeights(
+            desired, minHeight: stackMinHeight, totalHeight: home.height - gapTotal
+        ) else {
+            for member in items.flatMap({ $0.windows }) {
+                let slot = preservedSlot(member, x: x, home: home, frames: frames)
+                committedSlots[member] = slot
+                applyMove(
+                    member, to: slot, epoch: epoch,
+                    frames: frames, heldMembers: heldMembers
+                )
+                clampMemberSize(member, home: home, epoch: epoch, frames: frames)
+            }
+            return
+        }
+        var y = home.min.y
+        for (item, h) in zip(items, assigned) {
+            for member in item.windows {
+                let liveW = frames(member)?.width ?? 0
+                let target = clampSizeToViewport(
+                    IntSize(max(liveW, 0), max(h, 0)), viewport: home
+                )
+                let slot = IntPoint(x, y)
+                committedSlots[member] = slot
+                applyMove(
+                    member, to: slot, epoch: epoch,
+                    frames: frames, heldMembers: heldMembers
+                )
+                applySize(member, to: target, epoch: epoch, frames: frames)
+            }
+            y += h + gapVertical
+        }
+    }
+
+    /// Preserved-y slot: clamp the model's y into the owner viewport so a
+    /// window spawning near a horizontal seam never straddles it forever.
+    /// Oversize windows top-align.
+    private func preservedSlot(
+        _ member: WindowID, x: Int32, home: IntRect,
+        frames: (WindowID) -> IntRect?
+    ) -> IntPoint {
+        let height = frames(member)?.height ?? 0
+        let keptY = positions[member]?.y ?? home.min.y
+        let slotY = min(max(keptY, home.min.y), max(home.min.y, home.max.y - height))
+        return IntPoint(x, slotY)
+    }
+
+    /// Move intent with homing/hand/convergence handling (extracted
+    /// verbatim from the commit loop so stack and single paths share it).
+    private mutating func applyMove(
+        _ member: WindowID, to slot: IntPoint, epoch: UInt64,
+        frames: (WindowID) -> IntRect?, heldMembers: Set<WindowID>
+    ) {
+        if homing.contains(member) {
+            // Release homing restores the slot immediately (the animated
+            // glide lives in presentation); snap truth so the next tick
+            // rests instead of re-driving.
+            enqueueMove(member, to: slot, epoch: epoch)
+            homing.remove(member)
+            positions[member] = slot
+            glides.removeValue(forKey: member)
+        } else if heldMembers.contains(member) {
+            // Hand truth flows to the OS so mates follow; the
+            // slot waits for release.
+            if let hand = positions[member] {
+                enqueueMove(member, to: hand, epoch: epoch)
+            }
+        } else if positions[member] != slot {
+            // Converged live frames snap with no intent (dedup): glides
+            // only traverse real distance, so settled ticks stay silent.
+            if let live = frames(member),
+               abs(live.min.x - slot.x) <= axDeadbandPx,
+               abs(live.min.y - slot.y) <= axDeadbandPx
+            {
+                positions[member] = slot
+                glides.removeValue(forKey: member)
+            } else if !animationsEnabled || glideBaseMs == 0 {
+                enqueueMove(member, to: slot, epoch: epoch)
+                positions[member] = slot
+                glides.removeValue(forKey: member)
+            } else {
+                let from = positions[member] ?? slot
+                let step = glideStep(member, from: from, to: slot, epoch: epoch)
+                enqueueMove(member, to: step, epoch: epoch)
+                positions[member] = step
+                if step == slot { glides.removeValue(forKey: member) }
+            }
+        } else {
+            // Verify against live truth: manual moves,
+            // failed writes, and app snap-backs leave the
+            // OS window off-slot while the model claims
+            // convergence (a one-shot intent never
+            // retries). Re-drive drifted windows whose
+            // correction is due — `invalidateSent` exists
+            // precisely so drift re-sends even when the
+            // target matches the last intent. Cooldown
+            // keeps mid-glide frames from spamming AX.
+                            if let live = frames(member),
+                               abs(live.min.x - slot.x) > axDeadbandPx
+                                || abs(live.min.y - slot.y) > axDeadbandPx,
+                               // Degraded writer: repair only the focused
+                               // window (Rust `STUCK_DEGRADE` rung).
+                               !writerDegraded || member == focus
+                            {
+                // Stuck windows (the OS clamps or rejects
+                // the placement: success status, zero
+                // movement) stop retrying once the live
+                // frame goes static across attempts — the
+                // window rests where the OS holds it
+                // instead of jumping forever. Any live
+                // movement (or new intent) re-arms.
+                if redriveLastLive[member] == live {
+                    redriveStreak[member] = 5
+                }
+                // Exponential backoff per chronically
+                // unwritable window (apps that snap back
+                // every push): 0.5s, 1s, 2s, 4s, then 8s
+                // nudges instead of a 2Hz hammer. Converged
+                // frames reset the streak outright.
+                let streak = redriveStreak[member, default: 0]
+                let cooldown = redriveCooldownEpochs
+                    << min(streak, 4)
+                let last = lastRedrive[member]
+                let due: Bool = {
+                    guard let last else { return true }
+                    let (end, overflow) = last.addingReportingOverflow(cooldown)
+                    return overflow || epoch >= end
+                }()
+                if due {
+                    ax.invalidateSent(member)
+                    positions[member] = IntPoint(live.min.x, live.min.y)
+                    enqueueMove(member, to: slot, epoch: epoch)
+                    positions[member] = slot
+                    lastRedrive[member] = epoch
+                    redriveLastLive[member] = live
+                    redriveStreak[member] = min(streak + 1, 5)
+                }
+            } else {
+                redriveStreak[member] = 0
+                redriveLastLive.removeValue(forKey: member)
+            }
+        }
+    }
+
+    /// One-shot size intent with model truth (`sizes`): a target change
+    /// re-sends; an already-correct window records and rests; an
+    /// OS-clamped window is left alone (moves keep driving via origins).
+    private mutating func applySize(
+        _ member: WindowID, to target: IntSize, epoch: UInt64,
+        frames: (WindowID) -> IntRect?
+    ) {
+        guard sizes[member] != target else { return }
+        guard let live = frames(member) else { return }
+        guard abs(live.width - target.x) > 1 || abs(live.height - target.y) > 1 else {
+            sizes[member] = target
+            return
+        }
+        enqueueResize(member, to: target, epoch: epoch)
+        sizes[member] = target
+    }
+
+    /// Backstop for non-stack members: shrink over-viewport windows to
+    /// the viewport (Rust `clamp_managed_windows_to_viewport`); windows
+    /// that already fit record and rest.
+    private mutating func clampMemberSize(
+        _ member: WindowID, home: IntRect, epoch: UInt64,
+        frames: (WindowID) -> IntRect?
+    ) {
+        guard let live = frames(member) else { return }
+        applySize(
+            member,
+            to: clampSizeToViewport(
+                IntSize(max(live.width, 0), max(live.height, 0)), viewport: home
+            ),
+            epoch: epoch, frames: frames
+        )
+    }
+
+    /// One eased step along a glide leg (Rust `PositionDrive` legs):
+    /// distance-proportional duration, burst-joined deadlines so one
+    /// focus/swap/reveal lands lockstep, first-tick kick, landing nudge,
+    /// and an anti-stall nudge so pixel rounding can never pin a leg one
+    /// pixel short forever. Epoch-clocked at ~16ms each.
+    private mutating func glideStep(
+        _ member: WindowID, from: IntPoint, to: IntPoint, epoch: UInt64
+    ) -> IntPoint {
+        let nowMs = epoch &* 16
+        if let deadline = glideBurstDeadlineMs, nowMs > deadline {
+            glideBurstDeadlineMs = nil
+            glideBurstOpenedMs = nil
+        }
+        let dist: Float = {
+            let dx = Float(to.x - from.x), dy = Float(to.y - from.y)
+            return (dx * dx + dy * dy).squareRoot()
+        }()
+        var leg = glides[member]
+        if var live = leg, live.target != to {
+            let drift: Float = {
+                let dx = Float(to.x - live.target.x), dy = Float(to.y - live.target.y)
+                return (dx * dx + dy * dy).squareRoot()
+            }()
+            let elapsed = nowMs >= live.bornMs ? nowMs - live.bornMs : 0
+            if shouldCarryPhase(elapsedMs: elapsed, durationMs: live.durationMs, driftPx: drift) {
+                live.target = to
+                leg = live
+            } else {
+                leg = nil
+            }
+        }
+        if leg == nil {
+            let (stamp, opened) = birthPhase(nowMs: nowMs, burstOpenedMs: glideBurstOpenedMs)
+            if opened { glideBurstOpenedMs = stamp }
+            let own = proportionalDuration(distancePx: dist, baseMs: glideBaseMs)
+            let duration = joinDuration(
+                ownMs: own, nowMs: nowMs, deadlineMs: glideBurstDeadlineMs
+            )
+            glideBurstDeadlineMs = max(glideBurstDeadlineMs ?? 0, stamp + duration)
+            leg = GlideLeg(start: from, target: to, bornMs: stamp, durationMs: duration)
+        }
+        guard let live = leg else { return to }
+        glides[member] = live
+        let elapsed = nowMs >= live.bornMs ? nowMs - live.bornMs : 0
+        if tweenFinished(elapsedMs: elapsed, durationMs: live.durationMs) { return to }
+        var step = tweenPoint(
+            start: live.start, end: live.target,
+            t: easedFactor(elapsedMs: elapsed, durationMs: live.durationMs)
+        )
+        if step == live.start, elapsed <= firstTickWindowMs {
+            step = kickStart(from: live.start, to: live.target)
+        }
+        if step != live.target
+            && (step == from
+                || abs(step.x - live.target.x) + abs(step.y - live.target.y) <= 2)
+        {
+            step = nudgeLanding(from: step, to: live.target)
+        }
+        return step
     }
 
     /// Size twin of `enqueueMove`: coalesces into the same per-window job
@@ -1622,6 +1933,22 @@ public struct DaemonCore: Sendable {
     /// Record a worker completion, as the ack drain does.
     public mutating func acknowledge(winID: WindowID, seq: UInt64, epoch: UInt64) {
         ax.acknowledge(winID, seq: seq, epoch: epoch)
+    }
+
+    /// Poll the stuck-writer watchdog once per tick. Returns the
+    /// traveling gap when it newly deserves a warning (nil otherwise);
+    /// arms or clears the focused-only-repair flag. Mirrors
+    /// `AxWriteState::checkStall` + the 30/60/120-epoch ladder (no
+    /// separate sync path exists to fail open to — async dispatch IS
+    /// the path, so warn/degrade share one flag).
+    public mutating func pollWriterStall() -> UInt64? {
+        let warn = ax.checkStall()
+        let degraded = (ax.openGap() ?? 0) >= stuckDegradeEpochs
+        if degraded != writerDegraded {
+            writerDegraded = degraded
+            dirty.formUnion([.paint])
+        }
+        return warn
     }
 
     /// Drop focus sitting on a window the roster no longer holds (stale

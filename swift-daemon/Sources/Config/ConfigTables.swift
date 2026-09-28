@@ -200,8 +200,8 @@ public func parseWindowsSections(_ text: String) -> [String: [String: String]] {
                     .trimmingCharacters(in: .whitespaces)
                     .trimmingCharacters(in: CharacterSet(charactersIn: "\"'"))
                 current = name.isEmpty ? nil : name
-                if current != nil, sections[current!] == nil {
-                    sections[current!] = [:]
+                if let current, sections[current] == nil {
+                    sections[current] = [:]
                 }
             } else {
                 current = nil

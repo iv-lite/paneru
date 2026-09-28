@@ -198,8 +198,18 @@ public final class LiveWindow {
         else { return nil }
         var point = CGPoint.zero
         var size = CGSize.zero
-        guard AXValueGetValue(positionValue as! AXValue, .cgPoint, &point),
-              AXValueGetValue(sizeValue as! AXValue, .cgSize, &size)
+        // AX sometimes hands back a non-AXValue payload (or a value of
+        // the wrong flavor); gate on the CF type id first so the
+        // downcast below can never trap, then let AXValueGetValue
+        // reject wrong-flavor values by returning false.
+        guard CFGetTypeID(positionValue) == AXValueGetTypeID(),
+              CFGetTypeID(sizeValue) == AXValueGetTypeID(),
+              AXValueGetValue(
+                  unsafeDowncast(positionValue, to: AXValue.self), .cgPoint, &point
+              ),
+              AXValueGetValue(
+                  unsafeDowncast(sizeValue, to: AXValue.self), .cgSize, &size
+              )
         else { return nil }
         return CGRect(origin: point, size: size)
     }

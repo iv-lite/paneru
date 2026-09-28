@@ -15,13 +15,22 @@ private func check(_ condition: Bool, _ message: String) {
     }
 }
 
+
+private func freshBridge() -> LuaBridge {
+    guard let lua = LuaBridge() else {
+        print("FAIL: could not allocate Lua state")
+        exit(1)
+    }
+    return lua
+}
+
 private func checkEqual<T: Equatable>(_ a: T, _ b: T, _ message: String) {
     check(a == b, "\(message) (got \(a), want \(b))")
 }
 
 // A script runs and returns values.
 do {
-    let lua = LuaBridge()
+    let lua = freshBridge()
     try! lua.load("result = 6 * 7")
     try! lua.load("function answer() return 42 end")
     checkEqual(try! lua.call("answer"), .int(42), "integer return")
@@ -33,7 +42,7 @@ do {
 
 // Snapshot in, commands out: the handler protocol.
 do {
-    let lua = LuaBridge()
+    let lua = freshBridge()
     try! lua.pushStore(ScriptState(["count": .int(41), "name": .str("term")]))
     try! lua.load("""
         function on_space_changed()
@@ -50,7 +59,7 @@ do {
 
 // Nested state round-trips through the bridge whole.
 do {
-    let lua = LuaBridge()
+    let lua = freshBridge()
     let nested = ScriptState([
         "pads": .map(["term": .map(["window": .int(4611686018427387904), "open": .bool(true)])]),
         "names": .list([.str("a"), .str("b")]),
@@ -65,7 +74,7 @@ do {
 
 // Errors carry the interpreter message; the bridge survives them.
 do {
-    let lua = LuaBridge()
+    let lua = freshBridge()
     do {
         try lua.load("this is not lua ===")
         check(false, "broken source must throw")
@@ -92,7 +101,7 @@ do {
 
 // Prelude binds record rows; functions run by ref; flashes drain.
 do {
-    let lua = LuaBridge()
+    let lua = freshBridge()
     try! lua.installPrelude()
     try! lua.load("""
         paneru.bind("alt-b", "window balance")
@@ -130,7 +139,7 @@ do {
 // `paneru.setup` captures its table; non-tables throw; missing setup
 // reads nil; reinstalls reset.
 do {
-    let lua = LuaBridge()
+    let lua = freshBridge()
     try! lua.installPrelude()
     check(lua.readSetup() == nil, "missing setup reads nil")
     try! lua.load("""
@@ -172,7 +181,7 @@ do {
 // `paneru.match` marks filters; `on` rows carry the spec for the host
 // to compile, and plain handlers register filter-free.
 do {
-    let lua = LuaBridge()
+    let lua = freshBridge()
     try! lua.installPrelude()
     try! lua.load("""
         paneru.on("window_spawned", paneru.match({ bundle = "x" }), function(e) end)
@@ -206,7 +215,7 @@ do {
 // Dispatch passes (event, ws) and returns the ws op log: chaining
 // verbs accumulate rows the host replays, other returns commit nothing.
 do {
-    let lua = LuaBridge()
+    let lua = freshBridge()
     try! lua.installPrelude()
     try! lua.load("""
         paneru.on("window_spawned", function(event, ws)
@@ -257,7 +266,7 @@ do {
 // `paneru.exec` runs subprocesses synchronously, returning
 // `{code, stdout, stderr}`; launch failures throw.
 do {
-    let lua = LuaBridge()
+    let lua = freshBridge()
     try! lua.installPrelude()
     try! lua.load("""
         function runEcho()
@@ -309,7 +318,7 @@ do {
 
 // Event handlers list by name and run with the event name.
 do {
-    let lua = LuaBridge()
+    let lua = freshBridge()
     try! lua.installPrelude()
     try! lua.load("""
         paneru.on("window_focused", function(e) paneru.run("seen " .. e) end)

@@ -282,8 +282,8 @@ extension DaemonOptions {
         if let c = borderColor { out.borderColor = parseHexColor(c) }
         if let c = inactiveBorderColor { out.inactiveBorderColor = parseHexColor(c) }
         if let v = borderOpacity { out.borderOpacity = min(max(v, 0), 1) }
-        if borderColor != nil { out.borderAlpha = parseHexAlpha(borderColor!) }
-        if inactiveBorderColor != nil { out.inactiveBorderAlpha = parseHexAlpha(inactiveBorderColor!) }
+        if let c = borderColor { out.borderAlpha = parseHexAlpha(c) }
+        if let c = inactiveBorderColor { out.inactiveBorderAlpha = parseHexAlpha(c) }
         if let v = borderWidth { out.borderWidth = max(v, 0) }
         if let r = borderRadius {
             switch r {
@@ -292,9 +292,9 @@ extension DaemonOptions {
             }
         }
         // Dim activates on color presence; opacity composes with alpha.
-        if dimInactiveColor != nil {
-            out.dimColor = parseHexColor(dimInactiveColor!)
-            out.dimAlpha = parseHexAlpha(dimInactiveColor!)
+        if let c = dimInactiveColor {
+            out.dimColor = parseHexColor(c)
+            out.dimAlpha = parseHexAlpha(c)
             out.dimOpacity = Float(min(max(dimInactiveOpacity ?? 0, 0), 1))
             out.dimActive = true
         }
@@ -375,8 +375,8 @@ extension DaemonOptions {
         if let c = borderColor { config.borderColor = parseHexColor(c) }
         if let c = inactiveBorderColor { config.inactiveBorderColor = parseHexColor(c) }
         if let v = borderOpacity { config.borderOpacity = min(max(v, 0), 1) }
-        if borderColor != nil { config.borderAlpha = parseHexAlpha(borderColor!) }
-        if inactiveBorderColor != nil { config.inactiveBorderAlpha = parseHexAlpha(inactiveBorderColor!) }
+        if let c = borderColor { config.borderAlpha = parseHexAlpha(c) }
+        if let c = inactiveBorderColor { config.inactiveBorderAlpha = parseHexAlpha(c) }
         if let v = borderWidth { config.borderWidth = max(v, 0) }
         if let r = borderRadius {
             switch r {
@@ -384,9 +384,9 @@ extension DaemonOptions {
             case .value(let v): config.borderRadius = .value(max(v, 0))
             }
         }
-        if dimInactiveColor != nil {
-            config.dimColor = parseHexColor(dimInactiveColor!)
-            config.dimAlpha = parseHexAlpha(dimInactiveColor!)
+        if let c = dimInactiveColor {
+            config.dimColor = parseHexColor(c)
+            config.dimAlpha = parseHexAlpha(c)
             config.dimOpacity = Float(min(max(dimInactiveOpacity ?? 0, 0), 1))
             config.dimActive = true
         }
