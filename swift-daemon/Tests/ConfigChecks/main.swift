@@ -416,6 +416,26 @@ do {
     } catch {
         check("\(error)".contains("bad"), "titleless rules name the section")
     }
+    // Per-window border-radius overrides decode and resolve first-match
+    // (rules resolve in name order, like every other rule field).
+    do {
+        let rules = try! resolveWindowsTable([
+            "a-sharp": ["title": "Sharp", "border_radius": "0"],
+            "z-round": ["title": ".*", "border_radius": "14.5"],
+        ])
+        checkEqual(
+            ruleBorderRadius(title: "Sharp edges", bundleID: "x", in: rules), 0,
+            "first matching rule wins"
+        )
+        checkEqual(
+            ruleBorderRadius(title: "Other", bundleID: "x", in: rules), 14.5,
+            "fallback rule applies"
+        )
+        check(
+            ruleBorderRadius(title: "Other", bundleID: "x", in: []) == nil,
+            "no rules means no override (detection applies)"
+        )
+    }
     // Spawn pins decode on both surfaces, with threshold guards.
     do {
         let rules = try! resolveWindowsTable(["ff": [

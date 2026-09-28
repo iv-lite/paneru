@@ -143,6 +143,39 @@ do {
     )
 }
 
+// Flash lifetime: newest wins, expiry hides, re-arm extends.
+do {
+    var state = FlashState()
+    let t0 = Date(timeIntervalSince1970: 1000)
+    check(state.visible(now: t0) == nil, "empty state hides")
+    state.show(message: "Lua reloaded", duration: 1.5, now: t0)
+    checkEqual(
+        state.visible(now: t0.addingTimeInterval(1.0)), "Lua reloaded",
+        "toast shows inside its duration"
+    )
+    check(
+        state.visible(now: t0.addingTimeInterval(2.0)) == nil,
+        "toast hides past its deadline"
+    )
+    check(state.isEmpty, "expiry empties the state")
+    // Last-wins: a newer toast replaces, re-arming the deadline.
+    state.show(message: "first", duration: 10, now: t0)
+    state.show(message: "second", duration: 10, now: t0.addingTimeInterval(1))
+    checkEqual(
+        state.visible(now: t0.addingTimeInterval(5)), "second",
+        "newest toast wins"
+    )
+    state.show(message: "second", duration: 10, now: t0.addingTimeInterval(6))
+    checkEqual(
+        state.visible(now: t0.addingTimeInterval(15)), "second",
+        "re-show re-arms the deadline"
+    )
+    check(
+        state.visible(now: t0.addingTimeInterval(17)) == nil,
+        "re-armed toast still expires"
+    )
+}
+
 if failures == 0 {
     print("PresentationChecks: all checks passed")
 } else {

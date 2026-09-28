@@ -2109,18 +2109,26 @@ public struct DaemonCore: Sendable {
     }
 
     /// Edge-warp landing (pure): with `horizontal_mouse_warp` set, a
-    /// cursor within 3px of a display's left/right edge jumps to the
-    /// nearest display above/below per the warp sign (positive: left
-    /// edge goes down, right edge up; negative mirrored), preserving
-    /// relative Y plus the signed offset and landing 6px inside the
-    /// opposite edge so it can never sit on a threshold and ping-pong.
-    /// Mirrors `warp_landing` minus velocity carry (polled sampling
-    /// always exceeds the 80ms freshness window, so carry is zero) and
-    /// minus drag arming (Swift has no armed-drag concept: held-button
-    /// drags keep native edge behavior).
+    /// cursor within 3px of a display's left/right edge jumps per the
+    /// warp sign (positive: left edge goes down, right edge up; negative
+    /// mirrored), preserving relative Y plus the signed offset and
+    /// landing 6px inside the opposite edge so it can never sit on a
+    /// threshold and ping-pong. The caller passes FULL display frames
+    /// (Rust `Display::bounds`): inset viewports would hide physical
+    /// edges and skew cross-display Y math. Mirrors `warp_landing`
+    /// including velocity carry (30ms extrapolation, ±80px clamp);
+    /// drag arming stays out (Swift has no armed-drag concept:
+    /// held-button drags keep native edge behavior).
+    ///
+    /// Row-wrap fall-through (beyond Rust): when no vertical target
+    /// exists and the cursor sits on a GLOBAL outer edge, single-row
+    /// arrangements wrap around the row (leftmost-left → rightmost
+    /// right-inset and vice versa). Interior shared edges always miss
+    /// so native display crossings are never yanked, and stacked pairs
+    /// stay nil via the vertical-overlap guard.
     public func edgeWarpLanding(
         cursor: IntPoint, displays: [IntRect],
-        warpDirection: Int16, yOffset: Int32
+        warpDirection: Int16, yOffset: Int32, velocityX: Double? = nil
     ) -> IntPoint? {
         guard displays.count >= 2,
               let current = displays.first(where: { $0.contains(cursor) })
@@ -2128,7 +2136,8 @@ public struct DaemonCore: Sendable {
         let onLeftEdge = abs(cursor.x - current.min.x) < 3
         let onRightEdge = abs(current.max.x - cursor.x) < 3
         guard onLeftEdge || onRightEdge else { return nil }
-        let candidates = displays.filter { display in
+        let target: IntRect
+        if let directed = displays.filter({ display in
             guard display != current else { return false }
             let above = display.min.y < current.min.y
             let below = display.min.y > current.min.y
@@ -2137,10 +2146,19 @@ public struct DaemonCore: Sendable {
             } else {
                 return warpDirection > 0 ? above : below
             }
-        }
-        guard let target = candidates.min(by: {
+        }).min(by: {
             abs($0.min.y - current.min.y) < abs($1.min.y - current.min.y)
-        }) else { return nil }
+        }) {
+            target = directed
+        } else if let wrapped = rowWrapTarget(
+            cursor: cursor, current: current,
+            onLeftEdge: onLeftEdge, onRightEdge: onRightEdge,
+            displays: displays
+        ) {
+            target = wrapped
+        } else {
+            return nil
+        }
         let relativeY = cursor.y - current.min.y
         let directionSign: Int32 =
             target.min.y > current.min.y ? 1 : -1
@@ -2153,10 +2171,44 @@ public struct DaemonCore: Sendable {
                 target.min.x + (target.max.x - target.min.x) / 2, targetY
             )
         }
-        let targetX =
-            onLeftEdge ? min(max(target.max.x - 6, lo), hi)
-            : min(max(target.min.x + 6, lo), hi)
-        return IntPoint(targetX, targetY)
+        // Velocity carry so the cursor does not feel stuck at the edge;
+        // the inset floor keeps fast arrivals off the opposite threshold
+        // whatever the carry does (no ping-pong).
+        let carry: Int32 = {
+            guard let v = velocityX else { return 0 }
+            let px = (v * 0.03).rounded()
+            return Int32(min(max(px, -80), 80))
+        }()
+        let base = onLeftEdge ? target.max.x - 6 : target.min.x + 6
+        return IntPoint(min(max(base + carry, lo), hi), targetY)
+    }
+
+    /// Row-wrap target for single-row arrangements: the far display past
+    /// a GLOBAL outer edge (leftmost-left exits land rightmost and vice
+    /// versa). Interior shared edges miss (native crossings flow), and
+    /// the wrap target must vertically overlap the current display
+    /// (stacked pairs stay nil). Sign-independent: with no vertical
+    /// target the direction has nothing left to select.
+    private func rowWrapTarget(
+        cursor: IntPoint, current: IntRect,
+        onLeftEdge: Bool, onRightEdge: Bool,
+        displays: [IntRect]
+    ) -> IntRect? {
+        guard let globalMinX = displays.map({ $0.min.x }).min(),
+              let globalMaxX = displays.map({ $0.max.x }).max()
+        else { return nil }
+        let wrapTo: IntRect?
+        if onLeftEdge, abs(cursor.x - globalMinX) < 3 {
+            wrapTo = displays.max(by: { $0.max.x < $1.max.x })
+        } else if onRightEdge, abs(globalMaxX - cursor.x) < 3 {
+            wrapTo = displays.min(by: { $0.min.x < $1.min.x })
+        } else {
+            return nil
+        }
+        guard let wrapTo, wrapTo != current else { return nil }
+        let overlap = min(current.max.y, wrapTo.max.y) - max(current.min.y, wrapTo.min.y)
+        guard overlap > 0 else { return nil }
+        return wrapTo
     }
 
     /// Vanish triage (pure): split roster ids missing from the

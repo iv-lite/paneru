@@ -232,7 +232,7 @@ func logEffectiveTuning() {
     let vscroll = resolved.swipeScrollVerticalModifiers.map { "0x\(String($0.rawValue, radix: 16))" } ?? "off"
     let vw = viewport()
     print("config: tuning fingers=\(fingers) scroll=\(scroll) scroll_vertical=\(vscroll) padding=\(resolved.paddingLeft),\(resolved.paddingTop) border=\(resolved.borderWidth)px viewport=\(vw.min.x),\(vw.min.y) \(vw.width)x\(vw.height)")
-    print("config: tuning gaps=\(resolved.gapHorizontal),\(resolved.gapVertical) borderActive=\(resolved.borderActive) dimActive=\(resolved.dimActive) continuous=\(resolved.swipeContinuous) ffm=\(resolved.focusFollowsMouse) mff=\(resolved.mouseFollowsFocus) restore=\(resolved.restoreEnabled)/\(resolved.restoreStartupGraceMs)/\(resolved.restoreMissingWindows) presets=\(resolved.presetColumnWidths.map { String($0) }.joined(separator: ",")) popup=\(resolved.workspacePopupStatus)")
+    print("config: tuning gaps=\(resolved.gapHorizontal),\(resolved.gapVertical) borderActive=\(resolved.borderActive) dimActive=\(resolved.dimActive) continuous=\(resolved.swipeContinuous) ffm=\(resolved.focusFollowsMouse) mff=\(resolved.mouseFollowsFocus) warp=\(resolved.horizontalMouseWarp?.description ?? "off")/\(resolved.horizontalMouseWarpOffset) restore=\(resolved.restoreEnabled)/\(resolved.restoreStartupGraceMs)/\(resolved.restoreMissingWindows) presets=\(resolved.presetColumnWidths.map { String($0) }.joined(separator: ",")) popup=\(resolved.workspacePopupStatus)")
 }
 // Called below after MARK-State: top-level storage in the main file
 // initializes in source order, so this must not run before every
@@ -1142,8 +1142,11 @@ func publishScript(_ bridge: LuaBridge) throws {
 }
 
 /// Load (or reload) the script file. Failures keep the old runtime,
-/// including the previously loaded `paneru.setup` layer.
-func loadScript(from path: String) {
+/// including the previously loaded `paneru.setup` layer. Boot loads
+/// pass `quiet` (binds publish and the console logs, but no toast —
+/// Rust only announces inside `reload()`); watcher-driven reloads
+/// announce. Error toasts are always actionable, quiet or not.
+func loadScript(from path: String, quiet: Bool = false) {
     guard let bridge = LuaBridge() else {
         print("lua: warning: could not allocate Lua state (keeping previous runtime)")
         mailbox.applyReload(success: false, error: "could not allocate Lua state")
@@ -1184,7 +1187,9 @@ func loadScript(from path: String) {
         refreshDerivedConfig()
         print("lua: setup dropped (running fallback config)")
     }
-    mailbox.applyReload(success: true, keybinds: mailbox.keybinds)
+    if !quiet {
+        mailbox.applyReload(success: true, keybinds: mailbox.keybinds)
+    }
     print("lua: loaded \(path)")
 }
 
@@ -1277,6 +1282,7 @@ func refreshDerivedConfig() {
     core.centerSingleColumn = resolved.centerSingleColumn
     core.animationsEnabled = resolved.animationsEnabled
     core.glideBaseMs = resolved.animationDurationMs
+    radiusRulesGen += 1
     focusedStyle = makeFocusedStyle(resolved)
     tap.tuning = TapTuning(
         swipeFingers: resolved.swipeFingers,
@@ -1560,6 +1566,12 @@ func drainLuaFrame() {
 }
 
 var pendingFlashes: [(String, Double)] = []
+/// OSD toast arbitration (Rust `update_flash_messages`): newest wins,
+/// expiry hides. The manager only paints — this clock decides.
+var flashState = FlashState()
+/// Last presented toast: transitions to nil remove the window (every
+/// quiet tick would otherwise pay an order-out).
+var lastFlashMessage: String?
 
 // MARK: - Tick
 
@@ -1567,6 +1579,81 @@ var pendingFlashes: [(String, Double)] = []
 /// (the only global pattern this process trusts).
 var lastScriptMtime: Date?
 var lastTuningMtime: Date?
+
+/// Full display frames in top-left AX space (unlike viewports: no
+/// padding, no Dock/menubar insets). Edge warp tests against these —
+/// Rust `Display::bounds()` — so physical edges always contain.
+func fullDisplayFrames() -> [IntRect] {
+    displayScreens.map { screen in
+        IntRect(
+            min: IntPoint(
+                Int32(screen.frame.origin.x.rounded()),
+                Int32(screen.frame.origin.y.rounded())
+            ),
+            max: IntPoint(
+                Int32(screen.frame.maxX.rounded()),
+                Int32(screen.frame.maxY.rounded())
+            )
+        )
+    }
+}
+
+/// Last full-tick viewports, so the pointer poll samples on idle-skip
+/// ticks without paying the display walk every time.
+var lastViewports: [WorkspaceID: IntRect] = [:]
+/// Last warp-sampled cursor (point + time): 80ms-fresh samples yield
+/// horizontal velocity for warp carry (Rust `WarpVelocityState`); the
+/// sample rebases to each landing so post-warp motion measures from
+/// the new position, not the pre-warp one.
+var lastWarpSample = (point: IntPoint(0, 0), at: Date.distantPast)
+
+/// Pointer poll (~4Hz, movement-gated): edge warp first, then hover
+/// focus. A still cursor costs nothing past the timestamp check;
+/// drags, fresh swipes, and the restore window all hold (a teleported
+/// cursor skips hover until the next motion).
+func pollPointer(viewports: [WorkspaceID: IntRect]) {
+    guard tap.lastMouseMovedAt > lastPointerPoll else { return }
+    lastPointerPoll = Date()
+    guard !tap.leftButtonHeld,
+          Date().timeIntervalSince(tap.lastSwipe) >= mouseFollowSwipeQuiet,
+          restorePlanner == nil,
+          let cursor = cursorAXPoint()
+    else { return }
+    // Velocity from the previous sample (stale samples carry nothing).
+    let now = Date()
+    let dt = now.timeIntervalSince(lastWarpSample.at)
+    let velocityX: Double? =
+        (dt > 0 && dt <= 0.08) ? Double(cursor.x - lastWarpSample.point.x) / dt : nil
+    lastWarpSample = (cursor, now)
+    var warped = false
+    if let warp = resolved.horizontalMouseWarp,
+       let landing = core.edgeWarpLanding(
+           cursor: cursor, displays: fullDisplayFrames(),
+           warpDirection: warp,
+           yOffset: resolved.horizontalMouseWarpOffset,
+           velocityX: velocityX
+       )
+    {
+        warpMouse(to: CGPoint(x: Double(landing.x), y: Double(landing.y)))
+        lastWarpSample = (landing, now)
+        print("mouse: edge warp \(landing.x),\(landing.y)")
+        warped = true
+    }
+    if !warped, resolved.focusFollowsMouse,
+       let hovered = core.hoverFocusTarget(
+           frontToBack: (onScreenWindowIDs() ?? []).map { windowID($0) },
+           focusable: Set(core.strips.values.flatMap {
+               $0.values.flatMap { $0.allWindows }
+           })
+           .subtracting(minimizedWindows)
+           .subtracting(stashedMembers),
+           frames: { roster[CGWindowID(bitPattern: $0)]?.frame },
+           cursor: cursor
+       ), hovered != core.focus
+    {
+        pending.append(.focus(id: hovered))
+    }
+}
 
 // MARK: - Displays (one workspace per display)
 
@@ -1833,9 +1920,6 @@ func cursorAXPoint() -> IntPoint? {
     guard let point = CGEvent(source: nil)?.location else { return nil }
     return IntPoint(Int32(point.x.rounded()), Int32(point.y.rounded()))
 }
-/// Row-switch toast lifetime: re-armed per switch, removal after 1.0s.
-var switchFlashTimer: Timer?
-
 /// State snapshot path for hand-run diagnostics.
 let stateFilePath = "/tmp/paneru-swift-state.json"
 
@@ -1914,24 +1998,46 @@ let ackBox = NSLock()
 var pendingAcks: [AXWriteAck] = []
 
 /// Per-window detected corner radii (SLS, macOS 26+): probed on demand,
-/// coarse-cleared past the cap like the read side. Configured numeric
-/// radii bypass the cache entirely; `auto` resolves per window.
-var radiusCache: [WindowID: Double] = [:]
+/// coarse-cleared past the cap like the read side. Configured radii
+/// (global numeric or per-window rule) bypass the cache entirely;
+/// `auto` resolves per window. Entries pin the rules generation they
+/// were resolved under, so tuning reloads re-resolve.
+var radiusCache: [WindowID: (radius: Double, gen: Int)] = [:]
+/// Rules generation: bumped on every derived-config refresh so cached
+/// radii (and any rule-derived truth) re-resolve after reloads.
+var radiusRulesGen = 0
 
-/// Resolved corner radius for one window: configured value, else the
-/// SLS-detected corner, else the 10.0 default — mirroring Rust
-/// `border_radius_for` (per-window, not the old global constant).
+/// Per-window rule radius override, if any rule names one for this
+/// window (Rust `WindowProperties::border_radius`).
+func ruleRadiusFor(_ id: WindowID) -> Double? {
+    guard let meta = core.windowMetadata[id] else { return nil }
+    return ruleBorderRadius(title: meta.title, bundleID: meta.bundleID, in: windowRules)
+        .map { max($0, 0) }
+}
+
+/// Resolved corner radius for one window: global configured value, else
+/// per-window rule override, else the SLS-detected corner, else the
+/// 10.0 default — mirroring Rust `border_radius_for`
+/// (`configured.unwrap_or(base)` per window, not a global constant).
 func borderRadiusFor(_ id: WindowID?) -> Double {
     switch resolved.borderRadius {
     case .value(let v): return v
     case .auto:
-        if let id, let cached = radiusCache[id] { return cached }
-        if let id, let cid = skyCID,
-           let detected = skyWindowCornerRadius(cid: cid, wid: CGWindowID(bitPattern: id))
-        {
-            if radiusCache.count > 1024 { radiusCache.removeAll() }
-            radiusCache[id] = detected
-            return detected
+        if let id {
+            if let cached = radiusCache[id], cached.gen == radiusRulesGen {
+                return cached.radius
+            }
+            if let override = ruleRadiusFor(id) {
+                radiusCache[id] = (override, radiusRulesGen)
+                return override
+            }
+            if let cid = skyCID,
+               let detected = skyWindowCornerRadius(cid: cid, wid: CGWindowID(bitPattern: id))
+            {
+                if radiusCache.count > 1024 { radiusCache.removeAll() }
+                radiusCache[id] = (detected, radiusRulesGen)
+                return detected
+            }
         }
         return 10.0
     }
@@ -1975,13 +2081,18 @@ func tick() {
     }
     // Idle backoff: a fully quiet tick skips the scan/present work and
     // just advances the clock; every 30th tick still runs full (display
-    // and state cadences). Mirrors the Rust idle/low-power sleep
-    // ladder; the 60Hz timer stays, so wakeups are a frame away.
+    // and state cadences). The pointer poll keeps its own 4Hz floor on
+    // skip ticks (edge warp and hover must sample while the layout
+    // rests). Mirrors the Rust idle/low-power sleep ladder; the 60Hz
+    // timer stays, so wakeups are a frame away.
     if lastQuiescent, pending.isEmpty, !rosterDirty, !needTuningReload,
        restorePlanner == nil, restorePending.isEmpty, dragGrabbed == nil,
        !terminationRequested, tickCount % 30 != 0
     {
         tickCount += 1
+        if tickCount % 15 == 0 {
+            pollPointer(viewports: lastViewports)
+        }
         return
     }
     // Per-window border radius for this frame (previous focus — the plan
@@ -2025,6 +2136,7 @@ func tick() {
     // One viewport per workspace (display); the active display's rect
     // feeds the script snapshot, exactly as before.
     let viewports = workspaceViewports()
+    lastViewports = viewports
     core.workspaceRing = displayWorkspaceRing()
     let view = viewports[core.activeWorkspace] ?? IntRect(
         min: IntPoint(0, 0), max: IntPoint(0, 0)
@@ -2194,44 +2306,9 @@ func tick() {
         }
     }
     prevActiveWS = core.activeWorkspace
-    // Pointer poll (~4Hz, movement-gated): edge warp first, then
-    // hover focus. A still cursor costs nothing past the timestamp
-    // check; drags, fresh swipes, and the restore window all hold
-    // (a teleported cursor skips hover until the next motion).
-    if tickCount % 15 == 0, tap.lastMouseMovedAt > lastPointerPoll {
-        lastPointerPoll = Date()
-        if !tap.leftButtonHeld,
-           Date().timeIntervalSince(tap.lastSwipe) >= mouseFollowSwipeQuiet,
-           restorePlanner == nil,
-           let cursor = cursorAXPoint()
-        {
-            var warped = false
-            if let warp = resolved.horizontalMouseWarp,
-               let landing = core.edgeWarpLanding(
-                   cursor: cursor, displays: Array(viewports.values),
-                   warpDirection: warp,
-                   yOffset: resolved.horizontalMouseWarpOffset
-               )
-            {
-                warpMouse(to: CGPoint(x: Double(landing.x), y: Double(landing.y)))
-                print("mouse: edge warp \(landing.x),\(landing.y)")
-                warped = true
-            }
-            if !warped, resolved.focusFollowsMouse,
-               let hovered = core.hoverFocusTarget(
-                   frontToBack: (onScreenWindowIDs() ?? []).map { windowID($0) },
-                   focusable: Set(core.strips.values.flatMap {
-                       $0.values.flatMap { $0.allWindows }
-                   })
-                   .subtracting(minimizedWindows)
-                   .subtracting(stashedMembers),
-                   frames: { roster[CGWindowID(bitPattern: $0)]?.frame },
-                   cursor: cursor
-               ), hovered != core.focus
-            {
-                pending.append(.focus(id: hovered))
-            }
-        }
+    // Pointer poll (~4Hz, movement-gated); see `pollPointer`.
+    if tickCount % 15 == 0 {
+        pollPointer(viewports: viewports)
     }
     // Restore placement runs after the core ingests this frame's
     // `.appeared` events (placing earlier gets undone when they land)
@@ -2258,16 +2335,24 @@ func tick() {
         copiedRuleSent = rule
     }
     // Script flashes present top-right of the focused window's display
-    // (durations are advisory here).
+    // with enforced lifetimes (Rust `update_flash_messages`): newest
+    // wins, expiry hides — a toast can never stick on screen.
     let flashAnchor = result.focus.flatMap(workspaceOfWindow)
         .flatMap { viewports[$0] } ?? view
     for flash in pendingFlashes {
-        Presenter.showFlash(
-            message: flash.0, opacity: 1,
-            topRight: CGPoint(x: Double(flashAnchor.max.x), y: Double(flashAnchor.min.y))
-        )
+        flashState.show(message: flash.0, duration: flash.1, now: Date())
     }
     pendingFlashes.removeAll()
+    if let message = flashState.visible(now: Date()) {
+        Presenter.showFlash(
+            message: message, opacity: 1,
+            topRight: CGPoint(x: Double(flashAnchor.max.x), y: Double(flashAnchor.min.y))
+        )
+        lastFlashMessage = message
+    } else if lastFlashMessage != nil {
+        Presenter.removeFlash()
+        lastFlashMessage = nil
+    }
     // Frame refresh on the AX worker, staggered halves (~1Hz per
     // window instead of a 2Hz full-roster hammer): each read is two AX
     // round trips per window. The cached frame is lock-guarded, so the
@@ -2282,11 +2367,13 @@ func tick() {
         }
         // Detected corners only change on theme/scale switches: re-probe
         // the focused window on the refresh cadence so borders track.
+        // Rule-overridden windows skip: configured radius always wins.
         if tickCount % 300 == 0, let focus = result.focus,
+           ruleRadiusFor(focus) == nil,
            case .auto = resolved.borderRadius, let cid = skyCID
         {
             if let detected = skyWindowCornerRadius(cid: cid, wid: CGWindowID(bitPattern: focus)) {
-                radiusCache[focus] = detected
+                radiusCache[focus] = (detected, radiusRulesGen)
             }
         }
         axWorker.async {
@@ -2445,22 +2532,14 @@ func tick() {
             fired.append(rendered)
         }
         // Row-switch toast (badge with the 1-based row number, 1.0s),
-        // gated on the popup flag. Lifetime managed below: a new switch
-        // re-arms instead of stacking toasts.
+        // gated on the popup flag. Routes through the shared toast
+        // state: a new switch re-arms instead of stacking, and expiry
+        // hides without a private timer that could yank live toasts.
         if let message = switchFlashMessage(
             current: tickRow, previous: prevTickRow,
             enabled: resolved.workspacePopupStatus
-        ),
-           let anchor = viewports[core.activeWorkspace]
-        {
-            switchFlashTimer?.invalidate()
-            Presenter.showFlash(
-                message: message, opacity: 1,
-                topRight: CGPoint(x: Double(anchor.max.x), y: Double(anchor.min.y))
-            )
-            switchFlashTimer = Timer.scheduledTimer(withTimeInterval: 1.0, repeats: false) { _ in
-                Presenter.removeFlash()
-            }
+        ) {
+            flashState.show(message: message, duration: 1.0, now: Date())
         }
         prevTickRow = tickRow
     }
@@ -2505,7 +2584,7 @@ case .createDefault:
     }
 }
 if let scriptPath {
-    loadScript(from: scriptPath)
+    loadScript(from: scriptPath, quiet: true)
     watchScript(scriptPath)
 } else {
     print("lua: disabled (TOML owns this launch)")

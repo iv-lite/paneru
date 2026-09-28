@@ -1,4 +1,5 @@
 import CoreGraphics
+import Foundation
 import Geometry
 
 // AppKit-free overlay decision layer: what to show, move, reskin, or drop —
@@ -233,4 +234,50 @@ public func flashNeedsUpdate(
 ) -> Bool {
     guard let shown else { return true }
     return !(shown.msg == msg && shown.bucket == bucket && cgEqual(shown.frame, frame))
+}
+
+// MARK: - Flash lifetime
+
+/// One visible toast with its expiry (tick clock).
+public struct FlashToast: Equatable, Sendable {
+    public var message: String
+    public var expiresAt: Date
+
+    public init(message: String, expiresAt: Date) {
+        self.message = message
+        self.expiresAt = expiresAt
+    }
+}
+
+/// Lifetime arbitration for OSD toasts: newest shown wins (re-arming the
+/// deadline), expired entries drop, empty state means hidden. The
+/// presenter only paints; the tick owns this clock. Mirrors Rust
+/// `update_flash_messages` (newest-alive render, timeout despawn,
+/// remove-when-empty) — a toast can never stick on screen.
+public struct FlashState: Sendable {
+    private var current: FlashToast?
+
+    public init() {}
+
+    /// Show a toast for `duration` seconds from `now`, replacing
+    /// whatever shows (last-wins, like rapid workspace switches
+    /// replacing the previous badge).
+    public mutating func show(message: String, duration: Double, now: Date) {
+        current = FlashToast(
+            message: message, expiresAt: now.addingTimeInterval(max(duration, 0))
+        )
+    }
+
+    /// Visible message, pruning expired ones first. Nil means hidden —
+    /// the caller removes the window on the transition to nil.
+    public mutating func visible(now: Date) -> String? {
+        guard let live = current else { return nil }
+        guard now < live.expiresAt else {
+            current = nil
+            return nil
+        }
+        return live.message
+    }
+
+    public var isEmpty: Bool { current == nil }
 }

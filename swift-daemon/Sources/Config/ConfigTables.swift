@@ -99,9 +99,10 @@ public func findBinding(
 
 /// One `[windows.<name>]` rule. Only the slice the daemon applies today:
 /// regex title + exact bundle match, float/manage/dont-focus flags,
-/// initial width ratio, and the spawn-time width pin (`spawn_width`,
-/// gated on a minimum landing size). `grid`, `border_radius`, and
-/// per-rule paddings parse but wait for a core that can place them.
+/// initial width ratio, per-window border-radius override, and the
+/// spawn-time width pin (`spawn_width`, gated on a minimum landing
+/// size). `grid` and per-rule paddings parse but wait for a core that
+/// can place them.
 public struct WindowRule: Sendable {
     public var name: String
     public var title: NSRegularExpression
@@ -146,6 +147,16 @@ public struct WindowRule: Sendable {
         self.spawnMinWidth = spawnMinWidth
         self.spawnMinHeight = spawnMinHeight
     }
+}
+
+/// First matching rule's border-radius override, if any. Mirrors Rust
+/// `WindowProperties::border_radius`: a per-window configured radius
+/// wins over SLS detection. Clamped at use, not here.
+public func ruleBorderRadius(
+    title: String, bundleID: String, in rules: [WindowRule]
+) -> Double? {
+    matchWindowRules(title: title, bundleID: bundleID, in: rules)
+        .compactMap { $0.borderRadius }.first
 }
 
 /// All rules matching a window: bundle exact-or-absent plus title search.

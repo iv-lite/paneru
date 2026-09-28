@@ -1413,6 +1413,57 @@ do {
     checkEqual(daemon.positions[1], IntPoint(400, 0), "glide terminates exactly on the slot")
 }
 
+// Row-wrap fall-through (beyond Rust): outer global edges wrap around
+// a single row; interior shared edges never yank native crossings.
+do {
+    let daemon = DaemonCore()
+    let left = IntRect(0, 0, 1920, 1080)
+    let right = IntRect(1920, 0, 3840, 1080)
+    let row = [left, right]
+    checkEqual(
+        daemon.edgeWarpLanding(
+            cursor: IntPoint(1, 500), displays: row,
+            warpDirection: 1, yOffset: 0
+        ), IntPoint(3834, 500), "outer left edge wraps to the far right"
+    )
+    checkEqual(
+        daemon.edgeWarpLanding(
+            cursor: IntPoint(3839, 500), displays: row,
+            warpDirection: 1, yOffset: 0
+        ), IntPoint(6, 500), "outer right edge wraps to the far left"
+    )
+    checkEqual(
+        daemon.edgeWarpLanding(
+            cursor: IntPoint(1, 500), displays: row,
+            warpDirection: -1, yOffset: 0
+        ), IntPoint(3834, 500), "row wrap ignores the direction sign"
+    )
+    checkEqual(
+        daemon.edgeWarpLanding(
+            cursor: IntPoint(1920, 500), displays: row,
+            warpDirection: 1, yOffset: 0
+        ), nil, "shared interior edges cross natively"
+    )
+    checkEqual(
+        daemon.edgeWarpLanding(
+            cursor: IntPoint(1, 500), displays: row,
+            warpDirection: 1, yOffset: 0, velocityX: 600
+        ), IntPoint(3836, 500), "velocity carry pushes into the landing"
+    )
+    checkEqual(
+        daemon.edgeWarpLanding(
+            cursor: IntPoint(1, 500), displays: row,
+            warpDirection: 1, yOffset: 0, velocityX: -600
+        ), IntPoint(3816, 500), "negative carry pulls back from the edge"
+    )
+    checkEqual(
+        daemon.edgeWarpLanding(
+            cursor: IntPoint(1, 500), displays: row,
+            warpDirection: 1, yOffset: 0, velocityX: 100_000
+        ), IntPoint(3836, 500), "carry clamps at the inset floor"
+    )
+}
+
 if failures == 0 {
     print("DaemonChecks: all checks passed")
 } else {
