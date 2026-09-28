@@ -799,7 +799,7 @@ do {
 // Edge warp jumps displays at the 3px threshold, landing 6px inside
 // the opposite edge with relative Y preserved.
 do {
-    let daemon = DaemonCore()
+    var daemon = DaemonCore()
     // Stacked pair: main (0,0 1920x1080) above tall (1920,1080 1920x1080).
     let upper = IntRect(0, 0, 1920, 1080)
     let lower = IntRect(1920, 1080, 3840, 2160)
@@ -851,8 +851,9 @@ do {
         daemon.edgeWarpLanding(
             cursor: IntPoint(1, 1000), displays: [upper, short],
             warpDirection: 1, yOffset: 0
-        ), nil, "unmappable heights skip the warp"
+        ), IntPoint(3834, 1499), "unmappable heights clamp into range"
     )
+    checkEqual(daemon.lastWarpKind, "clamp:primary", "clamped landing reports its stage")
 }
 
 // Healing focus picks the surviving column nearest the viewport
@@ -1483,7 +1484,7 @@ do {
 // Row-wrap fall-through (beyond Rust): outer global edges wrap around
 // a single row; interior shared edges never yank native crossings.
 do {
-    let daemon = DaemonCore()
+    var daemon = DaemonCore()
     let left = IntRect(0, 0, 1920, 1080)
     let right = IntRect(1920, 0, 3840, 1080)
     let row = [left, right]
@@ -1534,7 +1535,7 @@ do {
 // Stairs wrap table (2-step down-right, both signs): primary
 // half-plane first, opposite fallback second, then row-wrap.
 do {
-    let daemon = DaemonCore()
+    var daemon = DaemonCore()
     let upper = IntRect(0, 0, 1920, 1080)
     let lower = IntRect(1920, 300, 3840, 1380)
     let stairs = [upper, lower]
@@ -1698,7 +1699,7 @@ do {
 // x == max, so the sample clamps into the union first), and a nearer
 // miss falls through to a farther hit.
 do {
-    let daemon = DaemonCore()
+    var daemon = DaemonCore()
     let left = IntRect(0, 0, 1920, 1080)
     let right = IntRect(1920, 0, 3840, 1080)
     checkEqual(
@@ -1844,6 +1845,135 @@ do {
     checkEqual(
         daemon.committedSlot(of: 0), IntPoint(312, 34),
         "maximized narrow lone centers: (1024-400)/2"
+    )
+}
+
+// Stairs of 3 reachability: outer endpoints wrap around the row
+// (circle-first, skipping the middle), interior step edges stay
+// directional, and every hop in the cycle lands.
+do {
+    var daemon = DaemonCore()
+    let a = IntRect(0, 0, 1920, 1080)
+    let b = IntRect(1920, 300, 3840, 1380)
+    let c = IntRect(3840, 600, 5760, 1680)
+    let stairs = [a, b, c]
+    checkEqual(
+        daemon.edgeWarpLanding(
+            cursor: IntPoint(1, 500), displays: stairs,
+            warpDirection: -1, yOffset: 0
+        ), IntPoint(5754, 1100), "outer endpoint wraps around the row"
+    )
+    checkEqual(daemon.lastWarpKind, "row", "circle beats the nearer middle step")
+    checkEqual(
+        daemon.edgeWarpLanding(
+            cursor: IntPoint(1921, 800), displays: stairs,
+            warpDirection: -1, yOffset: 0
+        ), IntPoint(1914, 500), "middle step stays directional"
+    )
+    checkEqual(daemon.lastWarpKind, "primary", "interior edges skip row-wrap")
+    checkEqual(
+        daemon.edgeWarpLanding(
+            cursor: IntPoint(5759, 1200), displays: stairs,
+            warpDirection: -1, yOffset: 0
+        ), IntPoint(6, 600), "far outer endpoint wraps around the row"
+    )
+    checkEqual(daemon.lastWarpKind, "row", "outer edges prefer the circle")
+}
+
+// Cross-display moves refocus even without a focus change: the moved
+// window actuates + reveals on its new display (same-value setFocus
+// alone would be a no-op). Same-workspace and stay moves don't.
+do {
+    var daemon = DaemonCore()
+    daemon.workspaceRing = [1, 2]
+    let left = IntRect(0, 0, 1024, 768)
+    let right = IntRect(1024, 0, 2048, 768)
+    let live = frames(slots: [0: IntPoint(0, 34)])
+    _ = daemon.tick(
+        events: [.appeared(id: 0, workspace: 1), .focus(id: 0)],
+        frames: live, viewports: [1: left, 2: right], focusedStyle: style
+    )
+    // Already focused: cross-display drop still refocuses + reveals.
+    let dropped = daemon.tick(
+        events: [.drop(id: 0, x: 1500)],
+        frames: live, viewports: [1: left, 2: right], focusedStyle: style
+    )
+    checkEqual(dropped.focus, 0, "transfer keeps model focus")
+    checkEqual(dropped.refocus, 0, "transfer refocuses without a change")
+    checkEqual(daemon.activeWorkspace, 2, "transfer follows the column")
+    checkEqual(
+        daemon.strips[2]?[0]?.allWindows, [0], "dropped column lands across"
+    )
+    // Same-workspace reorder: no refocus.
+    let same = daemon.tick(
+        events: [.drop(id: 0, x: 1100)],
+        frames: frames(slots: [0: IntPoint(1024, 34)]),
+        viewports: [1: left, 2: right], focusedStyle: style
+    )
+    checkEqual(same.refocus, nil, "same-workspace drops don't refocus")
+    // Follow-around-the-ring move refocuses; stay doesn't.
+    let followed = daemon.tick(
+        events: [.command(.window(.toNextDisplay(.follow)))],
+        frames: frames(slots: [0: IntPoint(1024, 34)]),
+        viewports: [1: left, 2: right], focusedStyle: style
+    )
+    checkEqual(followed.refocus, 0, "follow moves refocus")
+    checkEqual(daemon.activeWorkspace, 1, "follow wraps active around the ring")
+    let stayed = daemon.tick(
+        events: [.command(.window(.toNextDisplay(.stay)))],
+        frames: frames(slots: [0: IntPoint(0, 34)]),
+        viewports: [1: left, 2: right], focusedStyle: style
+    )
+    checkEqual(stayed.refocus, nil, "stay moves don't refocus")
+    checkEqual(daemon.activeWorkspace, 1, "stay keeps active behind")
+}
+
+// Maximized centering ignores carried scroll: a lone marked column
+// centers absolutely (not center + stale offset) while its offset
+// target reels home. General to any marked window, no app sniffing:
+// the scenario below is three plain tiles swiped, pared to one, then
+// maximized.
+do {
+    var daemon = DaemonCore()
+    let live = frames(slots: [0: IntPoint(0, 0), 1: IntPoint(400, 0), 2: IntPoint(800, 0)])
+    _ = daemon.tick(
+        events: [
+            .appeared(id: 0, workspace: 1), .appeared(id: 1, workspace: 1),
+            .appeared(id: 2, workspace: 1), .focus(id: 0),
+        ],
+        frames: live, viewport: viewport, focusedStyle: style
+    )
+    _ = daemon.tick(
+        events: [.swipe(delta: 0.5, fingers: 3)],
+        frames: live, viewport: viewport, focusedStyle: style
+    )
+    checkEqual(daemon.offsets[1], -512, "swipe parks scroll on the strip")
+    _ = daemon.tick(
+        events: [.disappeared(id: 1), .disappeared(id: 2)],
+        frames: live, viewport: viewport, focusedStyle: style
+    )
+    checkEqual(daemon.strips[1]?[0]?.allWindows, [0], "pared to a lone tile")
+    _ = daemon.tick(
+        events: [.command(.window(.fullWidth))],
+        frames: live, viewport: viewport, focusedStyle: style
+    )
+    checkEqual(
+        daemon.committedSlot(of: 0), IntPoint(312, 34),
+        "maximized centers absolutely despite carried scroll"
+    )
+    checkEqual(
+        daemon.offsetTarget(for: 1), 0, "maximized reels the offset target home"
+    )
+    for _ in 0..<25 {
+        _ = daemon.tick(
+            events: [], frames: live,
+            viewport: viewport, focusedStyle: style
+        )
+    }
+    checkEqual(daemon.offsets[1], 0, "carried scroll settles out")
+    checkEqual(
+        daemon.committedSlot(of: 0), IntPoint(312, 34),
+        "center holds after the reel"
     )
 }
 

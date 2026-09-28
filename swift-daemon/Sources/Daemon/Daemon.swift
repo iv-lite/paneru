@@ -75,6 +75,9 @@ public struct FrameResult: Sendable {
     /// True when focus arrived this tick wanting OS raise (latched
     /// while focus holds, so late-adopted windows still actuate).
     public var focusRaise: Bool
+    /// One-shot refocus target for cross-display moves (see
+    /// `focusTouch`): actuate + reveal even without a focus change.
+    public var refocus: WindowID?
     /// True when nothing is flagged and nothing was issued.
     public var quiescent: Bool
 }
@@ -140,6 +143,11 @@ public struct DaemonCore: Sendable {
     /// focus holds so late-adopted windows still actuate on appearance
     /// (the host retries until rostered); cleared on change or clear.
     private var focusRaiseLatched = false
+    /// One-shot refocus request for cross-display moves: the moved
+    /// window must actuate + reveal even when model focus never changed
+    /// (same-value `setFocus` is a no-op, so change-driven triggers
+    /// would otherwise miss it entirely). Consumed into the result.
+    private var focusTouch: WindowID?
     /// Current frame epoch (stamped each tick; the single-threaded
     /// contract makes it safe for arrival sites to read).
     private var currentEpoch: UInt64 = 0
@@ -427,10 +435,12 @@ public struct DaemonCore: Sendable {
         let plan = paintPass(frames: frames, viewports: viewports, focusedStyle: focusedStyle)
         let quiet = dirty.isQuiescent && jobs.isEmpty && plan.isEmpty
         dirty = []
-        return FrameResult(
+        let result = FrameResult(
             borderPlan: plan, axJobs: jobs, focus: focus,
-            focusRaise: focusRaiseLatched, quiescent: quiet
+            focusRaise: focusRaiseLatched, refocus: focusTouch, quiescent: quiet
         )
+        focusTouch = nil
+        return result
     }
 
     /// Single-viewport entry: everything resolves against one rect, which
@@ -611,6 +621,14 @@ public struct DaemonCore: Sendable {
                         if slot.workspace != activeWorkspace {
                             activeWorkspace = slot.workspace
                             setFocus(moving.top, raise: true)
+                            // Refocus + reveal regardless of change: an
+                            // already-focused drop must still actuate and
+                            // scroll into its new viewport (same-value
+                            // `setFocus` alone is a no-op).
+                            if let top = moving.top {
+                                pendingReveals.insert(top)
+                                focusTouch = top
+                            }
                         }
                     }
                 }
@@ -1184,6 +1202,10 @@ public struct DaemonCore: Sendable {
         if follow == .follow {
             activeWorkspace = workspace
             activeVirtual[workspace] = row
+            // Refocus + reveal the moved window even though model focus
+            // never changed hands (same no-op gap as drop transfers).
+            pendingReveals.insert(id)
+            focusTouch = id
         }
         dirty.formUnion([.layout, .paint])
     }
@@ -1229,6 +1251,10 @@ public struct DaemonCore: Sendable {
         }
         if follow == .follow {
             activeWorkspace = target
+            // Refocus + reveal the moved window even though model focus
+            // never changed hands (same no-op gap as drop transfers).
+            pendingReveals.insert(id)
+            focusTouch = id
         }
         dirty.formUnion([.layout, .paint])
     }
@@ -1669,17 +1695,23 @@ public struct DaemonCore: Sendable {
                 for (index, column) in strip.columns.enumerated() {
                     // A lone narrow column centers when configured (Rust
                     // `center_single_column`) or maximized (`fullWidth`
-                    // mark — a maximized window belongs in the middle,
-                    // not on the left edge); offsets still apply.
-                    // Truly full-width columns no-op (left == centered).
+                    // mark — a maximized window belongs mid-display).
+                    // Maximized columns center ABSOLUTELY: carried scroll
+                    // offsets would otherwise park them off-center (swipes
+                    // leave offsets behind), and a fitting strip has
+                    // nothing to scroll — so the offset target reels to 0
+                    // while marked. Truly full-width columns no-op
+                    // (left == centered).
                     let loneNarrow = strip.columns.count == 1
                         && colWidths[index] < home.width
-                    let centered =
-                        loneNarrow
-                        && (centerSingleColumn
-                            || column.windows.contains(where: { fullWidth[$0] != nil }))
+                    let marked = column.windows.contains(where: { fullWidth[$0] != nil })
                     let colX: Int32
-                    if centered {
+                    if loneNarrow && marked {
+                        colX = home.min.x + (home.width - colWidths[index]) / 2
+                        if offsetTargets[ws] != 0 {
+                            offsetTargets[ws] = 0
+                        }
+                    } else if loneNarrow && centerSingleColumn {
                         colX = home.min.x + (home.width - colWidths[index]) / 2
                             + (offsets[ws] ?? 0)
                     } else {
@@ -2373,7 +2405,14 @@ public struct DaemonCore: Sendable {
     /// edge asymmetrically), and candidates run nearest-first with the
     /// first MAPPING target winning (a nearer miss no longer strands a
     /// farther hit on 3+ display rows).
-    public func edgeWarpLanding(
+    ///
+    /// Branch order (see `lastWarpKind` for the taken path): signed
+    /// half-plane, then single-row wrap (circle-first on outer edges so
+    /// endpoint steps stay reachable), then opposite half-plane, then
+    /// clamped landings in the same order (uniform always-land).
+    public private(set) var lastWarpKind = "none"
+
+    public mutating func edgeWarpLanding(
         cursor: IntPoint, displays: [IntRect],
         warpDirection: Int16, yOffset: Int32, velocityX: Double? = nil
     ) -> IntPoint? {
@@ -2382,16 +2421,24 @@ public struct DaemonCore: Sendable {
               let gmaxX = displays.map({ $0.max.x }).max(),
               let gminY = displays.map({ $0.min.y }).min(),
               let gmaxY = displays.map({ $0.max.y }).max()
-        else { return nil }
+        else {
+            lastWarpKind = "none:single"
+            return nil
+        }
         let clamped = IntPoint(
             min(max(cursor.x, gminX), gmaxX - 1),
             min(max(cursor.y, gminY), gmaxY - 1)
         )
-        guard let current = displays.first(where: { $0.contains(clamped) })
-        else { return nil }
+        guard let current = displays.first(where: { $0.contains(clamped) }) else {
+            lastWarpKind = "none:outside"
+            return nil
+        }
         let onLeftEdge = abs(clamped.x - current.min.x) < 3
         let onRightEdge = abs(current.max.x - clamped.x) < 3
-        guard onLeftEdge || onRightEdge else { return nil }
+        guard onLeftEdge || onRightEdge else {
+            lastWarpKind = "none:interior"
+            return nil
+        }
         // Half-plane polarity per edge+sign; flipped = the opposite
         // half-plane (each edge warps both ways, primary first).
         func polarity(_ display: IntRect, flipped: Bool) -> Bool {
@@ -2409,44 +2456,87 @@ public struct DaemonCore: Sendable {
         let ordered = displays.filter { $0 != current }.sorted {
             abs($0.min.y - current.min.y) < abs($1.min.y - current.min.y)
         }
-        for flipped in [false, true] {
+        func attempt(flipped: Bool, strict: Bool) -> IntPoint? {
             for candidate in ordered where polarity(candidate, flipped: flipped) {
                 if let landing = warpLanding(
                     cursor: clamped, current: current, target: candidate,
                     onLeftEdge: onLeftEdge, yOffset: yOffset,
-                    velocityX: velocityX
+                    velocityX: velocityX, strict: strict
                 ) {
                     return landing
                 }
             }
+            return nil
+        }
+        if let landing = attempt(flipped: false, strict: true) {
+            lastWarpKind = "primary"
+            return landing
         }
         if let wrapped = rowWrapTarget(
             cursor: clamped, current: current,
             onLeftEdge: onLeftEdge, onRightEdge: onRightEdge,
             displays: displays
-        ) {
-            return warpLanding(
-                cursor: clamped, current: current, target: wrapped,
-                onLeftEdge: onLeftEdge, yOffset: yOffset,
-                velocityX: velocityX
-            )
+        ),
+           let landing = warpLanding(
+               cursor: clamped, current: current, target: wrapped,
+               onLeftEdge: onLeftEdge, yOffset: yOffset,
+               velocityX: velocityX, strict: true
+           )
+        {
+            lastWarpKind = "row"
+            return landing
         }
+        if let landing = attempt(flipped: true, strict: true) {
+            lastWarpKind = "fallback"
+            return landing
+        }
+        if let landing = attempt(flipped: false, strict: false) {
+            lastWarpKind = "clamp:primary"
+            return landing
+        }
+        if let landing = attempt(flipped: true, strict: false) {
+            lastWarpKind = "clamp:fallback"
+            return landing
+        }
+        if let wrapped = rowWrapTarget(
+            cursor: clamped, current: current,
+            onLeftEdge: onLeftEdge, onRightEdge: onRightEdge,
+            displays: displays
+        ),
+           let landing = warpLanding(
+               cursor: clamped, current: current, target: wrapped,
+               onLeftEdge: onLeftEdge, yOffset: yOffset,
+               velocityX: velocityX, strict: false
+           )
+        {
+            lastWarpKind = "clamp:row"
+            return landing
+        }
+        lastWarpKind = "none:nomap"
         return nil
     }
 
     /// One landing attempt on a fixed target: relative Y with signed
-    /// offset, range guard, velocity carry, opposite-edge inset. Nil
-    /// when the equivalent Y falls off the target (matches macOS
-    /// native side-by-side behavior).
+    /// offset, velocity carry, opposite-edge inset. Strict mode keeps
+    /// the range guard (nil when the equivalent Y falls off the target,
+    /// matching macOS native side-by-side behavior); relaxed mode
+    /// clamps into range so warps always land.
     private func warpLanding(
         cursor: IntPoint, current: IntRect, target: IntRect,
-        onLeftEdge: Bool, yOffset: Int32, velocityX: Double?
+        onLeftEdge: Bool, yOffset: Int32, velocityX: Double?,
+        strict: Bool
     ) -> IntPoint? {
         let relativeY = cursor.y - current.min.y
         let directionSign: Int32 =
             target.min.y > current.min.y ? 1 : -1
-        let targetY = target.min.y + relativeY + yOffset * directionSign
-        guard targetY >= target.min.y, targetY < target.max.y else { return nil }
+        let rawY = target.min.y + relativeY + yOffset * directionSign
+        let targetY: Int32
+        if strict {
+            guard rawY >= target.min.y, rawY < target.max.y else { return nil }
+            targetY = rawY
+        } else {
+            targetY = min(max(rawY, target.min.y), target.max.y - 1)
+        }
         let lo = target.min.x + 3 + 1
         let hi = target.max.x - (3 + 1)
         guard lo <= hi else {

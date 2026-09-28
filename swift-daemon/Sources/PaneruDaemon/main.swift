@@ -1646,17 +1646,17 @@ var lastViewports: [WorkspaceID: IntRect] = [:]
 /// the new position, not the pre-warp one.
 var lastWarpSample = (point: IntPoint(0, 0), at: Date.distantPast)
 
-/// Pointer poll (~4Hz, movement-gated): edge warp first, then hover
-/// focus. A still cursor costs nothing past the timestamp check;
-/// drags, fresh swipes, and the restore window all hold (a teleported
-/// cursor skips hover until the next motion).
-func pollPointer(viewports: [WorkspaceID: IntRect]) {
-    guard tap.lastMouseMovedAt > lastPointerPoll else { return }
-    lastPointerPoll = Date()
+/// Last motion signal consumed by the snappy warp path below.
+var lastWarpEval = Date.distantPast
+
+/// Edge-warp evaluation for one cursor sample: velocity from the
+/// trail, landing decision in core, warp + rebase on success.
+/// Shared by the 4Hz poll (backstop) and the movement-triggered fast
+/// path (response). Drags, fresh swipes, and the restore window hold.
+func checkWarp(cursor: IntPoint) {
     guard !tap.leftButtonHeld,
           Date().timeIntervalSince(tap.lastSwipe) >= mouseFollowSwipeQuiet,
-          restorePlanner == nil,
-          let cursor = cursorAXPoint()
+          restorePlanner == nil
     else { return }
     // Velocity from the previous sample (stale samples carry nothing).
     let now = Date()
@@ -1664,21 +1664,33 @@ func pollPointer(viewports: [WorkspaceID: IntRect]) {
     let velocityX: Double? =
         (dt > 0 && dt <= 0.08) ? Double(cursor.x - lastWarpSample.point.x) / dt : nil
     lastWarpSample = (cursor, now)
-    var warped = false
-    if let warp = resolved.horizontalMouseWarp,
-       let landing = core.edgeWarpLanding(
-           cursor: cursor, displays: fullDisplayFrames(),
-           warpDirection: warp,
-           yOffset: resolved.horizontalMouseWarpOffset,
-           velocityX: velocityX
-       )
-    {
-        warpMouse(to: CGPoint(x: Double(landing.x), y: Double(landing.y)))
-        lastWarpSample = (landing, now)
-        print("mouse: edge warp \(landing.x),\(landing.y)")
-        warped = true
-    }
-    if !warped, resolved.focusFollowsMouse,
+    guard let warp = resolved.horizontalMouseWarp,
+          let landing = core.edgeWarpLanding(
+              cursor: cursor, displays: fullDisplayFrames(),
+              warpDirection: warp,
+              yOffset: resolved.horizontalMouseWarpOffset,
+              velocityX: velocityX
+          )
+    else { return }
+    warpMouse(to: CGPoint(x: Double(landing.x), y: Double(landing.y)))
+    lastWarpSample = (landing, now)
+    print("mouse: edge warp \(landing.x),\(landing.y) via \(core.lastWarpKind)")
+}
+
+/// Pointer poll (~4Hz, movement-gated): edge warp first, then hover
+/// focus. A still cursor costs nothing past the timestamp check;
+/// drags, fresh swipes, and the restore window all hold (a teleported
+/// cursor skips hover until the next motion).
+func pollPointer(viewports: [WorkspaceID: IntRect]) {
+    guard tap.lastMouseMovedAt > lastPointerPoll else { return }
+    lastPointerPoll = Date()
+    guard let cursor = cursorAXPoint() else { return }
+    checkWarp(cursor: cursor)
+    guard !tap.leftButtonHeld,
+          Date().timeIntervalSince(tap.lastSwipe) >= mouseFollowSwipeQuiet,
+          restorePlanner == nil
+    else { return }
+    if resolved.focusFollowsMouse,
        let hovered = core.hoverFocusTarget(
            frontToBack: (onScreenWindowIDs() ?? []).map { windowID($0) },
            focusable: Set(core.strips.values.flatMap {
@@ -2128,6 +2140,16 @@ func tick() {
     for ack in acks {
         core.acknowledge(winID: ack.winID, seq: ack.seq, epoch: ack.epoch)
     }
+    // Snappy warp path: evaluate edges on pointer motion instead of
+    // waiting for the 4Hz poll (~1 frame response instead of ≤500ms).
+    // Consumes the motion signal; rest costs nothing, and the %15 poll
+    // below stays as hover + backstop.
+    if tap.lastMouseMovedAt > lastWarpEval {
+        lastWarpEval = tap.lastMouseMovedAt
+        if let cursor = cursorAXPoint() {
+            checkWarp(cursor: cursor)
+        }
+    }
     // Idle backoff: a fully quiet tick skips the scan/present work and
     // just advances the clock; every 30th tick still runs full (display
     // and state cadences). The pointer poll keeps its own 4Hz floor on
@@ -2285,8 +2307,19 @@ func tick() {
     // app, claim AX focus, and raise; ambient arrivals (hover, refill,
     // echo) claim AX focus without stealing key. Retried until the
     // window is rostered (adoption races); model echoes never re-fire.
-    if let id = result.focus, id != prevActuatedFocus,
-       let window = roster[CGWindowID(id)]
+    // One-shot cross-display refocus (`refocus`) actuates unconditionally
+    // — the moved window must key and raise on its new display even
+    // though model focus never changed hands.
+    if let id = result.refocus, let window = roster[CGWindowID(id)] {
+        if let pid = windowPIDs[id] {
+            NSRunningApplication(processIdentifier: pid)?
+                .activate(options: [.activateIgnoringOtherApps])
+        }
+        _ = window.focusWithoutRaise()
+        window.raise()
+        prevActuatedFocus = id
+    } else if let id = result.focus, id != prevActuatedFocus,
+              let window = roster[CGWindowID(id)]
     {
         if result.focusRaise {
             if let pid = windowPIDs[id] {
@@ -3079,4 +3112,12 @@ let terminationSourceINT = DispatchSource.makeSignalSource(signal: SIGINT, queue
 terminationSourceINT.setEventHandler { terminationRequested = true }
 terminationSourceINT.resume()
 print("paneru-swift running (60Hz tick, menubar commands live)")
+// Build stamp: which binary is actually live (answers "stale install"
+// confusion in one log line).
+if let exe = Bundle.main.executablePath,
+   let attrs = try? FileManager.default.attributesOfItem(atPath: exe),
+   let mtime = attrs[.modificationDate] as? Date
+{
+    print("paneru-swift build: \(exe) mtime \(mtime)")
+}
 RunLoop.main.run()
