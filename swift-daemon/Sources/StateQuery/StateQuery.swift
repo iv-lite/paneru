@@ -1,14 +1,19 @@
 // Query documents and subscription events (`crates/shared_types/state.rs`,
 // `json.rs`): what `paneru query …` prints and `paneru subscribe` pushes.
-// `nil` encodes as `null` (never omitted), matching `serde_json`; key
-// order is encoder-defined (JSON objects are unordered — serde field
-// order is not reproducible with `JSONEncoder`, so byte order is not
-// part of the contract). The terminal JSON shape flattens the
+// Struct `nil`s are *omitted* by `JSONEncoder` (only dictionary-built
+// bodies spell explicit `null`, as below) — a deliberate delta from
+// `serde_json`, harmless downstream (`jq`/`.get` both see null), but
+// byte-compare against Rust output will differ. Key order is likewise
+// encoder-defined (JSON objects are unordered — serde field order is
+// not reproducible with `JSONEncoder`). The terminal JSON shape flattens
+// the
 // externally-tagged enum into `{"event": …}` via `flattenTag`, because
 // the postcard wire form cannot carry a self-describing tag.
 
 import Foundation
 import IPC
+import Scripting
+import WindowSet
 
 // MARK: - flattenTag (json.rs)
 
@@ -29,6 +34,13 @@ public func flattenTag(_ value: Any, tag: String) -> Any {
 }
 
 // MARK: - Documents
+
+/// Query clock: whole seconds since the epoch, matching Rust's
+/// `now_timestamp` (millis here once broke `paneru query` shape
+/// parity — the checks below pin seconds).
+public func queryTimestamp(_ date: Date = Date()) -> UInt64 {
+    UInt64(date.timeIntervalSince1970)
+}
 
 /// Global display coordinates for query output.
 public struct QueryFrame: Equatable, Sendable, Codable {
@@ -259,6 +271,71 @@ public enum QueryPayload: Equatable, Sendable {
         case .active(let active): return try? encoder.encode(active)
         case .onScreen(let windows): return try? encoder.encode(windows)
         }
+    }
+}
+
+// MARK: - Request answering
+
+/// Answer one decoded IPC request against a caller-built snapshot.
+/// The daemon's `answerQuery` path and the loopback checks share it,
+/// so the wire stays honest without launchd: `state` is built once
+/// per call by the host (it owns the core), `onOps` enqueues replay
+/// ops, and `store` is the script-state authority, mutated in place
+/// by writes. Commands and subscribes stay with the connection
+/// handler (they need `pending` and the live connection), and window
+/// set *documents* are not served — no consumer exists (`paneru`
+/// only sends commands, queries, script-state, and subscribes) and
+/// there is no Swift document model for the Rust tree; query state
+/// covers the read need.
+public func answerIPCRequest(
+    _ request: IPCRequest,
+    state: QueryState,
+    onOps: ([LayoutOp]) -> Void,
+    store: inout ScriptState
+) -> Data {
+    switch request {
+    case .query(let kind):
+        guard let json = QueryPayload.slice(kind: kind, state: state).toJSONData() else {
+            return Data("error: could not render query".utf8)
+        }
+        return json
+    case .windowSetApply(let ops):
+        guard let data = ops.data(using: .utf8),
+              let decoded = try? JSONDecoder().decode([LayoutOp].self, from: data)
+        else {
+            return Data("error: bad ops document".utf8)
+        }
+        onOps(decoded)
+        return Data("ok".utf8)
+    case .scriptState(let req):
+        switch req {
+        case .get(let key):
+            let body: [String: Any] = ["value": store.get(key)?.toJSON() ?? NSNull()]
+            guard JSONSerialization.isValidJSONObject(body),
+                  let data = try? JSONSerialization.data(
+                      withJSONObject: body, options: [.sortedKeys]
+                  )
+            else {
+                return Data("error: could not render value".utf8)
+            }
+            return data
+        case .write(let write):
+            switch store.apply(write) {
+            case .success(let outcome):
+                guard let data = try? JSONSerialization.data(
+                    withJSONObject: outcome.toJSON(), options: [.sortedKeys]
+                ) else {
+                    return Data("error: could not render outcome".utf8)
+                }
+                return data
+            case .failure(let failure):
+                return Data("error: \(failure)".utf8)
+            }
+        }
+    case .windowSet:
+        return Data("error: window set documents are not served (use query state)".utf8)
+    case .command, .subscribe:
+        return Data("error: routed by the connection handler, not the answer path".utf8)
     }
 }
 

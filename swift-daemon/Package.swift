@@ -116,7 +116,7 @@ let package = Package(
         ),
         .executableTarget(
             name: "DaemonChecks",
-            dependencies: ["Daemon", "Geometry", "Presentation", "WindowSet"],
+            dependencies: ["Daemon", "Geometry", "Layout", "Presentation", "WindowSet"],
             path: "Tests/DaemonChecks"
         ),
         .executableTarget(
@@ -190,13 +190,18 @@ let package = Package(
             path: "Tests/SessionChecks"
         ),
         .executableTarget(
+            name: "SkyBridgeChecks",
+            dependencies: ["SkyBridge"],
+            path: "Tests/SkyBridgeChecks"
+        ),
+        .executableTarget(
             name: "WindowSetChecks",
             dependencies: ["WindowSet", "Geometry"],
             path: "Tests/WindowSetChecks"
         ),
         .executableTarget(
             name: "StateQueryChecks",
-            dependencies: ["StateQuery", "IPC"],
+            dependencies: ["StateQuery", "IPC", "Scripting", "WindowSet"],
             path: "Tests/StateQueryChecks"
         ),
         .executableTarget(
@@ -236,7 +241,7 @@ let package = Package(
                 "Geometry", "IPC", "KeyChords", "Layout", "LiveProviders",
                 "LuaAPI", "LuaBridge", "MenuBar", "PaneruXPC", "Presentation",
                 "Presenter",                 "ScriptEvents", "ScriptHost", "Scripting",
-                "Scroll", "Session", "StateQuery", "WindowSet",
+                "Focus", "Scroll", "Session", "SkyBridge", "StateQuery", "WindowSet",
             ],
             path: "Sources/PaneruDaemon"
         ),
@@ -255,7 +260,7 @@ let package = Package(
         // Mach XPC service (diagnostics instrument).
         .executableTarget(
             name: "pq",
-            dependencies: ["IPC", "PaneruXPC"],
+            dependencies: ["IPC", "PaneruXPC", "Scripting"],
             path: "Sources/PqQueryTool"
         ),
         .executableTarget(
@@ -376,6 +381,13 @@ let package = Package(
             dependencies: ["Geometry"],
             path: "Sources/Session"
         ),
+        // Private SkyLight bridge: SLS space ids for strip-per-Space
+        // layouts (dlopen, graceful fallback, no link dependency).
+        .target(
+            name: "SkyBridge",
+            dependencies: ["Geometry"],
+            path: "Sources/SkyBridge"
+        ),
         // Script-side predicted layout tree + replay log
         // (`crates/shared_types/windowset.rs`).
         .target(
@@ -387,7 +399,7 @@ let package = Package(
         // (`crates/shared_types/state.rs`, `json.rs`).
         .target(
             name: "StateQuery",
-            dependencies: ["IPC"],
+            dependencies: ["IPC", "Scripting", "WindowSet"],
             path: "Sources/StateQuery"
         ),
         // Live-runtime-free Lua client surface

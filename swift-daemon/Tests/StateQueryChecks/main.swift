@@ -1,6 +1,8 @@
 import Foundation
 import IPC
+import Scripting
 import StateQuery
+import WindowSet
 
 // `state.rs` + `json.rs`: document order, null spelling, on-screen sort,
 // event flattening, and per-kind slices. Exits nonzero on the first
@@ -137,6 +139,81 @@ do {
         jsonString(QueryPayload.slice(kind: .active, state: state).toJSONData())
             .contains(#""display_id":0"#),
         "payloads print as terminal JSON"
+    )
+}
+
+// Query clock parity: whole seconds (Rust `now_timestamp`), never
+// millis — `paneru query` shapes compare numerically downstream.
+do {
+    checkEqual(
+        queryTimestamp(Date(timeIntervalSince1970: 1_700_000_000.9)),
+        1_700_000_000, "timestamps truncate to seconds"
+    )
+    check(
+        queryTimestamp() < 9_999_999_999,
+        "timestamps stay in seconds range (no millis)"
+    )
+}
+
+// Request answering shares the daemon path (no launchd needed):
+// queries slice, ops enqueue, script-state reads/writes, and the
+// unserved shapes error loudly instead of guessing.
+do {
+    let doc = QueryState(
+        version: 1, timestamp: 7, active: ActiveState(displayID: 0),
+        virtualWorkspaces: [QueryWorkspace(number: 0, active: true)]
+    )
+    var store = ScriptState()
+    var enqueued: [[LayoutOp]] = []
+    func answer(_ request: IPCRequest) -> String {
+        String(
+            data: answerIPCRequest(
+                request, state: doc,
+                onOps: { enqueued.append($0) }, store: &store
+            ),
+            encoding: .utf8
+        ) ?? "<nil>"
+    }
+    check(
+        answer(.query(.active)).contains(#""display_id":0"#),
+        "active slice answers"
+    )
+    check(
+        answer(.windowSetApply(#"[{"focus":1}]"#)) == "ok",
+        "ops apply acks"
+    )
+    checkEqual(enqueued, [[.focus(1)]], "ops enqueue decoded")
+    check(
+        answer(.windowSetApply("nope")).hasPrefix("error:"),
+        "bad ops error"
+    )
+    check(
+        answer(.scriptState(.get(key: "k")))
+            == #"{"value":null}"#,
+        "missing keys read null"
+    )
+    check(
+        answer(.scriptState(.write(.set("k", .int(3)))))
+            .contains(#""outcome":"applied""#),
+        "writes apply"
+    )
+    check(
+        answer(.scriptState(.get(key: "k")))
+            .contains(":3}"),
+        "written values read back"
+    )
+    check(
+        answer(.scriptState(.write(.compareAndSet("k", expected: .int(9), value: .int(4)))))
+            .contains(#""outcome":"conflict""#),
+        "races conflict"
+    )
+    check(
+        answer(.windowSet).hasPrefix("error:"),
+        "window set documents are refused loudly"
+    )
+    check(
+        answer(.command(argv: ["x"])).hasPrefix("error:"),
+        "commands stay with the connection handler"
     )
 }
 

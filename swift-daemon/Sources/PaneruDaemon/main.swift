@@ -17,6 +17,7 @@ import CoreGraphics
 import Daemon
 import Darwin
 import Displays
+import Focus
 import Foundation
 import Geometry
 import IPC
@@ -34,6 +35,7 @@ import ScriptHost
 import Scripting
 import Scroll
 import Session
+import SkyBridge
 import StateQuery
 import WindowSet
 import Darwin
@@ -189,6 +191,15 @@ if let path = tuningPath {
 /// use): reads-before-declaration crashed this process at startup.
 var displayScreens: [(id: UInt32, frame: NSRect)] = []
 var workspaceDisplay: [WorkspaceID: UInt32] = [:]
+/// SLS connection for strip-per-Space layouts (nil = unavailable:
+/// single layout per display, exactly as before). Resolved once at
+/// startup; separate-spaces mode is required, anything else keeps
+/// the legacy model.
+var skyCID: Int32? = {
+    guard let cid = skyConnection(), skySpaceManagementMode() == 1 else { return nil }
+    print("space: SLS connected (strip-per-Space layouts live)")
+    return cid
+}()
 
 /// Effective input tuning, logged once so `swift.toml` layering (or its
 /// absence) is observable without guessing from behavior.
@@ -298,6 +309,10 @@ func cgRect(_ rect: IntRect) -> CGRect {
 var lastRosterSync = Date.distantPast
 let rosterSyncInterval: TimeInterval = 1.0
 var rosterDirty = true
+/// Space-switch observer token (retained: dropping it unregisters).
+/// Swift is Space-blind — off-Space windows read as vanished — so a
+/// switch re-resolves immediately instead of waiting the backstop.
+var workspaceSpaceObserver: NSObjectProtocol?
 /// Newcomers with an AX probe in flight (see `syncRoster`).
 var probing: Set<CGWindowID> = []
 
@@ -444,10 +459,54 @@ func adoptNewcomers(_ adopted: [(AdoptedWindow, AXUIElement)]) {
 /// Windows currently floated by native-fullscreen state (not by rule):
 /// clearing fullscreen re-tiles them; rule-floated windows stay floating.
 var fullscreenFloated: Set<WindowID> = []
+/// Minimized windows, edge-triggered off the same per-sync comparison
+/// as fullscreen flips (miniaturize notifications already mark the
+/// roster dirty). They keep strip membership and layout — only query
+/// visibility and hover candidacy change; focus healing on minimize
+/// stays an open gap.
+var minimizedWindows = Set<WindowID>()
+/// Windows parked on inactive SLS spaces (refreshed every sync from
+/// the stash): invisible but rostered, so Space returns skip the
+/// re-adopt storm. Same treatment as minimized.
+var stashedMembers = Set<WindowID>()
 /// Last sync's cached frame per window (re-home stability detection).
 /// Declared with the other top-level state: reads-before-declaration
 /// crashed this process at startup.
 var stableFrames: [CGWindowID: IntRect] = [:]
+
+/// Apply minimize flips collected on the worker: entering records,
+/// leaving clears. Membership and layout never move (Rust keeps
+/// minimized windows in their strips too — only visibility changes).
+func applyMinimizeFlips(_ flips: [(WindowID, Bool)]) {
+    for (id, minimized) in flips {
+        guard roster[CGWindowID(id)] != nil else {
+            minimizedWindows.remove(id)
+            continue
+        }
+        if minimized, minimizedWindows.insert(id).inserted {
+            print("window: minimized \(id)")
+            // Healing focus (Rust give_away_focus): a minimized
+            // focused window hands off to its nearest surviving
+            // neighbor instead of stranding keybinds on a hidden id.
+            if id == core.focus,
+               let ws = workspaceOfWindow(id),
+               let view = workspaceViewports()[ws],
+               let target = core.healFocusTarget(
+                   strip: core.strips[ws]?[core.activeVirtual[ws] ?? 0]
+                       ?? LayoutStrip(id: ws, virtualIndex: 0),
+                   viewport: view,
+                   frames: { roster[CGWindowID(bitPattern: $0)]?.frame },
+                   lost: id
+               )
+            {
+                pending.append(.focus(id: target))
+                print("focus: healed to \(target) after minimize")
+            }
+        } else if !minimized, minimizedWindows.remove(id) != nil {
+            print("window: deminimized \(id)")
+        }
+    }
+}
 
 /// Apply fullscreen flips collected on the worker: entering native
 /// fullscreen floats unmanaged (never relocated, like Rust's
@@ -485,10 +544,36 @@ func applyFullscreenFlips(_ flips: [(WindowID, Bool)]) {
 /// Reconcile the roster with the on-screen list. Vanished windows drop
 /// inline (no AX involved); newcomers probe on the AX worker and adopt
 /// back on main, so a wedged app's 0.25s timeouts never stall the tap.
+/// Re-resolve SLS spaces (no-op without a connection): rotate
+/// switched workspaces into their per-Space strips, prune destroyed
+/// stashes. Main thread; SLS calls are cheap C queries, parsed
+/// without AX. Runs inside every roster sync, so the NSWorkspace
+/// signal and the 1Hz backstop share one path.
+func refreshSpaces() {
+    guard skyCID != nil else { return }
+    var live = Set<SpaceID>()
+    for ws in displayWorkspaceRing() {
+        guard let display = workspaceDisplay[ws],
+              let space = skyCurrentSpace(displayID: display)
+        else { continue }
+        live.insert(space)
+        let old = core.spaceOfWorkspace[ws] ?? 0
+        if core.resolveSpace(workspace: ws, space: space), old != 0 {
+            print("space: ws=\(ws) \(old) → \(space)")
+        }
+    }
+    if let managed = skyManagedSpaces() {
+        core.pruneSpaces(
+            keeping: Set(managed.flatMap { $0.spaces }).union(live)
+        )
+    }
+}
+
 func syncRoster() {
     guard let onScreen = onScreenWindowIDs() else { return }
     lastRosterSync = Date()
     rosterDirty = false
+    refreshSpaces()
     let known = Set(roster.keys)
     let current = Set(onScreen)
     // Windows with a probe already in flight adopt when it lands;
@@ -535,24 +620,62 @@ func syncRoster() {
             // (Worker-side AX reads over the main-taken snapshot only;
             // the roster itself stays main-owned.)
             var flips: [(WindowID, Bool)] = []
+            var minFlips: [(WindowID, Bool)] = []
             for (wid, window) in refresh {
                 flips.append((windowID(wid), window.isFullscreen))
+                minFlips.append((windowID(wid), window.isMinimized))
             }
-            DispatchQueue.main.async { [flips] in
+            DispatchQueue.main.async { [flips, minFlips] in
                 // Clear in-flight first: failures retry on the next pass.
                 probing.subtract(attempted)
                 adoptNewcomers(adopted)
                 applyFullscreenFlips(flips)
+                applyMinimizeFlips(minFlips)
             }
         }
     }
+    // Stashed-space members never vanish-drop: their Space is
+    // simply inactive (re-adopting them on return would storm the
+    // worker and scramble focus for nothing).
+    stashedMembers = Set(
+        core.spaceStash.values.flatMap { $0.rows.values.flatMap { $0.allWindows } }
+    )
     for wid in known.subtracting(current) {
+        let id = windowID(wid)
+        if stashedMembers.contains(id) {
+            // App quit while stashed: drop like a real close.
+            if NSRunningApplication(processIdentifier: windowPIDs[id] ?? -1) == nil {
+                stashedMembers.remove(id)
+            } else {
+                continue
+            }
+        }
+        // Minimized windows leave the on-screen list but keep roster
+        // and strip membership (Rust parity): one main-thread AX read
+        // tells them apart from real closes. Vanishes are rare (close
+        // or minimize), so this never becomes a periodic AX walk.
+        if minimizedWindows.contains(id) {
+            // App quit while minimized: drop like a real close
+            // instead of haunting the strips.
+            if NSRunningApplication(processIdentifier: windowPIDs[id] ?? -1) == nil {
+                minimizedWindows.remove(id)
+            } else {
+                continue
+            }
+        } else if let window = roster[wid], window.isMinimized {
+            minimizedWindows.insert(id)
+            print("window: minimized \(id)")
+            continue
+        }
         roster.removeValue(forKey: wid)
-        windowPIDs.removeValue(forKey: windowID(wid))
-        dontFocus.remove(windowID(wid))
-        fullscreenFloated.remove(windowID(wid))
+        windowPIDs.removeValue(forKey: id)
+        dontFocus.remove(id)
+        fullscreenFloated.remove(id)
+        minimizedWindows.remove(id)
+        focusHistory.forget(id)
         stableFrames.removeValue(forKey: wid)
-        pending.append(.disappeared(id: windowID(wid)))
+        pending.append(.disappeared(id: id))
+        print("window: closed \(id)")
     }
     // Stale focus (arrival for a rejected or never-adopted window) clears
     // here; adoption in flight (probing) still wins its race.
@@ -677,6 +800,15 @@ if tap.install() {
 } else {
     print("input: warning: tap failed (commands still arrive via the menubar)")
 }
+// Space switches (public NSWorkspace signal, no SLS needed) resync
+// at once: waiting the backstop leaves a full second of churn.
+workspaceSpaceObserver = NSWorkspace.shared.notificationCenter.addObserver(
+    forName: NSWorkspace.activeSpaceDidChangeNotification,
+    object: nil, queue: .main
+) { _ in
+    rosterDirty = true
+    print("display: space changed (resyncing)")
+}
 
 /// Tap callback results with no daemon analog (pointer motion, touchpad
 /// lifecycle, vertical ticks the core does not model) map to nil and are
@@ -697,6 +829,10 @@ func tapEvent(_ event: TapEvent) -> DaemonEvent? {
                 * resolved.swipeSensitivity
         )
     case .keybind(let command):
+        // Every resolved key command marks keyboard cause for the
+        // mouse-follow drain (tap resolves before it sinks, so this
+        // covers lua, line, and fallback commands alike).
+        lastKeyCommandAt = Date()
         switch command {
         case .lua(let id):
             return .command(.lua(id))
@@ -707,7 +843,59 @@ func tapEvent(_ event: TapEvent) -> DaemonEvent? {
             }
             return .command(.printState)
         }
-    case .mouseDown, .mouseUp, .mouseDragged, .mouseMoved,
+    case .mouseDown(let point, let modifiers):
+        // Grab candidacy: press on a draggable window. Promotion
+        // waits for the threshold in dragged events.
+        if let hit = dragHitTest(point) {
+            dragCandidate = hit
+            dragPressPoint = point
+            dragPressArmed = dragArmed(modifiers: modifiers)
+            dragGrabbed = nil
+            dragFoldDX = 0
+            dragLastX = Double(point.x)
+        }
+        return nil
+    case .mouseDragged(let point, _):
+        guard dragCandidate != nil else { return nil }
+        dragFoldDX += Double(point.x) - dragLastX
+        dragLastX = Double(point.x)
+        if dragGrabbed == nil,
+           abs(Double(point.x) - Double(dragPressPoint.x)) > dragClickThreshold
+               || abs(Double(point.y) - Double(dragPressPoint.y)) > dragClickThreshold,
+           let candidate = dragCandidate
+        {
+            dragGrabbed = candidate
+            print("mouse: grab window=\(candidate) armed=\(dragPressArmed)")
+        }
+        return nil
+    case .mouseUp(let point, _):
+        defer {
+            dragCandidate = nil
+            dragGrabbed = nil
+            dragFoldDX = 0
+            Presenter.hideDrop()
+            lastGhostRect = nil
+        }
+        guard let grabbed = dragGrabbed, pending.count < 1024 else { return nil }
+        // Flush the tail fold ahead of the drop so the column drives
+        // from its live position, not a stale one.
+        let tail = Int32(max(-dragFoldClamp, min(dragFoldClamp, dragFoldDX.rounded())))
+        if tail != 0 {
+            pending.append(.dragMoved(id: grabbed, dx: tail))
+        }
+        let up = IntPoint(Int32(point.x.rounded()), Int32(point.y.rounded()))
+        if let ws = workspaceContaining(point: up),
+           ws != workspaceOfWindow(grabbed), !dragPressArmed
+        {
+            // Unarmed cross-display drags glide home (Rust parity).
+            pending.append(.released)
+            print("mouse: drop window=\(grabbed) glides home (unarmed cross-display)")
+        } else {
+            pending.append(.drop(id: grabbed, x: up.x))
+            print("mouse: drop window=\(grabbed) x=\(up.x) armed=\(dragPressArmed)")
+        }
+        return nil
+    case .mouseMoved,
          .verticalScrollTick, .verticalSwipe, .touchpadDown, .touchpadUp:
         return nil
     }
@@ -724,6 +912,11 @@ let menubar = MenuBarController { command in
     case .copyRule:
         pending.append(.command(.window(.copyRule)))
     case .quit:
+        // Clean exit persists like Rust's `AppExit` save (a SIGTERM
+        // keeps Rust semantics too: the crash loses at most one
+        // 30s interval by design) and clears the crash mark.
+        saveSessionState()
+        clearSessionRunning(statePath: sessionStatePath())
         exit(0)
     case .openAccessibilitySettings, .showAccessibilityInstructions:
         break
@@ -731,6 +924,23 @@ let menubar = MenuBarController { command in
 }
 
 // MARK: - Query snapshot
+
+/// AX-space display frames for geometry: `displayScreens` already
+/// stores flipped (top-left) rects, so this only rounds.
+func axDisplayFrames() -> [(id: UInt32, frame: IntRect)] {
+    displayScreens.map { entry in
+        (id: entry.id, frame: IntRect(
+            min: IntPoint(
+                Int32(entry.frame.origin.x.rounded()),
+                Int32(entry.frame.origin.y.rounded())
+            ),
+            max: IntPoint(
+                Int32((entry.frame.origin.x + entry.frame.size.width).rounded()),
+                Int32((entry.frame.origin.y + entry.frame.size.height).rounded())
+            )
+        ))
+    }
+}
 
 /// One roster frame as a query frame.
 func queryFrame(id: WindowID) -> QueryFrame? {
@@ -747,10 +957,12 @@ func buildQueryState() -> QueryState {
     let orderedWorkspaces = displayWorkspaceRing().filter {
         core.strips[$0] != nil || $0 == core.activeWorkspace
     }
+    let liveFrames = axDisplayFrames().map { $0.frame }
     let workspaces = orderedWorkspaces.flatMap { ws in
         (core.strips[ws] ?? [:]).keys.sorted().map { row in
             let windows = (core.strips[ws]?[row]?.allWindows ?? []).map { id in
-                QueryWindow(
+                let frame = roster[CGWindowID(id)]?.frame
+                return QueryWindow(
                     windowID: id,
                     bundleID: core.windowMetadata[id]?.bundleID ?? "",
                     appName: core.windowMetadata[id]?.appName ?? "",
@@ -758,12 +970,27 @@ func buildQueryState() -> QueryState {
                     focused: core.focus == id,
                     floating: core.unmanaged.contains(id),
                     displayID: workspaceDisplay[ws],
-                    frame: queryFrame(id: id),
-                    visible: true
+                    frame: frame.map {
+                        QueryFrame(
+                            x: $0.min.x, y: $0.min.y,
+                            width: $0.width, height: $0.height
+                        )
+                    },
+                    // Geometric overlap, like Rust; minimized and
+                    // stashed (other-Space) windows are tracked and
+                    // read hidden (hidden state has no AX signal
+                    // here, so those still read visible).
+                    visible: core.queryVisibleWindow(
+                        frame: frame, viewports: liveFrames,
+                        sliverWidth: resolved.sliverWidth
+                    ) && !minimizedWindows.contains(id)
+                        && !stashedMembers.contains(id)
                 )
             }
             return QueryWorkspace(
-                number: row, active: (core.activeVirtual[ws] ?? 0) == row,
+                number: row,
+                nativeWorkspaceID: core.spaceOfWorkspace[ws] ?? 0,
+                active: (core.activeVirtual[ws] ?? 0) == row,
                 windows: windows
             )
         }
@@ -771,9 +998,10 @@ func buildQueryState() -> QueryState {
     let ws = core.activeWorkspace
     return QueryState(
         version: 1,
-        timestamp: UInt64(Date().timeIntervalSince1970 * 1000),
+        timestamp: queryTimestamp(),
         active: ActiveState(
             displayID: workspaceDisplay[ws],
+            nativeWorkspaceID: core.spaceOfWorkspace[ws],
             virtualWorkspaceNumber: core.activeVirtual[ws],
             focusedWindowID: core.focus,
             focusedBundleID: core.focus.flatMap { core.windowMetadata[$0]?.bundleID },
@@ -785,13 +1013,26 @@ func buildQueryState() -> QueryState {
 }
 
 func answerQueryDocument(_ data: Data) -> Data {
-    guard case .query(let kind) = decodeRequest(data) else {
-        return Data(xpcError("expected a query request").utf8)
+    guard let request = decodeRequest(data) else {
+        return Data(xpcError("bad request").utf8)
     }
-    guard let json = QueryPayload.slice(kind: kind, state: buildQueryState()).toJSONData() else {
-        return Data(xpcError("could not render query").utf8)
+    switch request {
+    case .command(let argv):
+        do {
+            pending.append(.command(try parseCommand(argv)))
+            return Data("ok".utf8)
+        } catch {
+            return Data(xpcError("\(error)").utf8)
+        }
+    case .subscribe:
+        return Data(xpcError("subscribe needs a connection: use subscribe").utf8)
+    default:
+        return answerIPCRequest(
+            request, state: buildQueryState(),
+            onOps: { pending.append(.command(.layout($0))) },
+            store: &scriptStore
+        )
     }
-    return json
 }
 
 // MARK: - Script host
@@ -1109,6 +1350,8 @@ func scriptEvents(for events: [DaemonEvent]) -> [ScriptEvent] {
             out.append(.swipe(delta: delta, fingers: fingers))
         case .scroll(let delta):
             out.append(.scroll(delta: delta))
+        case .drop(let id, _):
+            out.append(.windowMoved(windowID: id))
         case .command, .dragMoved, .released:
             break
         }
@@ -1436,6 +1679,88 @@ var windowPIDs: [WindowID: pid_t] = [:]
 var prevTickFocus: WindowID?
 var prevTickRow: UInt32?
 var prevTickRoster = 0
+/// Last keybind fire (any resolved key command) and last focus seen
+/// by the mouse-follow drain: arrivals within the key window count as
+/// keyboard-caused and always recenter.
+var lastKeyCommandAt = Date.distantPast
+var prevMffFocus: WindowID?
+/// Session persistence dirtied since the last save (Rust 30s
+/// dirty-gated cadence, simplified: any busy tick or focus/row/
+/// roster drift marks it; the interval below does the write).
+var stateDirty = false
+/// Previous-window memory per workspace (read on workspace switches
+/// that land focusless, so keybinds never die on an empty arrival).
+var focusHistory = FocusHistory()
+/// Active workspace seen by the history reader (nil until the first
+/// tick, so startup never "switches").
+var prevActiveWS: WorkspaceID?
+
+/// Press arrivals never yank the click point; keyboard arrivals count
+/// for half a second after the keybind (Rust `PRESS_FOCUS_CAUSE` /
+/// keyboard-user windows). Swipes own the pointer briefly after lift.
+let mouseFollowPressWindow = 0.4
+let mouseFollowKeyWindow = 0.5
+let mouseFollowSwipeQuiet = 0.6
+/// Last pointer-poll time: hover and edge checks run ~4Hz but only
+/// after motion, so a still cursor costs no WindowServer round trips.
+var lastPointerPoll = Date.distantPast
+/// Pointer-drag grab state: press candidate → promoted grab past the
+/// 4px click threshold → per-tick folded drive → drop or release.
+/// Folds accumulate between ticks; the tick flushes them ahead of the
+/// event snapshot so drive lands the next frame. An unpromoted
+/// press+release stays a native click (nothing enqueued, ever).
+var dragCandidate: WindowID?
+var dragPressPoint = CGPoint.zero
+var dragPressArmed = false
+var dragGrabbed: WindowID?
+var dragFoldDX = 0.0
+var dragLastX = 0.0
+/// Last shown drop ghost (retained to skip steady-state rewrites).
+var lastGhostRect: CGRect?
+/// Click-vs-drag travel, per axis (Rust `CLICK_RELEASE_MAX_TRAVEL_PX`).
+let dragClickThreshold = 4.0
+/// Per-tick drive clamp (Rust folds the same ±512px).
+let dragFoldClamp = 512.0
+
+/// Windows a pointer grab may take: tiled, managed, present, and
+/// focusable (grabbing must never violate `dontFocus` — transfer
+/// focuses the column head).
+func draggableWindows() -> Set<WindowID> {
+    Set(core.strips.values.flatMap { $0.values.flatMap { $0.allWindows } })
+        .subtracting(core.unmanaged)
+        .subtracting(minimizedWindows)
+        .subtracting(stashedMembers)
+        .subtracting(dontFocus)
+}
+
+/// Grab-time arming for cross-display drags: the press modifiers must
+/// match `mouse_drag_display_modifier` exactly (unset = never armed).
+func dragArmed(modifiers: TapModifiers) -> Bool {
+    resolved.mouseDragDisplayModifiers.map { $0 == keyModifiers(modifiers) } ?? false
+}
+
+/// Front-to-back hit test in Quartz screen space (the daemon's frame
+/// space — no flip needed).
+func dragHitTest(_ point: CGPoint) -> WindowID? {
+    let cursor = IntPoint(Int32(point.x.rounded()), Int32(point.y.rounded()))
+    let draggable = draggableWindows()
+    return (onScreenWindowIDs() ?? []).compactMap { windowID($0) }.first { id in
+        draggable.contains(id)
+            && (roster[CGWindowID(bitPattern: id)]?.frame.contains(cursor) ?? false)
+    }
+}
+
+/// Workspace whose viewport contains a point (for drop targeting).
+func workspaceContaining(point: IntPoint) -> WorkspaceID? {
+    workspaceViewports().first { $0.value.contains(point) }?.key
+}
+
+/// Live cursor in Quartz screen space (the daemon's frame space, so
+/// no flip is needed for frame hit tests or warp targets).
+func cursorAXPoint() -> IntPoint? {
+    guard let point = CGEvent(source: nil)?.location else { return nil }
+    return IntPoint(Int32(point.x.rounded()), Int32(point.y.rounded()))
+}
 /// Row-switch toast lifetime: re-armed per switch, removal after 1.0s.
 var switchFlashTimer: Timer?
 
@@ -1528,11 +1853,19 @@ func tick() {
     }
     // Restore grace expiry: saved active rows apply once (all
     // arrivals are in), then the plan drops — unlaunched windows stay
-    // wherever later spawns put them. No file rewrite yet.
+    // wherever later spawns put them. Under `close` (which is where
+    // config `drop` folds — see `parseMissingWindowBehavior`) the
+    // snapshot re-saves, pruning unlaunched windows the way Rust's
+    // `MissingWindowBehavior::Drop` does; `ignore` keeps the file.
     if restorePlanner != nil, Date() > restoreDeadline {
         applyRestoreActiveRows()
+        let hadPlan = restoreState != nil
         restorePlanner = nil
         restoreState = nil
+        if hadPlan, resolved.restoreMissingWindows == .close {
+            saveSessionState()
+            print("restore: pruned missing windows (re-saved)")
+        }
         print("restore: grace expired (running live)")
     }
     // One viewport per workspace (display); the active display's rect
@@ -1544,6 +1877,16 @@ func tick() {
     )
     // Script hosting runs before the core consumes `pending`.
     drainLuaFrame()
+    // Pointer-drag drive: fold the inter-tick travel into one clamped
+    // delta ahead of the snapshot, so the column tracks the pointer
+    // with one frame of lag instead of bursting per HID event.
+    if let grabbed = dragGrabbed {
+        let dx = Int32(max(-dragFoldClamp, min(dragFoldClamp, dragFoldDX.rounded())))
+        if dx != 0, pending.count < 1024 {
+            pending.append(.dragMoved(id: grabbed, dx: dx))
+            dragFoldDX -= Double(dx)
+        }
+    }
     let events: [DaemonEvent] =
         pending.count > maxEventsPerTick
         ? Array(pending.prefix(maxEventsPerTick)) : pending
@@ -1557,6 +1900,10 @@ func tick() {
     for job in result.axJobs {
         let wid = CGWindowID(job.winID)
         guard let window = roster[wid] else { continue }
+        // Minimized windows hold no on-screen frame: AX writes would
+        // fail against the dock tile, so skip like roster-misses (the
+        // unacked job simply doesn't complete; deminimize resumes).
+        guard !minimizedWindows.contains(job.winID) else { continue }
         if let origin = job.origin {
             _ = window.reposition(to: origin)
         }
@@ -1574,6 +1921,131 @@ func tick() {
     // Cursor warp requests (display hops) go straight to the tap layer.
     if let warp = core.takeMouseWarp() {
         warpMouse(to: CGPoint(x: Double(warp.x), y: Double(warp.y)))
+        print("mouse: hop warp \(warp.x),\(warp.y)")
+    }
+    // Mouse-follows-focus: a focus arrival the pointer didn't cause
+    // warps to the window's visible center (simplified
+    // `Added<FocusedMarker>` arrival system — no skip-reshuffle
+    // generation, so an FFM hover echo can round-trip; hovers never
+    // warp, only keyboard and ambient arrivals do). Display hops above
+    // land first; the window center then wins, like Rust's arrival
+    // pass running after the move commands.
+    if resolved.mouseFollowsFocus,
+       let id = result.focus, id != prevMffFocus,
+       !tap.leftButtonHeld,
+       Date().timeIntervalSince(tap.lastSwipe) >= mouseFollowSwipeQuiet,
+       let window = roster[CGWindowID(bitPattern: id)],
+       let ws = workspaceOfWindow(id),
+       let view = viewports[ws]
+    {
+        let frame = window.frame
+        let pressInside =
+            tap.lastMouseDown.map { press in
+                Date().timeIntervalSince(press.at) < mouseFollowPressWindow
+                    && frame.contains(IntPoint(
+                        Int32(press.point.x.rounded()),
+                        Int32(press.point.y.rounded())
+                    ))
+            } ?? false
+        if !pressInside {
+            let cause: DaemonCore.FollowCause =
+                Date().timeIntervalSince(lastKeyCommandAt) < mouseFollowKeyWindow
+                ? .keyboard : .ambient
+            // An unknown cursor still recenters for keyboard arrivals
+            // (the pure decision ignores it there); ambient ones hold.
+            let cursor = cursorAXPoint()
+            if cause == .keyboard || cursor != nil,
+               let target = core.followWarpTarget(
+                   focusFrame: frame, viewport: view,
+                   cursor: cursor ?? IntPoint(0, 0),
+                   cause: cause, enabled: true
+               )
+            {
+                warpMouse(to: CGPoint(x: Double(target.x), y: Double(target.y)))
+                print("mouse: follow warp \(target.x),\(target.y) window=\(id) cause=\(cause)")
+            }
+        }
+    }
+    prevMffFocus = result.focus
+    // Drop ghost: a full-height bar tracking the grabbed column's
+    // landing slot (shared `dropSlot` math, so ghost == landing).
+    // Steady ticks skip the presenter instead of rewriting layers.
+    if let grabbed = dragGrabbed, let cursor = cursorAXPoint(),
+       let slot = core.dropSlot(
+           pointerX: cursor.x, viewports: viewports, excluding: grabbed
+       ),
+       let view = viewports[slot.workspace]
+    {
+        let barX = min(max(Double(cursor.x), Double(view.min.x)), Double(view.max.x))
+        let rect = CGRect(
+            x: barX - 3, y: Double(view.min.y),
+            width: 6, height: Double(view.height)
+        )
+        if lastGhostRect != rect {
+            lastGhostRect = rect
+            Presenter.showDrop(rect: rect, style: focusedStyle)
+        }
+    } else if lastGhostRect != nil {
+        lastGhostRect = nil
+        Presenter.hideDrop()
+    }
+    // Focus history records every arrival (idempotent on steady
+    // focus); the reader below spends it on focusless workspace
+    // switches.
+    if let id = result.focus {
+        focusHistory.record(
+            id, workspace: workspaceOfWindow(id) ?? core.activeWorkspace,
+            floating: core.unmanaged.contains(id)
+        )
+    }
+    if let prev = prevActiveWS, prev != core.activeWorkspace {
+        if result.focus == nil,
+           let last = focusHistory.lastManaged(workspace: core.activeWorkspace)
+               ?? focusHistory.lastFloating(workspace: core.activeWorkspace),
+           workspaceOfWindow(last) == core.activeWorkspace
+        {
+            pending.append(.focus(id: last))
+        }
+    }
+    prevActiveWS = core.activeWorkspace
+    // Pointer poll (~4Hz, movement-gated): edge warp first, then
+    // hover focus. A still cursor costs nothing past the timestamp
+    // check; drags, fresh swipes, and the restore window all hold
+    // (a teleported cursor skips hover until the next motion).
+    if tickCount % 15 == 0, tap.lastMouseMovedAt > lastPointerPoll {
+        lastPointerPoll = Date()
+        if !tap.leftButtonHeld,
+           Date().timeIntervalSince(tap.lastSwipe) >= mouseFollowSwipeQuiet,
+           restorePlanner == nil,
+           let cursor = cursorAXPoint()
+        {
+            var warped = false
+            if let warp = resolved.horizontalMouseWarp,
+               let landing = core.edgeWarpLanding(
+                   cursor: cursor, displays: Array(viewports.values),
+                   warpDirection: warp,
+                   yOffset: resolved.horizontalMouseWarpOffset
+               )
+            {
+                warpMouse(to: CGPoint(x: Double(landing.x), y: Double(landing.y)))
+                print("mouse: edge warp \(landing.x),\(landing.y)")
+                warped = true
+            }
+            if !warped, resolved.focusFollowsMouse,
+               let hovered = core.hoverFocusTarget(
+                   frontToBack: (onScreenWindowIDs() ?? []).map { windowID($0) },
+                   focusable: Set(core.strips.values.flatMap {
+                       $0.values.flatMap { $0.allWindows }
+                   })
+                   .subtracting(minimizedWindows)
+                   .subtracting(stashedMembers),
+                   frames: { roster[CGWindowID(bitPattern: $0)]?.frame },
+                   cursor: cursor
+               ), hovered != core.focus
+            {
+                pending.append(.focus(id: hovered))
+            }
+        }
     }
     // Restore placement runs after the core ingests this frame's
     // `.appeared` events (placing earlier gets undone when they land)
@@ -1581,6 +2053,16 @@ func tick() {
     // Unready windows (event still queued) retry on later ticks.
     if !restorePending.isEmpty {
         restorePending = restorePending.filter { !restoreAdopted(ref: $0) }
+    }
+    // Session persistence marks dirty on any live change (Rust
+    // `Changed<…>` gate, simplified): a busy tick, a focus or row
+    // move, or a roster size change. The 30s cadence by the tap
+    // ladder does the write; a crash loses at most one interval.
+    if !result.quiescent || result.focus != prevTickFocus
+        || core.activeVirtual[core.activeWorkspace] != prevTickRow
+        || roster.count != prevTickRoster
+    {
+        stateDirty = true
     }
     // Clipboard delivery for copyRule, edge-triggered.
     if let rule = core.lastCopiedRule, rule != copiedRuleSent {
@@ -1632,6 +2114,12 @@ func tick() {
         case .failed:
             print("input: warning: event tap dead (commands still arrive via the menubar)")
         }
+    }
+    // Saved-state persistence, Rust 30s dirty cadence: a quiet
+    // interval skips the write entirely.
+    if tickCount % 1800 == 0, stateDirty {
+        stateDirty = false
+        saveSessionState()
     }
     // Present borders. An empty plan means steady state: the pool already
     // shows exactly this set, so skip the sync — resolving deltas-only
@@ -1827,36 +2315,167 @@ if let tuningPath {
 // inside the grace window slot into their saved strips.
 loadRestoreState()
 
+// Crash marker: a leftover means the previous run never saved
+// cleanly (its snapshot may lag up to one interval). Gated on
+// restore like the saves themselves.
+if resolved.restoreEnabled {
+    if sessionCrashedPreviously(statePath: sessionStatePath()) {
+        print("restore: previous run ended uncleanly (state may lag up to one interval)")
+    }
+    markSessionRunning(statePath: sessionStatePath())
+}
+
 // MARK: - Session restore
 
 /// Saved-state restore: load once at startup, match newcomers inside
-/// the grace window, drop the plan at expiry. Read-only against
-/// Rust-written state files (this daemon never writes them yet);
-/// floats restore membership only, tiled strips restore structure.
-/// (Globals live above with the other top-level state.)
+/// the grace window, drop the plan at expiry; the 30s dirty cadence
+/// below re-saves the live layout, so restarts restore Swift-written
+/// snapshots too. Floats restore membership only, tiled strips
+/// restore structure. (Globals live above with the other top-level
+/// state.)
 
-/// `$XDG_DATA_HOME/paneru/state.json`, else `~/.local/share/...`.
+/// Rust `default_state_file_path`, honoring this launch's home (the
+/// helper defaults to the process home).
 func sessionStatePath() -> String {
-    let base = ProcessInfo.processInfo.environment["XDG_DATA_HOME"]
-        ?? (home + "/.local/share")
-    return base + "/paneru/state.json"
+    defaultSessionStatePath(homeDirectory: home)
 }
 
-/// Load the saved state when restore is enabled. Failures (missing
-/// file, version gate, corrupt JSON) warn and run fresh.
+/// Load the saved state when restore is enabled. A missing primary
+/// runs fresh silently (first launch); corrupt or version-gated
+/// files fall back to `.bak` inside the reader, anything worse warns.
 func loadRestoreState() {
     guard resolved.restoreEnabled else { return }
     let path = sessionStatePath()
-    guard let data = try? Data(contentsOf: URL(fileURLWithPath: path)) else { return }
     do {
-        let state = try decodeSessionState(data)
+        let state = try readSessionStateFile(primaryPath: path)
         restoreState = state
         restorePlanner = RestorePlanner(state: state)
         let graceMs = resolved.restoreStartupGraceMs
         restoreDeadline = Date().addingTimeInterval(Double(graceMs) / 1000.0)
         print("restore: loaded \(path) (\(state.workspaces.count) workspaces, grace \(graceMs)ms)")
     } catch {
-        print("restore: warning: \(error) (starting fresh)")
+        // Missing file and missing backup alike land here: first
+        // launch stays silent, real failures name themselves.
+        let missing =
+            (error as NSError).domain == NSCocoaErrorDomain
+            && (error as NSError).code == NSFileReadNoSuchFileError
+        if !missing {
+            print("restore: warning: \(error) (starting fresh)")
+        }
+    }
+}
+
+/// One saved window from live state: probed AX identity where known,
+/// struct defaults elsewhere (so a Swift-written file
+/// fallback-matches after restart, like a Rust one).
+func savedWindow(
+    id: WindowID, displayID: UInt32?, frame: SavedRect?
+) -> SavedWindow {
+    let meta = core.windowMetadata[id]
+    return SavedWindow(
+        windowID: id, pid: windowPIDs[id] ?? 0, psn: 0,
+        bundleID: meta?.bundleID ?? "", title: meta?.title ?? "",
+        identifier: meta?.identifier ?? "main",
+        role: meta?.role ?? "AXWindow",
+        subrole: meta?.subrole ?? "AXStandardWindow",
+        displayID: displayID, frame: frame
+    )
+}
+
+func savedRect(_ frame: IntRect) -> SavedRect {
+    SavedRect(
+        minX: frame.min.x, minY: frame.min.y,
+        maxX: frame.max.x, maxY: frame.max.y
+    )
+}
+
+/// Live layout as a state file: one workspace per display-ring entry
+/// with row-sorted strips, per-window display and AX frame for the
+/// geometry tie-break. Only strip membership persists (floats carry
+/// no flag — like Rust, they reappear only if still in a strip).
+func extractSessionState() -> PaneruSessionState {
+    let savedFrame: (WindowID) -> SavedRect? = { id in
+        guard let frame = roster[CGWindowID(bitPattern: id)]?.frame else { return nil }
+        return savedRect(frame)
+    }
+    let displays = axDisplayFrames().map { entry -> SavedDisplay in
+        let onDisplay = workspaceDisplay
+            .filter { $0.value == entry.id }.map { $0.key }.sorted()
+        return SavedDisplay(
+            displayID: entry.id, uuid: nil, bounds: savedRect(entry.frame),
+            active: onDisplay.contains(core.activeWorkspace),
+            workspaceIDs: onDisplay
+        )
+    }
+    let workspaces = displayWorkspaceRing().map { ws -> SavedWorkspace in
+        let displayID = workspaceDisplay[ws]
+        let strips = (core.strips[ws] ?? [:]).keys.sorted().compactMap { row -> SavedStrip? in
+            guard let strip = core.strips[ws]?[row] else { return nil }
+            let columns: [SavedColumn] = strip.columns.compactMap { column in
+                switch column {
+                case .single(let id):
+                    return .single(savedWindow(
+                        id: id, displayID: displayID, frame: savedFrame(id)
+                    ))
+                case .fullscreen(let id):
+                    return .fullscreen(savedWindow(
+                        id: id, displayID: displayID, frame: savedFrame(id)
+                    ))
+                case .tabs(let ids):
+                    guard !ids.isEmpty else { return nil }
+                    return .tabs(ids.map {
+                        savedWindow(id: $0, displayID: displayID, frame: savedFrame($0))
+                    })
+                case .stack(let items):
+                    let mapped: [SavedStackItem] = items.compactMap { item in
+                        switch item {
+                        case .single(let id):
+                            return .single(savedWindow(
+                                id: id, displayID: displayID, frame: savedFrame(id)
+                            ))
+                        case .tabs(let ids):
+                            guard !ids.isEmpty else { return nil }
+                            return .tabs(ids.map {
+                                savedWindow(
+                                    id: $0, displayID: displayID,
+                                    frame: savedFrame($0)
+                                )
+                            })
+                        }
+                    }
+                    guard !mapped.isEmpty else { return nil }
+                    return .stack(mapped)
+                }
+            }
+            guard !columns.isEmpty else { return nil }
+            return SavedStrip(virtualIndex: row, columns: columns)
+        }
+        // workspace_id is the live SLS space when resolved (Rust
+        // files read fully now), else the legacy display index —
+        // restore ignores the id for mapping either way.
+        return SavedWorkspace(
+            workspaceID: core.spaceOfWorkspace[ws] ?? ws,
+            displayID: displayID, displayUUID: nil,
+            activeVirtualIndex: core.activeVirtual[ws], strips: strips
+        )
+    }
+    return PaneruSessionState(
+        version: sessionStateVersion,
+        timestamp: queryTimestamp(),
+        activeDisplayID: workspaceDisplay[core.activeWorkspace],
+        displays: displays, workspaces: workspaces
+    )
+}
+
+/// Persist the live layout (atomic tmp+rename with `.bak` rotation).
+/// Failures warn; the next interval retries. Gated on restore like
+/// the load: a disabled restore leaves no files behind.
+func saveSessionState() {
+    guard resolved.restoreEnabled else { return }
+    do {
+        try writeSessionStateFile(extractSessionState(), at: sessionStatePath())
+    } catch {
+        print("restore: warning: save failed (\(error))")
     }
 }
 
@@ -1949,13 +2568,9 @@ func applyRestoreActiveRows() {
 /// workspace. Live UUIDs are unresolved, so numeric/geometry do the
 /// work today (mirrors Rust's UUID → numeric → active pick).
 func restoreWorkspace(for strip: PlannedStrip) -> WorkspaceID {
-    let liveFrames: [IntRect] = displayScreens.map { entry in
-        IntRect(
-            min: IntPoint(Int32(entry.frame.origin.x.rounded()), Int32(entry.frame.origin.y.rounded())),
-            max: IntPoint(Int32(entry.frame.maxX.rounded()), Int32(entry.frame.maxY.rounded()))
-        )
-    }
-    let liveIDs = displayScreens.map { $0.id }
+    let live = axDisplayFrames()
+    let liveFrames = live.map { $0.frame }
+    let liveIDs = live.map { $0.id }
     if let displayID = strip.displayID,
        let index = liveIDs.firstIndex(of: displayID)
     {

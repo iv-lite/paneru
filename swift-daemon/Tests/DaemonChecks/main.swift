@@ -1,6 +1,7 @@
 import Commands
 import Foundation
 import Daemon
+import Layout
 import Geometry
 import Presentation
 import WindowSet
@@ -644,6 +645,335 @@ do {
     )
     checkEqual(daemon.activeWorkspace, 1, "lone display holds")
     checkEqual(daemon.takeMouseWarp(), nil, "lone hops warp nothing")
+}
+
+// Mouse-follow decision is pure: keyboard arrivals always recenter on
+// the visible center, ambient ones hold when the cursor is already
+// inside, and slivers/off-screen frames never warp.
+do {
+    let daemon = DaemonCore()
+    let view = IntRect(0, 0, 1024, 768)
+    let frame = IntRect(100, 100, 500, 500)
+    checkEqual(
+        daemon.followWarpTarget(
+            focusFrame: frame, viewport: view, cursor: IntPoint(0, 0),
+            cause: .ambient, enabled: false
+        ), nil, "follow off warps nothing"
+    )
+    checkEqual(
+        daemon.followWarpTarget(
+            focusFrame: nil, viewport: view, cursor: IntPoint(0, 0),
+            cause: .keyboard, enabled: true
+        ), nil, "no frame warps nothing"
+    )
+    checkEqual(
+        daemon.followWarpTarget(
+            focusFrame: frame, viewport: view, cursor: IntPoint(200, 200),
+            cause: .ambient, enabled: true
+        ), nil, "ambient holds when the cursor is inside"
+    )
+    checkEqual(
+        daemon.followWarpTarget(
+            focusFrame: frame, viewport: view, cursor: IntPoint(200, 200),
+            cause: .keyboard, enabled: true
+        ), IntPoint(300, 300), "keyboard recenters even when inside"
+    )
+    checkEqual(
+        daemon.followWarpTarget(
+            focusFrame: frame, viewport: view, cursor: IntPoint(900, 700),
+            cause: .ambient, enabled: true
+        ), IntPoint(300, 300), "outside cursor warps to the window center"
+    )
+    checkEqual(
+        daemon.followWarpTarget(
+            focusFrame: IntRect(900, 100, 1200, 500), viewport: view,
+            cursor: IntPoint(0, 0), cause: .ambient, enabled: true
+        ), IntPoint(962, 300), "half-hung windows warp to the visible center"
+    )
+    checkEqual(
+        daemon.followWarpTarget(
+            focusFrame: IntRect(2000, 2000, 2010, 2010), viewport: view,
+            cursor: IntPoint(0, 0), cause: .keyboard, enabled: true
+        ), nil, "slivers never warp, even for keyboard"
+    )
+    checkEqual(
+        daemon.followWarpTarget(
+            focusFrame: IntRect(2000, 0, 2400, 768), viewport: view,
+            cursor: IntPoint(0, 0), cause: .keyboard, enabled: true
+        ), nil, "off-screen frames warp nothing"
+    )
+}
+
+// Hover focus picks the frontmost focusable window under the cursor.
+do {
+    let daemon = DaemonCore()
+    let frames: [WindowID: IntRect] = [
+        0: IntRect(0, 0, 500, 500),
+        1: IntRect(100, 100, 600, 600),
+    ]
+    let pick = { (order: [WindowID], focusable: Set<WindowID>, cursor: IntPoint, focus: WindowID?) in
+        daemon.hoverFocusTarget(
+            frontToBack: order, focusable: focusable,
+            frames: { frames[$0] }, cursor: cursor
+        )
+    }
+    checkEqual(
+        pick([1, 0], [0, 1], IntPoint(200, 200), 7), 1,
+        "frontmost under cursor wins"
+    )
+    checkEqual(
+        pick([1, 0], [0], IntPoint(200, 200), 7), 0,
+        "unfocusable front windows are skipped"
+    )
+    checkEqual(
+        pick([1, 0], [0, 1], IntPoint(700, 700), 7), nil,
+        "empty space focuses nothing"
+    )
+    checkEqual(
+        pick([1, 0], [0, 1], IntPoint(10, 10), 7), 0,
+        "back windows still catch the cursor"
+    )
+}
+
+// Edge warp jumps displays at the 3px threshold, landing 6px inside
+// the opposite edge with relative Y preserved.
+do {
+    let daemon = DaemonCore()
+    // Stacked pair: main (0,0 1920x1080) above tall (1920,1080 1920x1080).
+    let upper = IntRect(0, 0, 1920, 1080)
+    let lower = IntRect(1920, 1080, 3840, 2160)
+    let displays = [upper, lower]
+    checkEqual(
+        daemon.edgeWarpLanding(
+            cursor: IntPoint(1, 500), displays: displays,
+            warpDirection: 1, yOffset: 0
+        ), IntPoint(3834, 1580), "positive warp: left edge goes down"
+    )
+    checkEqual(
+        daemon.edgeWarpLanding(
+            cursor: IntPoint(3839, 1500), displays: displays,
+            warpDirection: 1, yOffset: 0
+        ), IntPoint(6, 420), "positive warp: right edge goes up"
+    )
+    checkEqual(
+        daemon.edgeWarpLanding(
+            cursor: IntPoint(1919, 500), displays: displays,
+            warpDirection: -1, yOffset: 0
+        ), IntPoint(1926, 1580), "negative warp: right edge goes down"
+    )
+    checkEqual(
+        daemon.edgeWarpLanding(
+            cursor: IntPoint(1, 500), displays: displays,
+            warpDirection: -1, yOffset: 0
+        ), nil, "negative warp: nothing above the top display"
+    )
+    checkEqual(
+        daemon.edgeWarpLanding(
+            cursor: IntPoint(500, 500), displays: displays,
+            warpDirection: -1, yOffset: 0
+        ), nil, "interior cursors never warp"
+    )
+    checkEqual(
+        daemon.edgeWarpLanding(
+            cursor: IntPoint(1, 500), displays: [upper],
+            warpDirection: 1, yOffset: 0
+        ), nil, "lone displays never warp"
+    )
+    checkEqual(
+        daemon.edgeWarpLanding(
+            cursor: IntPoint(1921, 1500), displays: displays,
+            warpDirection: -1, yOffset: 10
+        ), IntPoint(1914, 410), "negative warp: left edge goes up with signed offset"
+    )
+    let short = IntRect(1920, 1080, 3840, 1500)
+    checkEqual(
+        daemon.edgeWarpLanding(
+            cursor: IntPoint(1, 1000), displays: [upper, short],
+            warpDirection: 1, yOffset: 0
+        ), nil, "unmappable heights skip the warp"
+    )
+}
+
+// Healing focus picks the surviving column nearest the viewport
+// center, skipping tabs and the lost window.
+do {
+    let daemon = DaemonCore()
+    var strip = LayoutStrip(id: 1, virtualIndex: 0)
+    strip.append(0)
+    strip.append(1)
+    strip.appendTabGroup([2, 3])
+    let frames: [WindowID: IntRect] = [
+        0: IntRect(0, 0, 100, 100),
+        1: IntRect(900, 0, 1000, 100),
+        2: IntRect(450, 0, 550, 100),
+        3: IntRect(450, 0, 550, 100),
+    ]
+    let view = IntRect(0, 0, 1024, 768)
+    checkEqual(
+        daemon.healFocusTarget(
+            strip: strip, viewport: view,
+            frames: { frames[$0] }, lost: 9
+        ), 1, "nearest column to center wins"
+    )
+    checkEqual(
+        daemon.healFocusTarget(
+            strip: strip, viewport: view,
+            frames: { frames[$0] }, lost: 1
+        ), 0, "lost window is excluded"
+    )
+    var tabsOnly = LayoutStrip(id: 1, virtualIndex: 0)
+    tabsOnly.appendTabGroup([2, 3])
+    checkEqual(
+        daemon.healFocusTarget(
+            strip: tabsOnly, viewport: view,
+            frames: { frames[$0] }, lost: 9
+        ), nil, "tabs never take healing focus"
+    )
+    checkEqual(
+        daemon.healFocusTarget(
+            strip: LayoutStrip(id: 1, virtualIndex: 0), viewport: view,
+            frames: { frames[$0] }, lost: 9
+        ), nil, "empty strips heal nothing"
+    )
+}
+
+// Vanish triage: listed-but-off-screen hides, twice-missed drops,
+// first misses stage (flakes never drop).
+do {
+    let daemon = DaemonCore()
+    let triage = { (known: Set<WindowID>, on: Set<WindowID>, listed: Set<WindowID>, staged: Set<WindowID>) in
+        daemon.classifyVanished(known: known, onScreen: on, listed: listed, staged: staged)
+    }
+    let first = triage([0, 1, 2, 3], [0], [0, 1], [3])
+    checkEqual(first.hide, [1], "listed-but-off-screen hides")
+    checkEqual(first.drop, [3], "twice-missed drops")
+    checkEqual(first.stage, [2], "first miss stages")
+    check(
+        triage([0], [0, 1], [0, 1], []).hide.isEmpty
+            && triage([0], [0, 1], [0, 1], []).drop.isEmpty,
+        "on-screen windows triage nowhere"
+    )
+}
+
+// Space rotation stashes the outgoing layout and restores the
+// incoming (or starts fresh); unknown spaces never rotate.
+do {
+    var daemon = DaemonCore()
+    _ = daemon.tick(
+        events: [.appeared(id: 0, workspace: 1)],
+        frames: frames(slots: [0: IntPoint(0, 0)]),
+        viewport: viewport, focusedStyle: style
+    )
+    check(!daemon.resolveSpace(workspace: 1, space: 0), "space 0 never rotates")
+    check(!daemon.resolveSpace(workspace: 1, space: 11), "first sighting only records")
+    checkEqual(daemon.spaceOfWorkspace[1], 11, "records the live space")
+    check(daemon.resolveSpace(workspace: 1, space: 22), "switch rotates")
+    checkEqual(
+        daemon.strips[1]?[0]?.allWindows ?? [], [],
+        "outgoing layout stashed away"
+    )
+    checkEqual(daemon.spaceStash[11]?.rows[0]?.allWindows, [0], "stash holds the old strip")
+    _ = daemon.tick(
+        events: [.appeared(id: 1, workspace: 1)],
+        frames: frames(slots: [0: IntPoint(0, 0), 1: IntPoint(0, 0)]),
+        viewport: viewport, focusedStyle: style
+    )
+    check(daemon.resolveSpace(workspace: 1, space: 11), "switching back rotates")
+    checkEqual(daemon.strips[1]?[0]?.allWindows, [0], "incoming layout restores")
+    daemon.pruneSpaces(keeping: [11, 22])
+    checkEqual(
+        daemon.spaceStash[22]?.rows[0]?.allWindows, [1],
+        "live stashes survive pruning"
+    )
+    daemon.pruneSpaces(keeping: [11])
+    checkEqual(daemon.spaceStash[22], nil, "destroyed spaces prune")
+    checkEqual(
+        daemon.spaceStash[11]?.rows[0]?.allWindows, [0],
+        "live spaces survive pruning"
+    )
+    daemon.pruneSpaces(keeping: nil)
+    checkEqual(
+        daemon.spaceStash[11]?.rows[0]?.allWindows, [0],
+        "nil enumeration skips pruning"
+    )
+}
+
+// Query visibility is geometric: largest slice wins, slivers hide.
+do {
+    let daemon = DaemonCore()
+    let view = IntRect(0, 0, 1024, 768)
+    checkEqual(
+        daemon.queryVisibleWindow(
+            frame: IntRect(100, 100, 500, 500), viewports: [view], sliverWidth: 5
+        ), true, "overlapping frames are visible"
+    )
+    checkEqual(
+        daemon.queryVisibleWindow(
+            frame: IntRect(1020, 100, 1220, 500), viewports: [view], sliverWidth: 5
+        ), false, "4px slivers are hidden"
+    )
+    checkEqual(
+        daemon.queryVisibleWindow(
+            frame: nil, viewports: [view], sliverWidth: 5
+        ), false, "frameless windows are hidden"
+    )
+    checkEqual(
+        daemon.queryVisibleWindow(
+            frame: IntRect(0, 0, 100, 100), viewports: [], sliverWidth: 5
+        ), false, "no displays hides everything"
+    )
+}
+
+// Pointer drops relocate whole columns: far-right drops go last,
+// drops over another display transfer (following focus), drops
+// outside every viewport glide home via plain release instead.
+do {
+    var daemon = DaemonCore()
+    let left = IntRect(0, 0, 1024, 768)
+    let right = IntRect(1024, 0, 2048, 768)
+    _ = daemon.tick(
+        events: [
+            .appeared(id: 0, workspace: 1), .appeared(id: 1, workspace: 1),
+            .appeared(id: 2, workspace: 1), .appeared(id: 3, workspace: 2),
+        ],
+        frames: frames(slots: [
+            0: IntPoint(0, 0), 1: IntPoint(0, 0),
+            2: IntPoint(0, 0), 3: IntPoint(1024, 0),
+        ]),
+        viewports: [1: left, 2: right], focusedStyle: style
+    )
+    checkEqual(
+        daemon.dropSlot(pointerX: 5000, viewports: [1: left, 2: right], excluding: nil)?.workspace,
+        nil, "drops outside every viewport name nothing"
+    )
+    checkEqual(
+        daemon.dropSlot(pointerX: 100, viewports: [9: left], excluding: nil)?.workspace,
+        9, "empty strips take drops at row zero"
+    )
+    _ = daemon.tick(
+        events: [.drop(id: 0, x: 1023)],
+        frames: frames(slots: [
+            0: IntPoint(0, 0), 1: IntPoint(0, 0),
+            2: IntPoint(0, 0), 3: IntPoint(1024, 0),
+        ]),
+        viewports: [1: left, 2: right], focusedStyle: style
+    )
+    checkEqual(
+        daemon.strips[1]?[0]?.allWindows, [1, 2, 0],
+        "far-right drops land last"
+    )
+    _ = daemon.tick(
+        events: [.drop(id: 0, x: 1500)],
+        frames: frames(slots: [
+            0: IntPoint(0, 0), 1: IntPoint(0, 0),
+            2: IntPoint(0, 0), 3: IntPoint(1024, 0),
+        ]),
+        viewports: [1: left, 2: right], focusedStyle: style
+    )
+    let rightRow = daemon.strips[2]?[0]?.allWindows ?? []
+    check(rightRow.contains(0) && rightRow.contains(3), "cross-display drops transfer")
+    checkEqual(daemon.activeWorkspace, 2, "transfer follows the column")
+    checkEqual(daemon.focus, 0, "transfer focuses the column head")
 }
 
 // Restore placement relocates whole columns into planned slots,

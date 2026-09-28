@@ -175,6 +175,16 @@ public final class LiveTap {
     public var tuning = TapTuning()
     public var lastSwipe = Date.distantPast
     public var leftButtonHeld = false
+    /// Last physical press (either button) in Quartz screen space —
+    /// the daemon's frame space, so no flip is needed. Lets
+    /// mouse-follows-focus tell click arrivals (never yank the click
+    /// point) from keyboard ones (always recenter).
+    public var lastMouseDown: (point: CGPoint, at: Date)?
+    /// Last pointer motion, drags included. Hover and edge polls key
+    /// off it so a still cursor costs no WindowServer round trips;
+    /// storing the timestamp (never the event) keeps the tap
+    /// stall-proof by construction.
+    public var lastMouseMovedAt = Date.distantPast
     private var fingerPositions: [(id: AnyObject, x: Double, y: Double)] = []
 
     /// Resolution closures (see `resolveKeypress`).
@@ -277,16 +287,29 @@ public final class LiveTap {
         switch type {
         case .leftMouseDown, .rightMouseDown:
             if type == .leftMouseDown { leftButtonHeld = true }
-            // Pointer motion is never daemon input: sinking it queued a
-            // `.printState` per HID burst, growing `pending` without bound
-            // and keeping the main runloop (which also owns this tap)
-            // saturated until input starved. Track the button and deliver
-            // natively.
+            lastMouseDown = (event.location, Date())
+            lastMouseMovedAt = Date()
+            // Sunk for grab tracking, never swallowed: clicks and
+            // focus echoes still deliver natively (the tap returns
+            // false below). Drags are bounded by the button itself;
+            // motion without a button stays unsunk (see below).
+            sink?(.mouseDown(point: event.location, modifiers: modifiers))
             return false
         case .leftMouseUp, .rightMouseUp:
             if type == .leftMouseUp { leftButtonHeld = false }
+            sink?(.mouseUp(point: event.location, modifiers: modifiers))
             return false
-        case .leftMouseDragged, .rightMouseDragged, .mouseMoved:
+        case .leftMouseDragged, .rightMouseDragged:
+            lastMouseMovedAt = Date()
+            sink?(.mouseDragged(point: event.location, modifiers: modifiers))
+            return false
+        case .mouseMoved:
+            lastMouseMovedAt = Date()
+            // Pointer motion is never daemon input: sinking it queued a
+            // `.printState` per HID burst, growing `pending` without bound
+            // and keeping the main runloop (which also owns this tap)
+            // saturated until input starved. Track the motion timestamp
+            // and deliver natively.
             return false
         case .keyDown:
             let keycode = UInt8(clamping: event.getIntegerValueField(.keyboardEventKeycode))

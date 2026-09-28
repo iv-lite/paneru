@@ -18,6 +18,9 @@ import CoreGraphics
 public typealias WindowID = Int32
 /// Workspace identity. Mirrors `platform::WorkspaceId` (`u64`).
 public typealias WorkspaceID = UInt64
+/// Native SLS space identity (`u64`). Display-indexed workspaces use
+/// small ids; live spaces arrive here once SkyBridge resolves them.
+public typealias SpaceID = UInt64
 
 /// Sliver kept visible for parked (inactive-row) windows so macOS never
 /// relocates them to another display. Mirrors `layout::PARKED_STRIP_SLIVER`.

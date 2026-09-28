@@ -564,3 +564,91 @@ private func rectContains(_ rect: IntRect, _ point: (Int32, Int32)) -> Bool {
     point.0 >= rect.min.x && point.0 < rect.min.x + rect.width
         && point.1 >= rect.min.y && point.1 < rect.min.y + rect.height
 }
+
+// MARK: - Paths and persistence
+
+/// Rust `PaneruState::default_state_file_path`: the XDG state dir
+/// (`~/.local/state/paneru/state.json`), falling back to a
+/// `paneru/state.json` under the temp dir when no home resolves.
+/// (An older Swift build read `~/.local/share` — Rust never wrote
+/// there, so nothing migrates.)
+public func defaultSessionStatePath(
+    environment: [String: String] = ProcessInfo.processInfo.environment,
+    homeDirectory: String = NSHomeDirectory(),
+    temporaryDirectory: String = NSTemporaryDirectory()
+) -> String {
+    let base: String
+    if let xdg = environment["XDG_STATE_HOME"], !xdg.isEmpty {
+        base = xdg
+    } else if !homeDirectory.isEmpty {
+        base = homeDirectory + "/.local/state"
+    } else {
+        base = temporaryDirectory
+    }
+    let trimmed = base.hasSuffix("/") ? String(base.dropLast()) : base
+    return trimmed + "/paneru/state.json"
+}
+
+/// Persist one snapshot: rotate the current file to `.bak`, write
+/// `.tmp`, rename into place — the reader falls back to `.bak`, so a
+/// crash mid-write loses at most one interval. Mirrors the
+/// `src/ecs/state.rs` rotation.
+public func writeSessionStateFile(_ state: PaneruSessionState, at path: String) throws {
+    let manager = FileManager.default
+    try manager.createDirectory(
+        atPath: (path as NSString).deletingLastPathComponent,
+        withIntermediateDirectories: true
+    )
+    let data = try JSONEncoder().encode(state)
+    let tmpPath = path + ".tmp", bakPath = path + ".bak"
+    try data.write(to: URL(fileURLWithPath: tmpPath), options: .atomic)
+    if manager.fileExists(atPath: path) {
+        try? manager.removeItem(atPath: bakPath)
+        try manager.moveItem(atPath: path, toPath: bakPath)
+    }
+    try manager.moveItem(atPath: tmpPath, toPath: path)
+}
+
+/// Load a state file, falling back to `.bak` on any primary failure
+/// (missing, corrupt, or version-gated) — the writer rotation
+/// guarantees the backup predates the failed write.
+public func readSessionStateFile(primaryPath path: String) throws -> PaneruSessionState {
+    do {
+        return try decodeSessionState(try Data(contentsOf: URL(fileURLWithPath: path)))
+    } catch {
+        return try decodeSessionState(try Data(contentsOf: URL(fileURLWithPath: path + ".bak")))
+    }
+}
+
+// MARK: - Crash marker
+
+/// Sibling `state.crashed` next to the state file: presence means the
+/// previous run never reached its clean-exit save (Rust's panic-hook
+/// mark, approximated — Swift writes at startup and clears on clean
+/// quit, so SIGTERM kills count as crashes, matching the ≤30s loss
+/// budget the same way).
+public func sessionCrashMarkPath(statePath path: String) -> String {
+    (path as NSString).deletingLastPathComponent + "/state.crashed"
+}
+
+/// True once when a leftover mark exists (consumes it).
+public func sessionCrashedPreviously(statePath path: String) -> Bool {
+    let mark = sessionCrashMarkPath(statePath: path)
+    guard FileManager.default.fileExists(atPath: mark) else { return false }
+    try? FileManager.default.removeItem(atPath: mark)
+    return true
+}
+
+public func markSessionRunning(statePath path: String) {
+    let mark = sessionCrashMarkPath(statePath: path)
+    try? FileManager.default.createDirectory(
+        atPath: (mark as NSString).deletingLastPathComponent,
+        withIntermediateDirectories: true
+    )
+    let body = #"{"started":\#(UInt64(Date().timeIntervalSince1970)),"pid":\#(ProcessInfo.processInfo.processIdentifier)}"#
+    try? body.write(toFile: mark, atomically: true, encoding: .utf8)
+}
+
+public func clearSessionRunning(statePath path: String) {
+    try? FileManager.default.removeItem(atPath: sessionCrashMarkPath(statePath: path))
+}

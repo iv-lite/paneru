@@ -49,6 +49,10 @@ public enum DaemonEvent: Equatable, Sendable {
     case dragMoved(id: WindowID, dx: Int32)
     /// Button released: held columns glide home.
     case released
+    /// Pointer drop of a grabbed column at a screen x: reorder into
+    /// the slot under the pointer (same strip) or transfer whole to
+    /// the display under the pointer (cross-display, host-armed).
+    case drop(id: WindowID, x: Int32)
     /// A parsed command (hotkey, socket, script, replay).
     case command(PaneruCommand)
     /// Trackpad swipe: fractional viewport widths, signed by finger travel.
@@ -431,13 +435,37 @@ public struct DaemonCore: Sendable {
                 dirty.formUnion([.layout, .motion])
             case .released:
                 held = nil
-                // Only displaced members owe a home intent; untouched ones
-                // already match their slots.
-                for (id, slot) in committedSlots where positions[id] != slot {
-                    homing.insert(id)
+                settleReleased()
+            case .drop(let id, let x):
+                held = nil
+                // Relocate the whole column into the slot under the
+                // pointer (same strip reorder or armed cross-display
+                // transfer — the host gates arming; unarmed crosses
+                // arrive as .released and glide home instead).
+                if let slot = dropSlot(pointerX: x, viewports: viewports, excluding: id) {
+                    var moving: LayoutColumn?
+                    for ws in Array(strips.keys) {
+                        for row in Array((strips[ws] ?? [:]).keys) {
+                            if var strip = strips[ws]?[row],
+                               let index = strip.index(of: id)
+                            {
+                                moving = strip.removeColumn(at: index)
+                                strips[ws]?[row] = strip
+                            }
+                        }
+                    }
+                    if let moving {
+                        var target = strips[slot.workspace]?[slot.row]
+                            ?? LayoutStrip(id: slot.workspace, virtualIndex: slot.row)
+                        target.insertColumn(at: slot.index, moving)
+                        strips[slot.workspace, default: [:]][slot.row] = target
+                        if slot.workspace != activeWorkspace {
+                            activeWorkspace = slot.workspace
+                            focus = moving.top
+                        }
+                    }
                 }
-                glideHome()
-                dirty.insert(.layout)
+                settleReleased()
             case .command(let command):
                 ingestCommand(command, frames: frames, viewports: viewports, epoch: epoch)
             case .swipe(let delta, _), .scroll(let delta):
@@ -1249,6 +1277,17 @@ public struct DaemonCore: Sendable {
         }
     }
 
+    /// Shared release settle (plain release and pointer drop): only
+    /// displaced members owe a home intent; untouched ones already
+    /// match their slots.
+    private mutating func settleReleased() {
+        for (id, slot) in committedSlots where positions[id] != slot {
+            homing.insert(id)
+        }
+        glideHome()
+        dirty.insert(.layout)
+    }
+
     /// Last committed slot per window: what release homing restores.
     private var committedSlots: [WindowID: IntPoint] = [:]
 
@@ -1695,6 +1734,286 @@ public struct DaemonCore: Sendable {
     public mutating func takeMouseWarp() -> IntPoint? {
         defer { mouseWarp = nil }
         return mouseWarp
+    }
+
+    /// Cause of a focus arrival for mouse-follow gating.
+    public enum FollowCause: Equatable, Sendable {
+        /// A keybind just fired: the pointer didn't cause this.
+        case keyboard
+        /// Anything else (ambient arrival, script, menubar).
+        case ambient
+    }
+
+    /// Mouse-follow decision for one focus arrival (pure): warp the
+    /// cursor to the focused window's visible center (frame ∩ its
+    /// display viewport) when `mouse_follows_focus` owns the pointer.
+    /// Mirrors `src/ecs/focus.rs`: keyboard arrivals always recenter,
+    /// ambient ones skip when the cursor already sits inside the
+    /// visible frame, and parked/hidden slivers (visible area under
+    /// 50×50) never warp. The caller suppresses press arrivals whose
+    /// click landed inside the frame, drags, and swipes — those need
+    /// live tap state the core cannot see.
+    public func followWarpTarget(
+        focusFrame: IntRect?, viewport: IntRect, cursor: IntPoint,
+        cause: FollowCause, enabled: Bool
+    ) -> IntPoint? {
+        guard enabled, let frame = focusFrame else { return nil }
+        let visible = frame.intersected(with: viewport)
+        guard visible.area >= 50 * 50 else { return nil }
+        if cause != .keyboard, visible.contains(cursor) { return nil }
+        return IntPoint(
+            visible.min.x + visible.width / 2,
+            visible.min.y + visible.height / 2
+        )
+    }
+
+    /// Hover-focus pick (pure): the frontmost focusable window under
+    /// the cursor, or nil. The caller gates on movement (no polling
+    /// when the pointer is still), drags, swipes, and the restore
+    /// window — those need live tap/host state the core cannot see.
+    public func hoverFocusTarget(
+        frontToBack: [WindowID], focusable: Set<WindowID>,
+        frames: (WindowID) -> IntRect?, cursor: IntPoint
+    ) -> WindowID? {
+        frontToBack.first { id in
+            focusable.contains(id)
+                && (frames(id).map { $0.contains(cursor) } ?? false)
+        }
+    }
+
+    /// Edge-warp landing (pure): with `horizontal_mouse_warp` set, a
+    /// cursor within 3px of a display's left/right edge jumps to the
+    /// nearest display above/below per the warp sign (positive: left
+    /// edge goes down, right edge up; negative mirrored), preserving
+    /// relative Y plus the signed offset and landing 6px inside the
+    /// opposite edge so it can never sit on a threshold and ping-pong.
+    /// Mirrors `warp_landing` minus velocity carry (polled sampling
+    /// always exceeds the 80ms freshness window, so carry is zero) and
+    /// minus drag arming (Swift has no armed-drag concept: held-button
+    /// drags keep native edge behavior).
+    public func edgeWarpLanding(
+        cursor: IntPoint, displays: [IntRect],
+        warpDirection: Int16, yOffset: Int32
+    ) -> IntPoint? {
+        guard displays.count >= 2,
+              let current = displays.first(where: { $0.contains(cursor) })
+        else { return nil }
+        let onLeftEdge = abs(cursor.x - current.min.x) < 3
+        let onRightEdge = abs(current.max.x - cursor.x) < 3
+        guard onLeftEdge || onRightEdge else { return nil }
+        let candidates = displays.filter { display in
+            guard display != current else { return false }
+            let above = display.min.y < current.min.y
+            let below = display.min.y > current.min.y
+            if onLeftEdge {
+                return warpDirection > 0 ? below : above
+            } else {
+                return warpDirection > 0 ? above : below
+            }
+        }
+        guard let target = candidates.min(by: {
+            abs($0.min.y - current.min.y) < abs($1.min.y - current.min.y)
+        }) else { return nil }
+        let relativeY = cursor.y - current.min.y
+        let directionSign: Int32 =
+            target.min.y > current.min.y ? 1 : -1
+        let targetY = target.min.y + relativeY + yOffset * directionSign
+        guard targetY >= target.min.y, targetY < target.max.y else { return nil }
+        let lo = target.min.x + 3 + 1
+        let hi = target.max.x - (3 + 1)
+        guard lo <= hi else {
+            return IntPoint(
+                target.min.x + (target.max.x - target.min.x) / 2, targetY
+            )
+        }
+        let targetX =
+            onLeftEdge ? min(max(target.max.x - 6, lo), hi)
+            : min(max(target.min.x + 6, lo), hi)
+        return IntPoint(targetX, targetY)
+    }
+
+    /// Vanish triage (pure): split roster ids missing from the
+    /// on-screen list into hidden (still listed, on another Space —
+    /// keep roster and strips), dropped (missing twice running —
+    /// real closes), and staged (first miss — single-sync flakes
+    /// never drop). Reappeared ids are the caller's to unstage.
+    public struct VanishDecision: Equatable, Sendable {
+        public var hide: [WindowID]
+        public var drop: [WindowID]
+        public var stage: [WindowID]
+    }
+
+    public func classifyVanished(
+        known: Set<WindowID>, onScreen: Set<WindowID>,
+        listed: Set<WindowID>, staged: Set<WindowID>
+    ) -> VanishDecision {
+        var decision = VanishDecision(hide: [], drop: [], stage: [])
+        for id in known {
+            if onScreen.contains(id) { continue }
+            if listed.contains(id) { decision.hide.append(id); continue }
+            if staged.contains(id) { decision.drop.append(id); continue }
+            decision.stage.append(id)
+        }
+        decision.hide.sort(); decision.drop.sort(); decision.stage.sort()
+        return decision
+    }
+
+    /// One workspace's layout parked under an inactive SLS space.
+    public struct SpaceStash: Equatable, Sendable {
+        public var rows: [UInt32: LayoutStrip]
+        public var activeRow: UInt32?
+        public var offset: Int32?
+
+        public init(
+            rows: [UInt32: LayoutStrip] = [:],
+            activeRow: UInt32? = nil, offset: Int32? = nil
+        ) {
+            self.rows = rows
+            self.activeRow = activeRow
+            self.offset = offset
+        }
+    }
+
+    /// Current SLS space per workspace (absent = unknown: SLS
+    /// unavailable or not yet resolved — legacy single layout).
+    public var spaceOfWorkspace: [WorkspaceID: SpaceID] = [:]
+    /// Parked layouts of inactive spaces, keyed by space id.
+    public private(set) var spaceStash: [SpaceID: SpaceStash] = [:]
+
+    /// Resolve one workspace onto its live SLS space: stash the
+    /// outgoing layout, restore the incoming (or start fresh), and
+    /// record. Unknown spaces (0) and unchanged mappings are no-ops,
+    /// so an SLS-less launch keeps one layout per display forever.
+    /// Returns true when a switch rotated.
+    @discardableResult
+    public mutating func resolveSpace(workspace: WorkspaceID, space: SpaceID) -> Bool {
+        guard space != 0 else { return false }
+        if let current = spaceOfWorkspace[workspace], current != space {
+            spaceStash[current] = SpaceStash(
+                rows: strips[workspace] ?? [:],
+                activeRow: activeVirtual[workspace],
+                offset: offsets[workspace]
+            )
+            if let incoming = spaceStash[space] {
+                strips[workspace] = incoming.rows
+                if let row = incoming.activeRow {
+                    activeVirtual[workspace] = row
+                } else {
+                    activeVirtual.removeValue(forKey: workspace)
+                }
+                if let offset = incoming.offset {
+                    offsets[workspace] = offset
+                } else {
+                    offsets.removeValue(forKey: workspace)
+                }
+            } else {
+                strips[workspace] = [:]
+                activeVirtual.removeValue(forKey: workspace)
+                offsets.removeValue(forKey: workspace)
+            }
+            dirty.formUnion([.layout, .paint])
+        }
+        let switched = spaceOfWorkspace[workspace] != nil
+            && spaceOfWorkspace[workspace] != space
+        spaceOfWorkspace[workspace] = space
+        return switched
+    }
+
+    /// Drop stashes for spaces no longer managed (SpaceDestroyed). A
+    /// failed enumeration passes nil and skips — never prune on
+    /// missing data.
+    public mutating func pruneSpaces(keeping live: Set<SpaceID>?) {
+        guard let live else { return }
+        spaceStash = spaceStash.filter { live.contains($0.key) }
+    }
+
+    /// Drop slot for a pointer x (readout, pure): the workspace
+    /// whose viewport spans x, its active row, and the insertion
+    /// index — first column strictly right of x. Columns sort by
+    /// committed slot x (unknown slots last, strip order kept for
+    /// ties); the dragged column is excluded and the index is
+    /// removal-adjusted, so host ghost and drop commit agree. Nil
+    /// when x names no workspace (drop there glides home).
+    public func dropSlot(
+        pointerX x: Int32, viewports: [WorkspaceID: IntRect],
+        excluding: WindowID?
+    ) -> (workspace: WorkspaceID, row: UInt32, index: Int)? {
+        guard let (ws, _) = viewports.first(where: {
+            x >= $0.value.min.x && x < $0.value.max.x
+        }) else { return nil }
+        let row = activeVirtual[ws] ?? 0
+        guard let strip = strips[ws]?[row] else { return (ws, row, 0) }
+        let selfIndex: Int? = excluding.flatMap { strip.index(of: $0) }
+        var positioned: [(stripIndex: Int, x: Int32)] = []
+        for (index, column) in strip.columns.enumerated() {
+            if let ex = excluding, column.contains(ex) { continue }
+            var slotX = Int32.max
+            if let top = column.top, let slot = committedSlots[top] {
+                slotX = slot.x
+            }
+            positioned.append((index, slotX))
+        }
+        let ordered = positioned.sorted { $0.x < $1.x }
+        guard let hit = ordered.firstIndex(where: { $0.x > x }) else {
+            return (ws, row, Int.max)
+        }
+        var at = ordered[hit].stripIndex
+        if let selfIndex, at > selfIndex { at -= 1 }
+        return (ws, row, at)
+    }
+
+    /// Healing-focus pick (pure): the surviving column closest to
+    /// the viewport center, skipping tabbed columns (never heal
+    /// into a tab) and the lost window itself. Mirrors Rust
+    /// `give_away_focus` minus the AX raise (the host raises through
+    /// its own path when it enqueues the focus).
+    public func healFocusTarget(
+        strip: LayoutStrip, viewport: IntRect,
+        frames: (WindowID) -> IntRect?, lost: WindowID
+    ) -> WindowID? {
+        let center = IntPoint(
+            viewport.min.x + viewport.width / 2,
+            viewport.min.y + viewport.height / 2
+        )
+        var best: (id: WindowID, distance: Int64)?
+        for column in strip.columns {
+            if case .tabs = column { continue }
+            guard let top = column.top, top != lost,
+                  let frame = frames(top)
+            else { continue }
+            let dx = Int64(frame.min.x + frame.width / 2 - center.x)
+            let dy = Int64(frame.min.y + frame.height / 2 - center.y)
+            let distance = dx * dx + dy * dy
+            if best.map({ distance < $0.distance }) ?? true {
+                best = (top, distance)
+            }
+        }
+        return best?.id
+    }
+
+    /// Query visibility (pure): the display showing the largest slice
+    /// wins; visible when that slice is wider than the sliver width
+    /// and non-empty tall. Mirrors the geometric half of
+    /// `window_visibility` — the host ANDs the minimized set
+    /// (`minimizedWindows`), which this core never sees.
+    public func queryVisibleWindow(
+        frame: IntRect?, viewports: [IntRect], sliverWidth: Int32
+    ) -> Bool {
+        guard let frame else { return false }
+        var bestArea: Int64 = -1
+        var bestSize: (width: Int32, height: Int32)?
+        for view in viewports {
+            let overlap = frame.intersected(with: view)
+            let width: Int32 = max(overlap.width, 0)
+            let height: Int32 = max(overlap.height, 0)
+            let area = Int64(width) * Int64(height)
+            if area > bestArea {
+                bestArea = area
+                bestSize = (width, height)
+            }
+        }
+        guard let bestSize else { return false }
+        return bestSize.width > sliverWidth && bestSize.height > 0
     }
 
     /// Script store + revision live beside the core (owned by Scripting).

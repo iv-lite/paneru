@@ -232,6 +232,79 @@ do {
     )
 }
 
+// State paths mirror Rust's XDG state dir (never `~/.local/share`,
+// which an older Swift build read but Rust never wrote).
+do {
+    checkEqual(
+        defaultSessionStatePath(
+            environment: ["XDG_STATE_HOME": "/xdg/state"],
+            homeDirectory: "/Users/someone"
+        ),
+        "/xdg/state/paneru/state.json", "XDG state home wins"
+    )
+    checkEqual(
+        defaultSessionStatePath(environment: [:], homeDirectory: "/Users/someone"),
+        "/Users/someone/.local/state/paneru/state.json", "home fallback"
+    )
+    checkEqual(
+        defaultSessionStatePath(
+            environment: [:], homeDirectory: "",
+            temporaryDirectory: "/tmp/"
+        ),
+        "/tmp/paneru/state.json", "homeless falls back to temp"
+    )
+}
+
+// Persistence rotation: tmp+rename keeps the previous snapshot in
+// `.bak`, and loads fall back to it on any primary failure.
+do {
+    let dir = FileManager.default.temporaryDirectory
+        .appendingPathComponent("paneru-session-checks-\(Int.random(in: 0..<1_000_000))")
+        .path
+    let path = dir + "/state.json"
+    let first = state(strips: [
+        SavedStrip(virtualIndex: 0, columns: [.single(saved(winID: 7))]),
+    ])
+    var second = first
+    second.timestamp = 1
+    try! writeSessionStateFile(first, at: path)
+    checkEqual(try! readSessionStateFile(primaryPath: path), first, "round-trips")
+    try! writeSessionStateFile(second, at: path)
+    checkEqual(try! readSessionStateFile(primaryPath: path), second, "rewrite wins")
+    try! "corrupt".write(toFile: path, atomically: true, encoding: .utf8)
+    checkEqual(
+        try! readSessionStateFile(primaryPath: path), first,
+        "corrupt primary falls back to .bak"
+    )
+    try? FileManager.default.removeItem(atPath: path)
+    try? FileManager.default.removeItem(atPath: path + ".bak")
+    var threw = false
+    do { _ = try readSessionStateFile(primaryPath: path) } catch { threw = true }
+    check(threw, "missing primary and backup throws")
+    try? FileManager.default.removeItem(atPath: dir)
+}
+
+// Crash marker round-trips beside the state file: absent first,
+// present after marking, consumed (once) by the check.
+do {
+    let dir = FileManager.default.temporaryDirectory
+        .appendingPathComponent("paneru-crash-checks-\(Int.random(in: 0..<1_000_000))")
+        .path
+    let path = dir + "/state.json"
+    checkEqual(
+        sessionCrashMarkPath(statePath: path), dir + "/state.crashed",
+        "mark sits beside the state file"
+    )
+    check(!sessionCrashedPreviously(statePath: path), "no mark on first launch")
+    markSessionRunning(statePath: path)
+    check(sessionCrashedPreviously(statePath: path), "leftover mark reports once")
+    check(!sessionCrashedPreviously(statePath: path), "report consumes the mark")
+    markSessionRunning(statePath: path)
+    clearSessionRunning(statePath: path)
+    check(!sessionCrashedPreviously(statePath: path), "clean quit clears the mark")
+    try? FileManager.default.removeItem(atPath: dir)
+}
+
 if failures == 0 {
     print("SessionChecks: all checks passed")
 } else {
