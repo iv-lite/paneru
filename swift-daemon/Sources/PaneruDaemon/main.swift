@@ -432,6 +432,13 @@ func adoptNewcomers(_ adopted: [(AdoptedWindow, AXUIElement)]) {
         case .tile, .float:
             roster[wid] = window
             windowPIDs[windowID(wid)] = probe.ownerPID
+            // Adoption-race top-up: an OS focus arrival that landed
+            // before adoption (dropped by the arrival filter as stray)
+            // re-issues now that the window is rostered — clicks on
+            // slow-adopting apps never lose their focus.
+            if apps[probe.ownerPID]?.focusedWindowID() == wid {
+                pending.append(.focus(id: windowID(wid)))
+            }
             // Spawn lands on its origin display's workspace (never the
             // hardcoded ws 1): each display tiles its own strip.
             let ws = workspaceForFrame(probe.frame)
@@ -1836,6 +1843,10 @@ var tapPassthrough: Set<String> = []
 /// Owner pid per adopted window (for spawn payloads).
 var windowPIDs: [WindowID: pid_t] = [:]
 var prevTickFocus: WindowID?
+/// Last focus the host actuated (OS-side): retries until rostered so
+/// late-adopted arrivals still land (the core latches the raise cause
+/// while focus holds).
+var prevActuatedFocus: WindowID?
 var prevTickRow: UInt32?
 var prevTickRosterSig = 0
 /// Last keybind fire (any resolved key command) and last focus seen
@@ -2157,8 +2168,20 @@ func tick() {
         pending.count > maxEventsPerTick
         ? Array(pending.prefix(maxEventsPerTick)) : pending
     pending.removeFirst(min(events.count, pending.count))
+    // Focus arrival filter (Rust arrival guards, centralized): drop
+    // suppressed (`dontFocus`) and stray arrivals — nowhere: not
+    // placed, unmanaged, current, or rostered. Adoption races top up
+    // on adopt (see `adoptNewcomers`), so drops never strand.
+    let filteredEvents = events.filter { event in
+        guard case .focus(let id) = event, let id else { return true }
+        if dontFocus.contains(id) { return false }
+        if id == core.focus { return true }
+        return workspaceOfWindow(id) != nil
+            || core.unmanaged.contains(id)
+            || roster[CGWindowID(id)] != nil
+    }
     let result = core.tick(
-        events: events,
+        events: filteredEvents,
         frames: { roster[CGWindowID(bitPattern: $0)]?.frame },
         viewports: viewports, focusedStyle: focusedStyle
     )
@@ -2215,6 +2238,28 @@ func tick() {
         if let window = roster[CGWindowID(id)] {
             window.raise()
         }
+    }
+    // Focus actuation (Rust `focus_with/without_raise`): the core owns
+    // model focus, the host owns the OS. Command arrivals activate the
+    // app, claim AX focus, and raise; ambient arrivals (hover, refill,
+    // echo) claim AX focus without stealing key. Retried until the
+    // window is rostered (adoption races); model echoes never re-fire.
+    if let id = result.focus, id != prevActuatedFocus,
+       let window = roster[CGWindowID(id)]
+    {
+        if result.focusRaise {
+            if let pid = windowPIDs[id] {
+                NSRunningApplication(processIdentifier: pid)?
+                    .activate(options: [.activateIgnoringOtherApps])
+            }
+            _ = window.focusWithoutRaise()
+            window.raise()
+        } else {
+            _ = window.focusWithoutRaise()
+        }
+        prevActuatedFocus = id
+    } else if result.focus == nil {
+        prevActuatedFocus = nil
     }
     // Cursor warp requests (display hops) go straight to the tap layer.
     if let warp = core.takeMouseWarp() {

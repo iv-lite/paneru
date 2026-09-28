@@ -333,6 +333,17 @@ public final class LiveWindow {
     public func raise() {
         AXUIElementPerformAction(element, kAXRaiseAction as CFString)
     }
+
+    /// Claim AX focus without activation (hover/ambient arrivals): sets
+    /// the focused attribute, never stealing another app's key status
+    /// (Rust `focus_without_raise`). Full activation stays host-side
+    /// (AppKit-only, like all process control).
+    @discardableResult
+    public func focusWithoutRaise() -> Bool {
+        AXUIElementSetAttributeValue(
+            element, kAXFocusedAttribute as CFString, kCFBooleanTrue
+        ) == .success
+    }
 }
 
 // MARK: - Observers

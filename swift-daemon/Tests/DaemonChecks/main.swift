@@ -36,7 +36,8 @@ private func frames(slots: [Int32: IntPoint]) -> (Int32) -> IntRect? {
 private let viewport = IntRect(0, 0, 1024, 768)
 private let style = BorderStyle(r: 1, g: 1, b: 1, opacity: 1, width: 2, radius: 8)
 
-// Spawn lays out left to right; second identical tick is quiescent.
+// Spawn lays out left to right (short singles center vertically);
+// second tick with centered frames is quiescent.
 do {
     var daemon = DaemonCore()
     let r1 = daemon.tick(
@@ -45,13 +46,13 @@ do {
         viewport: viewport, focusedStyle: style
     )
     checkEqual(daemon.strips[1]?[0]?.allWindows, [0, 1, 2], "spawned windows strip left to right")
-    checkEqual(r1.axJobs.map { $0.winID }.sorted(), [1, 2], "displaced windows get intents")
+    checkEqual(r1.axJobs.map { $0.winID }.sorted(), [0, 1, 2], "spawned windows glide to centered slots")
     check(!r1.quiescent, "first tick does work")
     check(r1.borderPlan.isEmpty, "nothing focused, no borders")
 
     let r2 = daemon.tick(
         events: [],
-        frames: frames(slots: [0: IntPoint(0, 0), 1: IntPoint(400, 0), 2: IntPoint(800, 0)]),
+        frames: frames(slots: [0: IntPoint(0, 34), 1: IntPoint(400, 34), 2: IntPoint(800, 34)]),
         viewport: viewport, focusedStyle: style
     )
     check(r2.axJobs.isEmpty, "dedup silences converged truth")
@@ -59,16 +60,17 @@ do {
 }
 
 // Focus plans a border; drag moves the column and flows intents.
+// Live frames ride centered slots (400x700 on 768 centers at y=34).
 do {
     var daemon = DaemonCore()
     _ = daemon.tick(
         events: [.appeared(id: 0, workspace: 1), .appeared(id: 1, workspace: 1)],
-        frames: frames(slots: [0: IntPoint(0, 0), 1: IntPoint(0, 0)]),
+        frames: frames(slots: [0: IntPoint(0, 34), 1: IntPoint(0, 34)]),
         viewport: viewport, focusedStyle: style
     )
     let focused = daemon.tick(
         events: [.focus(id: 0)],
-        frames: frames(slots: [0: IntPoint(0, 0), 1: IntPoint(400, 0)]),
+        frames: frames(slots: [0: IntPoint(0, 34), 1: IntPoint(400, 34)]),
         viewport: viewport, focusedStyle: style
     )
     checkEqual(focused.focus, 0, "focus lands")
@@ -76,25 +78,25 @@ do {
 
     let dragged = daemon.tick(
         events: [.dragMoved(id: 0, dx: 100)],
-        frames: frames(slots: [0: IntPoint(0, 0), 1: IntPoint(400, 0)]),
+        frames: frames(slots: [0: IntPoint(0, 34), 1: IntPoint(400, 34)]),
         viewport: viewport, focusedStyle: style
     )
-    checkEqual(daemon.positions[0], IntPoint(100, 0), "column follows the hand")
-    checkEqual(daemon.positions[1], IntPoint(400, 0), "mates stay unless grabbed")
+    checkEqual(daemon.positions[0], IntPoint(100, 34), "column follows the hand")
+    checkEqual(daemon.positions[1], IntPoint(400, 34), "mates stay unless grabbed")
     check(dragged.axJobs.contains { $0.winID == 0 }, "hand truth flows to AX")
     check(!dragged.quiescent, "drag tick works")
 
     let released = daemon.tick(
         events: [.released],
-        frames: frames(slots: [0: IntPoint(100, 0), 1: IntPoint(400, 0)]),
+        frames: frames(slots: [0: IntPoint(100, 34), 1: IntPoint(400, 34)]),
         viewport: viewport, focusedStyle: style
     )
-    checkEqual(daemon.positions[0], IntPoint(0, 0), "release restores the slot")
+    checkEqual(daemon.positions[0], IntPoint(0, 34), "release restores the slot")
     check(released.axJobs.contains { $0.winID == 0 }, "homing flows once")
 
     let homing = daemon.tick(
         events: [],
-        frames: frames(slots: [0: IntPoint(0, 0), 1: IntPoint(400, 0)]),
+        frames: frames(slots: [0: IntPoint(0, 34), 1: IntPoint(400, 34)]),
         viewport: viewport, focusedStyle: style
     )
     checkEqual(homing.borderPlan.moved.map { $0.0 }, [0], "border rides the window home")
@@ -102,13 +104,13 @@ do {
 
     let settled = daemon.tick(
         events: [],
-        frames: frames(slots: [0: IntPoint(0, 0), 1: IntPoint(400, 0)]),
+        frames: frames(slots: [0: IntPoint(0, 34), 1: IntPoint(400, 34)]),
         viewport: viewport, focusedStyle: style
     )
     check(settled.quiescent, "post-release tick rests")
 }
 
-// Disappear removes everywhere and clears focus.
+// Disappear removes everywhere and heals focus to a surviving neighbor.
 do {
     var daemon = DaemonCore()
     _ = daemon.tick(
@@ -124,8 +126,8 @@ do {
     checkEqual(daemon.strips[1]?[0]?.allWindows, [0], "disappeared window leaves the strip")
     // Model truth survives for space returns: the committed slot is the
     // glide target (positions walk the eased curve toward it).
-    checkEqual(daemon.committedSlot(of: 1), IntPoint(400, 0), "slots survive for space returns")
-    checkEqual(gone.focus, nil, "focus clears with its window")
+    checkEqual(daemon.committedSlot(of: 1), IntPoint(400, 34), "slots survive for space returns")
+    checkEqual(gone.focus, 0, "vanished focus heals to the neighbor")
     checkEqual(gone.borderPlan.removed, [1], "border orders out")
 }
 
@@ -220,14 +222,35 @@ do {
         checkEqual(auto.activeVirtual[1], 1, "south past last creates with the flag")
     }
     checkEqual(daemon.strips[1]?[2]?.allWindows, [], "new row starts empty")
-    // Swipe scrolls the active strip; a quiet tick rests after.
+    // Composition across ticks: settle any in-flight reveal glide,
+    // then swipe lands immediately on top of it (hand truth syncs the
+    // target, so nothing drifts after).
+    for _ in 0..<25 {
+        _ = daemon.tick(
+            events: [],
+            frames: frames(slots: [0: IntPoint(0, 0), 1: IntPoint(400, 0), 2: IntPoint(800, 0)]),
+            viewport: viewport, focusedStyle: style
+        )
+    }
+    checkEqual(daemon.offsets[1], -176, "earlier reveal settled")
     let swiped = daemon.tick(
         events: [.swipe(delta: 0.5, fingers: 3)],
         frames: frames(slots: [0: IntPoint(0, 0), 1: IntPoint(400, 0), 2: IntPoint(800, 0)]),
         viewport: viewport, focusedStyle: style
     )
-    checkEqual(daemon.offsets[1], -176 - 512, "rested reveal plus swipe compose on the offset")
+    checkEqual(daemon.offsets[1], -176 - 512, "swipe composes immediately onto settled reveal")
+    checkEqual(
+        daemon.offsetTarget(for: 1), -176 - 512, "hand truth syncs the glide target"
+    )
     check(!swiped.quiescent, "swipe tick works")
+    for _ in 0..<25 {
+        _ = daemon.tick(
+            events: [],
+            frames: frames(slots: [0: IntPoint(0, 0), 1: IntPoint(400, 0), 2: IntPoint(800, 0)]),
+            viewport: viewport, focusedStyle: style
+        )
+    }
+    checkEqual(daemon.offsets[1], -176 - 512, "composed offset holds at rest")
 }
 
 // Gesture travel clamps to the strip extents (continuous: last/first
@@ -271,9 +294,10 @@ do {
         frames: frames(slots: [0: IntPoint(0, 0)]),
         viewport: viewport, focusedStyle: style
     )
+    // Converge onto the centered slot first (live == slot snaps silent).
     _ = daemon.tick(
         events: [],
-        frames: frames(slots: [0: IntPoint(0, 0)]),
+        frames: frames(slots: [0: IntPoint(0, 34)]),
         viewport: viewport, focusedStyle: style
     )
     // The OS window wanders off (user drag); the model still claims the
@@ -284,7 +308,7 @@ do {
         viewport: viewport, focusedStyle: style
     )
     check(
-        drifted.axJobs.contains { $0.winID == 0 && $0.origin == IntPoint(0, 0) },
+        drifted.axJobs.contains { $0.winID == 0 && $0.origin == IntPoint(0, 34) },
         "drift re-drives home"
     )
     // Still adrift next tick: cooldown suppresses the repeat.
@@ -294,10 +318,10 @@ do {
         viewport: viewport, focusedStyle: style
     )
     check(quiet.axJobs.isEmpty, "verify cools down instead of spamming")
-    // Sub-pixel truth never costs a round trip.
+    // Sub-pixel truth never costs a round trip (1px off the slot).
     let calm = daemon.tick(
         events: [],
-        frames: { _ in IntRect(min: IntPoint(0, 0), max: IntPoint(400, 700)) },
+        frames: frames(slots: [0: IntPoint(0, 35)]),
         viewport: viewport, focusedStyle: style
     )
     check(calm.axJobs.isEmpty, "deadband holds converged windows")
@@ -318,19 +342,21 @@ do {
     checkEqual(daemon.strips[1]?[0]?.allWindows, [0], "ws1 adopts its spawn")
     checkEqual(daemon.strips[2]?[0]?.allWindows, [1], "ws2 adopts its spawn")
     // Each strip tiles from its own origin: ws2 slots start at 1024
-    // (positions glide there over the next ticks).
-    checkEqual(daemon.committedSlot(of: 1), IntPoint(1024, 0), "ws2 places from its own origin")
+    // (vertically centered like every short single).
+    checkEqual(daemon.committedSlot(of: 1), IntPoint(1024, 34), "ws2 places from its own origin")
     check(
         placed.axJobs.contains { $0.winID == 1 },
         "ws2 spawn issues a glide intent"
     )
     check(
-        !placed.axJobs.contains { $0.winID == 0 && $0.origin != IntPoint(0, 0) },
+        !placed.axJobs.contains {
+            $0.winID == 0 && ($0.origin?.x).map({ $0 != 0 }) ?? false
+        },
         "ws1 stays home"
     )
     let settled = daemon.tick(
         events: [],
-        frames: frames(slots: [0: IntPoint(0, 0), 1: IntPoint(1024, 0)]),
+        frames: frames(slots: [0: IntPoint(0, 34), 1: IntPoint(1024, 34)]),
         viewports: [1: left, 2: right], focusedStyle: style
     )
     check(settled.quiescent, "per-display slots converge quietly")
@@ -372,8 +398,9 @@ do {
     checkEqual(daemon.offsets[1], -400, "reveal stands down mid-gesture")
 }
 
-// Slot y clamps into the owner viewport: seam spawns stop straddling
-// the neighbor display; oversize windows top-align.
+// Slot y centers short windows into the owner viewport (400x700 on
+// 768 centers at y=34): seam spawns stop straddling the neighbor
+// display; oversize windows top-align.
 do {
     var daemon = DaemonCore()
     let placed = daemon.tick(
@@ -390,8 +417,8 @@ do {
         "seam spawn issues a glide intent"
     )
     checkEqual(
-        daemon.committedSlot(of: 0), IntPoint(0, 468),
-        "seam spawns pull into the viewport"
+        daemon.committedSlot(of: 0), IntPoint(0, 234),
+        "seam spawns center into the viewport"
     )
     check(
         placed.axJobs.contains { $0.winID == 1 },
@@ -424,7 +451,7 @@ do {
         viewport: viewport, focusedStyle: style
     )
     check(!daemon.unmanaged.contains(1), "vanished floats leave unmanaged")
-    checkEqual(daemon.focus, nil, "vanished focus clears")
+    checkEqual(daemon.focus, 0, "vanished focus heals to the neighbor")
     daemon.clearFocusIfGone { _ in false }
     checkEqual(daemon.focus, nil, "clear is idempotent")
     // Orphan the active workspace: falls back to the live one.
@@ -500,23 +527,34 @@ do {
         frames: frames(slots: [:]),
         viewport: viewport, focusedStyle: style
     )
-    // Both return to matching frames: silent, order kept, no intents.
-    let back = daemon.tick(
+    // Both return to matching (centered) frames: silent, order kept,
+    // no intents; the parked scroll offset eases back over the ticks.
+    _ = daemon.tick(
         events: [.appeared(id: 1, workspace: 1), .appeared(id: 0, workspace: 1)],
-        frames: frames(slots: [0: IntPoint(0, 0), 1: IntPoint(400, 0)]),
+        frames: frames(slots: [0: IntPoint(0, 34), 1: IntPoint(400, 34)]),
         viewport: viewport, focusedStyle: style
     )
-    checkEqual(daemon.offsets[1], 0, "return restores the parked offset")
     checkEqual(
         daemon.strips[1]?[0]?.allWindows, [0, 1],
         "return restores column order despite arrival order"
     )
-    check(back.axJobs.isEmpty, "matching frames glide nowhere")
+    checkEqual(
+        daemon.offsetTarget(for: 1), 0, "return retargets the parked offset"
+    )
+    for _ in 0..<25 {
+        _ = daemon.tick(
+            events: [],
+            frames: frames(slots: [0: IntPoint(0, 34), 1: IntPoint(400, 34)]),
+            viewport: viewport, focusedStyle: style
+        )
+    }
+    checkEqual(daemon.offsets[1], 0, "parked offset glides home")
     let rested = daemon.tick(
         events: [],
-        frames: frames(slots: [0: IntPoint(0, 0), 1: IntPoint(400, 0)]),
+        frames: frames(slots: [0: IntPoint(0, 34), 1: IntPoint(400, 34)]),
         viewport: viewport, focusedStyle: style
     )
+    check(rested.axJobs.isEmpty, "matching frames glide nowhere")
     check(rested.quiescent, "space return rests")
 }
 
@@ -570,7 +608,16 @@ do {
         frames: frames(slots: hidden),
         viewports: [1: viewport], focusedStyle: style
     )
-    checkEqual(daemon.offsets[1], 0, "fully-hidden focus reveals after rest")
+    checkEqual(
+        daemon.offsetTarget(for: 1), 0, "fully-hidden focus retargets after rest"
+    )
+    for _ in 0..<25 {
+        _ = daemon.tick(
+            events: [], frames: frames(slots: hidden),
+            viewports: [1: viewport], focusedStyle: style
+        )
+    }
+    checkEqual(daemon.offsets[1], 0, "reveal glides the hidden window home")
 }
 
 // East/west at the strip edge steps across displays: nearest viewport
@@ -777,7 +824,7 @@ do {
         daemon.edgeWarpLanding(
             cursor: IntPoint(1, 500), displays: displays,
             warpDirection: -1, yOffset: 0
-        ), nil, "negative warp: nothing above the top display"
+        ), IntPoint(3834, 1580), "negative warp: left edge falls back below"
     )
     checkEqual(
         daemon.edgeWarpLanding(
@@ -1036,13 +1083,21 @@ do {
     )
     checkEqual(daemon.strips[1]?[0]?.allWindows, [1, 0, 2], "swap west bubbles back")
     checkEqual(daemon.focus, 0, "swap keeps focus")
-    // Center shifts the strip so the focused 400-wide window centers.
+    // Center retargets the strip so the focused 400-wide window
+    // centers (512-200); the offset glides there over the ticks.
     let centered = daemon.tick(
         events: [.command(.window(.center))],
         frames: frames(slots: settled), viewport: viewport, focusedStyle: style
     )
-    checkEqual(daemon.offsets[1], 312, "center parks the strip at 512-200")
+    checkEqual(daemon.offsetTarget(for: 1), 312, "center targets 512-200")
     check(!centered.quiescent, "center tick works")
+    for _ in 0..<25 {
+        _ = daemon.tick(
+            events: [], frames: frames(slots: settled),
+            viewport: viewport, focusedStyle: style
+        )
+    }
+    checkEqual(daemon.offsets[1], 312, "center glides home")
     // Resize grow steps 400/1024 through the presets to one half.
     let grown = daemon.tick(
         events: [.command(.window(.resize(.grow)))],
@@ -1089,13 +1144,23 @@ do {
     )
     checkEqual(daemon.unmanaged, [], "manage again recovers")
     checkEqual(daemon.strips[1]?[0]?.allWindows, [1, 2, 0], "recovered window appends")
-    // Snap clamps a half-hidden frame back by the shortfall.
+    // Snap clamps a half-hidden frame back by the shortfall (eased).
     _ = daemon.tick(
         events: [.command(.window(.snap))],
         frames: frames(slots: [0: IntPoint(-100, 0), 1: IntPoint(400, 0), 2: IntPoint(800, 0)]),
         viewport: viewport, focusedStyle: style
     )
-    checkEqual(daemon.offsets[1], 312 + 100, "snap scrolls by the left shortfall")
+    checkEqual(
+        daemon.offsetTarget(for: 1), 312 + 100, "snap retargets by the left shortfall"
+    )
+    for _ in 0..<25 {
+        _ = daemon.tick(
+            events: [],
+            frames: frames(slots: [0: IntPoint(-100, 0), 1: IntPoint(400, 0), 2: IntPoint(800, 0)]),
+            viewport: viewport, focusedStyle: style
+        )
+    }
+    checkEqual(daemon.offsets[1], 312 + 100, "snap glides home")
 }
 
 // Vertical resize and equalize share heights across one stack.
@@ -1386,7 +1451,7 @@ do {
         frames: frames(slots: [0: IntPoint(0, 0), 1: IntPoint(0, 0)]),
         viewport: viewport, focusedStyle: style
     )
-    checkEqual(daemon.positions[1], IntPoint(400, 0), "disabled animations snap to the slot")
+    checkEqual(daemon.positions[1], IntPoint(400, 34), "disabled animations snap to the slot")
 }
 do {
     var daemon = DaemonCore()
@@ -1410,7 +1475,7 @@ do {
             viewport: viewport, focusedStyle: style
         )
     }
-    checkEqual(daemon.positions[1], IntPoint(400, 0), "glide terminates exactly on the slot")
+    checkEqual(daemon.positions[1], IntPoint(400, 34), "glide terminates exactly on the slot")
 }
 
 // Row-wrap fall-through (beyond Rust): outer global edges wrap around
@@ -1462,6 +1527,134 @@ do {
             warpDirection: 1, yOffset: 0, velocityX: 100_000
         ), IntPoint(3836, 500), "carry clamps at the inset floor"
     )
+}
+
+// Stairs wrap table (2-step down-right, both signs): primary
+// half-plane first, opposite fallback second, then row-wrap.
+do {
+    let daemon = DaemonCore()
+    let upper = IntRect(0, 0, 1920, 1080)
+    let lower = IntRect(1920, 300, 3840, 1380)
+    let stairs = [upper, lower]
+    checkEqual(
+        daemon.edgeWarpLanding(
+            cursor: IntPoint(1, 500), displays: stairs,
+            warpDirection: 1, yOffset: 0
+        ), IntPoint(3834, 800), "stairs: left edge goes down (primary)"
+    )
+    checkEqual(
+        daemon.edgeWarpLanding(
+            cursor: IntPoint(1919, 500), displays: stairs,
+            warpDirection: 1, yOffset: 0
+        ), IntPoint(1926, 800), "stairs: right edge falls back below"
+    )
+    checkEqual(
+        daemon.edgeWarpLanding(
+            cursor: IntPoint(1921, 800), displays: stairs,
+            warpDirection: 1, yOffset: 0
+        ), IntPoint(1914, 500), "stairs: lower-left falls back above"
+    )
+    checkEqual(
+        daemon.edgeWarpLanding(
+            cursor: IntPoint(3839, 800), displays: stairs,
+            warpDirection: 1, yOffset: 0
+        ), IntPoint(6, 500), "stairs: lower-right goes up (primary)"
+    )
+    checkEqual(
+        daemon.edgeWarpLanding(
+            cursor: IntPoint(3839, 800), displays: stairs,
+            warpDirection: -1, yOffset: 0
+        ), IntPoint(6, 500), "stairs: mirrored sign still lands (fallback)"
+    )
+}
+
+// Focus arrivals carry their actuation cause: commands raise, ambient
+// arrivals only claim (latched while focus holds); echoes never
+// re-raise; close heals to the neighbor with raise cause.
+do {
+    var daemon = DaemonCore()
+    let live = frames(slots: [0: IntPoint(0, 34), 1: IntPoint(400, 34)])
+    _ = daemon.tick(
+        events: [.appeared(id: 0, workspace: 1), .appeared(id: 1, workspace: 1)],
+        frames: live, viewport: viewport, focusedStyle: style
+    )
+    let ambient = daemon.tick(
+        events: [.focus(id: 1)], frames: live,
+        viewport: viewport, focusedStyle: style
+    )
+    checkEqual(ambient.focus, 1, "ambient arrival lands")
+    check(!ambient.focusRaise, "ambient arrivals claim without raise")
+    let echo = daemon.tick(
+        events: [.focus(id: 1)], frames: live,
+        viewport: viewport, focusedStyle: style
+    )
+    checkEqual(echo.focus, 1, "echoes hold focus")
+    check(!echo.focusRaise, "echoes never re-raise")
+    let commanded = daemon.tick(
+        events: [.command(.window(.focus(.west)))], frames: live,
+        viewport: viewport, focusedStyle: style
+    )
+    checkEqual(commanded.focus, 0, "command steps focus")
+    check(commanded.focusRaise, "command arrivals raise")
+    let gone = daemon.tick(
+        events: [.disappeared(id: 0)], frames: live,
+        viewport: viewport, focusedStyle: style
+    )
+    checkEqual(gone.focus, 1, "close heals to the neighbor")
+    check(gone.focusRaise, "healed focus actuates")
+}
+
+// Short singles vertically center; full-height top-aligns;
+// oversize top-aligns; stacks keep full-height binpack fill.
+do {
+    var daemon = DaemonCore()
+    let frames: (Int32) -> IntRect? = {
+        switch $0 {
+        case 0: return IntRect(min: IntPoint(0, 0), max: IntPoint(400, 700))
+        case 1: return IntRect(min: IntPoint(0, 0), max: IntPoint(400, 768))
+        default: return IntRect(min: IntPoint(0, 0), max: IntPoint(400, 2000))
+        }
+    }
+    _ = daemon.tick(
+        events: [
+            .appeared(id: 0, workspace: 1), .appeared(id: 1, workspace: 1),
+            .appeared(id: 2, workspace: 1),
+        ],
+        frames: frames, viewport: viewport, focusedStyle: style
+    )
+    checkEqual(
+        daemon.committedSlot(of: 0), IntPoint(0, 34),
+        "short singles center: (768-700)/2"
+    )
+    checkEqual(
+        daemon.committedSlot(of: 1), IntPoint(400, 0),
+        "full-height singles top-align"
+    )
+    checkEqual(
+        daemon.committedSlot(of: 2), IntPoint(800, 0),
+        "oversize singles top-align"
+    )
+}
+
+// Rapid refocus accumulates: the latest arrival wins once the strip
+// rests (no single-slot loss mid-glide).
+do {
+    var daemon = DaemonCore()
+    let live = frames(slots: [0: IntPoint(0, 0), 1: IntPoint(400, 0), 2: IntPoint(800, 0)])
+    _ = daemon.tick(
+        events: [
+            .appeared(id: 0, workspace: 1), .appeared(id: 1, workspace: 1),
+            .appeared(id: 2, workspace: 1),
+        ],
+        frames: live, viewport: viewport, focusedStyle: style
+    )
+    _ = daemon.tick(events: [.focus(id: 2)], frames: live, viewport: viewport, focusedStyle: style)
+    _ = daemon.tick(events: [.focus(id: 0)], frames: live, viewport: viewport, focusedStyle: style)
+    for _ in 0..<30 {
+        _ = daemon.tick(events: [], frames: live, viewport: viewport, focusedStyle: style)
+    }
+    checkEqual(daemon.focus, 0, "latest focus holds")
+    checkEqual(daemon.offsets[1], 0, "latest arrival reveals after churn")
 }
 
 if failures == 0 {

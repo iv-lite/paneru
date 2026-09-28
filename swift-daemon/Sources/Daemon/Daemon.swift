@@ -72,6 +72,9 @@ public struct FrameResult: Sendable {
     public var axJobs: [AXWriteJob]
     /// Focus after this tick.
     public var focus: WindowID?
+    /// True when focus arrived this tick wanting OS raise (latched
+    /// while focus holds, so late-adopted windows still actuate).
+    public var focusRaise: Bool
     /// True when nothing is flagged and nothing was issued.
     public var quiescent: Bool
 }
@@ -113,12 +116,30 @@ public struct DaemonCore: Sendable {
     public private(set) var activeVirtual: [WorkspaceID: UInt32] = [:]
     /// Scroll offsets by workspace (active row).
     public private(set) var offsets: [WorkspaceID: Int32] = [:]
+    /// Eased offset destinations: programmatic moves (reveal, center,
+    /// snap, resize shifts, restores) write targets and the commit pass
+    /// glides `offsets` toward them, so strips travel composed instead
+    /// of jumping. Direct manipulation (swipe/scroll) writes both,
+    /// staying immediate. Absent = settled.
+    private var offsetTargets: [WorkspaceID: Int32] = [:]
+    /// Offset glide legs (one per workspace, burst-joined with window
+    /// legs so strips and members land lockstep).
+    private var offsetLegs: [WorkspaceID: GlideLeg] = [:]
     /// Slot truth: window origins. Sizes come from the frame provider.
     public private(set) var positions: [WindowID: IntPoint] = [:]
     /// Active workspace (receives spawns).
     public var activeWorkspace: WorkspaceID = 1
     public private(set) var focus: WindowID?
     public private(set) var dirty: DirtyFlags = []
+    /// Actuation cause of the latest arrival (Rust `focus_entity` raise
+    /// flag): command-driven arrivals want OS raise, ambient ones
+    /// (hover/refill/echo) only claim. Consumed into the latched
+    /// `focusRaise` below; see `setFocus`.
+    private var lastFocusRaise = false
+    /// Whether the current focus arrived wanting raise. Latched while
+    /// focus holds so late-adopted windows still actuate on appearance
+    /// (the host retries until rostered); cleared on change or clear.
+    private var focusRaiseLatched = false
     /// Held drag target, if any.
     private var held: WindowID?
     /// This tick saw fresh swipe/scroll input: motion stays flagged past
@@ -176,8 +197,10 @@ public struct DaemonCore: Sendable {
     /// Ticks between verify re-drives of the same window (~0.5s at 60Hz):
     /// lets genuine glides land instead of re-pushing every frame.
     private let redriveCooldownEpochs: UInt64 = 30
-    /// Focus arrival deferred past motion: fires once the strip rests.
-    private var pendingReveal: WindowID?
+    /// Focus arrivals deferred past motion: each fires once the strip
+    /// rests. A set (not a slot): flapping arrivals accumulate instead
+    /// of overwriting each other.
+    private var pendingReveals = Set<WindowID>()
     /// Last verify re-drive epoch per window (see the commit pass).
     private var lastRedrive: [WindowID: UInt64] = [:]
     /// A row that emptied while its windows left the screen (native
@@ -211,8 +234,12 @@ public struct DaemonCore: Sendable {
     /// converged pushes leave offsets alone, and gating on them would
     /// stand reveals down for the whole settle.
     private var lastOffsetMoveEpoch: UInt64?
-    /// Quiet epochs required before a reveal (~0.5s at 60Hz).
-    private let revealRestEpochs: UInt64 = 30
+    /// Quiet epochs required before a reveal (~0.15s at 60Hz): long
+    /// enough to let a glide settle, short enough that arrivals never
+    /// feel stuck. (Was 30: with eased offsets the strip is near-home
+    /// quickly, and per-window pending removes the flap-loss the long
+    /// gate compensated for.)
+    private let revealRestEpochs: UInt64 = 8
     /// Hidden fraction of the focused window above which arrival
     /// reveals. Mirrors `window_hidden_ratio`: 0 always reveals on any
     /// shortfall (legacy), 1 only when fully hidden (quiet clicks —
@@ -279,6 +306,29 @@ public struct DaemonCore: Sendable {
         strips[activeWorkspace, default: [:]][row] = strip
     }
 
+    /// Assign model focus with its actuation cause (Rust `focus_entity`):
+    /// command-driven arrivals (`raise: true`) want OS raise, ambient
+    /// ones (hover/refill/echo) only claim. Same-value arrivals
+    /// short-circuit — no reveal churn, no re-actuation.
+    private mutating func setFocus(_ id: WindowID?, raise: Bool) {
+        // Same-value echoes are total no-ops: the latched cause stands
+        // (a later change recomputes it), so echoes never churn reveal
+        // or re-arm actuation.
+        guard id != focus else { return }
+        focus = id
+        lastFocusRaise = raise && id != nil
+        // Focus follows the window's display: clicking onto another
+        // screen retargets the active workspace (mirrors the Rust
+        // `ActiveDisplayMarker`), so gestures, menubar, and reveal
+        // act where the user is looking.
+        if let id, let owner = workspaceOf(id), owner != activeWorkspace {
+            activeWorkspace = owner
+            dirty.insert(.layout)
+        }
+        dirty.insert(.focus)
+        dirty.insert(.paint)
+    }
+
     /// Run one frame: ingest, layout, commit, paint. `frames` supplies live
     /// window rects (sizes); `viewports` carries one viewport per
     /// workspace (single-display callers pass one entry and everything
@@ -297,30 +347,29 @@ public struct DaemonCore: Sendable {
         let epoch = ax.beginFrame()
         let offsetsBeforeTick = offsets
         ingest(events, frames: frames, viewports: viewports, epoch: epoch)
+        // Focus arrivals pend their reveal (drained below against fresh
+        // slots); the raise latch follows arrivals while focus holds so
+        // late-adopted windows still actuate on appearance.
+        if focus != prevFocus, let id = focus {
+            pendingReveals.insert(id)
+        }
+        if focus != prevFocus {
+            focusRaiseLatched = (focus != nil && lastFocusRaise)
+        }
         // Focus arrival reveals: scroll the minimal shortfall so the
         // focused window is fully visible (mirrors ensure_visible; the
         // strip never chases anything else). Only at rest — an offset
         // write this tick, a held drag, fresh gestures, or a recent move
-        // stand the reveal down into a pending slot that fires once the
-        // strip settles, so a flapping focus cannot yank mid-flight. The
-        // result still clamps to strip bounds like any other offset
-        // write. Pure AX traffic (resizes, converged pushes) does not
-        // count as motion.
+        // stand the reveal down into the pending set that fires once the
+        // strip settles, so a flapping focus cannot yank mid-flight.
+        // Reveal writes offset TARGETS against this tick's fresh slots
+        // (commit just wrote them); the ease below glides there over
+        // the next ticks. Pure AX traffic (resizes, converged pushes)
+        // does not count as motion.
         func rested() -> Bool {
             offsets == offsetsBeforeTick
                 && !gestureFresh && held == nil
                 && (lastOffsetMoveEpoch.map({ epoch &- $0 >= revealRestEpochs }) ?? true)
-        }
-        if focus != prevFocus, let id = focus {
-            pendingReveal = nil
-            if rested() {
-                revealOwner(id, frames: frames, viewports: viewports)
-            } else {
-                pendingReveal = id
-            }
-        } else if let id = pendingReveal, rested() {
-            pendingReveal = nil
-            revealOwner(id, frames: frames, viewports: viewports)
         }
         layoutPass()
         // NOTE: no orphan fallback here: an emptied active workspace is
@@ -334,6 +383,12 @@ public struct DaemonCore: Sendable {
             auditPass()
         }
         let jobs = commitPass(frames: frames, viewports: viewports, epoch: epoch)
+        if !pendingReveals.isEmpty, rested() {
+            for id in pendingReveals.sorted() {
+                revealOwner(id, frames: frames, viewports: viewports)
+            }
+            pendingReveals.removeAll()
+        }
         // Offset clock for the reveal gate: only actual strip travel
         // stands the next reveal down.
         if offsets != offsetsBeforeTick {
@@ -342,7 +397,10 @@ public struct DaemonCore: Sendable {
         let plan = paintPass(frames: frames, viewports: viewports, focusedStyle: focusedStyle)
         let quiet = dirty.isQuiescent && jobs.isEmpty && plan.isEmpty
         dirty = []
-        return FrameResult(borderPlan: plan, axJobs: jobs, focus: focus, quiescent: quiet)
+        return FrameResult(
+            borderPlan: plan, axJobs: jobs, focus: focus,
+            focusRaise: focusRaiseLatched, quiescent: quiet
+        )
     }
 
     /// Single-viewport entry: everything resolves against one rect, which
@@ -413,7 +471,9 @@ public struct DaemonCore: Sendable {
                        epoch &- parked.atEpoch <= parkedRowTTLEpochs,
                        parked.offset != (offsets[workspace] ?? 0)
                     {
-                        offsets[workspace] = parked.offset
+                        // Restored scroll eases in like any programmatic
+                        // move (see `offsetTargets`).
+                        offsetTargets[workspace] = parked.offset
                     }
                     parkedOffsets.removeValue(forKey: workspace)
                 }
@@ -459,24 +519,35 @@ public struct DaemonCore: Sendable {
                 // Positions survive disappearance: a space return restores
                 // silently when the model still matches live truth. The
                 // parked-row sweep below reaps truly closed windows.
-                if pendingReveal == id { pendingReveal = nil }
+                if pendingReveals.remove(id) != nil { /* dropped with it */ }
                 lastRedrive.removeValue(forKey: id)
                 redriveStreak.removeValue(forKey: id)
-                if focus == id { focus = nil }
+                if focus == id {
+                    // Synchronous heal (Rust `give_away_focus`): hand off
+                    // to the nearest surviving neighbor instead of
+                    // stranding keybinds on a hidden id.
+                    let ws = workspaceOf(id) ?? activeWorkspace
+                    let row = activeVirtual[ws] ?? 0
+                    if let strip = strips[ws]?[row],
+                       let target = healFocusTarget(
+                           strip: strip,
+                           viewport: viewport(for: ws, in: viewports),
+                           frames: frames, lost: id
+                       )
+                    {
+                        setFocus(target, raise: true)
+                    } else {
+                        setFocus(nil, raise: false)
+                    }
+                }
                 if held == id { held = nil }
                 dirty.formUnion([.layout, .paint])
             case .focus(let id):
-                focus = id
-                // Focus follows the window's display: clicking onto another
-                // screen retargets the active workspace (mirrors the Rust
-                // `ActiveDisplayMarker`), so gestures, menubar, and reveal
-                // act where the user is looking.
-                if let id, let owner = workspaceOf(id), owner != activeWorkspace {
-                    activeWorkspace = owner
-                    dirty.insert(.layout)
-                }
-                dirty.insert(.focus)
-                dirty.insert(.paint)
+                // Ambient arrival class (hover/refill/echo): claim only,
+                // never raise. The host filters strays and suppressed ids
+                // before ingest (see tick); same-value echoes short-circuit
+                // inside `setFocus` (no reveal churn).
+                setFocus(id, raise: false)
             case .dragMoved(let id, let dx):
                 held = id
                 driveColumn(of: id, dx: dx)
@@ -509,7 +580,7 @@ public struct DaemonCore: Sendable {
                         strips[slot.workspace, default: [:]][slot.row] = target
                         if slot.workspace != activeWorkspace {
                             activeWorkspace = slot.workspace
-                            focus = moving.top
+                            setFocus(moving.top, raise: true)
                         }
                     }
                 }
@@ -528,8 +599,11 @@ public struct DaemonCore: Sendable {
                 let ws = activeWorkspace
                 // Zero steps (sub-pixel deltas) must not touch the dict:
                 // key creation alone reads as motion to the rest gate.
+                // Hand truth writes both sides (immediate, cancelling
+                // any programmatic glide in flight).
                 if step != 0 {
                     offsets[ws, default: 0] += step
+                    offsetTargets[ws] = offsets[ws]
                     clampSwipeTravel(ws, viewport: active, frames: frames)
                 }
                 gestureFresh = true
@@ -577,7 +651,7 @@ public struct DaemonCore: Sendable {
         activeWorkspace = target
         let row = activeVirtual[target] ?? 0
         if let first = strips[target]?[row]?.first()?.top {
-            focus = first
+            setFocus(first, raise: true)
         }
         let view = viewport(for: target, in: viewports)
         mouseWarp = IntPoint(
@@ -609,8 +683,7 @@ public struct DaemonCore: Sendable {
                 activeStrip: strip, siblingStrips: []
             ) {
             case .focus(let target):
-                focus = target
-                dirty.formUnion([.focus, .paint])
+                setFocus(target, raise: true)
             case .fallThrough:
                 // East/west at the strip edge steps across displays into
                 // the neighboring workspace's strip (single-display
@@ -660,25 +733,21 @@ public struct DaemonCore: Sendable {
             moveFocusedToDisplay(next: false, follow: follow, frames: frames, viewports: viewports, epoch: epoch)
         case .focusUnmanaged:
             if let target = unmanaged.sorted().first {
-                focus = target
-                dirty.formUnion([.focus, .paint])
+                setFocus(target, raise: true)
             }
         case .focusManaged:
             if let target = activeStrip().first()?.top {
-                focus = target
-                dirty.formUnion([.focus, .paint])
+                setFocus(target, raise: true)
             }
         case .raiseFloating:
             if let target = unmanaged.sorted().first {
                 raised = unmanaged.sorted()
-                focus = target
-                dirty.formUnion([.focus, .paint])
+                setFocus(target, raise: true)
             }
         case .toggleFloatingLayer:
             if let target = unmanaged.sorted().first {
                 raised = unmanaged.sorted().filter { $0 != target }
-                focus = target
-                dirty.formUnion([.focus, .paint])
+                setFocus(target, raise: true)
             }
         case .copyRule:
             copyFocusedRule()
@@ -720,8 +789,7 @@ public struct DaemonCore: Sendable {
             activeVirtual[ws] = index
             dirty.formUnion([.layout, .paint])
         case .focusNeighbor(let id):
-            focus = id
-            dirty.formUnion([.focus, .paint])
+            setFocus(id, raise: true)
         }
     }
 
@@ -797,7 +865,7 @@ public struct DaemonCore: Sendable {
         if activeStrip().contains(id) {
             let shift = origin.x - frame.min.x
             if shift != 0 {
-                offsets[activeWorkspace, default: 0] += shift
+                offsetTargets[activeWorkspace, default: offsets[activeWorkspace] ?? 0] += shift
             }
         } else {
             enqueueMove(id, to: origin, epoch: epoch)
@@ -844,7 +912,7 @@ public struct DaemonCore: Sendable {
         if strip.contains(id) {
             let shift = origin.x - frame.min.x
             if shift != 0 {
-                offsets[activeWorkspace, default: 0] += shift
+                offsetTargets[activeWorkspace, default: offsets[activeWorkspace] ?? 0] += shift
             }
         } else {
             enqueueMove(id, to: origin, epoch: epoch)
@@ -943,7 +1011,7 @@ public struct DaemonCore: Sendable {
                 if strip.contains(id) {
                     let shift = viewport.min.x - frame.min.x
                     if shift != 0 {
-                        offsets[activeWorkspace, default: 0] += shift
+                        offsetTargets[activeWorkspace, default: offsets[activeWorkspace] ?? 0] += shift
                     }
                 } else {
                     enqueueMove(id, to: viewport.min, epoch: epoch)
@@ -1030,7 +1098,7 @@ public struct DaemonCore: Sendable {
         let origin = clampOriginToViewport(origin: frame.min, size: size, viewport: viewport)
         let shift = origin.x - frame.min.x
         if shift != 0 {
-            offsets[activeWorkspace, default: 0] += shift
+            offsetTargets[activeWorkspace, default: offsets[activeWorkspace] ?? 0] += shift
         }
         dirty.formUnion([.layout, .motion, .paint])
     }
@@ -1061,7 +1129,7 @@ public struct DaemonCore: Sendable {
         guard let best else { return }
         let row = activeVirtual[best.ws] ?? 0
         guard let target = strips[best.ws]?[row]?.first()?.top else { return }
-        focus = target
+        setFocus(target, raise: true)
         activeWorkspace = best.ws
         dirty.formUnion([.focus, .paint])
     }
@@ -1160,8 +1228,7 @@ public struct DaemonCore: Sendable {
             switch op {
             case .focus(let id):
                 if activeStrip().contains(id) || unmanaged.contains(id) {
-                    focus = id
-                    dirty.formUnion([.focus, .paint])
+                    setFocus(id, raise: true)
                 }
             case .setFrame(let id, let frame):
                 enqueueMove(
@@ -1281,23 +1348,28 @@ public struct DaemonCore: Sendable {
         // Bounds are viewport-relative (offsets are too): identical to
         // the absolute form on origin-anchored viewports.
         let width = viewport.width
-        let clamped: Int32
-        if continuousSwipe {
-            // Travel until the last/first window snaps to the far edge.
-            clamped = min(max(offset, -last), width - first)
-        } else {
-            let total = last + lastWidth - first
-            guard total > 0 else { return }
-            if width < total {
-                clamped = min(max(offset, width - total), 0)
+        func clamp(_ value: Int32) -> Int32 {
+            if continuousSwipe {
+                // Travel until the last/first window snaps to the far edge.
+                return min(max(value, -last), width - first)
             } else {
-                clamped = min(max(offset, 0), width - total)
+                let total = last + lastWidth - first
+                guard total > 0 else { return value }
+                if width < total {
+                    return min(max(value, width - total), 0)
+                } else {
+                    return min(max(value, 0), width - total)
+                }
             }
         }
         // No-op writes still mutate the dict (key creation), which the
-        // rest gate would misread as motion.
-        if clamped != offset {
-            offsets[ws] = clamped
+        // rest gate would misread as motion. Both sides clamp: the hand
+        // position and any eased target in flight.
+        if clamp(offset) != offset {
+            offsets[ws] = clamp(offset)
+        }
+        if let target = offsetTargets[ws], clamp(target) != target {
+            offsetTargets[ws] = clamp(target)
         }
     }
 
@@ -1392,8 +1464,9 @@ public struct DaemonCore: Sendable {
         )
         // Assign only on change: a no-op write still mutates the dict
         // (key creation), which the rest gate would misread as motion.
-        if next.x != offset {
-            offsets[owner] = next.x
+        // Targets ease in commit — no same-tick jump.
+        if next.x != (offsetTargets[owner] ?? offset) {
+            offsetTargets[owner] = next.x
             dirty.formUnion([.layout, .motion])
         }
     }
@@ -1524,6 +1597,9 @@ public struct DaemonCore: Sendable {
         // Rows that are not showing park at their own display's sliver
         // instead of their slots (mirrors workspace-switch parking; the
         // OS must hold them there so macOS never relocates them).
+        // Programmatic offset targets ease first, so this tick's slots
+        // already account for strip travel (members ride composed).
+        easeOffsets(epoch: epoch)
         for (ws, rows) in strips {
             let home = viewport(for: ws, in: viewports)
             let parked = parkedOrigin(viewport: home)
@@ -1593,9 +1669,10 @@ public struct DaemonCore: Sendable {
 
     /// Tile one column: multi-item stacks split the viewport height
     /// across items (Rust `relative_positions` + `binpack_heights`);
-    /// singles, tabs, single-item stacks, and fullscreen keep
-    /// preserved-y slots. Every member also gets its size clamped to
-    /// the viewport (Rust `clamp_managed_windows_to_viewport`).
+    /// singles and tabs vertically center when shorter than the
+    /// viewport; single-item stacks and fullscreen keep preserved-y
+    /// slots. Every member also gets its size clamped to the viewport
+    /// (Rust `clamp_managed_windows_to_viewport`).
     private mutating func layoutColumn(
         _ column: LayoutColumn, x: Int32, home: IntRect,
         epoch: UInt64, frames: (WindowID) -> IntRect?,
@@ -1607,9 +1684,23 @@ public struct DaemonCore: Sendable {
                 items, x: x, home: home, epoch: epoch,
                 frames: frames, heldMembers: heldMembers
             )
-        default:
+        case .fullscreen:
+            // OS-managed: never relocate, keep preserved slots.
             for member in column.windows {
                 let slot = preservedSlot(member, x: x, home: home, frames: frames)
+                committedSlots[member] = slot
+                applyMove(
+                    member, to: slot, epoch: epoch,
+                    frames: frames, heldMembers: heldMembers
+                )
+                clampMemberSize(member, home: home, epoch: epoch, frames: frames)
+            }
+        default:
+            // Singles, tabs, and single-item stacks vertically center
+            // when shorter than the viewport (stacks keep full-height
+            // binpack fill; user drags recenter on the next layout).
+            for member in column.windows {
+                let slot = centeredSlot(member, x: x, home: home, frames: frames)
                 committedSlots[member] = slot
                 applyMove(
                     member, to: slot, epoch: epoch,
@@ -1676,6 +1767,21 @@ public struct DaemonCore: Sendable {
         let keptY = positions[member]?.y ?? home.min.y
         let slotY = min(max(keptY, home.min.y), max(home.min.y, home.max.y - height))
         return IntPoint(x, slotY)
+    }
+
+    /// Vertically centered slot for short singles/tabs: content sits at
+    /// `min.y + (viewport − content) / 2`; full-height or taller content
+    /// top-aligns like the preserved path. Sizes are untouched (the
+    /// size backstop clamps separately) — only the origin centers.
+    private func centeredSlot(
+        _ member: WindowID, x: Int32, home: IntRect,
+        frames: (WindowID) -> IntRect?
+    ) -> IntPoint {
+        let liveH = max(frames(member)?.height ?? 0, 0)
+        guard liveH < home.height else {
+            return IntPoint(x, home.min.y)
+        }
+        return IntPoint(x, home.min.y + (home.height - liveH) / 2)
     }
 
     /// Move intent with homing/hand/convergence handling (extracted
@@ -1870,6 +1976,84 @@ public struct DaemonCore: Sendable {
         return step
     }
 
+    /// Ease programmatic offset targets toward live offsets (one
+    /// workspace at a time, burst-joined with window legs). Snaps when
+    /// animations are off. Direct-manipulation writes set both sides,
+    /// so only eased targets ever differ here.
+    private mutating func easeOffsets(epoch: UInt64) {
+        for ws in Array(offsetTargets.keys) {
+            guard let target = offsetTargets[ws] else { continue }
+            let from = offsets[ws] ?? 0
+            guard from != target else {
+                offsetLegs.removeValue(forKey: ws)
+                continue
+            }
+            if !animationsEnabled || glideBaseMs == 0 {
+                offsets[ws] = target
+                offsetLegs.removeValue(forKey: ws)
+                continue
+            }
+            let step = offsetGlideStep(ws: ws, from: from, to: target, epoch: epoch)
+            offsets[ws] = step
+            if step == target { offsetLegs.removeValue(forKey: ws) }
+        }
+    }
+
+    /// One eased step for a strip offset: the window-leg curve over a
+    /// scalar axis, sharing the burst clock so strips and members land
+    /// lockstep. Same kick/nudge/anti-stall guarantees as `glideStep`.
+    private mutating func offsetGlideStep(
+        ws: WorkspaceID, from: Int32, to: Int32, epoch: UInt64
+    ) -> Int32 {
+        let nowMs = epoch &* 16
+        if let deadline = glideBurstDeadlineMs, nowMs > deadline {
+            glideBurstDeadlineMs = nil
+            glideBurstOpenedMs = nil
+        }
+        let dist = Float(abs(to - from))
+        var leg = offsetLegs[ws]
+        if var live = leg, live.target != IntPoint(to, 0) {
+            let drift = Float(abs(to - live.target.x))
+            let elapsed = nowMs >= live.bornMs ? nowMs - live.bornMs : 0
+            if shouldCarryPhase(elapsedMs: elapsed, durationMs: live.durationMs, driftPx: drift) {
+                live.target = IntPoint(to, 0)
+                leg = live
+            } else {
+                leg = nil
+            }
+        }
+        if leg == nil {
+            let (stamp, opened) = birthPhase(nowMs: nowMs, burstOpenedMs: glideBurstOpenedMs)
+            if opened { glideBurstOpenedMs = stamp }
+            let own = proportionalDuration(distancePx: dist, baseMs: glideBaseMs)
+            let duration = joinDuration(
+                ownMs: own, nowMs: nowMs, deadlineMs: glideBurstDeadlineMs
+            )
+            glideBurstDeadlineMs = max(glideBurstDeadlineMs ?? 0, stamp + duration)
+            leg = GlideLeg(
+                start: IntPoint(from, 0), target: IntPoint(to, 0),
+                bornMs: stamp, durationMs: duration
+            )
+        }
+        guard let live = leg else { return to }
+        offsetLegs[ws] = live
+        let elapsed = nowMs >= live.bornMs ? nowMs - live.bornMs : 0
+        if tweenFinished(elapsedMs: elapsed, durationMs: live.durationMs) { return to }
+        var step = tweenPoint(
+            start: live.start, end: live.target,
+            t: easedFactor(elapsedMs: elapsed, durationMs: live.durationMs)
+        ).x
+        if step == live.start.x, elapsed <= firstTickWindowMs {
+            step = kickStart(from: live.start, to: live.target).x
+        }
+        if step != live.target.x
+            && (step == from || abs(step - live.target.x) <= 2)
+        {
+            step = nudgeLanding(from: IntPoint(step, 0), to: live.target).x
+        }
+        return step
+    }
+
     /// Size twin of `enqueueMove`: coalesces into the same per-window job
     /// (origin and size travel together through one drain).
     private mutating func enqueueResize(_ id: WindowID, to size: IntSize, epoch: UInt64) {
@@ -1957,6 +2141,8 @@ public struct DaemonCore: Sendable {
     public mutating func clearFocusIfGone(_ present: (WindowID) -> Bool) {
         if let id = focus, !present(id) {
             focus = nil
+            focusRaiseLatched = false
+            lastFocusRaise = false
             dirty.insert(.paint)
         }
     }
@@ -1969,6 +2155,12 @@ public struct DaemonCore: Sendable {
     /// Current strip offset for a workspace (diagnostics/tuning).
     public func offset(for workspace: WorkspaceID) -> Int32 {
         offsets[workspace] ?? 0
+    }
+
+    /// Eased offset destination for a workspace, if a programmatic move
+    /// is in flight (diagnostics/tests).
+    public func offsetTarget(for workspace: WorkspaceID) -> Int32? {
+        offsetTargets[workspace]
     }
 
     /// Last committed slot for a window, if it holds one (re-home gate).
@@ -2113,7 +2305,9 @@ public struct DaemonCore: Sendable {
     /// warp sign (positive: left edge goes down, right edge up; negative
     /// mirrored), preserving relative Y plus the signed offset and
     /// landing 6px inside the opposite edge so it can never sit on a
-    /// threshold and ping-pong. The caller passes FULL display frames
+    /// threshold and ping-pong. When the signed half-plane has no
+    /// display, the opposite half-plane serves as fallback (each edge
+    /// warps both ways); then the single-row wrap below. The caller passes FULL display frames
     /// (Rust `Display::bounds`): inset viewports would hide physical
     /// edges and skew cross-display Y math. Mirrors `warp_landing`
     /// including velocity carry (30ms extrapolation, ±80px clamp);
@@ -2150,6 +2344,22 @@ public struct DaemonCore: Sendable {
             abs($0.min.y - current.min.y) < abs($1.min.y - current.min.y)
         }) {
             target = directed
+        } else if let flipped = displays.filter({ display in
+            // Bidirectional fallback: the opposite half-plane serves
+            // stairs whose facing step sits on the other side, so each
+            // edge warps both ways (primary first, fallback second).
+            guard display != current else { return false }
+            let above = display.min.y < current.min.y
+            let below = display.min.y > current.min.y
+            if onLeftEdge {
+                return warpDirection > 0 ? above : below
+            } else {
+                return warpDirection > 0 ? below : above
+            }
+        }).min(by: {
+            abs($0.min.y - current.min.y) < abs($1.min.y - current.min.y)
+        }) {
+            target = flipped
         } else if let wrapped = rowWrapTarget(
             cursor: cursor, current: current,
             onLeftEdge: onLeftEdge, onRightEdge: onRightEdge,
@@ -2185,10 +2395,12 @@ public struct DaemonCore: Sendable {
 
     /// Row-wrap target for single-row arrangements: the far display past
     /// a GLOBAL outer edge (leftmost-left exits land rightmost and vice
-    /// versa). Interior shared edges miss (native crossings flow), and
-    /// the wrap target must vertically overlap the current display
-    /// (stacked pairs stay nil). Sign-independent: with no vertical
-    /// target the direction has nothing left to select.
+    /// versa). Interior shared edges always miss so native display
+    /// crossings are never yanked, and the wrap target must vertically
+    /// overlap the current display (stacked pairs stay nil).
+    /// Sign-independent, and ordered after the bidirectional fallback:
+    /// with no vertical target anywhere, the direction has nothing
+    /// left to select.
     private func rowWrapTarget(
         cursor: IntPoint, current: IntRect,
         onLeftEdge: Bool, onRightEdge: Bool,
@@ -2280,15 +2492,21 @@ public struct DaemonCore: Sendable {
                 } else {
                     activeVirtual.removeValue(forKey: workspace)
                 }
+                // Restored scroll eases in (see `offsetTargets`); a fresh
+                // space resets both sides.
                 if let offset = incoming.offset {
-                    offsets[workspace] = offset
+                    offsetTargets[workspace] = offset
                 } else {
                     offsets.removeValue(forKey: workspace)
+                    offsetTargets.removeValue(forKey: workspace)
+                    offsetLegs.removeValue(forKey: workspace)
                 }
             } else {
                 strips[workspace] = [:]
                 activeVirtual.removeValue(forKey: workspace)
                 offsets.removeValue(forKey: workspace)
+                offsetTargets.removeValue(forKey: workspace)
+                offsetLegs.removeValue(forKey: workspace)
             }
             dirty.formUnion([.layout, .paint])
         }
