@@ -1694,6 +1694,159 @@ do {
     )
 }
 
+// Boundary pixels evaluate their edge (half-open containment drops
+// x == max, so the sample clamps into the union first), and a nearer
+// miss falls through to a farther hit.
+do {
+    let daemon = DaemonCore()
+    let left = IntRect(0, 0, 1920, 1080)
+    let right = IntRect(1920, 0, 3840, 1080)
+    checkEqual(
+        daemon.edgeWarpLanding(
+            cursor: IntPoint(3840, 500), displays: [left, right],
+            warpDirection: 1, yOffset: 0
+        ), IntPoint(6, 500), "x == global max still evaluates the edge"
+    )
+    checkEqual(
+        daemon.edgeWarpLanding(
+            cursor: IntPoint(0, 500), displays: [left, right],
+            warpDirection: 1, yOffset: 0
+        ), IntPoint(3834, 500), "x == global min wraps"
+    )
+    // Near miss falls through: short below misses by Y, tall maps.
+    let short = IntRect(1920, 300, 3840, 500)
+    let tall = IntRect(1920, 600, 3840, 1680)
+    checkEqual(
+        daemon.edgeWarpLanding(
+            cursor: IntPoint(1, 400), displays: [left, short, tall],
+            warpDirection: 1, yOffset: 0
+        ), IntPoint(3834, 1000), "nearer miss yields to farther hit"
+    )
+}
+
+// Re-home decision: slot-converged on the wrong workspace rehomes;
+// travelers and converged residents never do.
+do {
+    let slot = IntPoint(100, 34)
+    let atSlot = IntRect(min: IntPoint(100, 34), max: IntPoint(500, 734))
+    let traveling = IntRect(min: IntPoint(200, 34), max: IntPoint(600, 734))
+    check(
+        shouldRehome(
+            stableFrame: atSlot, liveFrame: atSlot, slot: slot,
+            home: 1, actual: 2, spaceFresh: false
+        ),
+        "steady: stable slot-converged mismatch rehomes"
+    )
+    check(
+        !shouldRehome(
+            stableFrame: traveling, liveFrame: atSlot, slot: slot,
+            home: 1, actual: 2, spaceFresh: false
+        ),
+        "steady: single match could catch a traveler"
+    )
+    check(
+        !shouldRehome(
+            stableFrame: atSlot, liveFrame: traveling, slot: slot,
+            home: 1, actual: 2, spaceFresh: false
+        ),
+        "steady: off-slot live never rehomes"
+    )
+    check(
+        shouldRehome(
+            stableFrame: nil, liveFrame: atSlot, slot: slot,
+            home: 1, actual: 2, spaceFresh: true
+        ),
+        "space-fresh: one converged observation suffices"
+    )
+    check(
+        !shouldRehome(
+            stableFrame: nil, liveFrame: traveling, slot: slot,
+            home: 1, actual: 2, spaceFresh: true
+        ),
+        "space-fresh: travelers still wait"
+    )
+    check(
+        !shouldRehome(
+            stableFrame: atSlot, liveFrame: atSlot, slot: slot,
+            home: 1, actual: 1, spaceFresh: true
+        ),
+        "residents never rehome"
+    )
+    check(
+        !shouldRehome(
+            stableFrame: atSlot, liveFrame: atSlot, slot: nil,
+            home: 1, actual: 2, spaceFresh: true
+        ),
+        "slotless windows never rehome"
+    )
+}
+
+// Transfer protection: ambient echoes inside the raise window set
+// model focus but never move the active display (stale old-app
+// reports during activation can't yank back); settled ambient
+// arrivals hop normally.
+do {
+    var daemon = DaemonCore()
+    daemon.workspaceRing = [1, 2]
+    let left = IntRect(0, 0, 1024, 768)
+    let right = IntRect(1024, 0, 2048, 768)
+    let live = frames(slots: [0: IntPoint(0, 34), 2: IntPoint(400, 34), 1: IntPoint(1024, 34)])
+    _ = daemon.tick(
+        events: [
+            .appeared(id: 0, workspace: 1), .appeared(id: 2, workspace: 1),
+            .appeared(id: 1, workspace: 2), .focus(id: 2),
+        ],
+        frames: live, viewports: [1: left, 2: right], focusedStyle: style
+    )
+    _ = daemon.tick(
+        events: [.command(.window(.focus(.east)))],
+        frames: live, viewports: [1: left, 2: right], focusedStyle: style
+    )
+    checkEqual(daemon.focus, 1, "command crosses to the next display")
+    checkEqual(daemon.activeWorkspace, 2, "command retargets active")
+    _ = daemon.tick(
+        events: [.focus(id: 0)],
+        frames: live, viewports: [1: left, 2: right], focusedStyle: style
+    )
+    checkEqual(daemon.focus, 0, "stale echo still lands model focus")
+    checkEqual(daemon.activeWorkspace, 2, "protected window holds the display")
+    for _ in 0..<40 {
+        _ = daemon.tick(
+            events: [], frames: live,
+            viewports: [1: left, 2: right], focusedStyle: style
+        )
+    }
+    _ = daemon.tick(
+        events: [.focus(id: 2)],
+        frames: live, viewports: [1: left, 2: right], focusedStyle: style
+    )
+    checkEqual(daemon.focus, 2, "settled echo lands")
+    checkEqual(daemon.activeWorkspace, 1, "settled ambient arrivals hop")
+}
+
+// Maximized lone columns center horizontally; unmarked narrow
+// lones stay left-anchored (center_single_column stays opt-in).
+do {
+    var daemon = DaemonCore()
+    let live = frames(slots: [0: IntPoint(0, 34)])
+    _ = daemon.tick(
+        events: [.appeared(id: 0, workspace: 1), .focus(id: 0)],
+        frames: live, viewport: viewport, focusedStyle: style
+    )
+    checkEqual(
+        daemon.committedSlot(of: 0), IntPoint(0, 34),
+        "unmarked narrow lone stays left"
+    )
+    _ = daemon.tick(
+        events: [.command(.window(.fullWidth))],
+        frames: live, viewport: viewport, focusedStyle: style
+    )
+    checkEqual(
+        daemon.committedSlot(of: 0), IntPoint(312, 34),
+        "maximized narrow lone centers: (1024-400)/2"
+    )
+}
+
 if failures == 0 {
     print("DaemonChecks: all checks passed")
 } else {

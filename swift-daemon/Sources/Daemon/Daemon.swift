@@ -140,6 +140,15 @@ public struct DaemonCore: Sendable {
     /// focus holds so late-adopted windows still actuate on appearance
     /// (the host retries until rostered); cleared on change or clear.
     private var focusRaiseLatched = false
+    /// Current frame epoch (stamped each tick; the single-threaded
+    /// contract makes it safe for arrival sites to read).
+    private var currentEpoch: UInt64 = 0
+    /// Epoch of the latest raise-arrival. Ambient arrivals skip the
+    /// display-hop inside this window so a stale echo during a transfer
+    /// (old app reporting while activation is in flight) cannot yank
+    /// the active display back. ~0.5s at 60Hz.
+    private var lastRaiseEpoch: UInt64?
+    private let raiseHopQuietEpochs: UInt64 = 30
     /// Held drag target, if any.
     private var held: WindowID?
     /// Grab-time arming for the held drag (host-owned): armed grabs
@@ -324,13 +333,24 @@ public struct DaemonCore: Sendable {
         guard id != focus else { return }
         focus = id
         lastFocusRaise = raise && id != nil
+        if raise, id != nil {
+            lastRaiseEpoch = currentEpoch
+        }
         // Focus follows the window's display: clicking onto another
         // screen retargets the active workspace (mirrors the Rust
         // `ActiveDisplayMarker`), so gestures, menubar, and reveal
-        // act where the user is looking.
-        if let id, let owner = workspaceOf(id), owner != activeWorkspace {
-            activeWorkspace = owner
-            dirty.insert(.layout)
+        // act where the user is looking. Command arrivals (raise) and
+        // settled ambient arrivals hop; ambient echoes inside the
+        // transfer-protection window don't (stale old-app reports
+        // during activation would yank straight back).
+        if let id {
+            let protected =
+                !raise
+                && lastRaiseEpoch.map({ currentEpoch &- $0 <= raiseHopQuietEpochs }) ?? false
+            if !protected, let owner = workspaceOf(id), owner != activeWorkspace {
+                activeWorkspace = owner
+                dirty.insert(.layout)
+            }
         }
         dirty.insert(.focus)
         dirty.insert(.paint)
@@ -352,6 +372,7 @@ public struct DaemonCore: Sendable {
         // One frame clock for ingest and commit alike: surgery intents
         // enqueued during ingest carry this tick's epoch.
         let epoch = ax.beginFrame()
+        currentEpoch = epoch
         let offsetsBeforeTick = offsets
         ingest(events, frames: frames, viewports: viewports, epoch: epoch)
         // Focus arrivals pend their reveal (drained below against fresh
@@ -1646,12 +1667,19 @@ public struct DaemonCore: Sendable {
                 // center/snap ops position intentionally.
                 var x = home.min.x + (offsets[ws] ?? 0)
                 for (index, column) in strip.columns.enumerated() {
-                    // A lone column centers when configured (Rust
-                    // `center_single_column`); offsets still apply.
+                    // A lone narrow column centers when configured (Rust
+                    // `center_single_column`) or maximized (`fullWidth`
+                    // mark — a maximized window belongs in the middle,
+                    // not on the left edge); offsets still apply.
+                    // Truly full-width columns no-op (left == centered).
+                    let loneNarrow = strip.columns.count == 1
+                        && colWidths[index] < home.width
+                    let centered =
+                        loneNarrow
+                        && (centerSingleColumn
+                            || column.windows.contains(where: { fullWidth[$0] != nil }))
                     let colX: Int32
-                    if centerSingleColumn, strip.columns.count == 1,
-                       colWidths[index] < home.width
-                    {
+                    if centered {
                         colX = home.min.x + (home.width - colWidths[index]) / 2
                             + (offsets[ws] ?? 0)
                     } else {
@@ -2339,55 +2367,81 @@ public struct DaemonCore: Sendable {
     /// right-inset and vice versa). Interior shared edges always miss
     /// so native display crossings are never yanked, and stacked pairs
     /// stay nil via the vertical-overlap guard.
+    ///
+    /// Sampling notes: the cursor clamps into the display union first
+    /// (half-open containment drops boundary pixels, killing the outer
+    /// edge asymmetrically), and candidates run nearest-first with the
+    /// first MAPPING target winning (a nearer miss no longer strands a
+    /// farther hit on 3+ display rows).
     public func edgeWarpLanding(
         cursor: IntPoint, displays: [IntRect],
         warpDirection: Int16, yOffset: Int32, velocityX: Double? = nil
     ) -> IntPoint? {
         guard displays.count >= 2,
-              let current = displays.first(where: { $0.contains(cursor) })
+              let gminX = displays.map({ $0.min.x }).min(),
+              let gmaxX = displays.map({ $0.max.x }).max(),
+              let gminY = displays.map({ $0.min.y }).min(),
+              let gmaxY = displays.map({ $0.max.y }).max()
         else { return nil }
-        let onLeftEdge = abs(cursor.x - current.min.x) < 3
-        let onRightEdge = abs(current.max.x - cursor.x) < 3
+        let clamped = IntPoint(
+            min(max(cursor.x, gminX), gmaxX - 1),
+            min(max(cursor.y, gminY), gmaxY - 1)
+        )
+        guard let current = displays.first(where: { $0.contains(clamped) })
+        else { return nil }
+        let onLeftEdge = abs(clamped.x - current.min.x) < 3
+        let onRightEdge = abs(current.max.x - clamped.x) < 3
         guard onLeftEdge || onRightEdge else { return nil }
-        let target: IntRect
-        if let directed = displays.filter({ display in
+        // Half-plane polarity per edge+sign; flipped = the opposite
+        // half-plane (each edge warps both ways, primary first).
+        func polarity(_ display: IntRect, flipped: Bool) -> Bool {
             guard display != current else { return false }
             let above = display.min.y < current.min.y
             let below = display.min.y > current.min.y
+            let wantBelow: Bool
             if onLeftEdge {
-                return warpDirection > 0 ? below : above
+                wantBelow = (warpDirection > 0) != flipped
             } else {
-                return warpDirection > 0 ? above : below
+                wantBelow = (warpDirection <= 0) != flipped
             }
-        }).min(by: {
+            return wantBelow ? below : above
+        }
+        let ordered = displays.filter { $0 != current }.sorted {
             abs($0.min.y - current.min.y) < abs($1.min.y - current.min.y)
-        }) {
-            target = directed
-        } else if let flipped = displays.filter({ display in
-            // Bidirectional fallback: the opposite half-plane serves
-            // stairs whose facing step sits on the other side, so each
-            // edge warps both ways (primary first, fallback second).
-            guard display != current else { return false }
-            let above = display.min.y < current.min.y
-            let below = display.min.y > current.min.y
-            if onLeftEdge {
-                return warpDirection > 0 ? above : below
-            } else {
-                return warpDirection > 0 ? below : above
+        }
+        for flipped in [false, true] {
+            for candidate in ordered where polarity(candidate, flipped: flipped) {
+                if let landing = warpLanding(
+                    cursor: clamped, current: current, target: candidate,
+                    onLeftEdge: onLeftEdge, yOffset: yOffset,
+                    velocityX: velocityX
+                ) {
+                    return landing
+                }
             }
-        }).min(by: {
-            abs($0.min.y - current.min.y) < abs($1.min.y - current.min.y)
-        }) {
-            target = flipped
-        } else if let wrapped = rowWrapTarget(
-            cursor: cursor, current: current,
+        }
+        if let wrapped = rowWrapTarget(
+            cursor: clamped, current: current,
             onLeftEdge: onLeftEdge, onRightEdge: onRightEdge,
             displays: displays
         ) {
-            target = wrapped
-        } else {
-            return nil
+            return warpLanding(
+                cursor: clamped, current: current, target: wrapped,
+                onLeftEdge: onLeftEdge, yOffset: yOffset,
+                velocityX: velocityX
+            )
         }
+        return nil
+    }
+
+    /// One landing attempt on a fixed target: relative Y with signed
+    /// offset, range guard, velocity carry, opposite-edge inset. Nil
+    /// when the equivalent Y falls off the target (matches macOS
+    /// native side-by-side behavior).
+    private func warpLanding(
+        cursor: IntPoint, current: IntRect, target: IntRect,
+        onLeftEdge: Bool, yOffset: Int32, velocityX: Double?
+    ) -> IntPoint? {
         let relativeY = cursor.y - current.min.y
         let directionSign: Int32 =
             target.min.y > current.min.y ? 1 : -1
@@ -2441,6 +2495,8 @@ public struct DaemonCore: Sendable {
         guard overlap > 0 else { return nil }
         return wrapTo
     }
+
+    // MARK: - Re-home decision (pure, free function below)
 
     /// Vanish triage (pure): split roster ids missing from the
     /// on-screen list into hidden (still listed, on another Space —
@@ -2634,4 +2690,24 @@ public struct DaemonCore: Sendable {
 
     /// Script store + revision live beside the core (owned by Scripting).
     public var scriptRevision: UInt64 = 0
+}
+
+// MARK: - Re-home decision (pure)
+
+/// Re-home decision (pure): a window resting at its committed slot on
+/// the wrong workspace is misplaced, not traveling. The steady path
+/// needs two identical observations (glide frames keep changing, so a
+/// single match could catch a traveler); right after a space change
+/// one slot-converged observation suffices — a window sitting AT its
+/// slot cannot be mid-glide.
+public func shouldRehome(
+    stableFrame: IntRect?, liveFrame: IntRect, slot: IntPoint?,
+    home: WorkspaceID?, actual: WorkspaceID, spaceFresh: Bool
+) -> Bool {
+    guard let home, home != actual, let slot else { return false }
+    guard abs(liveFrame.min.x - slot.x) <= 1,
+          abs(liveFrame.min.y - slot.y) <= 1
+    else { return false }
+    if spaceFresh { return true }
+    return stableFrame == liveFrame
 }

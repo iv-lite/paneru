@@ -741,24 +741,33 @@ func syncRoster() {
         }
     }
     // Re-home windows that settled outside their strip (manual display
-    // drags, space returns, stale adoptions): a frame stable across two
-    // syncs in another workspace re-homes the whole column there.
-    // Traveling windows never match twice: mid-glide frames keep
-    // changing AND the live frame must sit at its committed slot —
-    // without the slot gate a slow glide gets yanked back to whatever
-    // display it is currently passing through, fighting the ring move
-    // (or verify push) that owns it.
+    // drags, space returns, stale adoptions). Right after a space
+    // change one slot-converged observation suffices (a window sitting
+    // AT its slot cannot be mid-glide); otherwise frames must hold
+    // still across two syncs so traveling windows are never yanked.
+    // Bounded confirm reads (8) cover stagger lag on fresh space
+    // changes instead of waiting another full cadence.
+    let spaceFresh =
+        spaceChangedAt.map { Date().timeIntervalSince($0) < 2.0 } ?? false
+    var confirms = 0
     for (wid, window) in roster {
         let id = windowID(wid)
+        if spaceFresh, confirms < 8,
+           let home = workspaceOfWindow(id),
+           home != workspaceForFrame(window.frame),
+           window.updateFrame() != nil
+        {
+            confirms += 1
+        }
         let frame = window.frame
         defer { stableFrames[wid] = frame }
-        guard stableFrames[wid] == frame,
-              let home = workspaceOfWindow(id),
-              let slot = core.committedSlot(of: id),
-              abs(frame.min.x - slot.x) <= 1,
-              abs(frame.min.y - slot.y) <= 1,
-              home != workspaceForFrame(frame)
-        else { continue }
+        guard shouldRehome(
+            stableFrame: stableFrames[wid], liveFrame: frame,
+            slot: core.committedSlot(of: id),
+            home: workspaceOfWindow(id),
+            actual: workspaceForFrame(frame),
+            spaceFresh: spaceFresh
+        ) else { continue }
         core.rehomeColumn(id, to: workspaceForFrame(frame))
     }
 }
@@ -788,6 +797,14 @@ func observeFired(app: LiveApp) {
     // every notification re-reads, but only CHANGES enqueue — otherwise a
     // window gliding under the cursor storms a focus event per notification
     // and each one re-drives reveal/scroll corrections (the jitter loop).
+    // Frontmost-gated (Rust window_focused_trigger): a focus echo from an
+    // app that is not frontmost is stale by definition (e.g. the old app
+    // reporting during a display transfer) and must not yank focus or
+    // the active display back.
+    guard NSWorkspace.shared.frontmostApplication?.processIdentifier == app.pid else {
+        rosterDirty = true
+        return
+    }
     if let focused = app.focusedWindowID(),
        !dontFocus.contains(windowID(focused)),
        windowID(focused) != core.focus
@@ -845,11 +862,15 @@ if tap.install() {
 }
 // Space switches (public NSWorkspace signal, no SLS needed) resync
 // at once: waiting the backstop leaves a full second of churn.
+// `spaceChangedAt` opens the fast re-home path (single slot-converged
+// observation instead of two stable syncs) for 2s after each switch.
+var spaceChangedAt: Date?
 workspaceSpaceObserver = NSWorkspace.shared.notificationCenter.addObserver(
     forName: NSWorkspace.activeSpaceDidChangeNotification,
     object: nil, queue: .main
 ) { _ in
     rosterDirty = true
+    spaceChangedAt = Date()
     print("display: space changed (resyncing)")
 }
 
