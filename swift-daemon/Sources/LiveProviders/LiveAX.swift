@@ -131,6 +131,25 @@ public final class LiveWindow {
         self.enhancedUIAbsent = enhancedUIAbsent
     }
 
+    /// Retarget the gap insets (Rust `set_padding`): re-bases the cached
+    /// frame through raw CG truth so no AX round trip is needed. Slots
+    /// always abut; the visual gap between neighbors is the sum of the
+    /// adjacent insets.
+    public func setPadding(hPad: Int32, vPad: Int32) {
+        let rawMin = IntPoint(
+            frame.min.x + horizontalPadding, frame.min.y + verticalPadding
+        )
+        let rawMax = IntPoint(
+            frame.max.x - horizontalPadding, frame.max.y - verticalPadding
+        )
+        horizontalPadding = hPad
+        verticalPadding = vPad
+        frame = IntRect(
+            min: IntPoint(rawMin.x - hPad, rawMin.y - vPad),
+            max: IntPoint(rawMax.x + hPad, rawMax.y + vPad)
+        )
+    }
+
     /// Report a write failure once per distinct signature; success
     /// clears. Prints outside the lock (a rare duplicate line is
     /// harmless, a deadlock is not).

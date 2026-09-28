@@ -856,6 +856,97 @@ do {
     checkEqual(daemon.lastWarpKind, "clamp:primary", "clamped landing reports its stage")
 }
 
+// Wrap A: exposed interior steps wrap around the display circle instead
+// of sticking. Tops-aligned row with two short displays: the bands past
+// a neighbor's end have no seam, no vertical target either way, and sit
+// off the global extremes — previously a hard nil one way.
+do {
+    var daemon = DaemonCore()
+    let a = IntRect(0, 0, 1920, 1080)
+    let b = IntRect(1920, 0, 3840, 900)
+    let c = IntRect(3840, 0, 5760, 950)
+    let row = [a, b, c]
+    // C's left step below B's bottom slips around the corner onto B.
+    checkEqual(
+        daemon.edgeWarpLanding(
+            cursor: IntPoint(3840, 925), displays: row,
+            warpDirection: -1, yOffset: 0
+        ), IntPoint(3834, 899), "exposed left step wraps onto the predecessor"
+    )
+    checkEqual(daemon.lastWarpKind, "clamp:row", "corner slip reports its stage")
+    // A's right step above B's bottom slips onto B the other way.
+    checkEqual(
+        daemon.edgeWarpLanding(
+            cursor: IntPoint(1919, 950), displays: row,
+            warpDirection: -1, yOffset: 0
+        ), IntPoint(1926, 899), "exposed right step wraps onto the successor"
+    )
+    checkEqual(daemon.lastWarpKind, "clamp:row", "right corner slip reports its stage")
+    // Global outer edges keep classic wrap-around through the same path.
+    checkEqual(
+        daemon.edgeWarpLanding(
+            cursor: IntPoint(0, 500), displays: row,
+            warpDirection: -1, yOffset: 0
+        ), IntPoint(5754, 500), "outer left still wraps to the far end"
+    )
+    checkEqual(daemon.lastWarpKind, "row", "outer wrap reports its stage")
+    checkEqual(
+        daemon.edgeWarpLanding(
+            cursor: IntPoint(5759, 500), displays: row,
+            warpDirection: -1, yOffset: 0
+        ), IntPoint(6, 500), "outer right still wraps to the far end"
+    )
+    // Shared seams stay native in both directions.
+    checkEqual(
+        daemon.edgeWarpLanding(
+            cursor: IntPoint(1920, 500), displays: row,
+            warpDirection: -1, yOffset: 0
+        ), nil, "shared left seam never yanks"
+    )
+    checkEqual(daemon.lastWarpKind, "none:seam", "seam miss reports its stage")
+    checkEqual(
+        daemon.edgeWarpLanding(
+            cursor: IntPoint(3839, 500), displays: row,
+            warpDirection: -1, yOffset: 0
+        ), nil, "shared right seam never yanks"
+    )
+}
+
+// Stairs descending left to right (60Hz, 60Hz, builtin): half-plane
+// landings keep working in both directions, outer edges wrap around.
+do {
+    var daemon = DaemonCore()
+    let a = IntRect(0, 0, 1920, 1080)
+    let b = IntRect(1920, 300, 3840, 1380)
+    let c = IntRect(3840, 600, 5352, 1582)
+    let stairs = [a, b, c]
+    checkEqual(
+        daemon.edgeWarpLanding(
+            cursor: IntPoint(3839, 400), displays: stairs,
+            warpDirection: -1, yOffset: 0
+        ), IntPoint(3846, 700), "stairs right step lands below"
+    )
+    checkEqual(daemon.lastWarpKind, "primary", "stairs landing reports its stage")
+    checkEqual(
+        daemon.edgeWarpLanding(
+            cursor: IntPoint(1920, 1200), displays: stairs,
+            warpDirection: -1, yOffset: 0
+        ), IntPoint(1914, 900), "stairs left step lands above"
+    )
+    checkEqual(
+        daemon.edgeWarpLanding(
+            cursor: IntPoint(0, 500), displays: stairs,
+            warpDirection: -1, yOffset: 0
+        ), IntPoint(5346, 1100), "stairs outer left wraps to the far end"
+    )
+    checkEqual(
+        daemon.edgeWarpLanding(
+            cursor: IntPoint(5351, 1000), displays: stairs,
+            warpDirection: -1, yOffset: 0
+        ), IntPoint(6, 400), "stairs outer right wraps to the far end"
+    )
+}
+
 // Healing focus picks the surviving column nearest the viewport
 // center, skipping tabs and the lost window.
 do {
@@ -2091,6 +2182,77 @@ do {
         backed.axJobs.allSatisfy { $0.winID != 0 || $0.size == nil },
         "re-drive backs off instead of hammering"
     )
+}
+
+// Slots abut: gaps are host-side AX insets, never slot pitch. Padded-size
+// frames (416 = 400 + 2x8 insets) still tile edge to edge.
+do {
+    var daemon = DaemonCore()
+    daemon.animationsEnabled = false
+    daemon.glideBaseMs = 0
+    let padded: (Int32) -> IntRect? = { id in
+        let x: Int32 = id == 0 ? 0 : 416
+        return IntRect(min: IntPoint(x, 0), max: IntPoint(x + 416, 768))
+    }
+    _ = daemon.tick(
+        events: [.appeared(id: 0, workspace: 1), .appeared(id: 1, workspace: 1)],
+        frames: { _ in IntRect(min: IntPoint(0, 0), max: IntPoint(416, 768)) },
+        viewport: viewport, focusedStyle: style
+    )
+    let rested = daemon.tick(
+        events: [], frames: padded, viewport: viewport, focusedStyle: style
+    )
+    checkEqual(daemon.positions[0], IntPoint(0, 0), "first column slots at the edge")
+    checkEqual(daemon.positions[1], IntPoint(416, 0), "second column abuts (no pitch gap)")
+    check(rested.axJobs.isEmpty, "abutted truth rests")
+}
+
+// autoCenter: a focus arrival centers the window in its viewport by moving
+// the strip (512-200-800 = -488); repeating focus on the centered window
+// retargets nothing.
+do {
+    var daemon = DaemonCore()
+    daemon.animationsEnabled = false
+    daemon.glideBaseMs = 0
+    daemon.autoCenter = true
+    _ = daemon.tick(
+        events: [
+            .appeared(id: 0, workspace: 1), .appeared(id: 1, workspace: 1),
+            .appeared(id: 2, workspace: 1),
+        ],
+        frames: frames(slots: [0: IntPoint(0, 0), 1: IntPoint(0, 0), 2: IntPoint(0, 0)]),
+        viewports: [1: viewport], focusedStyle: style
+    )
+    let settled: [Int32: IntPoint] = [
+        0: IntPoint(0, 0), 1: IntPoint(400, 0), 2: IntPoint(800, 0),
+    ]
+    for _ in 0..<40 {
+        _ = daemon.tick(
+            events: [], frames: frames(slots: settled),
+            viewports: [1: viewport], focusedStyle: style
+        )
+    }
+    _ = daemon.tick(
+        events: [.focus(id: 2)],
+        frames: frames(slots: settled),
+        viewports: [1: viewport], focusedStyle: style
+    )
+    checkEqual(
+        daemon.offsetTarget(for: 1), -488, "focus centers the window (512-200-800)"
+    )
+    checkEqual(daemon.offsets[1], -488, "centering snaps with animations off")
+    let centered: [Int32: IntPoint] = [
+        0: IntPoint(-488, 0), 1: IntPoint(-88, 0), 2: IntPoint(312, 0),
+    ]
+    _ = daemon.tick(
+        events: [.focus(id: 2)],
+        frames: frames(slots: centered),
+        viewports: [1: viewport], focusedStyle: style
+    )
+    checkEqual(
+        daemon.offsetTarget(for: 1), -488, "repeat focus holds the center"
+    )
+    checkEqual(daemon.offsets[1], -488, "centered strip does not jog")
 }
 
 if failures == 0 {

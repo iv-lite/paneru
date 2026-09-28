@@ -284,8 +284,8 @@ core.resizeCycle = resolved.windowResizeCycle
 core.continuousSwipe = resolved.swipeContinuous
 core.windowHiddenRatio = resolved.windowHiddenRatio
 core.createWorkspaceAutomatically = resolved.createWorkspaceAutomatically
-core.gapHorizontal = resolved.gapHorizontal
-core.gapVertical = resolved.gapVertical
+core.autoCenter = resolved.autoCenter
+// Slots abut; gaps live in per-window AX padding (see applyWindowPadding).
 core.centerSingleColumn = resolved.centerSingleColumn
 core.animationsEnabled = resolved.animationsEnabled
 core.glideBaseMs = resolved.animationDurationMs
@@ -391,6 +391,10 @@ func adoptNewcomers(_ adopted: [(AdoptedWindow, AXUIElement)]) {
             }
         }
         let window = LiveWindow(id: windowID(wid), element: element, frame: probe.frame)
+        // Slots abut; the between-window gap is this per-window AX inset
+        // (Rust `set_padding`). The probe frame is raw CG truth, so the
+        // cached frame expands by exactly the insets here.
+        window.setPadding(hPad: resolved.gapHorizontal, vPad: resolved.gapVertical)
         // Window rules: manage forces adoption past role rejection and
         // dont_focus suppresses focus arrival. Floating and width replay
         // focus-free through LayoutOps; index waits on a strip-position
@@ -1309,6 +1313,15 @@ func watchTuning(_ path: String) {
 /// Refresh every derived consumer from the resolved config (core
 /// presets, border style, tap tuning) and re-log effective tuning.
 /// Called after each rebuild once the owners exist.
+///
+/// Retargets every rostered window's gap insets from the resolved config
+/// (Rust `set_padding`): pure cached-frame re-basing, no AX round trips.
+func applyWindowPadding() {
+    for window in roster.values {
+        window.setPadding(hPad: resolved.gapHorizontal, vPad: resolved.gapVertical)
+    }
+}
+
 func refreshDerivedConfig() {
     core.presetWidths = resolved.presetColumnWidths
     core.presetHeights = resolved.presetStackHeights
@@ -1316,12 +1329,13 @@ func refreshDerivedConfig() {
     core.continuousSwipe = resolved.swipeContinuous
     core.windowHiddenRatio = resolved.windowHiddenRatio
     core.createWorkspaceAutomatically = resolved.createWorkspaceAutomatically
-    core.gapHorizontal = resolved.gapHorizontal
-    core.gapVertical = resolved.gapVertical
+    core.autoCenter = resolved.autoCenter
+    // Slots abut; gaps live in per-window AX padding (see applyWindowPadding).
     core.centerSingleColumn = resolved.centerSingleColumn
     core.animationsEnabled = resolved.animationsEnabled
     core.glideBaseMs = resolved.animationDurationMs
     radiusRulesGen += 1
+    applyWindowPadding()
     focusedStyle = makeFocusedStyle(resolved)
     tap.tuning = TapTuning(
         swipeFingers: resolved.swipeFingers,
@@ -1664,14 +1678,21 @@ func checkWarp(cursor: IntPoint) {
     let velocityX: Double? =
         (dt > 0 && dt <= 0.08) ? Double(cursor.x - lastWarpSample.point.x) / dt : nil
     lastWarpSample = (cursor, now)
-    guard let warp = resolved.horizontalMouseWarp,
-          let landing = core.edgeWarpLanding(
-              cursor: cursor, displays: fullDisplayFrames(),
-              warpDirection: warp,
-              yOffset: resolved.horizontalMouseWarpOffset,
-              velocityX: velocityX
-          )
-    else { return }
+    guard let warp = resolved.horizontalMouseWarp else { return }
+    guard let landing = core.edgeWarpLanding(
+        cursor: cursor, displays: fullDisplayFrames(),
+        warpDirection: warp,
+        yOffset: resolved.horizontalMouseWarpOffset,
+        velocityX: velocityX
+    ) else {
+        // Name the killer branch on edge-adjacent misses (seam vs nomap):
+        // interior/lone/outside samples are the common quiet case.
+        let kind = core.lastWarpKind
+        if kind == "none:seam" || kind == "none:nomap" {
+            print("mouse: edge warp missed via \(kind) at \(cursor.x),\(cursor.y)")
+        }
+        return
+    }
     warpMouse(to: CGPoint(x: Double(landing.x), y: Double(landing.y)))
     lastWarpSample = (landing, now)
     print("mouse: edge warp \(landing.x),\(landing.y) via \(core.lastWarpKind)")

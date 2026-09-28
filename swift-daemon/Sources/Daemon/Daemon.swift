@@ -288,11 +288,13 @@ public struct DaemonCore: Sendable {
     /// shortfall (legacy), 1 only when fully hidden (quiet clicks —
     /// a clicked window is visible by definition).
     public var windowHiddenRatio = 0.0
-    /// Gaps (px) between columns and stacked items. Mirrors resolved
-    /// `gapHorizontal`/`gapVertical` (Rust default 8); the core default
-    /// is 0 so unit checks pin gap-free geometry unless they opt in.
-    public var gapHorizontal: Int32 = 0
-    public var gapVertical: Int32 = 0
+    /// Center the focused window in its viewport on focus arrival by
+    /// moving the strip (Rust `auto_center` / `autocenter_window_on_focus`).
+    /// Slots always abut: between-window gaps live entirely in the host
+    /// AX layer as per-window padding insets (Rust `set_ax_position` /
+    /// `set_ax_size`), never as slot pitch — so the core holds no gap
+    /// state at all.
+    public var autoCenter = false
     /// Center a lone column in the viewport (Rust `center_single_column`).
     public var centerSingleColumn = false
     /// Minimum stacked-item height for `binpackHeights` (Rust 200px).
@@ -1589,19 +1591,28 @@ public struct DaemonCore: Sendable {
     ) {
         let owner = workspaceOf(id) ?? activeWorkspace
         revealFocus(id, frames: frames, viewport: viewport(for: owner, in: viewports))
-        clampSwipeTravel(owner, viewport: viewport(for: owner, in: viewports), frames: frames)
+        // Under autoCenter the centering target owns out-of-range offsets
+        // (Rust: the edge invariant is unenforced); clamping here would
+        // uncenter edge windows and fight the glide. Manual gesture travel
+        // still clamps at the ingest site.
+        if !autoCenter {
+            clampSwipeTravel(owner, viewport: viewport(for: owner, in: viewports), frames: frames)
+        }
     }
 
     /// Scroll the minimal shortfall to reveal the focused window.
+    /// Under `autoCenter` the focused window is centered in its viewport
+    /// instead (Rust `autocenter_window_on_focus`): the strip moves, never
+    /// the window, so the arrival rides rigidly with its siblings.
     /// Uses last committed slots (layout is unchanged by focus itself).
     /// Only fires for windows in the shown row (revealing a parked slot
-    /// is meaningless motion), and only when the hidden fraction exceeds
-    /// `windowHiddenRatio`: with the shipped 1.0, clicks (always on
-    /// visible windows) never scroll, while keyboard focus into
-    /// fully-hidden windows still reveals. Slots are absolute (they bake
-    /// the offset), so the layout arm passes the offset-free position —
-    /// passing the absolute slot double-counts the offset on settled
-    /// strips.
+    /// is meaningless motion), and — on the minimal-expose path only —
+    /// when the hidden fraction exceeds `windowHiddenRatio`: with the
+    /// shipped 1.0, clicks (always on visible windows) never scroll, while
+    /// keyboard focus into fully-hidden windows still reveals. Slots are
+    /// absolute (they bake the offset), so the layout arm passes the
+    /// offset-free position — passing the absolute slot double-counts the
+    /// offset on settled strips.
     private mutating func revealFocus(
         _ id: WindowID, frames: (WindowID) -> IntRect?, viewport: IntRect
     ) {
@@ -1611,6 +1622,10 @@ public struct DaemonCore: Sendable {
         else { return }
         let width = frames(id)?.width ?? 0
         let offset = offsets[owner] ?? 0
+        if autoCenter {
+            centerFocus(slot: slot, width: width, offset: offset, viewport: viewport, owner: owner)
+            return
+        }
         let view = IntRect(
             min: IntPoint(viewport.min.x, 0),
             max: IntPoint(viewport.max.x, viewport.height)
@@ -1638,6 +1653,30 @@ public struct DaemonCore: Sendable {
             offsetTargets[owner] = next.x
             dirty.formUnion([.layout, .motion])
         }
+    }
+
+    /// Center the focused window in its viewport by moving the strip
+    /// (Rust `focus_arrival_center`: `strip_target = center - size/2 -
+    /// layout`, deliberately unclamped). The window keeps no move intent
+    /// of its own, so it rides the strip rigidly with its siblings.
+    /// Skips when the strip already sits at the target (2px quantum for
+    /// OS rounding drift) and the window is fully visible — a redundant
+    /// target would restart the glide and jog a settled strip.
+    private mutating func centerFocus(
+        slot: IntPoint, width: Int32, offset: Int32,
+        viewport: IntRect, owner: WorkspaceID
+    ) {
+        let centerX = viewport.min.x + viewport.width / 2
+        let target = centerX - width / 2 - (slot.x - offset)
+        let current = offsetTargets[owner] ?? offset
+        if target == current { return }
+        if abs(offset - target) <= 2, width > 0 {
+            let lo = max(slot.x, viewport.min.x)
+            let hi = min(slot.x + width, viewport.max.x)
+            if hi - lo >= width { return }
+        }
+        offsetTargets[owner] = target
+        dirty.formUnion([.layout, .motion])
     }
 
     /// Row holding a vanished window in this workspace, if its parked
@@ -1828,7 +1867,8 @@ public struct DaemonCore: Sendable {
                         column, x: colX, home: home,
                         epoch: epoch, frames: frames, heldMembers: heldMembers
                     )
-                    x += colWidths[index] + gapHorizontal
+                    // Slots abut: gaps are host-side AX insets, never pitch.
+                    x += colWidths[index]
                 }
             }
         }
@@ -1906,9 +1946,10 @@ public struct DaemonCore: Sendable {
             item.windows.compactMap { frames($0)?.height }.max()
                 ?? home.height / Int32(max(items.count, 1))
         }
-        let gapTotal = Int32(items.count - 1) * gapVertical
+        // Stacked slots abut like columns: gaps are host-side AX
+        // insets, never pitch, so heights fill the viewport exactly.
         guard let assigned = binpackHeights(
-            desired, minHeight: stackMinHeight, totalHeight: home.height - gapTotal
+            desired, minHeight: stackMinHeight, totalHeight: home.height
         ) else {
             for member in items.flatMap({ $0.windows }) {
                 let slot = preservedSlot(member, x: x, home: home, frames: frames)
@@ -1936,7 +1977,7 @@ public struct DaemonCore: Sendable {
                 )
                 applySize(member, to: target, epoch: epoch, frames: frames)
             }
-            y += h + gapVertical
+            y += h
         }
     }
 
@@ -2522,11 +2563,13 @@ public struct DaemonCore: Sendable {
     /// held-button drags keep native edge behavior).
     ///
     /// Row-wrap fall-through (beyond Rust): when no vertical target
-    /// exists and the cursor sits on a GLOBAL outer edge, single-row
-    /// arrangements wrap around the row (leftmost-left → rightmost
-    /// right-inset and vice versa). Interior shared edges always miss
-    /// so native display crossings are never yanked, and stacked pairs
-    /// stay nil via the vertical-overlap guard.
+    /// exists, any left/right edge with no seam neighbor at the cursor Y
+    /// wraps around the row — global outer edges (leftmost-left →
+    /// rightmost right-inset and vice versa) as well as exposed interior
+    /// steps (a short display's edge band past its neighbor's end wraps
+    /// instead of sticking like native macOS). Interior shared edges
+    /// always miss so native display crossings are never yanked, and
+    /// stacked pairs stay nil via the vertical-overlap guard.
     ///
     /// Sampling notes: the cursor clamps into the display union first
     /// (half-open containment drops boundary pixels, killing the outer
@@ -2535,9 +2578,11 @@ public struct DaemonCore: Sendable {
     /// farther hit on 3+ display rows).
     ///
     /// Branch order (see `lastWarpKind` for the taken path): signed
-    /// half-plane, then single-row wrap (circle-first on outer edges so
-    /// endpoint steps stay reachable), then opposite half-plane, then
-    /// clamped landings in the same order (uniform always-land).
+    /// half-plane, then row wrap (circle-first on outer edges so
+    /// endpoint steps stay reachable, and on exposed interior steps so
+    /// mixed-height rows wrap instead of sticking), then opposite
+    /// half-plane, then clamped landings in the same order (uniform
+    /// always-land).
     public private(set) var lastWarpKind = "none"
 
     public mutating func edgeWarpLanding(
@@ -2623,7 +2668,7 @@ public struct DaemonCore: Sendable {
             return landing
         }
         if let wrapped = rowWrapTarget(
-            cursor: clamped, current: current,
+            current: current,
             onLeftEdge: onLeftEdge, onRightEdge: onRightEdge,
             displays: displays
         ),
@@ -2649,7 +2694,7 @@ public struct DaemonCore: Sendable {
             return landing
         }
         if let wrapped = rowWrapTarget(
-            cursor: clamped, current: current,
+            current: current,
             onLeftEdge: onLeftEdge, onRightEdge: onRightEdge,
             displays: displays
         ),
@@ -2706,31 +2751,37 @@ public struct DaemonCore: Sendable {
         return IntPoint(min(max(base + carry, lo), hi), targetY)
     }
 
-    /// Row-wrap target for single-row arrangements: the far display past
-    /// a GLOBAL outer edge (leftmost-left exits land rightmost and vice
-    /// versa). Interior shared edges always miss so native display
-    /// crossings are never yanked, and the wrap target must vertically
-    /// overlap the current display (stacked pairs stay nil).
+    /// Row-wrap target: the neighbor around the display circle past a
+    /// left/right edge with no seam neighbor at the cursor Y. Exiting
+    /// left enters at the predecessor's right side, exiting right at
+    /// the successor's left side (displays ordered by left edge, ends
+    /// joined). Global outer edges reduce to the classic wrap-around
+    /// (leftmost-left → rightmost right-inset and vice versa); exposed
+    /// interior steps (wrap A: a short display's edge band past its
+    /// neighbor's end) slip around the step corner onto the neighbor
+    /// instead of sticking like native macOS. Interior shared edges
+    /// never reach here (seam suppression returns first), so native
+    /// display crossings are never yanked. The wrap target must
+    /// vertically overlap the current display (stacked pairs stay nil).
     /// Sign-independent, and ordered after the bidirectional fallback:
     /// with no vertical target anywhere, the direction has nothing
     /// left to select.
     private func rowWrapTarget(
-        cursor: IntPoint, current: IntRect,
+        current: IntRect,
         onLeftEdge: Bool, onRightEdge: Bool,
         displays: [IntRect]
     ) -> IntRect? {
-        guard let globalMinX = displays.map({ $0.min.x }).min(),
-              let globalMaxX = displays.map({ $0.max.x }).max()
-        else { return nil }
-        let wrapTo: IntRect?
-        if onLeftEdge, abs(cursor.x - globalMinX) < 3 {
-            wrapTo = displays.max(by: { $0.max.x < $1.max.x })
-        } else if onRightEdge, abs(globalMaxX - cursor.x) < 3 {
-            wrapTo = displays.min(by: { $0.min.x < $1.min.x })
+        let order = displays.sorted { $0.min.x < $1.min.x }
+        guard order.count >= 2, let at = order.firstIndex(of: current) else { return nil }
+        let wrapTo: IntRect
+        if onLeftEdge {
+            wrapTo = order[(at + order.count - 1) % order.count]
+        } else if onRightEdge {
+            wrapTo = order[(at + 1) % order.count]
         } else {
             return nil
         }
-        guard let wrapTo, wrapTo != current else { return nil }
+        guard wrapTo != current else { return nil }
         let overlap = min(current.max.y, wrapTo.max.y) - max(current.min.y, wrapTo.min.y)
         guard overlap > 0 else { return nil }
         return wrapTo
