@@ -338,19 +338,119 @@ extension DaemonOptions {
         out.mouseDragDisplayModifiers = parseModifierField(mouseDragDisplayModifier)
         return out
     }
+
+    /// Layer these options over an already-resolved config, touching only
+    /// fields this layer sets. Same defaults/clamps as `resolved()`, so a
+    /// `swift.toml` fallback (or a `paneru.setup` table) fills gaps without
+    /// ever clobbering base values. Precedence: setup > fallback > base.
+    public func apply(to config: inout ResolvedConfig) {
+        if let v = focusFollowsMouse { config.focusFollowsMouse = v }
+        if let v = mouseFollowsFocus { config.mouseFollowsFocus = v }
+        if let v = horizontalMouseWarp { config.horizontalMouseWarp = v }
+        if let v = horizontalMouseWarpOffset { config.horizontalMouseWarpOffset = v }
+        if animations == false {
+            config.animationsEnabled = false
+            config.animationDurationMs = 0
+        } else if animations == true {
+            config.animationsEnabled = true
+            if let d = animationDurationMs {
+                config.animationDurationMs = min(d, 2000)
+            }
+        } else if let d = animationDurationMs {
+            config.animationDurationMs = min(d, 2000)
+        }
+        if autoCenter == true { config.autoCenter = true }
+        if centerSingleColumn == true { config.centerSingleColumn = true }
+        if let r = defaultRatio, r > 0 { config.defaultRatio = min(r, 1.0) }
+        if let v = sliverHeight { config.sliverHeight = min(max(v, 0.1), 1.0) }
+        if let v = sliverWidth { config.sliverWidth = max(Int32(v), 1) }
+        if let v = paddingTop { config.paddingTop = Int32(v) }
+        if let v = paddingBottom { config.paddingBottom = Int32(v) }
+        if let v = paddingLeft { config.paddingLeft = Int32(v) }
+        if let v = paddingRight { config.paddingRight = Int32(v) }
+        if let v = gapHorizontal { config.gapHorizontal = min(max(Int32(v), 0), maxGapPx) }
+        if let v = gapVertical { config.gapVertical = min(max(Int32(v), 0), maxGapPx) }
+        if borderActive == true { config.borderActive = true }
+        if borderInactive == true { config.borderInactive = true }
+        if let c = borderColor { config.borderColor = parseHexColor(c) }
+        if let c = inactiveBorderColor { config.inactiveBorderColor = parseHexColor(c) }
+        if let v = borderOpacity { config.borderOpacity = min(max(v, 0), 1) }
+        if borderColor != nil { config.borderAlpha = parseHexAlpha(borderColor!) }
+        if inactiveBorderColor != nil { config.inactiveBorderAlpha = parseHexAlpha(inactiveBorderColor!) }
+        if let v = borderWidth { config.borderWidth = max(v, 0) }
+        if let r = borderRadius {
+            switch r {
+            case .auto: config.borderRadius = .auto
+            case .value(let v): config.borderRadius = .value(max(v, 0))
+            }
+        }
+        if dimInactiveColor != nil {
+            config.dimColor = parseHexColor(dimInactiveColor!)
+            config.dimAlpha = parseHexAlpha(dimInactiveColor!)
+            config.dimOpacity = Float(min(max(dimInactiveOpacity ?? 0, 0), 1))
+            config.dimActive = true
+        }
+        if let v = dimNightOpacity { config.dimNightOpacity = v }
+        if let v = swipeFingers { config.swipeFingers = v }
+        if let v = swipeDirection { config.swipeDirection = v }
+        if let v = swipeVertical { config.swipeVertical = v }
+        if let v = swipeSensitivity { config.swipeSensitivity = min(max(v, 0.1), 2.0) }
+        if let v = swipeContinuous { config.swipeContinuous = v }
+        if let v = swipeDeceleration { config.swipeDeceleration = min(max(v, 1.0), 10.0) }
+        if let v = maximizeTiledWindows { config.maximizeTiledWindows = v }
+        if let v = menubarHeight { config.menubarHeight = Int32(v) }
+        if let v = windowHiddenRatio { config.windowHiddenRatio = min(max(v, 0), 1) }
+        if let v = windowResizeCycle { config.windowResizeCycle = v }
+        if reapEmptyWorkspaces == true { config.reapEmptyWorkspaces = true }
+        if disableNativeTabs == true { config.nativeTabsEnabled = false }
+        if virtualWorkspaceAnimations == true { config.virtualWorkspaceAnimations = true }
+        if insertWindowsMidStrip == true { config.insertWindowsMidStrip = true }
+        if createWorkspaceAutomatically == true { config.createWorkspaceAutomatically = true }
+        if let v = defaultWorkspaces { config.defaultWorkspaces = max(v, 1) }
+        if let v = axWriter { config.axWriterEnabled = v }
+        if let v = restoreEnabled { config.restoreEnabled = v }
+        if let v = restoreStartupGraceMs { config.restoreStartupGraceMs = v }
+        if let v = restoreMissingWindows { config.restoreMissingWindows = v }
+        if let v = presetColumnWidths { config.presetColumnWidths = v }
+        if let v = presetStackHeights { config.presetStackHeights = v }
+        if let v = workspaceMenuStatus { config.workspaceMenuStatus = v }
+        if let v = workspacePopupStatus { config.workspacePopupStatus = v }
+        if let v = menubarOrientation { config.menubarOrientation = v }
+        if let v = menubarIndicatorStyle { config.menubarIndicatorStyle = v }
+        if let v = menubarIndicatorFormat { config.menubarIndicatorFormat = v }
+        if let v = menubarActiveCharacter { config.menubarActiveCharacter = v }
+        if let v = menubarInactiveCharacter { config.menubarInactiveCharacter = v }
+        if let v = menubarFontSize { config.menubarFontSize = min(max(v, 1.0), 24.0) }
+        if let v = menubarDescriptorStyle { config.menubarDescriptorStyle = v }
+        if let v = menubarDescriptorText { config.menubarDescriptorText = v }
+        if let v = menubarDescriptorSymbol { config.menubarDescriptorSymbol = v }
+        if swipeScrollModifier != nil {
+            config.swipeScrollModifiers = parseModifierField(swipeScrollModifier)
+        }
+        if swipeScrollVerticalModifier != nil {
+            config.swipeScrollVerticalModifiers = parseModifierField(swipeScrollVerticalModifier)
+        }
+        if mouseResizeModifier != nil {
+            config.mouseResizeModifiers = parseModifierField(mouseResizeModifier)
+        }
+        if mouseDragDisplayModifier != nil {
+            config.mouseDragDisplayModifiers = parseModifierField(mouseDragDisplayModifier)
+        }
+    }
 }
 
 // MARK: - Hex colors
 
-/// Parse `#RRGGBB[AA]` channels (alpha handled separately); anything else
-/// is white. Mirrors `config::parse_hex_color`.
+/// Parse `#RRGGBB[AA]` channels into 0–1 floats (alpha handled
+/// separately); anything else is white. Mirrors
+/// `config::parse_hex_color` (`#FF0000 == (1, 0, 0)`).
 public func parseHexColor(_ hex: String) -> (Double, Double, Double) {
     let digits = hex.hasPrefix("#") ? String(hex.dropFirst()) : hex
     guard digits.count == 6 || digits.count == 8 else { return (1, 1, 1) }
     func channel(_ lo: Int) -> Double {
         let start = digits.index(digits.startIndex, offsetBy: lo)
         let end = digits.index(start, offsetBy: 2)
-        return Double(UInt8(String(digits[start..<end]), radix: 16) ?? 255)
+        return Double(UInt8(String(digits[start..<end]), radix: 16) ?? 255) / 255.0
     }
     return (channel(0), channel(2), channel(4))
 }

@@ -79,7 +79,9 @@ public struct LaunchAgentSpec: Equatable, Sendable {
     }
 }
 
-/// Render the agent plist, byte-faithful in keys to `assets/launchd.plist`.
+/// Render the agent plist, byte-faithful in keys to `assets/launchd.plist`
+/// plus `ThrottleInterval` (30s): a grant-check failure must back off
+/// instead of respinning at launchd's default cadence.
 public func launchAgentPlist(_ spec: LaunchAgentSpec) -> String {
     """
     <?xml version="1.0" encoding="UTF-8"?>
@@ -117,6 +119,8 @@ public func launchAgentPlist(_ spec: LaunchAgentSpec) -> String {
         </dict>
         <key>RunAtLoad</key>
         <true />
+        <key>ThrottleInterval</key>
+        <integer>30</integer>
         <key>StandardErrorPath</key>
         <string>\(spec.errorLogPath)</string>
         <key>StandardOutPath</key>

@@ -53,9 +53,15 @@ final class DimManager {
             }
             let window = surfaces[idx].window
             guard let layer = window.contentView?.layer else { continue }
-            layer.backgroundColor = NSColor(
-                srgbRed: r, green: g, blue: b, alpha: Double(opacity)
-            ).cgColor
+            // Steady ticks must not recomposite: rewriting the background
+            // color every frame costs a composite at display rate even at
+            // rest. The tick-level cache above already skips most of these;
+            // this guards direct callers too.
+            if surfaces[idx].opacity != opacity || surfaces[idx].color != (r, g, b) {
+                layer.backgroundColor = NSColor(
+                    srgbRed: r, green: g, blue: b, alpha: Double(opacity)
+                ).cgColor
+            }
             // Mask path rebuilds only when the hole moves: same fullscreen
             // rect plus rounded cutout, even-odd filled. This is the GPU
             // win — no view re-raster, ever.

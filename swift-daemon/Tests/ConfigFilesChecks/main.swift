@@ -45,6 +45,63 @@ do {
         tomlCandidates(system).suffix(2) == ["/x1/paneru/paneru.toml", "/x2/paneru/paneru.toml"],
         "XDG dirs iterate in order"
     )
+    // Bare environments (no XDG_CONFIG_HOME): $HOME/.config backs discovery.
+    let bare = ConfigSearchEnv(home: "/home/u")
+    checkEqual(
+        tomlCandidates(bare),
+        ["/home/u/.paneru", "/home/u/.paneru.toml", "/home/u/.config/paneru/paneru.toml"],
+        "home backs xdg for toml"
+    )
+    checkEqual(
+        luaCandidates(bare),
+        ["/home/u/.paneru.lua", "/home/u/.config/paneru/init.lua"],
+        "home backs xdg for lua"
+    )
+    checkEqual(
+        swiftTOMLCandidates(bare, luaPath: nil),
+        ["/home/u/.config/paneru/swift.toml"],
+        "home backs xdg for swift.toml"
+    )
+}
+
+// swift.toml fallback discovery: override, lua sibling, then XDG.
+do {
+    let env = ConfigSearchEnv(
+        home: "/home/u", xdgConfigHome: "/home/u/.config", xdgConfigDirs: []
+    )
+    checkEqual(
+        swiftTOMLCandidates(env, luaPath: "/home/u/.config/paneru/init.lua"),
+        ["/home/u/.config/paneru/swift.toml"],
+        "sibling leads, repeats dropped"
+    )
+    checkEqual(
+        swiftTOMLCandidates(env, luaPath: "/elsewhere/init.lua"),
+        ["/elsewhere/swift.toml", "/home/u/.config/paneru/swift.toml"],
+        "distinct sibling leads xdg"
+    )
+    checkEqual(
+        swiftTOMLCandidates(env, luaPath: nil),
+        ["/home/u/.config/paneru/swift.toml"],
+        "no lua means xdg only"
+    )
+    let over = ConfigSearchEnv(
+        paneruSwiftTOML: "/etc/swift.toml", home: "/home/u",
+        xdgConfigHome: "/home/u/.config"
+    )
+    checkEqual(
+        swiftTOMLCandidates(over, luaPath: nil).first, "/etc/swift.toml",
+        "override leads"
+    )
+    let found = discoverSwiftTOML(over, luaPath: nil) {
+        $0 == "/home/u/.config/paneru/swift.toml"
+    }
+    checkEqual(
+        found.path, "/home/u/.config/paneru/swift.toml",
+        "missing override falls through"
+    )
+    checkEqual(found.warnings.count, 1, "missing override warns once")
+    let none = discoverSwiftTOML(ConfigSearchEnv(), luaPath: nil) { _ in false }
+    checkEqual(none.path, nil, "no fallback discovers nothing")
 }
 
 // Default write locations and startup selection.

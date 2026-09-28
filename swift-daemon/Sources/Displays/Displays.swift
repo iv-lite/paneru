@@ -16,6 +16,36 @@ public enum DockPosition: Equatable, Sendable {
     case hidden
 }
 
+// MARK: - Point location
+
+/// Index of the display containing a point, else the nearest display's
+/// index by clamped distance. Off-screen spawns (cascade offsets,
+/// slide-ins) must resolve to the NEAREST display: falling back to the
+/// merely-active workspace teleports them across screens (they land at
+/// the neighbor display's edge, y preserved). Nil only when there are
+/// no displays at all.
+public func displayIndexForPoint(_ point: IntPoint, in frames: [IntRect]) -> Int? {
+    for (index, frame) in frames.enumerated() {
+        if point.x >= frame.min.x && point.x < frame.min.x + frame.width
+            && point.y >= frame.min.y && point.y < frame.min.y + frame.height
+        {
+            return index
+        }
+    }
+    var best: (index: Int, distance: Int64)?
+    for (index, frame) in frames.enumerated() {
+        let cx = min(max(Int64(point.x), Int64(frame.min.x)), Int64(frame.min.x) + Int64(frame.width))
+        let cy = min(max(Int64(point.y), Int64(frame.min.y)), Int64(frame.min.y) + Int64(frame.height))
+        let dx = Int64(point.x) - cx
+        let dy = Int64(point.y) - cy
+        let distance = dx * dx + dy * dy
+        if best.map({ distance < $0.distance }) ?? true {
+            best = (index, distance)
+        }
+    }
+    return best?.index
+}
+
 // MARK: - Display
 
 /// A physical monitor. Mirrors `manager::Display`.

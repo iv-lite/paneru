@@ -1,4 +1,5 @@
 import CLua
+import Foundation
 import Scripting
 
 // Thin Swift owner for one PUC-Rio Lua state, shaped for the snapshot
@@ -35,11 +36,13 @@ private let luaRegistryIndex: Int32 = -1_073_742_823
 
 /// The `paneru` table scripts program against. Binds record
 /// `{chord, handler}` rows for the host to publish; `run`/`command`
-/// append to the outbox; `flash` accumulates flashes. `on`, `match`,
-/// `query`, and `state` arrive with later slices — calling them now is
-/// a loud error, not a silent nil.
+/// append to the outbox; `flash` accumulates flashes; `setup` captures
+/// the declarative config table for the host to decode. `match` marks a
+/// filter the full windowset API does not serve yet: `on` with a match
+/// skips loudly instead of failing the script, and `query`/`state`
+/// remain loud errors, not silent nils.
 public let luaPrelude = """
-    paneru = { _binds = {} }
+    paneru = { _binds = {}, _setup = nil }
     function paneru.bind(chord, handler)
       if type(handler) ~= "function" and type(handler) ~= "string" then
         error("paneru.bind: handler must be a function or command string")
@@ -54,7 +57,31 @@ public let luaPrelude = """
       table.insert(paneru_flashes, { message = message, duration = duration or 2.0 })
     end
     function paneru.log(message) end
-    function paneru.on(name, handler)
+    paneru.mouse = {}
+    function paneru.mouse.next_display()
+      paneru.run("mouse nextdisplay")
+    end
+    function paneru.mouse.previous_display()
+      paneru.run("mouse previousdisplay")
+    end
+    function paneru.setup(t)
+      if type(t) ~= "table" then
+        error("paneru.setup: expected a table")
+      end
+      paneru._setup = t
+    end
+    function paneru.match(t)
+      if type(t) ~= "table" then
+        error("paneru.match: expected a table")
+      end
+      return { _match = t }
+    end
+    function paneru.on(name, a, b)
+      local handler = b or a
+      if b ~= nil and type(a) == "table" then
+        print("paneru: on('" .. tostring(name) .. "') with match() skipped (full windowset API not yet)")
+        return
+      end
       if type(handler) ~= "function" then
         error("paneru.on: handler must be a function")
       end
@@ -63,6 +90,100 @@ public let luaPrelude = """
       table.insert(paneru._handlers[name], handler)
     end
     """
+
+/// Wall-clock cap for one `paneru.exec` call: past it the child is
+/// killed and the result reports 124 (matches `timeout(1)`).
+private let execTimeoutSecs: TimeInterval = 30
+
+/// `paneru.exec(path[, args])` implementation: synchronous subprocess
+/// with captured output. Plain C calling convention for `lua_pushcclosure`;
+/// all stack discipline mirrors the methods above.
+private func paneruExecImpl(_ state: OpaquePointer?) -> Int32 {
+    guard let state else { return 0 }
+    func fail(_ message: String) -> Int32 {
+        // `luaL_error` is variadic (unimportable): push the message and
+        // raise with `lua_error` instead (longjmps; the return is dead).
+        lua_pushstring(state, message)
+        return lua_error(state)
+    }
+    guard Int(lua_gettop(state)) >= 1,
+          lua_type(state, 1) == LUA_TSTRING,
+          let path = lua_tolstring(state, 1, nil)
+    else {
+        return fail("paneru.exec: expected a command path")
+    }
+    let command = String(cString: path)
+    var args: [String] = []
+    if Int(lua_gettop(state)) >= 2 {
+        switch lua_type(state, 2) {
+        case LUA_TTABLE:
+            let count = Int(lua_rawlen(state, 2))
+            if count > 0 {
+                for i in 1...count {
+                    lua_geti(state, 2, Int64(i))
+                    guard lua_type(state, -1) == LUA_TSTRING,
+                          let cstr = lua_tolstring(state, -1, nil)
+                    else {
+                        lua_settop(state, 0)
+                        return fail("paneru.exec: args must be strings")
+                    }
+                    args.append(String(cString: cstr))
+                    lua_settop(state, 1 + 1)
+                }
+            }
+            lua_settop(state, 2)
+        case LUA_TSTRING:
+            if let cstr = lua_tolstring(state, 2, nil) {
+                args = [String(cString: cstr)]
+            }
+        case LUA_TNIL, LUA_TNONE:
+            break
+        default:
+            return fail("paneru.exec: args must be a table or string")
+        }
+    }
+    let process = Process()
+    process.executableURL = URL(fileURLWithPath: command)
+    process.arguments = args
+    let outPipe = Pipe()
+    let errPipe = Pipe()
+    process.standardOutput = outPipe
+    process.standardError = errPipe
+    do {
+        try process.run()
+    } catch {
+        return fail("paneru.exec: cannot run '\(command)': \(error)")
+    }
+    // Bounded wait: poll so overruns kill the child instead of wedging
+    // the owning thread past the cap.
+    let deadline = Date().addingTimeInterval(execTimeoutSecs)
+    while process.isRunning, Date() < deadline {
+        Thread.sleep(forTimeInterval: 0.05)
+    }
+    var code: Int32
+    if process.isRunning {
+        process.terminate()
+        process.waitUntilExit()
+        code = 124
+    } else {
+        code = process.terminationStatus
+    }
+    let stdout = String(
+        data: outPipe.fileHandleForReading.readDataToEndOfFile(), encoding: .utf8
+    ) ?? ""
+    let stderr = String(
+        data: errPipe.fileHandleForReading.readDataToEndOfFile(), encoding: .utf8
+    ) ?? ""
+    lua_settop(state, 0)
+    lua_createtable(state, 0, 3)
+    lua_pushinteger(state, Int64(code))
+    lua_setfield(state, -2, "code")
+    lua_pushstring(state, stdout)
+    lua_setfield(state, -2, "stdout")
+    lua_pushstring(state, stderr)
+    lua_setfield(state, -2, "stderr")
+    return 1
+}
 
 public final class LuaBridge {
     private let state: OpaquePointer
@@ -98,6 +219,22 @@ public final class LuaBridge {
     public func pushStore(_ store: ScriptState) {
         pushScriptValue(.map(store.fields))
         lua_setglobal(state, luaStateGlobal)
+    }
+
+    /// Read the `paneru._setup` table captured by `paneru.setup(t)`.
+    /// Nil when the script never called it (or first assigned a
+    /// non-table, which the prelude rejects): TOML/defaults stay
+    /// authoritative. Reads through the same table decoder as stores,
+    /// so nested option tables arrive as plain `Sendable` values.
+    public func readSetup() -> ScriptValue? {
+        guard lua_getglobal(state, "paneru") == LUA_TTABLE else {
+            pop(1)
+            return nil
+        }
+        lua_getfield(state, -1, "_setup")
+        defer { pop(2) }
+        guard lua_type(state, -1) == LUA_TTABLE else { return nil }
+        return readTable(at: -1)
     }
 
     /// Read back the `paneru_state` global as a store.
@@ -159,9 +296,27 @@ public final class LuaBridge {
     }
 
     /// Install the `paneru` table. Idempotent: reloading re-runs it over
-    /// whatever the user script defined.
+    /// whatever the user script defined (the native `exec` entry is
+    /// re-pinned each time, harmlessly overwriting itself).
     public func installPrelude() throws {
         try load(luaPrelude)
+        installExec()
+    }
+
+    /// Pin the native `paneru.exec` entry onto the prelude table:
+    /// `paneru.exec(path[, args])` runs a subprocess synchronously and
+    /// returns `{code, stdout, stderr}`. Synchronous by contract (binds
+    /// read the result inline); long commands stall the owning thread,
+    /// so scripts must keep them short — past 30s the child is killed
+    /// and `code` reports 124. Launch failures raise a Lua error.
+    private func installExec() {
+        guard lua_getglobal(state, "paneru") == LUA_TTABLE else {
+            pop(1)
+            return
+        }
+        lua_pushcclosure(state, paneruExecImpl, 0)
+        lua_setfield(state, -2, "exec")
+        pop(1)
     }
 
     // MARK: - Binds

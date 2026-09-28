@@ -47,6 +47,7 @@ do {
         "<key>EnvironmentVariables</key>", "<key>NO_COLOR</key>",
         "<key>RUST_LOG</key>", "<key>XDG_CONFIG_HOME</key>",
         "<key>RunAtLoad</key>", "<key>KeepAlive</key>",
+        "<key>ThrottleInterval</key>", "<integer>30</integer>",
         "<key>StandardErrorPath</key>", "<key>StandardOutPath</key>",
         "<key>Nice</key>", "<integer>-20</integer>",
         "<key>ProcessType</key>", "<string>Interactive</string>",

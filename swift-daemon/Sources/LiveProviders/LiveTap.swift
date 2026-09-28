@@ -98,22 +98,55 @@ public enum TapHealth: Equatable, Sendable {
 
 // MARK: - Tap
 
-/// Scroll/swipe tuning injected from config.
+/// Scroll/swipe tuning injected from config. Scroll targets are optional:
+/// nil means scroll interception is disabled entirely (plain scrolling
+/// always delivers natively). A non-nil target uses group-exact matching
+/// (see `scrollGroupMatches`), so an empty target only matches bare,
+/// modifier-free scrolls — it never swallows every scroll the way a
+/// subset check on `[]` would.
 public struct TapTuning: Equatable, Sendable {
     public var swipeFingers: Int?
     public var swipeVertical: Bool
-    public var scrollTarget: TapModifiers
-    public var scrollVertical: TapModifiers
+    public var scrollTarget: TapModifiers?
+    public var scrollVertical: TapModifiers?
 
     public init(
         swipeFingers: Int? = nil, swipeVertical: Bool = false,
-        scrollTarget: TapModifiers = [], scrollVertical: TapModifiers = []
+        scrollTarget: TapModifiers? = nil, scrollVertical: TapModifiers? = nil
     ) {
         self.swipeFingers = swipeFingers
         self.swipeVertical = swipeVertical
         self.scrollTarget = scrollTarget
         self.scrollVertical = scrollVertical
     }
+}
+
+/// Group-exact modifier match for scroll interception. For each modifier
+/// group (shift, control, alternate, command, function): a target that
+/// requires the group needs at least one held side; a target that does
+/// not require it forbids every side. Mirrors Rust `Modifiers::matches`
+/// (`src/platform.rs`), adapted to the tap's left/right-distinct bits.
+/// Unlike `TapModifiers.matches` (subset: extras allowed, empty matches
+/// everything), this rejects extra groups so plain scrolling is never
+/// hijacked by an unrelated binding.
+public func scrollGroupMatches(target: TapModifiers, held: TapModifiers) -> Bool {
+    let groups: [TapModifiers] = [
+        [.leftShift, .rightShift],
+        [.leftControl, .rightControl],
+        [.leftAlternate, .rightAlternate],
+        [.leftCommand, .rightCommand],
+        [.function],
+    ]
+    for group in groups {
+        if !target.intersection(group).isEmpty {
+            if held.intersection(group).isEmpty {
+                return false
+            }
+        } else if !held.intersection(group).isEmpty {
+            return false
+        }
+    }
+    return true
 }
 
 /// Keypress resolution order: focused passthrough, then scripted binds,
@@ -244,17 +277,16 @@ public final class LiveTap {
         switch type {
         case .leftMouseDown, .rightMouseDown:
             if type == .leftMouseDown { leftButtonHeld = true }
-            _ = emit(.mouseDown(point: event.location, modifiers: modifiers))
+            // Pointer motion is never daemon input: sinking it queued a
+            // `.printState` per HID burst, growing `pending` without bound
+            // and keeping the main runloop (which also owns this tap)
+            // saturated until input starved. Track the button and deliver
+            // natively.
             return false
         case .leftMouseUp, .rightMouseUp:
             if type == .leftMouseUp { leftButtonHeld = false }
-            _ = emit(.mouseUp(point: event.location, modifiers: modifiers))
             return false
-        case .leftMouseDragged, .rightMouseDragged:
-            _ = emit(.mouseDragged(point: event.location, modifiers: modifiers))
-            return false
-        case .mouseMoved:
-            _ = emit(.mouseMoved(point: event.location, modifiers: modifiers))
+        case .leftMouseDragged, .rightMouseDragged, .mouseMoved:
             return false
         case .keyDown:
             let keycode = UInt8(clamping: event.getIntegerValueField(.keyboardEventKeycode))
@@ -276,11 +308,18 @@ public final class LiveTap {
         if Date().timeIntervalSince(lastSwipe) < tapScrollSuppressInterval {
             return true
         }
+        // No scroll target configured: never intercept. (The old subset
+        // check on an empty target matched every scroll, swallowing plain
+        // scrolling and turning it into tiling offsets.)
+        guard let target = tuning.scrollTarget else { return false }
         let horizontal = event.getDoubleValueField(.scrollWheelEventFixedPtDeltaAxis2)
         let vertical = event.getDoubleValueField(.scrollWheelEventFixedPtDeltaAxis1)
         let held = tapModifiers(flags: event.flags.rawValue)
-        let base = tuning.scrollTarget.matches(held)
-        let combined = (tuning.scrollTarget.union(tuning.scrollVertical)).matches(held)
+        let base = scrollGroupMatches(target: target, held: held)
+        let combined: Bool = {
+            guard let verticalMods = tuning.scrollVertical else { return false }
+            return scrollGroupMatches(target: target.union(verticalMods), held: held)
+        }()
         guard base || combined else { return false }
         if combined, abs(vertical) > tapSwipeThreshold {
             return emit(.verticalScrollTick(delta: vertical))
@@ -296,21 +335,22 @@ public final class LiveTap {
         return emit(.scroll(delta: delta))
     }
 
+    /// Minimum touches for a paging swipe. Two-touch gestures are scrolls
+    /// (plain, or modifier-held); they never page, even when no swipe is
+    /// configured.
+    private let swipeTouchCount = 2
+
     private func handleSwipe(event: CGEvent) -> Bool {
-        guard let fingers = tuning.swipeFingers, fingers >= tapMinimumFingers else {
-            return false
-        }
         guard let nsEvent = NSEvent(cgEvent: event),
               nsEvent.type == .gesture else {
             return false
         }
         if nsEvent.phase.contains(.ended) || nsEvent.phase.contains(.cancelled) {
             fingerPositions = []
-            _ = emit(.touchpadUp)
+            // Finger lift is not daemon input; deliver natively.
             return false
         }
         let touches = nsEvent.allTouches()
-        guard touches.count == fingers else { return false }
         var current: [(id: AnyObject, x: Double, y: Double)] = []
         var began = false
         for touch in touches {
@@ -322,33 +362,82 @@ public final class LiveTap {
             ))
         }
         defer { fingerPositions = current }
+        // Configured-finger gestures consume even quiet events (below):
+        // leaking them lets macOS start its own full-screen/page swipe
+        // (Rust parity: 3+ fingers down intercepts everything).
+        let pagingCount = tuning.swipeFingers.flatMap {
+            $0 >= tapMinimumFingers ? $0 : nil
+        }
         if began {
-            _ = emit(.touchpadDown)
-            return false
+            // Fresh gesture: nothing carries over from the last one, but
+            // a configured-count start still consumes (see above).
+            return pagingCount.map { current.count == $0 } ?? false
         }
         guard !fingerPositions.isEmpty else { return false }
-        var sumX = 0.0
-        var sumY = 0.0
-        var tracked = 0
+        // Per-finger deltas on each axis. Like Rust (`swipe_gesture`),
+        // the dominant axis carries only when EVERY tracked finger
+        // exceeds the threshold on it — a summed threshold lets one
+        // fast finger (or pooled jitter) drag the rest along and
+        // inflates travel well past Rust feel.
+        var dx: [Double] = []
+        var dy: [Double] = []
         for touch in current {
             guard let prev = fingerPositions.first(where: { $0.id.isEqual(touch.id) }) else {
                 continue
             }
-            sumX += prev.x - touch.x
-            sumY += prev.y - touch.y
-            tracked += 1
+            dx.append(prev.x - touch.x)
+            dy.append(prev.y - touch.y)
         }
-        guard tracked == current.count else { return false }
-        if abs(sumX) >= abs(sumY) {
-            guard abs(sumX) > tapSwipeThreshold else { return false }
+        // Identity mismatches (fresh gesture, no began phase — common at
+        // tap level) still consume when the count qualifies: leaking the
+        // first motion lets macOS start its own spaces/page swipe from a
+        // partial stream. The deferred baseline store heals tracking on
+        // the very next event.
+        guard dx.count == current.count else {
+            return pagingCount.map { current.count == $0 } ?? false
+        }
+        let sumX = dx.reduce(0, +)
+        let sumY = dy.reduce(0, +)
+        // Paging swipe: exactly the configured finger count (3+).
+        // Sub-threshold events still consume (see above): the OS must
+        // never see a partial gesture stream.
+        if let fingers = pagingCount, current.count == fingers {
+            if abs(sumX) >= abs(sumY) {
+                guard dx.allSatisfy({ abs($0) > tapSwipeThreshold }) else { return true }
+                lastSwipe = Date()
+                return emit(.swipe(delta: sumX, fingers: fingers))
+            }
+            guard tuning.swipeVertical,
+                  dy.allSatisfy({ abs($0) > tapSwipeThreshold })
+            else {
+                return true
+            }
             lastSwipe = Date()
-            return emit(.swipe(delta: sumX, fingers: fingers))
+            return emit(.verticalSwipe(delta: sumY, fingers: fingers))
         }
-        guard tuning.swipeVertical, abs(sumY) > tapSwipeThreshold else {
-            return false
+        // Modifier scroll on the trackpad: the HID tap sees touchpad
+        // scrolling as gesture touches, never as scroll-wheel events
+        // (those are synthesized downstream past the tap), so a two-touch
+        // gesture with the scroll modifiers held is the scroll signal —
+        // the same ZFingers-vs-modifiers split the Rust scroll path makes
+        // on wheel deltas. Plain two-touch gestures deliver natively.
+        if current.count == swipeTouchCount,
+           let target = tuning.scrollTarget,
+           scrollGroupMatches(
+               target: target,
+               held: tapModifiers(flags: event.flags.rawValue)
+           )
+        {
+            // Same per-finger discipline as swipes: dominant axis, every
+            // finger past the threshold, or the event is jitter.
+            if abs(sumX) >= abs(sumY) {
+                guard dx.allSatisfy({ abs($0) > tapSwipeThreshold }) else { return false }
+                return emit(.scroll(delta: sumX))
+            }
+            guard dy.allSatisfy({ abs($0) > tapSwipeThreshold }) else { return false }
+            return emit(.scroll(delta: sumY))
         }
-        lastSwipe = Date()
-        return emit(.verticalSwipe(delta: sumY, fingers: fingers))
+        return false
     }
 }
 

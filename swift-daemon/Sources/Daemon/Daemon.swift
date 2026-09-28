@@ -139,8 +139,65 @@ public struct DaemonCore: Sendable {
     public var presetHeights: [Double] = [0.25, 0.33333, 0.50, 0.66667, 0.75]
     /// Whether resize runs past the last preset back to the first.
     public var resizeCycle = true
+    /// Continuous swipe lets the strip travel until the first/last window
+    /// snaps (rather than clamping to fill edges). Mirrors
+    /// `continuous_swipe`; only gesture travel clamps — programmatic
+    /// moves (center/snap/reveal) own out-of-range offsets.
+    public var continuousSwipe = true
+    /// Workspace ring in spatial display order (host-owned): cross-display
+    /// moves resolve neighbors here. Empty keeps the legacy `±1` fallback
+    /// the single-display checks pin.
+    public var workspaceRing: [WorkspaceID] = []
     /// Minimum stack-member height. Mirrors `MIN_WINDOW_HEIGHT`.
     private let minWindowHeight: Int32 = 200
+    /// Live-frame convergence deadband for the verify pass. Mirrors the
+    /// AX write deadband: sub-pixel truth must not cost a round trip.
+    private let axDeadbandPx: Int32 = 1
+    /// Ticks between verify re-drives of the same window (~0.5s at 60Hz):
+    /// lets genuine glides land instead of re-pushing every frame.
+    private let redriveCooldownEpochs: UInt64 = 30
+    /// Focus arrival deferred past motion: fires once the strip rests.
+    private var pendingReveal: WindowID?
+    /// Last verify re-drive epoch per window (see the commit pass).
+    private var lastRedrive: [WindowID: UInt64] = [:]
+    /// A row that emptied while its windows left the screen (native
+    /// fullscreen Space, Mission Control): the whole strip object waits
+    /// here so returning windows restore order, stacks, and positions
+    /// instead of re-appending scrambled. Swept by TTL.
+    private struct ParkedRow {
+        var strip: LayoutStrip
+        var atEpoch: UInt64
+    }
+    private var parkedRows: [WorkspaceID: [UInt32: ParkedRow]] = [:]
+    /// Parked strip offsets per workspace: a Space trip must not inherit
+    /// scroll drift accumulated while away (the spaces swipe itself can
+    /// read as a tiling swipe) — on return the strip waits exactly as
+    /// left. Consumed once, alongside the row restore.
+    private var parkedOffsets: [WorkspaceID: (offset: Int32, atEpoch: UInt64)] = [:]
+    /// How long a parked row (and its positions) survives: a minute at
+    /// 60Hz covers Space trips; truly closed windows sweep out after.
+    private let parkedRowTTLEpochs: UInt64 = 3600
+    /// Consecutive un-converged re-drives per window: backs the cooldown
+    /// off for windows whose apps snap every push back.
+    private var redriveStreak: [WindowID: UInt8] = [:]
+    /// Live frame at the last re-drive attempt: identical frames mean
+    /// the OS is holding the window (clamped/rejected placement), so
+    /// further pushes stop instead of jumping forever.
+    private var redriveLastLive: [WindowID: IntRect] = [:]
+    /// Last epoch the strip offsets moved: focus arrival reveals only
+    /// when the strip is at rest, never mid-flight. Nil until the first
+    /// move — a fresh core is at rest by definition (and short harnesses
+    /// must reveal immediately). AX jobs alone do not count: resizes and
+    /// converged pushes leave offsets alone, and gating on them would
+    /// stand reveals down for the whole settle.
+    private var lastOffsetMoveEpoch: UInt64?
+    /// Quiet epochs required before a reveal (~0.5s at 60Hz).
+    private let revealRestEpochs: UInt64 = 30
+    /// Hidden fraction of the focused window above which arrival
+    /// reveals. Mirrors `window_hidden_ratio`: 0 always reveals on any
+    /// shortfall (legacy), 1 only when fully hidden (quiet clicks —
+    /// a clicked window is visible by definition).
+    public var windowHiddenRatio = 0.0
 
     public init() {}
 
@@ -161,11 +218,13 @@ public struct DaemonCore: Sendable {
     }
 
     /// Run one frame: ingest, layout, commit, paint. `frames` supplies live
-    /// window rects (sizes); `viewport` bounds the paint pass.
+    /// window rects (sizes); `viewports` carries one viewport per
+    /// workspace (single-display callers pass one entry and everything
+    /// behaves exactly as before).
     public mutating func tick(
         events: [DaemonEvent],
         frames: (WindowID) -> IntRect?,
-        viewport: IntRect,
+        viewports: [WorkspaceID: IntRect],
         focusedStyle: BorderStyle
     ) -> FrameResult {
         let prevFocus = focus
@@ -174,48 +233,181 @@ public struct DaemonCore: Sendable {
         // One frame clock for ingest and commit alike: surgery intents
         // enqueued during ingest carry this tick's epoch.
         let epoch = ax.beginFrame()
-        ingest(events, frames: frames, viewport: viewport, epoch: epoch)
+        let offsetsBeforeTick = offsets
+        ingest(events, frames: frames, viewports: viewports, epoch: epoch)
         // Focus arrival reveals: scroll the minimal shortfall so the
         // focused window is fully visible (mirrors ensure_visible; the
-        // strip never chases anything else).
+        // strip never chases anything else). Only at rest — an offset
+        // write this tick, a held drag, fresh gestures, or a recent move
+        // stand the reveal down into a pending slot that fires once the
+        // strip settles, so a flapping focus cannot yank mid-flight. The
+        // result still clamps to strip bounds like any other offset
+        // write. Pure AX traffic (resizes, converged pushes) does not
+        // count as motion.
+        func rested() -> Bool {
+            offsets == offsetsBeforeTick
+                && !gestureFresh && held == nil
+                && (lastOffsetMoveEpoch.map({ epoch &- $0 >= revealRestEpochs }) ?? true)
+        }
         if focus != prevFocus, let id = focus {
-            revealFocus(id, frames: frames, viewport: viewport)
+            pendingReveal = nil
+            if rested() {
+                revealOwner(id, frames: frames, viewports: viewports)
+            } else {
+                pendingReveal = id
+            }
+        } else if let id = pendingReveal, rested() {
+            pendingReveal = nil
+            revealOwner(id, frames: frames, viewports: viewports)
         }
         layoutPass()
-        let jobs = commitPass(frames: frames, viewport: viewport, epoch: epoch)
-        let plan = paintPass(frames: frames, viewport: viewport, focusedStyle: focusedStyle)
+        // NOTE: no orphan fallback here: an emptied active workspace is
+        // legitimate (sent its last window away with `stay`, still
+        // looking at that display). Focus arrival retargets naturally;
+        // yanking active away breaks stay semantics.
+        sweepParkedRows(epoch: epoch)
+        let jobs = commitPass(frames: frames, viewports: viewports, epoch: epoch)
+        // Offset clock for the reveal gate: only actual strip travel
+        // stands the next reveal down.
+        if offsets != offsetsBeforeTick {
+            lastOffsetMoveEpoch = epoch
+        }
+        let plan = paintPass(frames: frames, viewports: viewports, focusedStyle: focusedStyle)
         let quiet = dirty.isQuiescent && jobs.isEmpty && plan.isEmpty
         dirty = []
         return FrameResult(borderPlan: plan, axJobs: jobs, focus: focus, quiescent: quiet)
+    }
+
+    /// Single-viewport entry: everything resolves against one rect, which
+    /// is also the legacy behavior the checks pin.
+    public mutating func tick(
+        events: [DaemonEvent],
+        frames: (WindowID) -> IntRect?,
+        viewport: IntRect,
+        focusedStyle: BorderStyle
+    ) -> FrameResult {
+        tick(
+            events: events, frames: frames,
+            viewports: [activeWorkspace: viewport], focusedStyle: focusedStyle
+        )
+    }
+
+    /// Viewport for a workspace: its own when the host supplied one, else
+    /// the active workspace's, else an empty rect (callers guard widths).
+    private func viewport(
+        for workspace: WorkspaceID?, in viewports: [WorkspaceID: IntRect]
+    ) -> IntRect {
+        if let workspace, let view = viewports[workspace] {
+            return view
+        }
+        if let view = viewports[activeWorkspace] {
+            return view
+        }
+        return viewports.values.first ?? IntRect(
+            min: IntPoint(0, 0), max: IntPoint(0, 0)
+        )
+    }
+
+    /// Workspace owning a window id, if it sits in any strip.
+    private func workspaceOf(_ id: WindowID) -> WorkspaceID? {
+        for (ws, rows) in strips {
+            for strip in rows.values where strip.contains(id) {
+                return ws
+            }
+        }
+        return nil
     }
 
     // MARK: Passes
 
     private mutating func ingest(
         _ events: [DaemonEvent], frames: (WindowID) -> IntRect?,
-        viewport: IntRect, epoch: UInt64
+        viewports: [WorkspaceID: IntRect], epoch: UInt64
     ) {
         for event in events {
             switch event {
             case .appeared(let id, let workspace):
+                // Space return: a parked row holding this window restores
+                // whole (order, stacks, positions) instead of appending
+                // scrambled. Newcomers from other rows merge at the end.
+                if let row = parkedRow(containing: id, in: workspace, epoch: epoch) {
+                    var restored = parkedRows[workspace]![row]!.strip
+                    parkedRows[workspace]!.removeValue(forKey: row)
+                    if parkedRows[workspace]!.isEmpty {
+                        parkedRows.removeValue(forKey: workspace)
+                    }
+                    if let current = strips[workspace]?[row] {
+                        for member in current.allWindows where !restored.contains(member) {
+                            restored.append(member)
+                        }
+                    }
+                    strips[workspace, default: [:]][row] = restored
+                    if let parked = parkedOffsets[workspace],
+                       epoch &- parked.atEpoch <= parkedRowTTLEpochs,
+                       parked.offset != (offsets[workspace] ?? 0)
+                    {
+                        offsets[workspace] = parked.offset
+                    }
+                    parkedOffsets.removeValue(forKey: workspace)
+                }
                 var strip = strips[workspace]?[activeVirtual[workspace] ?? 0]
                     ?? LayoutStrip(id: workspace, virtualIndex: activeVirtual[workspace] ?? 0)
                 strip.append(id)
                 strips[workspace, default: [:]][strip.virtualIndex] = strip
-                positions[id] = positions[id] ?? IntPoint(0, 0)
+                // Seed model truth from the live frame, never (0, 0): the
+                // commit pass only enqueues moves where the slot differs
+                // from `positions`, so a (0, 0) seed equals a (0, y) slot
+                // and fresh windows would never glide into place.
+                if positions[id] == nil {
+                    positions[id] = frames(id).map {
+                        IntPoint($0.min.x, $0.min.y)
+                    } ?? IntPoint(0, 0)
+                }
                 dirty.formUnion([.layout, .paint])
             case .disappeared(let id):
+                // Park rows before removing: the first vanish captures
+                // the full layout (later ones must not clobber it with
+                // progressively emptier strips).
+                for ws in Array(strips.keys) {
+                    for row in Array((strips[ws] ?? [:]).keys) {
+                        if strips[ws]?[row]?.contains(id) == true,
+                           parkedRows[ws]?[row] == nil,
+                           let strip = strips[ws]?[row]
+                        {
+                            parkedRows[ws, default: [:]][row] = ParkedRow(
+                                strip: strip, atEpoch: epoch
+                            )
+                            if parkedOffsets[ws] == nil {
+                                parkedOffsets[ws] = (offsets[ws] ?? 0, epoch)
+                            }
+                        }
+                    }
+                }
                 for ws in Array(strips.keys) {
                     for row in Array((strips[ws] ?? [:]).keys) {
                         strips[ws]?[row]?.remove(id)
                     }
                 }
-                positions.removeValue(forKey: id)
+                unmanaged.remove(id)
+                // Positions survive disappearance: a space return restores
+                // silently when the model still matches live truth. The
+                // parked-row sweep below reaps truly closed windows.
+                if pendingReveal == id { pendingReveal = nil }
+                lastRedrive.removeValue(forKey: id)
+                redriveStreak.removeValue(forKey: id)
                 if focus == id { focus = nil }
                 if held == id { held = nil }
                 dirty.formUnion([.layout, .paint])
             case .focus(let id):
                 focus = id
+                // Focus follows the window's display: clicking onto another
+                // screen retargets the active workspace (mirrors the Rust
+                // `ActiveDisplayMarker`), so gestures, menubar, and reveal
+                // act where the user is looking.
+                if let id, let owner = workspaceOf(id), owner != activeWorkspace {
+                    activeWorkspace = owner
+                    dirty.insert(.layout)
+                }
                 dirty.insert(.focus)
                 dirty.insert(.paint)
             case .dragMoved(let id, let dx):
@@ -232,15 +424,23 @@ public struct DaemonCore: Sendable {
                 glideHome()
                 dirty.insert(.layout)
             case .command(let command):
-                ingestCommand(command, frames: frames, viewport: viewport, epoch: epoch)
+                ingestCommand(command, frames: frames, viewports: viewports, epoch: epoch)
             case .swipe(let delta, _), .scroll(let delta):
                 // Fractional viewport widths, natural direction (finger-left
                 // moves the strip left). Integer truncation matches the
-                // pixel-quantized model elsewhere.
-                let width = Double(max(viewport.width, 1))
+                // pixel-quantized model elsewhere. The active display's
+                // width scales the gesture (a union would overdrive every
+                // smaller screen).
+                let active = viewport(for: activeWorkspace, in: viewports)
+                let width = Double(max(active.width, 1))
                 let step = Int32((delta * width * -1.0).rounded())
                 let ws = activeWorkspace
-                offsets[ws, default: 0] += step
+                // Zero steps (sub-pixel deltas) must not touch the dict:
+                // key creation alone reads as motion to the rest gate.
+                if step != 0 {
+                    offsets[ws, default: 0] += step
+                    clampSwipeTravel(ws, viewport: active, frames: frames)
+                }
                 gestureFresh = true
                 dirty.formUnion([.layout, .motion])
             }
@@ -251,27 +451,62 @@ public struct DaemonCore: Sendable {
     /// and quit/restart stay with the integrator (documented above).
     private mutating func ingestCommand(
         _ command: PaneruCommand, frames: (WindowID) -> IntRect?,
-        viewport: IntRect, epoch: UInt64
+        viewports: [WorkspaceID: IntRect], epoch: UInt64
     ) {
         switch command {
         case .window(let op):
-            ingestWindowOperation(op, frames: frames, viewport: viewport, epoch: epoch)
+            ingestWindowOperation(op, frames: frames, viewports: viewports, epoch: epoch)
         case .layout(let ops):
-            ingestLayoutOps(ops, frames: frames, viewport: viewport, epoch: epoch)
-        case .mouse, .quit, .restart, .printState, .lua:
+            ingestLayoutOps(ops, frames: frames, viewports: viewports, epoch: epoch)
+        case .mouse(let op):
+            ingestMouseOperation(op, viewports: viewports)
+        case .quit, .restart, .printState, .lua:
             break
         }
     }
 
+    /// Focus display hop: retarget the active workspace around the ring,
+    /// focus its first window when it has one, and ask the host to warp
+    /// the cursor to the display center. The warp itself stays host-side
+    /// (AppKit-only, like all pointer writes); the core only records the
+    /// request. A lone display is a no-op.
+    private mutating func ingestMouseOperation(
+        _ op: MouseOperation, viewports: [WorkspaceID: IntRect]
+    ) {
+        guard !workspaceRing.isEmpty else { return }
+        let position = workspaceRing.firstIndex(of: activeWorkspace) ?? 0
+        let target: WorkspaceID
+        switch op {
+        case .toNextDisplay:
+            target = workspaceRing[(position + 1) % workspaceRing.count]
+        case .toPreviousDisplay:
+            target = workspaceRing[(position + workspaceRing.count - 1) % workspaceRing.count]
+        }
+        guard target != activeWorkspace else { return }
+        activeWorkspace = target
+        let row = activeVirtual[target] ?? 0
+        if let first = strips[target]?[row]?.first()?.top {
+            focus = first
+        }
+        let view = viewport(for: target, in: viewports)
+        mouseWarp = IntPoint(
+            view.min.x + view.width / 2, view.min.y + view.height / 2
+        )
+        dirty.formUnion([.focus, .paint])
+    }
+
     private mutating func ingestWindowOperation(
         _ op: WindowOperation, frames: (WindowID) -> IntRect?,
-        viewport: IntRect, epoch: UInt64
+        viewports: [WorkspaceID: IntRect], epoch: UInt64
     ) {
         // NOTE: no shared writeback here on purpose. The stack branch mutates
         // the entry row in place; the virtual branches switch rows and manage
         // their own strips (a shared writeback would resurrect moved columns
         // or clobber the new active row with a stale copy).
         var strip = activeStrip()
+        // Geometry ops act on the focused window's own display, never the
+        // active viewport by assumption (mirrors `owner_viewport`).
+        let viewport = viewport(for: focus.flatMap(workspaceOf), in: viewports)
         switch op {
         case .focus(let direction):
             // No anchor, no step (mirrors the Rust caller, which skips
@@ -286,7 +521,13 @@ public struct DaemonCore: Sendable {
                 focus = target
                 dirty.formUnion([.focus, .paint])
             case .fallThrough:
-                break
+                // East/west at the strip edge steps across displays into
+                // the neighboring workspace's strip (single-display
+                // setups have no neighbor and stay put). North/south
+                // belong to virtual rows, handled by focusOrVirtual.
+                if direction == .east || direction == .west {
+                    focusNeighborDisplay(direction: direction, viewports: viewports)
+                }
             }
         case .stack(let on):
             guard let id = focus else { return }
@@ -323,11 +564,9 @@ public struct DaemonCore: Sendable {
         case .snap:
             snapWindow(frames: frames, viewport: viewport)
         case .toNextDisplay(let follow):
-            moveFocusedToWorkspace(activeWorkspace + 1, row: 0, follow: follow)
+            moveFocusedToDisplay(next: true, follow: follow, frames: frames, viewports: viewports, epoch: epoch)
         case .toPreviousDisplay(let follow):
-            if activeWorkspace > 1 {
-                moveFocusedToWorkspace(activeWorkspace - 1, row: 0, follow: follow)
-            }
+            moveFocusedToDisplay(next: false, follow: follow, frames: frames, viewports: viewports, epoch: epoch)
         case .focusUnmanaged:
             if let target = unmanaged.sorted().first {
                 focus = target
@@ -465,7 +704,10 @@ public struct DaemonCore: Sendable {
         var origin = frame.min
         origin.x = centerX - frame.width / 2
         if activeStrip().contains(id) {
-            offsets[activeWorkspace, default: 0] += origin.x - frame.min.x
+            let shift = origin.x - frame.min.x
+            if shift != 0 {
+                offsets[activeWorkspace, default: 0] += shift
+            }
         } else {
             enqueueMove(id, to: origin, epoch: epoch)
         }
@@ -509,7 +751,10 @@ public struct DaemonCore: Sendable {
         )
         let strip = activeStrip()
         if strip.contains(id) {
-            offsets[activeWorkspace, default: 0] += origin.x - frame.min.x
+            let shift = origin.x - frame.min.x
+            if shift != 0 {
+                offsets[activeWorkspace, default: 0] += shift
+            }
         } else {
             enqueueMove(id, to: origin, epoch: epoch)
         }
@@ -605,7 +850,10 @@ public struct DaemonCore: Sendable {
             fullWidth[id] = ratio
             if let frame = frames(id) {
                 if strip.contains(id) {
-                    offsets[activeWorkspace, default: 0] += viewport.min.x - frame.min.x
+                    let shift = viewport.min.x - frame.min.x
+                    if shift != 0 {
+                        offsets[activeWorkspace, default: 0] += shift
+                    }
                 } else {
                     enqueueMove(id, to: viewport.min, epoch: epoch)
                 }
@@ -689,13 +937,48 @@ public struct DaemonCore: Sendable {
         else { return }
         let size = IntSize(frame.width, frame.height)
         let origin = clampOriginToViewport(origin: frame.min, size: size, viewport: viewport)
-        offsets[activeWorkspace, default: 0] += origin.x - frame.min.x
+        let shift = origin.x - frame.min.x
+        if shift != 0 {
+            offsets[activeWorkspace, default: 0] += shift
+        }
         dirty.formUnion([.layout, .motion, .paint])
     }
 
+    /// Focus the nearest window on the neighboring display in `direction`
+    /// (east = smallest viewport gap to the right, west mirrored),
+    /// skipping empty workspaces. Retargets the active workspace so
+    /// gestures and reveal follow the eyes.
+    private mutating func focusNeighborDisplay(
+        direction: Direction, viewports: [WorkspaceID: IntRect]
+    ) {
+        guard direction == .east || direction == .west else { return }
+        let home = viewport(for: activeWorkspace, in: viewports)
+        var best: (ws: WorkspaceID, gap: Int32)?
+        for (ws, viewport) in viewports where ws != activeWorkspace {
+            let gap: Int32
+            if direction == .east {
+                guard viewport.min.x >= home.max.x else { continue }
+                gap = viewport.min.x - home.max.x
+            } else {
+                guard viewport.max.x <= home.min.x else { continue }
+                gap = home.min.x - viewport.max.x
+            }
+            if best.map({ gap < $0.gap }) ?? true {
+                best = (ws, gap)
+            }
+        }
+        guard let best else { return }
+        let row = activeVirtual[best.ws] ?? 0
+        guard let target = strips[best.ws]?[row]?.first()?.top else { return }
+        focus = target
+        activeWorkspace = best.ws
+        dirty.formUnion([.focus, .paint])
+    }
+
     /// Move the focused window's whole column to another workspace row,
-    /// following it or staying behind. Physical displays collapse onto
-    /// workspaces until the multi-display model ports.
+    /// following it or staying behind. Rows live inside one workspace
+    /// (one display); cross-display moves go through
+    /// `moveFocusedToDisplay`.
     private mutating func moveFocusedToWorkspace(
         _ workspace: WorkspaceID, row: UInt32, follow: MoveFocus
     ) {
@@ -712,6 +995,51 @@ public struct DaemonCore: Sendable {
         if follow == .follow {
             activeWorkspace = workspace
             activeVirtual[workspace] = row
+        }
+        dirty.formUnion([.layout, .paint])
+    }
+
+    /// Move the focused window's whole column to the neighboring display
+    /// workspace (spatial ring, wrapping), preserving its width ratio and
+    /// clamping into the target viewport — mirrors the Rust ring move
+    /// (`adjacent` + width-ratio + `clamp_size_to_viewport`). `follow`
+    /// retargets the active workspace; `stay` leaves focus behind on the
+    /// source display.
+    private mutating func moveFocusedToDisplay(
+        next: Bool, follow: MoveFocus,
+        frames: (WindowID) -> IntRect?,
+        viewports: [WorkspaceID: IntRect], epoch: UInt64
+    ) {
+        guard let id = focus else { return }
+        let target: WorkspaceID
+        if workspaceRing.isEmpty {
+            target = next ? activeWorkspace + 1 : activeWorkspace > 1 ? activeWorkspace - 1 : 1
+        } else if let position = workspaceRing.firstIndex(of: activeWorkspace) {
+            let step = next ? 1 : workspaceRing.count - 1
+            target = workspaceRing[(position + step) % workspaceRing.count]
+        } else {
+            target = workspaceRing.first ?? activeWorkspace
+        }
+        guard target != activeWorkspace else { return }
+        let sourceViewport = viewport(for: activeWorkspace, in: viewports)
+        let targetViewport = viewport(for: target, in: viewports)
+        var source = activeStrip()
+        guard let index = source.index(of: id),
+              let column = source.removeColumn(at: index)
+        else { return }
+        setActiveStrip(source)
+        let row = activeVirtual[target] ?? 0
+        var destination = strips[target]?[row] ?? LayoutStrip(id: target, virtualIndex: row)
+        destination.insertColumn(at: Int.max, column)
+        strips[target, default: [:]][row] = destination
+        // Width ratio survives the trip, clamped into the new display.
+        if let frame = frames(id), sourceViewport.width > 0 {
+            let ratio = Double(frame.width) / Double(max(sourceViewport.width, 1))
+            let width = min(max(Int32((ratio * Double(max(targetViewport.width, 1))).rounded()), 1), max(targetViewport.width, 1))
+            enqueueResize(id, to: IntSize(width, frame.height), epoch: epoch)
+        }
+        if follow == .follow {
+            activeWorkspace = target
         }
         dirty.formUnion([.layout, .paint])
     }
@@ -735,7 +1063,7 @@ public struct DaemonCore: Sendable {
     /// and impossible placements drop; the log never throws.
     private mutating func ingestLayoutOps(
         _ ops: [LayoutOp], frames: (WindowID) -> IntRect?,
-        viewport: IntRect, epoch: UInt64
+        viewports: [WorkspaceID: IntRect], epoch: UInt64
     ) {
         for op in ops {
             switch op {
@@ -756,7 +1084,8 @@ public struct DaemonCore: Sendable {
                 dirty.formUnion([.layout, .motion, .paint])
             case .setWidth(let id, let ratio):
                 if let current = frames(id) {
-                    let width = roundPx(ratio * Double(max(viewport.width, 1)))
+                    let owner = viewport(for: workspaceOf(id), in: viewports)
+                    let width = roundPx(ratio * Double(max(owner.width, 1)))
                     enqueueResize(
                         id, to: IntSize(width, current.height), epoch: epoch
                     )
@@ -833,6 +1162,54 @@ public struct DaemonCore: Sendable {
         }
     }
 
+    /// Clamp gesture-driven travel to the strip extents (mirrors
+    /// `clamp_viewport_offset`, which constrains scroll physics only —
+    /// never programmatic moves). The layout is rebuilt offset-free from
+    /// live widths (committed slots bake the offset in flight, so they
+    /// cannot rebase themselves).
+    private mutating func clampSwipeTravel(
+        _ ws: WorkspaceID, viewport: IntRect,
+        frames: (WindowID) -> IntRect?
+    ) {
+        guard let offset = offsets[ws] else { return }
+        let row = activeVirtual[ws] ?? 0
+        guard let strip = strips[ws]?[row], !strip.columns.isEmpty else { return }
+        var first: Int32?
+        var last: Int32?
+        var lastWidth: Int32 = 0
+        var x: Int32 = 0
+        for column in strip.columns {
+            if first == nil {
+                first = x
+            }
+            last = x
+            lastWidth = column.windows.compactMap { frames($0)?.width }.max() ?? 0
+            x += lastWidth
+        }
+        guard let first, let last else { return }
+        // Bounds are viewport-relative (offsets are too): identical to
+        // the absolute form on origin-anchored viewports.
+        let width = viewport.width
+        let clamped: Int32
+        if continuousSwipe {
+            // Travel until the last/first window snaps to the far edge.
+            clamped = min(max(offset, -last), width - first)
+        } else {
+            let total = last + lastWidth - first
+            guard total > 0 else { return }
+            if width < total {
+                clamped = min(max(offset, width - total), 0)
+            } else {
+                clamped = min(max(offset, 0), width - total)
+            }
+        }
+        // No-op writes still mutate the dict (key creation), which the
+        // rest gate would misread as motion.
+        if clamped != offset {
+            offsets[ws] = clamped
+        }
+    }
+
     /// Drives a held window's whole column by `dx` (stacked mates follow).
     private mutating func driveColumn(of id: WindowID, dx: Int32) {
         for ws in Array(strips.keys) {
@@ -860,25 +1237,112 @@ public struct DaemonCore: Sendable {
     /// Last committed slot per window: what release homing restores.
     private var committedSlots: [WindowID: IntPoint] = [:]
 
+    /// Reveal a window on its own display plus clamp: one call for both
+    /// immediate and deferred arrivals.
+    private mutating func revealOwner(
+        _ id: WindowID, frames: (WindowID) -> IntRect?,
+        viewports: [WorkspaceID: IntRect]
+    ) {
+        let owner = workspaceOf(id) ?? activeWorkspace
+        revealFocus(id, frames: frames, viewport: viewport(for: owner, in: viewports))
+        clampSwipeTravel(owner, viewport: viewport(for: owner, in: viewports), frames: frames)
+    }
+
     /// Scroll the minimal shortfall to reveal the focused window.
     /// Uses last committed slots (layout is unchanged by focus itself).
+    /// Only fires for windows in the shown row (revealing a parked slot
+    /// is meaningless motion), and only when the hidden fraction exceeds
+    /// `windowHiddenRatio`: with the shipped 1.0, clicks (always on
+    /// visible windows) never scroll, while keyboard focus into
+    /// fully-hidden windows still reveals. Slots are absolute (they bake
+    /// the offset), so the layout arm passes the offset-free position —
+    /// passing the absolute slot double-counts the offset on settled
+    /// strips.
     private mutating func revealFocus(
         _ id: WindowID, frames: (WindowID) -> IntRect?, viewport: IntRect
     ) {
-        guard let slot = committedSlots[id] else { return }
+        guard let owner = workspaceOf(id),
+              strips[owner]?[activeVirtual[owner] ?? 0]?.contains(id) == true,
+              let slot = committedSlots[id]
+        else { return }
         let width = frames(id)?.width ?? 0
-        let offset = offsets[activeWorkspace] ?? 0
+        let offset = offsets[owner] ?? 0
         let view = IntRect(
             min: IntPoint(viewport.min.x, 0),
             max: IntPoint(viewport.max.x, viewport.height)
         )
+        if windowHiddenRatio > 0 {
+            let lo = max(slot.x, view.min.x)
+            let hi = min(slot.x + width, view.max.x)
+            let visible = max(hi - lo, 0)
+            let hidden: Double
+            if width <= 0 {
+                hidden = 1.0
+            } else {
+                hidden = 1.0 - Double(visible) / Double(width)
+            }
+            guard hidden >= windowHiddenRatio, hidden > 0 else { return }
+        }
         let next = originExposing(
-            layout: IntPoint(slot.x, 0), size: IntSize(width, 0),
+            layout: IntPoint(slot.x - offset, 0), size: IntSize(width, 0),
             origin: IntPoint(offset, 0), viewport: view
         )
-        offsets[activeWorkspace] = next.x
+        // Assign only on change: a no-op write still mutates the dict
+        // (key creation), which the rest gate would misread as motion.
         if next.x != offset {
+            offsets[owner] = next.x
             dirty.formUnion([.layout, .motion])
+        }
+    }
+
+    /// Row holding a vanished window in this workspace, if its parked
+    /// row is still fresh. Searches every parked row (returns survive
+    /// virtual-row switches, not just the active one).
+    private func parkedRow(containing id: WindowID, in workspace: WorkspaceID, epoch: UInt64) -> UInt32? {
+        guard let rows = parkedRows[workspace] else { return nil }
+        for (row, parked) in rows
+            where epoch &- parked.atEpoch <= parkedRowTTLEpochs
+            && parked.strip.contains(id)
+        {
+            return row
+        }
+        return nil
+    }
+
+    /// Drop expired parked rows, clearing positions of members that never
+    /// came back (truly closed windows must not pin truth forever — and
+    /// CG window ids get reused, so stale positions would misplace fresh
+    /// windows).
+    private mutating func sweepParkedRows(epoch: UInt64) {
+        for ws in Array(parkedRows.keys) {
+            for row in Array((parkedRows[ws] ?? [:]).keys) {
+                guard let parked = parkedRows[ws]?[row],
+                      epoch &- parked.atEpoch <= parkedRowTTLEpochs
+                else {
+                    if let parked = parkedRows[ws]?[row] {
+                        for member in parked.strip.allWindows
+                            where !inAnyStrip(member)
+                        {
+                            positions.removeValue(forKey: member)
+                        }
+                    }
+                    parkedRows[ws]?.removeValue(forKey: row)
+                    continue
+                }
+            }
+            if parkedRows[ws]?.isEmpty == true {
+                parkedRows.removeValue(forKey: ws)
+            }
+            if parkedRows[ws] == nil {
+                parkedOffsets.removeValue(forKey: ws)
+            }
+        }
+    }
+
+    /// Whether any strip currently holds a window.
+    private func inAnyStrip(_ id: WindowID) -> Bool {
+        strips.values.contains { rows in
+            rows.values.contains { $0.contains(id) }
         }
     }
 
@@ -907,7 +1371,8 @@ public struct DaemonCore: Sendable {
     }
 
     private mutating func commitPass(
-        frames: (WindowID) -> IntRect?, viewport: IntRect, epoch: UInt64
+        frames: (WindowID) -> IntRect?, viewports: [WorkspaceID: IntRect],
+        epoch: UInt64
     ) -> [AXWriteJob] {
         // Members of the held column, if any: the hand owns their truth
         // until release; everything else snaps to its slot.
@@ -920,11 +1385,12 @@ public struct DaemonCore: Sendable {
             }
         }
         // Recompute slot origins left to right per strip at its offset.
-        // Rows that are not showing park at the sliver instead of their
-        // slots (mirrors workspace-switch parking; the OS must hold them
-        // there so macOS never relocates them).
-        let parked = parkedOrigin(viewport: viewport)
+        // Rows that are not showing park at their own display's sliver
+        // instead of their slots (mirrors workspace-switch parking; the
+        // OS must hold them there so macOS never relocates them).
         for (ws, rows) in strips {
+            let home = viewport(for: ws, in: viewports)
+            let parked = parkedOrigin(viewport: home)
             let shownRow = activeVirtual[ws] ?? 0
             let offset = offsets[ws] ?? 0
             for (rowIndex, strip) in rows {
@@ -938,11 +1404,23 @@ public struct DaemonCore: Sendable {
                     }
                     continue
                 }
-                var x = offset
+                // Slots anchor at the workspace viewport's origin: each
+                // display tiles its own strip (offsets stay viewport-
+                // relative, 0 == left edge, on every screen).
+                var x = home.min.x + offset
                 for column in strip.columns {
                     let width: Int32 = column.windows.compactMap { frames($0)?.width }.max() ?? 0
                     for member in column.windows {
-                        let slot = IntPoint(x, positions[member]?.y ?? 0)
+                        // Clamp the preserved y into the owner viewport: a
+                        // window spawning near a horizontal seam otherwise
+                        // keeps its neighbor-display height forever,
+                        // straddling the seam (e.g. its titlebar bleeding
+                        // onto the adjacent display's bottom edge).
+                        // Oversize windows top-align.
+                        let height = frames(member)?.height ?? 0
+                        let keptY = positions[member]?.y ?? home.min.y
+                        let slotY = min(max(keptY, home.min.y), max(home.min.y, home.max.y - height))
+                        let slot = IntPoint(x, slotY)
                         committedSlots[member] = slot
                         if homing.contains(member) {
                             enqueueMove(member, to: slot, epoch: epoch)
@@ -953,11 +1431,55 @@ public struct DaemonCore: Sendable {
                             if let hand = positions[member] {
                                 enqueueMove(member, to: hand, epoch: epoch)
                             }
-                        } else {
-                            if positions[member] != slot {
-                                enqueueMove(member, to: slot, epoch: epoch)
-                            }
+                        } else if positions[member] != slot {
+                            enqueueMove(member, to: slot, epoch: epoch)
                             positions[member] = slot
+                        } else {
+                            // Verify against live truth: manual moves,
+                            // failed writes, and app snap-backs leave the
+                            // OS window off-slot while the model claims
+                            // convergence (a one-shot intent never
+                            // retries). Re-drive drifted windows whose
+                            // correction is due — `invalidateSent` exists
+                            // precisely so drift re-sends even when the
+                            // target matches the last intent. Cooldown
+                            // keeps mid-glide frames from spamming AX.
+                            if let live = frames(member),
+                               abs(live.min.x - slot.x) > axDeadbandPx
+                                || abs(live.min.y - slot.y) > axDeadbandPx
+                            {
+                                // Stuck windows (the OS clamps or rejects
+                                // the placement: success status, zero
+                                // movement) stop retrying once the live
+                                // frame goes static across attempts — the
+                                // window rests where the OS holds it
+                                // instead of jumping forever. Any live
+                                // movement (or new intent) re-arms.
+                                if redriveLastLive[member] == live {
+                                    redriveStreak[member] = 5
+                                }
+                                // Exponential backoff per chronically
+                                // unwritable window (apps that snap back
+                                // every push): 0.5s, 1s, 2s, 4s, then 8s
+                                // nudges instead of a 2Hz hammer. Converged
+                                // frames reset the streak outright.
+                                let streak = redriveStreak[member, default: 0]
+                                let cooldown = redriveCooldownEpochs
+                                    << min(streak, 4)
+                                let last = lastRedrive[member]
+                                if last == nil || epoch >= last! + cooldown {
+                                    ax.invalidateSent(member)
+                                    positions[member] = IntPoint(live.min.x, live.min.y)
+                                    enqueueMove(member, to: slot, epoch: epoch)
+                                    positions[member] = slot
+                                    lastRedrive[member] = epoch
+                                    redriveLastLive[member] = live
+                                    redriveStreak[member] = min(streak + 1, 5)
+                                }
+                            } else {
+                                redriveStreak[member] = 0
+                                redriveLastLive.removeValue(forKey: member)
+                            }
                         }
                     }
                     x += width
@@ -1004,7 +1526,7 @@ public struct DaemonCore: Sendable {
 
     private mutating func paintPass(
         frames: (WindowID) -> IntRect?,
-        viewport: IntRect,
+        viewports: [WorkspaceID: IntRect],
         focusedStyle: BorderStyle
     ) -> BorderSyncPlan {
         var desired: [(WindowID, CGRect, BorderStyle)] = []
@@ -1013,9 +1535,12 @@ public struct DaemonCore: Sendable {
                 x: Double(frame.min.x), y: Double(frame.min.y),
                 width: Double(frame.width), height: Double(frame.height)
             )
+            // Gate on the focused window's own display (unknown windows
+            // fall back to the active viewport).
+            let owner = viewport(for: workspaceOf(focus), in: viewports)
             if rectsIntersect(cg, CGRect(
-                x: Double(viewport.min.x), y: Double(viewport.min.y),
-                width: Double(viewport.width), height: Double(viewport.height)
+                x: Double(owner.min.x), y: Double(owner.min.y),
+                width: Double(owner.width), height: Double(owner.height)
             )) {
                 desired.append((focus, cg, focusedStyle))
             }
@@ -1045,9 +1570,70 @@ public struct DaemonCore: Sendable {
         ax.acknowledge(winID, seq: seq, epoch: epoch)
     }
 
+    /// Drop focus sitting on a window the roster no longer holds (stale
+    /// arrival for a rejected or never-adopted window). The adoption race
+    /// (focus before appeared) is the caller's to protect.
+    public mutating func clearFocusIfGone(_ present: (WindowID) -> Bool) {
+        if let id = focus, !present(id) {
+            focus = nil
+            dirty.insert(.paint)
+        }
+    }
+
     /// Whether a window still has traveling truth.
     public func isUnacked(_ winID: WindowID) -> Bool {
         ax.unacked(winID)
+    }
+
+    /// Current strip offset for a workspace (diagnostics/tuning).
+    public func offset(for workspace: WorkspaceID) -> Int32 {
+        offsets[workspace] ?? 0
+    }
+
+    /// Last committed slot for a window, if it holds one (re-home gate).
+    public func committedSlot(of id: WindowID) -> IntPoint? {
+        committedSlots[id]
+    }
+
+    /// Re-home one window's whole column into another workspace (row of
+    /// the target's active virtual): display drags, space returns, and
+    /// stale adoptions that settled outside their strip. No focus or
+    /// offset changes; the next commit glides the column into its new
+    /// slots. Unknown or unmanaged windows are no-ops.
+    public mutating func rehomeColumn(_ id: WindowID, to workspace: WorkspaceID) {
+        var sourceWS: WorkspaceID?
+        var sourceRow: UInt32?
+        var sourceIndex: Int?
+        for (ws, rows) in strips {
+            for (row, strip) in rows {
+                if let index = strip.index(of: id) {
+                    sourceWS = ws
+                    sourceRow = row
+                    sourceIndex = index
+                }
+            }
+        }
+        guard let sourceWS, let sourceRow, let sourceIndex,
+              sourceWS != workspace,
+              var source = strips[sourceWS]?[sourceRow],
+              let column = source.removeColumn(at: sourceIndex)
+        else { return }
+        strips[sourceWS]?[sourceRow] = source
+        let row = activeVirtual[workspace] ?? 0
+        var target = strips[workspace]?[row] ?? LayoutStrip(id: workspace, virtualIndex: row)
+        target.insertColumn(at: Int.max, column)
+        strips[workspace, default: [:]][row] = target
+        dirty.formUnion([.layout, .paint])
+    }
+
+    /// Pending cursor warp for the host (display hop): AppKit-only, so
+    /// the core records it and the integrator drains it post-tick.
+    public private(set) var mouseWarp: IntPoint?
+
+    /// Take a pending warp, clearing it (exactly-once delivery).
+    public mutating func takeMouseWarp() -> IntPoint? {
+        defer { mouseWarp = nil }
+        return mouseWarp
     }
 
     /// Script store + revision live beside the core (owned by Scripting).

@@ -127,6 +127,124 @@ do {
     }
 }
 
+// `paneru.setup` captures its table; non-tables throw; missing setup
+// reads nil; reinstalls reset.
+do {
+    let lua = LuaBridge()
+    try! lua.installPrelude()
+    check(lua.readSetup() == nil, "missing setup reads nil")
+    try! lua.load("""
+        paneru.setup({ options = { swipe_sensitivity = 0.5 }, swipe = { gesture = { fingers_count = 3 } } })
+        paneru.bind("alt-b", "window balance")
+        """)
+    guard let setup = lua.readSetup() else {
+        check(false, "setup captures")
+        exit(1)
+    }
+    guard case .map(let root) = setup,
+          case .map(let swipe) = root["swipe"],
+          case .map(let gesture) = swipe["gesture"],
+          case .int(let fingers) = gesture["fingers_count"]
+    else {
+        check(false, "setup nests intact")
+        exit(1)
+    }
+    checkEqual(fingers, 3, "setup ints survive")
+    checkEqual(lua.listBinds().count, 1, "setup coexists with binds")
+    // Second setup overwrites; reinstall resets.
+    try! lua.load("paneru.setup({ options = {} })")
+    guard case .map(let root2) = lua.readSetup() else {
+        check(false, "second setup captures")
+        exit(1)
+    }
+    check(root2["swipe"] == nil, "overwrite drops old tables")
+    try! lua.installPrelude()
+    check(lua.readSetup() == nil, "prelude reinstall resets setup")
+    do {
+        try lua.load("paneru.setup(42)")
+        check(false, "non-table setup throws")
+    } catch let err as LuaBridgeError {
+        check(err.message.contains("paneru.setup"), "setup errors name the call")
+    }
+    check(lua.readSetup() == nil, "failed setup leaves nil")
+}
+
+// `paneru.match` marks filters; `on` with a match skips loudly instead
+// of failing the script, and plain handlers still register.
+do {
+    let lua = LuaBridge()
+    try! lua.installPrelude()
+    try! lua.load("""
+        paneru.on("window_spawned", paneru.match({ bundle = "x" }), function(e) end)
+        paneru.on("window_focused", function(e) end)
+        """)
+    let handlers = lua.listHandlers()
+    checkEqual(handlers.count, 1, "match-filtered handlers skip")
+    checkEqual(handlers.first?.name, "window_focused", "plain handlers register")
+    for handler in handlers {
+        lua.releaseRef(handler.ref)
+    }
+    do {
+        try lua.load("paneru.match(42)")
+        check(false, "non-table match throws")
+    } catch let err as LuaBridgeError {
+        check(err.message.contains("paneru.match"), "match errors name the call")
+    }
+}
+
+// `paneru.exec` runs subprocesses synchronously, returning
+// `{code, stdout, stderr}`; launch failures throw.
+do {
+    let lua = LuaBridge()
+    try! lua.installPrelude()
+    try! lua.load("""
+        function runEcho()
+          return paneru.exec("/bin/echo", { "hello" })
+        end
+        function runSingle()
+          return paneru.exec("/bin/echo", "solo")
+        end
+        function runFalse()
+          return paneru.exec("/usr/bin/false")
+        end
+        """)
+    guard case .map(let echo) = try! lua.call("runEcho"),
+          case .int(let code) = echo["code"],
+          case .str(let text) = echo["stdout"]
+    else {
+        check(false, "exec returns a result table")
+        exit(1)
+    }
+    checkEqual(code, 0, "echo exits zero")
+    checkEqual(text, "hello\n", "stdout captures")
+    guard case .map(let solo) = try! lua.call("runSingle"),
+          case .str(let soloText) = solo["stdout"]
+    else {
+        check(false, "string args decode")
+        exit(1)
+    }
+    checkEqual(soloText, "solo\n", "single string args work")
+    guard case .map(let failed) = try! lua.call("runFalse"),
+          case .int(let failedCode) = failed["code"]
+    else {
+        check(false, "failures return tables")
+        exit(1)
+    }
+    checkEqual(failedCode, 1, "nonzero codes surface")
+    do {
+        try lua.load("paneru.exec('/nonexistent-binary-xyz')")
+        check(false, "missing binaries throw")
+    } catch let err as LuaBridgeError {
+        check(err.message.contains("paneru.exec"), "launch failures name the call")
+    }
+    do {
+        try lua.load("paneru.exec({})")
+        check(false, "non-string commands throw")
+    } catch let err as LuaBridgeError {
+        check(err.message.contains("paneru.exec"), "bad commands name the call")
+    }
+}
+
 // Event handlers list by name and run with the event name.
 do {
     let lua = LuaBridge()

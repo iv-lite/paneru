@@ -59,21 +59,49 @@ public func resolveBindingsTable(
     return out
 }
 
+/// Group-exact modifier match for keybinds: bindings name groups
+/// (either side counts), so a `cmd + alt` binding matches a left-held
+/// chord. For each group (alt, shift, cmd, ctrl, fn): a required group
+/// needs at least one held side; an unrequired group forbids every
+/// side. Mirrors Rust `Modifiers::matches` and the tap's
+/// `scrollGroupMatches` — a raw `isSubset` on side-distinct bits never
+/// matches, because bindings carry both sides while fingers hold one.
+public func bindingMatches(required: KeyModifiers, held: KeyModifiers) -> Bool {
+    let groups: [KeyModifiers] = [
+        [.leftAlt, .rightAlt],
+        [.leftShift, .rightShift],
+        [.leftCmd, .rightCmd],
+        [.leftCtrl, .rightCtrl],
+        [.fn_],
+    ]
+    for group in groups {
+        if !required.intersection(group).isEmpty {
+            if held.intersection(group).isEmpty {
+                return false
+            }
+        } else if !held.intersection(group).isEmpty {
+            return false
+        }
+    }
+    return true
+}
+
 /// First binding whose keycode matches with all required modifiers held.
 public func findBinding(
     code: UInt8, held: KeyModifiers, in bindings: [ResolvedBinding]
 ) -> PaneruCommand? {
     bindings.first {
-        $0.code == code && $0.modifiers.isSubset(of: held)
+        $0.code == code && bindingMatches(required: $0.modifiers, held: held)
     }?.command
 }
 
 // MARK: - Window rules
 
 /// One `[windows.<name>]` rule. Only the slice the daemon applies today:
-/// regex title + exact bundle match, float/manage/dont-focus flags, and
-/// initial width ratio. `grid`, `border_radius`, and per-rule paddings
-/// parse but wait for a core that can place them.
+/// regex title + exact bundle match, float/manage/dont-focus flags,
+/// initial width ratio, and the spawn-time width pin (`spawn_width`,
+/// gated on a minimum landing size). `grid`, `border_radius`, and
+/// per-rule paddings parse but wait for a core that can place them.
 public struct WindowRule: Sendable {
     public var name: String
     public var title: NSRegularExpression
@@ -86,13 +114,22 @@ public struct WindowRule: Sendable {
     public var grid: String?
     public var borderRadius: Double?
     public var passthrough: [(UInt8, KeyModifiers)]
+    /// Spawn-time width ratio, applied once when the window lands (the
+    /// declarative form of a spawn handler pin).
+    public var spawnWidth: Double?
+    /// Minimum landing frame for the spawn pin; smaller popups/dialogs
+    /// keep their OS size (and may still float).
+    public var spawnMinWidth: Int32?
+    public var spawnMinHeight: Int32?
 
     public init(
         name: String, title: NSRegularExpression, bundleID: String? = nil,
         floating: Bool = false, manage: Bool = false, index: Int? = nil,
         dontFocus: Bool = false, width: Double? = nil, grid: String? = nil,
         borderRadius: Double? = nil,
-        passthrough: [(UInt8, KeyModifiers)] = []
+        passthrough: [(UInt8, KeyModifiers)] = [],
+        spawnWidth: Double? = nil, spawnMinWidth: Int32? = nil,
+        spawnMinHeight: Int32? = nil
     ) {
         self.name = name
         self.title = title
@@ -105,6 +142,9 @@ public struct WindowRule: Sendable {
         self.grid = grid
         self.borderRadius = borderRadius
         self.passthrough = passthrough
+        self.spawnWidth = spawnWidth
+        self.spawnMinWidth = spawnMinWidth
+        self.spawnMinHeight = spawnMinHeight
     }
 }
 
@@ -253,7 +293,10 @@ public func resolveWindowsTable(
             dontFocus: parseBool(fields["dont_focus"]),
             width: parseDouble(fields["width"]).flatMap { $0 > 0 ? $0 : nil },
             grid: fields["grid"], borderRadius: parseDouble(fields["border_radius"]),
-            passthrough: passthrough
+            passthrough: passthrough,
+            spawnWidth: parseDouble(fields["spawn_width"]).flatMap { $0 > 0 ? $0 : nil },
+            spawnMinWidth: parseInt(fields["spawn_min_width"]).flatMap { Int32(exactly: $0) },
+            spawnMinHeight: parseInt(fields["spawn_min_height"]).flatMap { Int32(exactly: $0) }
         ))
     }
     return out

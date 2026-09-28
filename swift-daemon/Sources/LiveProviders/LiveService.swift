@@ -87,6 +87,8 @@ public struct AgentPlist: Equatable, Sendable {
             </dict>
             <key>RunAtLoad</key>
             <\(runAtLoad)/>
+            <key>ThrottleInterval</key>
+            <integer>30</integer>
         </dict>
         </plist>
         """

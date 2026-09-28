@@ -1,6 +1,7 @@
 import Foundation
 import Config
 import KeyChords
+import Scripting
 
 // Parity ports of the default/clamp rules in `src/config.rs` getters.
 // Expectations copied verbatim.
@@ -111,18 +112,27 @@ do {
     checkEqual(c.dimAlpha, 1.0, "no hex alpha means 1")
 }
 
-// Hex parsing mirrors parse_hex_color / parse_hex_alpha.
+// Hex parsing mirrors parse_hex_color / parse_hex_alpha: channels are
+// 0-1 floats for the paint path (`#FF0000 == (1, 0, 0)` upstream).
 do {
-    checkEqual3(parseHexColor("#FF0000"), (255.0, 0.0, 0.0), "red parses")
-    checkEqual3(parseHexColor("#FFFFFF66"), (255.0, 255.0, 255.0), "alpha ignored in channels")
+    checkEqual3(parseHexColor("#FF0000"), (1.0, 0.0, 0.0), "red parses")
+    checkEqual3(parseHexColor("#FFFFFF66"), (1.0, 1.0, 1.0), "alpha ignored in channels")
     checkEqual3(parseHexColor("bogus"), (1.0, 1.0, 1.0), "garbage is white")
     checkEqual(parseHexAlpha("#FFFFFF66"), 102.0 / 255.0, "alpha composes")
     checkEqual(parseHexAlpha("#FFFFFF"), 1.0, "no alpha means 1")
     var o = DaemonOptions()
     o.borderColor = "#FF000080"
     let c = o.resolved()
-    checkEqual3(c.borderColor, (255.0, 0.0, 0.0), "border channels")
+    checkEqual3(c.borderColor, (1.0, 0.0, 0.0), "border channels")
     checkEqual(c.borderAlpha, 128.0 / 255.0, "border alpha composes")
+    var mid = DaemonOptions()
+    mid.borderColor = "#2b303c"
+    let m = mid.resolved().borderColor
+    check(
+        abs(m.0 - 43.0 / 255.0) < 0.001 && abs(m.1 - 48.0 / 255.0) < 0.001
+            && abs(m.2 - 60.0 / 255.0) < 0.001,
+        "mid-tone channels scale (got \(m))"
+    )
 }
 
 // Opt-in flags stay off unless set.
@@ -211,8 +221,8 @@ do {
     checkEqual(resolved.menubarFontSize, 24.0, "font clamps to 24")
     let color = resolved.borderColor
     check(
-        color.0 == 255.0 && color.1 == 0.0 && color.2 == 0.0,
-        "hex parses (got \(color))"
+        color.0 == 1.0 && color.1 == 0.0 && color.2 == 0.0,
+        "hex parses to 0-1 (got \(color))"
     )
     // No dim color means no dim, even with an opacity set.
     var bare = DaemonOptions()
@@ -230,6 +240,86 @@ do {
             .isSuperset(of: KeyModifiers(arrayLiteral: .leftCmd, .rightCmd)) == true,
         "mouse modifiers resolve"
     )
+}
+
+// Layering (`apply(to:)`): fallback fills gaps, never clobbers base,
+// same clamps as `resolved()`.
+do {
+    var base = ResolvedConfig()
+    var layer = DaemonOptions()
+    layer.swipeFingers = 3
+    layer.swipeScrollModifier = "cmd + alt"
+    layer.paddingTop = 8
+    layer.apply(to: &base)
+    checkEqual(base.swipeFingers, 3, "fallback fills fingers")
+    checkEqual(base.paddingTop, 8, "fallback fills padding")
+    check(
+        base.swipeScrollModifiers?
+            .isSuperset(of: KeyModifiers(arrayLiteral: .leftCmd, .rightCmd)) == true,
+        "fallback modifiers resolve"
+    )
+    // Set fields survive the layer.
+    var keep = ResolvedConfig()
+    keep.swipeFingers = 5
+    keep.paddingTop = 2
+    var thin = DaemonOptions()
+    thin.swipeSensitivity = 0.5
+    thin.apply(to: &keep)
+    checkEqual(keep.swipeFingers, 5, "base fingers survive")
+    checkEqual(keep.paddingTop, 2, "base padding survives")
+    checkEqual(keep.swipeSensitivity, 0.5, "layer sensitivity fills")
+    // Clamps match resolved().
+    var clamped = ResolvedConfig()
+    var wild = DaemonOptions()
+    wild.swipeSensitivity = 9.9
+    wild.gapHorizontal = 99
+    wild.menubarFontSize = 99
+    wild.apply(to: &clamped)
+    checkEqual(clamped.swipeSensitivity, 2.0, "sensitivity clamps high")
+    checkEqual(clamped.gapHorizontal, 50, "gaps clamp to maxGapPx")
+    checkEqual(clamped.menubarFontSize, 24.0, "font clamps to 24")
+    // Animations tri-state: false kills, true enables without resetting
+    // an existing duration, duration alone only retunes.
+    var anim = ResolvedConfig()
+    var off = DaemonOptions()
+    off.animations = false
+    off.apply(to: &anim)
+    checkEqual(anim.animationsEnabled, false, "false disables")
+    checkEqual(anim.animationDurationMs, 0, "false zeroes duration")
+    var on = DaemonOptions()
+    on.animations = true
+    on.apply(to: &anim)
+    checkEqual(anim.animationsEnabled, true, "true re-enables")
+    checkEqual(anim.animationDurationMs, 0, "true alone keeps duration")
+    var retune = DaemonOptions()
+    retune.animationDurationMs = 100
+    retune.apply(to: &anim)
+    checkEqual(anim.animationDurationMs, 100, "duration alone retunes")
+    // Dim stays gated on color presence.
+    var dim = ResolvedConfig()
+    var opacityOnly = DaemonOptions()
+    opacityOnly.dimInactiveOpacity = 0.5
+    opacityOnly.apply(to: &dim)
+    checkEqual(dim.dimActive, false, "opacity alone does not dim")
+    var colored = DaemonOptions()
+    colored.dimInactiveColor = "#000000"
+    colored.dimInactiveOpacity = 0.5
+    colored.apply(to: &dim)
+    checkEqual(dim.dimActive, true, "color activates dim")
+    // Bad modifier spellings unset, like resolved().
+    var mods = ResolvedConfig()
+    mods.swipeScrollModifiers = KeyModifiers(arrayLiteral: .leftAlt, .rightAlt)
+    var badMods = DaemonOptions()
+    badMods.swipeScrollModifier = "bogus-mod"
+    badMods.apply(to: &mods)
+    checkEqual(mods.swipeScrollModifiers, nil, "bad modifiers unset")
+    // Border color carries its alpha along.
+    var border = ResolvedConfig()
+    var tinted = DaemonOptions()
+    tinted.borderColor = "#ff000080"
+    tinted.apply(to: &border)
+    check(tinted.borderColor != nil, "tint parses")
+    check(border.borderAlpha < 1.0, "alpha rides along")
 }
 
 // [bindings]: command keys split on `_`, chords resolve, misses fall
@@ -255,6 +345,25 @@ do {
     )
     checkEqual(east, .window(.focus(.east)), "keys split into argv")
     checkEqual(findBinding(code: 255, held: [], in: bindings), nil, "misses fall through")
+    // Bindings name groups (both sides); fingers hold one side.
+    let altHeld: KeyModifiers = [.leftAlt]
+    check(
+        bindingMatches(required: [.leftAlt, .rightAlt], held: altHeld),
+        "either side satisfies its group"
+    )
+    check(
+        !bindingMatches(required: [.leftAlt, .rightAlt], held: []),
+        "missing groups miss"
+    )
+    check(
+        !bindingMatches(required: [.leftAlt], held: [.leftAlt, .leftShift]),
+        "extra groups rejected"
+    )
+    checkEqual(
+        findBinding(code: eastBinding.code, held: [.leftAlt], in: bindings),
+        .window(.focus(.east)),
+        "one held side satisfies a both-sides binding"
+    )
     do {
         _ = try resolveBindingsTable(["bogus_command": ["alt-h"]])
         check(false, "bad commands throw")
@@ -306,5 +415,111 @@ do {
         check(false, "titleless rules throw")
     } catch {
         check("\(error)".contains("bad"), "titleless rules name the section")
+    }
+    // Spawn pins decode on both surfaces, with threshold guards.
+    do {
+        let rules = try! resolveWindowsTable(["ff": [
+            "title": ".*", "bundle_id": "org.mozilla.firefox",
+            "spawn_width": "0.5", "spawn_min_width": "800", "spawn_min_height": "600",
+        ]])
+        let rule = rules.first!
+        checkEqual(rule.spawnWidth, 0.5, "spawn widths decode")
+        checkEqual(rule.spawnMinWidth, 800, "spawn min widths decode")
+        checkEqual(rule.spawnMinHeight, 600, "spawn min heights decode")
+        let bad = try! resolveWindowsTable(["neg": ["title": ".*", "spawn_width": "-1"]])
+        checkEqual(bad.first?.spawnWidth, nil, "non-positive spawn widths drop")
+    }
+}
+
+// `paneru.setup` decodes into the same three layers as TOML: options
+// (nested tables beside `options`), space-separated bindings, window
+// rules with the spawn pin. Unknown keys are ignored everywhere.
+do {
+    // Explicitly typed: deep leading-dot literals choke inference.
+    let root: [String: ScriptValue] = [
+        "options": .map([
+            "focus_follows_mouse": .bool(true),
+            "animation_duration_ms": .int(100),
+            "preset_column_widths": .list([.float(0.3), .int(1)]),
+        ]),
+        "padding": .map(["top": .int(8)]),
+        "swipe": .map([
+            "sensitivity": .float(0.5),
+            "scroll": .map(["modifier": .str("cmd + alt")]),
+            "gesture": .map([
+                "fingers_count": .int(3),
+                "direction": .str("Reversed"),
+                "vertical": .bool(false),
+            ]),
+        ]),
+        "decorations": .map([
+            "active": .map(["border": .map([
+                "enabled": .bool(true), "color": .str("#112233"),
+                "width": .int(3), "radius": .str("auto"),
+            ])]),
+            "inactive": .map(["dim": .map([
+                "color": .str("#000000"), "opacity": .float(0.4),
+            ])]),
+            "mystery": .int(1),
+        ]),
+        "restore": .map(["missing_windows": .str("drop")]),
+        "bindings": .map([
+            "window focus east": .str("cmd + alt - rightarrow"),
+            "window balance": .str("cmd + alt - b"),
+        ]),
+        "windows": .map([
+            "ff": .map([
+                "title": .str(".*"), "bundle_id": .str("org.mozilla.firefox"),
+                "spawn_width": .float(0.5),
+                "spawn_min_width": .int(800), "spawn_min_height": .int(600),
+            ]),
+        ]),
+        "unknown_table": .map(["x": .int(1)]),
+    ]
+    let doc = try! decodeSetupDocument(.map(root))
+    var resolved = ResolvedConfig()
+    doc.options.apply(to: &resolved)
+    checkEqual(resolved.focusFollowsMouse, true, "setup options apply")
+    checkEqual(resolved.animationDurationMs, 100, "setup ints apply")
+    checkEqual(resolved.presetColumnWidths, [0.3, 1.0], "setup lists apply")
+    checkEqual(resolved.paddingTop, 8, "setup padding applies")
+    checkEqual(resolved.swipeSensitivity, 0.5, "setup swipe applies")
+    checkEqual(resolved.swipeFingers, 3, "setup gesture applies")
+    checkEqual(resolved.swipeDirection, .reversed, "setup direction applies")
+    checkEqual(resolved.swipeVertical, false, "setup vertical applies")
+    checkEqual(
+        resolved.swipeScrollModifiers,
+        KeyModifiers(arrayLiteral: .leftCmd, .rightCmd, .leftAlt, .rightAlt),
+        "setup scroll modifiers apply"
+    )
+    checkEqual(resolved.borderActive, true, "setup borders apply")
+    checkEqual(resolved.borderWidth, 3.0, "setup ints widen borders")
+    checkEqual(resolved.dimActive, true, "setup dim activates on color")
+    checkEqual(resolved.restoreMissingWindows, .close, "setup restore maps drop")
+    checkEqual(doc.bindings?.count ?? -1, 2, "setup bindings resolve")
+    let east = doc.bindings?.first { $0.command == .window(.focus(.east)) }
+    check(east != nil, "space-separated commands split")
+    checkEqual(doc.rules?.count ?? -1, 1, "setup rules resolve")
+    let ff = doc.rules?.first
+    check(ff?.bundleID == "org.mozilla.firefox", "setup rule bundles match")
+    check(ff?.spawnWidth == 0.5, "setup spawn pins decode")
+    check(ff?.spawnMinWidth == 800, "setup spawn thresholds decode")
+    // Absent tables inherit (nil, not empty); bad tables throw.
+    let bare = try! decodeSetupDocument(.map(["options": .map([:])]))
+    check(bare.bindings == nil, "absent bindings inherit")
+    check(bare.rules == nil, "absent rules inherit")
+    do {
+        _ = try decodeSetupDocument(.map([
+            "bindings": .map(["bogus command here": .str("alt-h")]),
+        ]))
+        check(false, "bad setup commands throw")
+    } catch {
+        check("\(error)".contains("bogus_command_here"), "bad setup commands name the key")
+    }
+    do {
+        _ = try decodeSetupDocument(.str("nope"))
+        check(false, "non-map setup throws")
+    } catch {
+        check("\(error)".contains("top level"), "non-map setup explained")
     }
 }

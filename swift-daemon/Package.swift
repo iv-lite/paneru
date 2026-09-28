@@ -156,7 +156,7 @@ let package = Package(
         ),
         .executableTarget(
             name: "ConfigChecks",
-            dependencies: ["Config", "KeyChords"],
+            dependencies: ["Config", "KeyChords", "Scripting"],
             path: "Tests/ConfigChecks"
         ),
         .executableTarget(
@@ -232,11 +232,11 @@ let package = Package(
         .executableTarget(
             name: "paneru-swift",
             dependencies: [
-                "Commands", "Config", "ConfigFiles", "Daemon", "Geometry",
-                "IPC", "KeyChords", "Layout", "LiveProviders", "LuaBridge",
-                "MenuBar", "PaneruXPC", "Presentation", "Presenter",
-                "ScriptEvents", "ScriptHost", "Scripting", "StateQuery",
-                "WindowSet",
+                "Commands", "Config", "ConfigFiles", "Daemon", "Displays",
+                "Geometry", "IPC", "KeyChords", "Layout", "LiveProviders",
+                "LuaBridge", "MenuBar", "PaneruXPC", "Presentation",
+                "Presenter", "ScriptEvents", "ScriptHost", "Scripting",
+                "Scroll", "StateQuery", "WindowSet",
             ],
             path: "Sources/PaneruDaemon"
         ),
@@ -250,6 +250,13 @@ let package = Package(
             name: "RenderPlist",
             dependencies: ["Service"],
             path: "Sources/RenderPlist"
+        ),
+        // Direct query/command CLI against a running daemon over its
+        // Mach XPC service (diagnostics instrument).
+        .executableTarget(
+            name: "pq",
+            dependencies: ["IPC", "PaneruXPC"],
+            path: "Sources/PqQueryTool"
         ),
         .executableTarget(
             name: "ScriptingChecks",
@@ -328,7 +335,7 @@ let package = Package(
         // Resolved daemon configuration (`src/config.rs` getters).
         .target(
             name: "Config",
-            dependencies: ["Commands", "KeyChords", "MenuBar"],
+            dependencies: ["Commands", "KeyChords", "MenuBar", "Scripting"],
             path: "Sources/Config"
         ),
         // Key-chord resolution (`resolve_chord`, modifier + keycode tables).

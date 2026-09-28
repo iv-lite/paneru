@@ -34,6 +34,28 @@ do {
 }
 
 do {
+    // Scroll gating: nil disables, empty requires bare scroll, extras rejected.
+    var off = TapTuning()
+    check(off.scrollTarget == nil, "unset scroll target disables interception")
+    let altOnly = TapModifiers.leftAlternate
+    let altCmd: TapModifiers = [.leftAlternate, .leftCommand]
+    check(scrollGroupMatches(target: [], held: []), "empty target matches bare scroll")
+    check(!scrollGroupMatches(target: [], held: altOnly), "empty target rejects modifiers")
+    check(scrollGroupMatches(target: altOnly, held: altOnly), "held group matches")
+    check(
+        scrollGroupMatches(
+            target: [.leftAlternate, .leftCommand], held: altCmd
+        ), "either side counts"
+    )
+    check(!scrollGroupMatches(target: altOnly, held: altCmd), "extra groups rejected")
+    check(!scrollGroupMatches(target: altOnly, held: []), "missing group misses")
+    check(!scrollGroupMatches(target: altOnly, held: .leftCommand), "wrong group misses")
+    check(!scrollGroupMatches(target: altOnly, held: [.leftAlternate, .leftShift]), "extra groups rejected")
+    off.scrollTarget = []
+    check(off.scrollTarget != nil, "explicit empty enables bare-scroll interception")
+}
+
+do {
     let passthrough: (UInt8, TapModifiers) -> Bool = { code, _ in code == 9 }
     let scripted: (UInt8, TapModifiers) -> UInt32? = { code, _ in
         code == 11 ? 7 : nil
@@ -100,6 +122,7 @@ do {
     check(xml.contains("<string>com.example.paneru</string>"), "labels render")
     check(xml.contains("<key>MachServices</key>"), "mach services render")
     check(xml.contains("<key>Program</key>"), "single program path renders")
+    check(xml.contains("<key>ThrottleInterval</key>"), "respawn backoff renders")
     check(xml.contains("/opt/paneru/bin/paneru-swift"), "program renders")
     checkEqual(
         plist.installPath(home: "/home/u"),

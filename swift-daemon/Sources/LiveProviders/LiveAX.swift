@@ -95,11 +95,19 @@ public enum WindowQualification: Equatable, Sendable {
     case reject
 }
 
-/// One live window: element plus cached truth. Main-thread confined.
+/// One live window: element plus cached truth. The cached frame hops
+/// threads (the AX worker refreshes it, the main tick reads it), so it
+/// is lock-guarded; the element itself is only ever touched on one lane
+/// at a time (worker for probes/refreshes, main for ordered writes).
 public final class LiveWindow {
     public let id: WindowID
     public let element: AXUIElement
-    public var frame: IntRect
+    private let frameLock = NSLock()
+    private var _frame: IntRect
+    public var frame: IntRect {
+        get { frameLock.withLock { _frame } }
+        set { frameLock.withLock { _frame = newValue } }
+    }
     public var horizontalPadding: Int32
     public var verticalPadding: Int32
     /// Pids whose apps lack the enhanced-UI workaround stay synchronous.
@@ -112,7 +120,7 @@ public final class LiveWindow {
     ) {
         self.id = id
         self.element = element
-        self.frame = frame
+        self._frame = frame
         self.horizontalPadding = horizontalPadding
         self.verticalPadding = verticalPadding
         self.enhancedUIAbsent = enhancedUIAbsent
@@ -361,21 +369,19 @@ public final class LiveObserver {
             retained.release()
             return
         }
+        // Single attempt per notification, no sleeping: this runs on the
+        // main runloop (which also owns the event tap), and a 50–200ms
+        // sleep here stalls all input delivery. Transient `.cannotComplete`
+        // failures heal on the next roster pass, which re-registers live
+        // observers for apps that need them.
         var registered = 0
         for notification in notifications {
-            var attempt = 0
-            while attempt < axObserverMaxAttempts {
-                let status = AXObserverAddNotification(
-                    observer, app.element, notification as CFString,
-                    retained.toOpaque()
-                )
-                if status == .success || status == .notificationAlreadyRegistered {
-                    registered += 1
-                    break
-                }
-                if status != .cannotComplete { break }
-                Thread.sleep(forTimeInterval: 0.05 * Double(1 << attempt))
-                attempt += 1
+            let status = AXObserverAddNotification(
+                observer, app.element, notification as CFString,
+                retained.toOpaque()
+            )
+            if status == .success || status == .notificationAlreadyRegistered {
+                registered += 1
             }
         }
         guard registered > 0 else {

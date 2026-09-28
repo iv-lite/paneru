@@ -23,6 +23,10 @@ Paneru is built on Bevy and strictly follows Data-Driven Design (ECS). **Always 
 *   **Change Detection:** Use `Changed<T>` to trigger expensive macOS API updates (like window repositioning) only when the ECS state actually changes.
 *   **The Lua Worker:** The scripting runtime (`src/lua/worker.rs`, `lua` feature) runs on its own thread — handlers are user code of unbounded duration and must never stall `pump_events`. Every message to the worker carries the frame's `BatchSnapshot`, which handlers read synchronously; only script-state *writes* round-trip for their ack. Anything crossing that boundary must be plain `Send` data, never a Lua value or an ECS borrow. If you add a main-thread-only FFI call to a path a script can reach (`resolve_chord` is the existing example), compute it on the main thread and cache it — see `config::prime_virtual_keymap`.
 
+## 2b. Swift Daemon (`swift-daemon/Sources/PaneruDaemon/main.swift`)
+
+*   **Top-level state initializes in source order — declare before first use.** The integrator file mixes top-level executable statements (startup discovery, config layering, log lines) with global state. A global read before its declaration executes against zeroed storage: harmless for plain structs/ints, but an instant `EXC_BAD_ACCESS` for reference payloads (arrays, dictionaries, strings, class refs, optionals with non-zero nil layouts). This crashed the daemon five times with misleading stacks (tuple copies, `Date` stores, string compares, array counts). Keep ALL top-level `var`/`let` storage above the first statement that reads it; functions may live anywhere.
+
 ## 3. Layout & Workspace Logic
 
 *   **LayoutStrip:** The core layout data structure is `LayoutStrip` (in `src/ecs/layout.rs`). It manages columns, stacks, and tabs.

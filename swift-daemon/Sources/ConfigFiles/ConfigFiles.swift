@@ -18,17 +18,20 @@ import Foundation
 public struct ConfigSearchEnv: Equatable, Sendable {
     public var paneruConfig: String?
     public var paneruLua: String?
+    public var paneruSwiftTOML: String?
     public var home: String?
     public var xdgConfigHome: String?
     public var xdgConfigDirs: [String]
 
     public init(
         paneruConfig: String? = nil, paneruLua: String? = nil,
+        paneruSwiftTOML: String? = nil,
         home: String? = nil, xdgConfigHome: String? = nil,
         xdgConfigDirs: [String] = []
     ) {
         self.paneruConfig = paneruConfig
         self.paneruLua = paneruLua
+        self.paneruSwiftTOML = paneruSwiftTOML
         self.home = home
         self.xdgConfigHome = xdgConfigHome
         self.xdgConfigDirs = xdgConfigDirs
@@ -36,6 +39,23 @@ public struct ConfigSearchEnv: Equatable, Sendable {
 }
 
 // MARK: - Discovery
+
+/// XDG config dirs, falling back to `$HOME/.config` when neither
+/// `XDG_CONFIG_DIRS` nor `XDG_CONFIG_HOME` is set (bare launchd/nohup
+/// environments). Mirrors `defaultWritePath` so discovery and creation
+/// agree on where `paneru/` lives.
+func xdgSearchDirs(_ env: ConfigSearchEnv) -> [String] {
+    if !env.xdgConfigDirs.isEmpty {
+        return env.xdgConfigDirs
+    }
+    if let xdg = env.xdgConfigHome {
+        return [xdg]
+    }
+    if let home = env.home {
+        return [home + "/.config"]
+    }
+    return []
+}
 
 /// TOML candidates in precedence order: `$PANERU_CONFIG` (when it
 /// exists), `~/.paneru`, `~/.paneru.toml`, then each XDG
@@ -47,13 +67,7 @@ public func tomlCandidates(_ env: ConfigSearchEnv) -> [String] {
         paths.append(home + "/.paneru")
         paths.append(home + "/.paneru.toml")
     }
-    let dirs: [String]
-    if env.xdgConfigDirs.isEmpty {
-        dirs = env.xdgConfigHome.map { [$0] } ?? []
-    } else {
-        dirs = env.xdgConfigDirs
-    }
-    for dir in dirs { paths.append(dir + "/paneru/paneru.toml") }
+    for dir in xdgSearchDirs(env) { paths.append(dir + "/paneru/paneru.toml") }
     return paths
 }
 
@@ -63,13 +77,7 @@ public func luaCandidates(_ env: ConfigSearchEnv) -> [String] {
     var paths: [String] = []
     if let overridePath = env.paneruLua { paths.append(overridePath) }
     if let home = env.home { paths.append(home + "/.paneru.lua") }
-    let dirs: [String]
-    if env.xdgConfigDirs.isEmpty {
-        dirs = env.xdgConfigHome.map { [$0] } ?? []
-    } else {
-        dirs = env.xdgConfigDirs
-    }
-    for dir in dirs { paths.append(dir + "/paneru/init.lua") }
+    for dir in xdgSearchDirs(env) { paths.append(dir + "/paneru/init.lua") }
     return paths
 }
 
@@ -102,6 +110,38 @@ public func discoverLua(
 ) -> (path: String?, warnings: [String]) {
     discover(
         candidates: luaCandidates(env), overridePath: env.paneruLua,
+        exists: exists
+    )
+}
+
+/// swift.toml candidates in precedence order: `$PANERU_SWIFT_TOML` (when
+/// it exists), the sibling of the discovered `init.lua`, then each XDG
+/// `<dir>/paneru/swift.toml`. Additive tuning that layers over defaults
+/// (and under `paneru.setup`) even when Lua owns the launch; it never
+/// replaces `init.lua`.
+public func swiftTOMLCandidates(_ env: ConfigSearchEnv, luaPath: String?) -> [String] {
+    var paths: [String] = []
+    if let overridePath = env.paneruSwiftTOML { paths.append(overridePath) }
+    if let luaPath {
+        let dir = URL(fileURLWithPath: luaPath).deletingLastPathComponent().path
+        paths.append(dir + "/swift.toml")
+    }
+    for dir in xdgSearchDirs(env) { paths.append(dir + "/paneru/swift.toml") }
+    // The lua sibling often equals the XDG path; drop repeats so logs
+    // and watchers see each file once.
+    var seen: Set<String> = []
+    return paths.filter { seen.insert($0).inserted }
+}
+
+/// First existing swift.toml candidate, plus an override-missing warning.
+/// Nil when no fallback exists: the daemon runs on base config alone.
+public func discoverSwiftTOML(
+    _ env: ConfigSearchEnv, luaPath: String?,
+    exists: (String) -> Bool
+) -> (path: String?, warnings: [String]) {
+    discover(
+        candidates: swiftTOMLCandidates(env, luaPath: luaPath),
+        overridePath: env.paneruSwiftTOML,
         exists: exists
     )
 }

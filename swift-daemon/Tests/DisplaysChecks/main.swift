@@ -74,6 +74,32 @@ do {
     checkEqual(leftDocked.min.x, 60, "left dock eats x")
 }
 
+// Point location: containing display wins, off-screen points resolve
+// to the nearest display (never nil while displays exist).
+do {
+    let frames = [
+        IntRect(0, 0, 1920, 1080),
+        IntRect(1920, 1080, 3840, 2160),
+    ]
+    checkEqual(
+        displayIndexForPoint(IntPoint(100, 100), in: frames), 0,
+        "inside resolves"
+    )
+    checkEqual(
+        displayIndexForPoint(IntPoint(2000, 1500), in: frames), 1,
+        "second display resolves"
+    )
+    checkEqual(
+        displayIndexForPoint(IntPoint(-50, 500), in: frames), 0,
+        "off-screen cascades snap to the nearest"
+    )
+    checkEqual(
+        displayIndexForPoint(IntPoint(5000, 5000), in: frames), 1,
+        "far corners snap to the nearest"
+    )
+    checkEqual(displayIndexForPoint(IntPoint(0, 0), in: []), nil, "no displays is nil")
+}
+
 if failures == 0 {
     print("DisplaysChecks: all checks passed")
 } else {
