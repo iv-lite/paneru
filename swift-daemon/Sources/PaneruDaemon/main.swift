@@ -2228,6 +2228,14 @@ func tick() {
         pending.count > maxEventsPerTick
         ? Array(pending.prefix(maxEventsPerTick)) : pending
     pending.removeFirst(min(events.count, pending.count))
+    // Maximized-toggle diagnostics: mark state plus the inputs the
+    // lone-column centering decides on (live size, strip width,
+    // offsets, committed slot). Rare user action, permanent value —
+    // answers "why isn't it centered" in one log line.
+    let fullWidthToggled = pending.contains {
+        if case .command(.window(.fullWidth)) = $0 { return true }
+        return false
+    }
     // Focus arrival filter (Rust arrival guards, centralized): drop
     // suppressed (`dontFocus`) and stray arrivals — nowhere: not
     // placed, unmanaged, current, or rostered. Adoption races top up
@@ -2334,6 +2342,20 @@ func tick() {
         prevActuatedFocus = id
     } else if result.focus == nil {
         prevActuatedFocus = nil
+    }
+    // Maximized-toggle report (see scan above): one line per toggle.
+    if fullWidthToggled, let id = result.focus {
+        let live = roster[CGWindowID(id)]?.frame
+        let row = core.activeVirtual[core.activeWorkspace] ?? 0
+        let cols = core.strips[core.activeWorkspace]?[row]?.columns.count ?? -1
+        let slot = core.committedSlot(of: id)
+        print(
+            "fullwidth: window=\(id) marked=\(core.isFullWidth(id))"
+                + " live=\(live.map { "\($0.width)x\($0.height)" } ?? "?")"
+                + " stripCols=\(cols)"
+                + " slot=\(slot.map { "\($0.x),\($0.y)" } ?? "?")"
+                + " offsets=\(core.offsets[core.activeWorkspace] ?? 0)"
+        )
     }
     // Cursor warp requests (display hops) go straight to the tap layer.
     if let warp = core.takeMouseWarp() {

@@ -225,6 +225,18 @@ public struct DaemonCore: Sendable {
     /// rests. A set (not a slot): flapping arrivals accumulate instead
     /// of overwriting each other.
     private var pendingReveals = Set<WindowID>()
+    /// Transfer reveals (cross-display moves with unchanged focus):
+    /// drained POST-commit against fresh slots — pre-commit slots here
+    /// still describe the pre-transfer layout and would scroll from
+    /// stale geometry. Focus-change reveals drain pre-commit (parity
+    /// path); same gate, same targets.
+    private var transferReveals = Set<WindowID>()
+    /// Source strips awaiting neighbor-centering after a cross-display
+    /// transfer (workspace → the removed column's row + index): the
+    /// window now at the hole scrolls to viewport center. Same-display
+    /// moves and closes never file here. Applied post-commit against
+    /// fresh slots (see `applyPendingCenters`).
+    private var pendingCenterNeighbor: [WorkspaceID: (row: UInt32, index: Int)] = [:]
     /// Last verify re-drive epoch per window (see the commit pass).
     private var lastRedrive: [WindowID: UInt64] = [:]
     /// A row that emptied while its windows left the screen (native
@@ -251,6 +263,13 @@ public struct DaemonCore: Sendable {
     /// the OS is holding the window (clamped/rejected placement), so
     /// further pushes stop instead of jumping forever.
     private var redriveLastLive: [WindowID: IntRect] = [:]
+    /// Size-intent streak + last attempt per window (mirrors the move
+    /// redrive above, tracked separately so a stuck move and a stuck
+    /// resize don't share a backoff): a recorded size target the OS
+    /// never converges to is re-driven on cooldown instead of pinning
+    /// the window oversized forever.
+    private var sizeStreak: [WindowID: UInt8] = [:]
+    private var lastSizeRedrive: [WindowID: UInt64] = [:]
     /// Last epoch the strip offsets moved: focus arrival reveals only
     /// when the strip is at rest, never mid-flight. Nil until the first
     /// move — a fresh core is at rest by definition (and short harnesses
@@ -427,6 +446,17 @@ public struct DaemonCore: Sendable {
             auditPass()
         }
         let jobs = commitPass(frames: frames, viewports: viewports, epoch: epoch)
+        // Transfer reveals land on fresh slots (commit just wrote them);
+        // the ease below glides there over the next ticks.
+        if !transferReveals.isEmpty, rested() {
+            for id in transferReveals.sorted() {
+                revealOwner(id, frames: frames, viewports: viewports)
+            }
+            transferReveals.removeAll()
+        }
+        // Transfer-centerings land on fresh slots (commit just wrote
+        // them); the ease below glides there over the next ticks.
+        applyPendingCenters(viewports: viewports, frames: frames)
         // Offset clock for the reveal gate: only actual strip travel
         // stands the next reveal down.
         if offsets != offsetsBeforeTick {
@@ -562,6 +592,8 @@ public struct DaemonCore: Sendable {
                 if pendingReveals.remove(id) != nil { /* dropped with it */ }
                 lastRedrive.removeValue(forKey: id)
                 redriveStreak.removeValue(forKey: id)
+                sizeStreak.removeValue(forKey: id)
+                lastSizeRedrive.removeValue(forKey: id)
                 if focus == id {
                     // Synchronous heal (Rust `give_away_focus`): hand off
                     // to the nearest surviving neighbor instead of
@@ -603,6 +635,7 @@ public struct DaemonCore: Sendable {
                 // arrive as .released and glide home instead).
                 if let slot = dropSlot(pointerX: x, viewports: viewports, excluding: id) {
                     var moving: LayoutColumn?
+                    var source: (ws: WorkspaceID, row: UInt32, index: Int)?
                     for ws in Array(strips.keys) {
                         for row in Array((strips[ws] ?? [:]).keys) {
                             if var strip = strips[ws]?[row],
@@ -610,6 +643,11 @@ public struct DaemonCore: Sendable {
                             {
                                 moving = strip.removeColumn(at: index)
                                 strips[ws]?[row] = strip
+                                // First hit wins (membership is unique;
+                                // audit dedups the rest).
+                                if source == nil {
+                                    source = (ws, row, index)
+                                }
                             }
                         }
                     }
@@ -626,8 +664,19 @@ public struct DaemonCore: Sendable {
                             // scroll into its new viewport (same-value
                             // `setFocus` alone is a no-op).
                             if let top = moving.top {
-                                pendingReveals.insert(top)
+                                transferReveals.insert(top)
                                 focusTouch = top
+                            }
+                            // Recenter the left-behind strip on the
+                            // neighbor now at the hole (see
+                            // `pendingCenterNeighbor`).
+                            if let source,
+                               let from = strips[source.ws]?[source.row],
+                               !from.columns.isEmpty
+                            {
+                                pendingCenterNeighbor[source.ws] = (
+                                    row: source.row, index: source.index
+                                )
                             }
                         }
                     }
@@ -1035,6 +1084,12 @@ public struct DaemonCore: Sendable {
         dirty.formUnion([.layout, .motion, .paint])
     }
 
+    /// Whether a window carries the maximized mark (diagnostics/host
+    /// logging; placement reads it directly).
+    public func isFullWidth(_ id: WindowID) -> Bool {
+        fullWidth[id] != nil
+    }
+
     /// Toggle full-viewport sizing, remembering the width ratio for the way
     /// back. Turning on first unstacks, then parks the strip so the window
     /// lands on the viewport's left edge.
@@ -1190,6 +1245,8 @@ public struct DaemonCore: Sendable {
         _ workspace: WorkspaceID, row: UInt32, follow: MoveFocus
     ) {
         guard let id = focus else { return }
+        let sourceWS = activeWorkspace
+        let sourceRow = activeVirtual[sourceWS] ?? 0
         var source = activeStrip()
         guard let index = source.index(of: id),
               let column = source.removeColumn(at: index)
@@ -1204,8 +1261,17 @@ public struct DaemonCore: Sendable {
             activeVirtual[workspace] = row
             // Refocus + reveal the moved window even though model focus
             // never changed hands (same no-op gap as drop transfers).
-            pendingReveals.insert(id)
+            // Transfer drain (post-commit): pre-commit slots still
+            // describe the pre-move layout.
+            transferReveals.insert(id)
             focusTouch = id
+        }
+        // Cross-workspace relocation recenters the source strip on the
+        // neighbor now at the hole; same-display row moves keep scroll.
+        if workspace != sourceWS,
+           let from = strips[sourceWS]?[sourceRow], !from.columns.isEmpty
+        {
+            pendingCenterNeighbor[sourceWS] = (row: sourceRow, index: index)
         }
         dirty.formUnion([.layout, .paint])
     }
@@ -1232,6 +1298,8 @@ public struct DaemonCore: Sendable {
             target = workspaceRing.first ?? activeWorkspace
         }
         guard target != activeWorkspace else { return }
+        let sourceWS = activeWorkspace
+        let sourceRow = activeVirtual[sourceWS] ?? 0
         let sourceViewport = viewport(for: activeWorkspace, in: viewports)
         let targetViewport = viewport(for: target, in: viewports)
         var source = activeStrip()
@@ -1253,8 +1321,17 @@ public struct DaemonCore: Sendable {
             activeWorkspace = target
             // Refocus + reveal the moved window even though model focus
             // never changed hands (same no-op gap as drop transfers).
-            pendingReveals.insert(id)
+            // Transfer drain (post-commit): pre-commit slots still
+            // describe the pre-move layout.
+            transferReveals.insert(id)
             focusTouch = id
+        }
+        // The source display loses a column either way: recenter it on
+        // the neighbor now at the hole (stay keeps looking at source).
+        // The removal index may now dangle past the end; the apply
+        // step clamps to the surviving neighbor.
+        if let from = strips[sourceWS]?[sourceRow], !from.columns.isEmpty {
+            pendingCenterNeighbor[sourceWS] = (row: sourceRow, index: index)
         }
         dirty.formUnion([.layout, .paint])
     }
@@ -1476,6 +1553,34 @@ public struct DaemonCore: Sendable {
     /// Last committed slot per window: what release homing restores.
     private var committedSlots: [WindowID: IntPoint] = [:]
 
+    /// Apply pending transfer-centerings against fresh slots: the
+    /// window now at each hole scrolls to viewport center over the next
+    /// ticks (offset glide). Skipped mid-gesture (retried later ticks);
+    /// entries clear on attempt, success or guard-fail alike, so stale
+    /// rows never pin.
+    private mutating func applyPendingCenters(
+        viewports: [WorkspaceID: IntRect], frames: (WindowID) -> IntRect?
+    ) {
+        guard !pendingCenterNeighbor.isEmpty, !gestureFresh, held == nil else { return }
+        for (ws, loc) in Array(pendingCenterNeighbor) {
+            pendingCenterNeighbor.removeValue(forKey: ws)
+            guard let strip = strips[ws]?[loc.row], !strip.columns.isEmpty else { continue }
+            let home = viewport(for: ws, in: viewports)
+            let at = min(max(loc.index, 0), strip.len - 1)
+            guard let column = strip.get(at),
+                  let top = column.top,
+                  let slot = committedSlots[top],
+                  let live = frames(top)
+            else { continue }
+            let centerX = home.min.x + home.width / 2
+            let shift = (centerX - live.width / 2) - slot.x
+            if shift != 0 {
+                offsetTargets[ws, default: offsets[ws] ?? 0] += shift
+                dirty.formUnion([.layout, .motion, .paint])
+            }
+        }
+    }
+
     /// Reveal a window on its own display plus clamp: one call for both
     /// immediate and deferred arrivals.
     private mutating func revealOwner(
@@ -1566,6 +1671,8 @@ public struct DaemonCore: Sendable {
                             positions.removeValue(forKey: member)
                             sizes.removeValue(forKey: member)
                             glides.removeValue(forKey: member)
+                            sizeStreak.removeValue(forKey: member)
+                            lastSizeRedrive.removeValue(forKey: member)
                         }
                     }
                     parkedRows[ws]?.removeValue(forKey: row)
@@ -1961,17 +2068,38 @@ public struct DaemonCore: Sendable {
     }
 
     /// One-shot size intent with model truth (`sizes`): a target change
-    /// re-sends; an already-correct window records and rests; an
-    /// OS-clamped window is left alone (moves keep driving via origins).
+    /// re-sends; an already-correct window records and rests. A recorded
+    /// target the live frame never converges to (rejected writes,
+    /// snap-back apps — the Firefox class) re-drives on cooldown with
+    /// its own backoff, so one stuck write can't pin an oversize window
+    /// forever. Degraded writers repair focused windows only.
     private mutating func applySize(
         _ member: WindowID, to target: IntSize, epoch: UInt64,
         frames: (WindowID) -> IntRect?
     ) {
-        guard sizes[member] != target else { return }
         guard let live = frames(member) else { return }
         guard abs(live.width - target.x) > 1 || abs(live.height - target.y) > 1 else {
             sizes[member] = target
+            sizeStreak[member] = 0
+            lastSizeRedrive.removeValue(forKey: member)
             return
+        }
+        if sizes[member] == target {
+            guard !writerDegraded || member == focus else { return }
+            let streak = sizeStreak[member, default: 0]
+            let cooldown = redriveCooldownEpochs << min(streak, 4)
+            let last = lastSizeRedrive[member]
+            let due: Bool = {
+                guard let last else { return false }
+                let (end, overflow) = last.addingReportingOverflow(cooldown)
+                return overflow || epoch >= end
+            }()
+            guard due else { return }
+            sizeStreak[member] = min(streak + 1, 5)
+            lastSizeRedrive[member] = epoch
+        } else {
+            sizeStreak[member] = 0
+            lastSizeRedrive[member] = epoch
         }
         enqueueResize(member, to: target, epoch: epoch)
         sizes[member] = target
@@ -2437,6 +2565,28 @@ public struct DaemonCore: Sendable {
         let onRightEdge = abs(current.max.x - clamped.x) < 3
         guard onLeftEdge || onRightEdge else {
             lastWarpKind = "none:interior"
+            return nil
+        }
+        // Shared-edge suppression: half-open containment evaluates seam
+        // samples as the right display's left edge, which would teleport
+        // mid-crossing in one travel direction while the other flows
+        // natively. Where a neighbor shares this exact edge segment at
+        // the cursor Y, macOS crosses natively — stay out entirely.
+        // (Deliberate Rust divergence: closed-contains there evaluates a
+        // right-edge warp.) Outer and step edges have no neighbor at
+        // their Y and evaluate normally.
+        if onLeftEdge, displays.contains(where: {
+            $0 != current && $0.max.x == current.min.x
+                && clamped.y >= $0.min.y && clamped.y < $0.max.y
+        }) {
+            lastWarpKind = "none:seam"
+            return nil
+        }
+        if onRightEdge, displays.contains(where: {
+            $0 != current && $0.min.x == current.max.x
+                && clamped.y >= $0.min.y && clamped.y < $0.max.y
+        }) {
+            lastWarpKind = "none:seam"
             return nil
         }
         // Half-plane polarity per edge+sign; flipped = the opposite

@@ -1549,13 +1549,13 @@ do {
         daemon.edgeWarpLanding(
             cursor: IntPoint(1919, 500), displays: stairs,
             warpDirection: 1, yOffset: 0
-        ), IntPoint(1926, 800), "stairs: right edge falls back below"
+        ), nil, "stairs: shared step edges cross natively (right)"
     )
     checkEqual(
         daemon.edgeWarpLanding(
             cursor: IntPoint(1921, 800), displays: stairs,
             warpDirection: 1, yOffset: 0
-        ), IntPoint(1914, 500), "stairs: lower-left falls back above"
+        ), nil, "stairs: shared step edges cross natively (left)"
     )
     checkEqual(
         daemon.edgeWarpLanding(
@@ -1849,8 +1849,8 @@ do {
 }
 
 // Stairs of 3 reachability: outer endpoints wrap around the row
-// (circle-first, skipping the middle), interior step edges stay
-// directional, and every hop in the cycle lands.
+// (circle-first, skipping the middle); shared step bands cross
+// natively; unshared bands still warp directionally.
 do {
     var daemon = DaemonCore()
     let a = IntRect(0, 0, 1920, 1080)
@@ -1868,9 +1868,16 @@ do {
         daemon.edgeWarpLanding(
             cursor: IntPoint(1921, 800), displays: stairs,
             warpDirection: -1, yOffset: 0
-        ), IntPoint(1914, 500), "middle step stays directional"
+        ), nil, "shared middle edges cross natively"
     )
-    checkEqual(daemon.lastWarpKind, "primary", "interior edges skip row-wrap")
+    checkEqual(daemon.lastWarpKind, "none:seam", "native crossings report the seam")
+    checkEqual(
+        daemon.edgeWarpLanding(
+            cursor: IntPoint(1921, 1200), displays: stairs,
+            warpDirection: -1, yOffset: 0
+        ), IntPoint(1914, 900), "unshared step bands still warp"
+    )
+    checkEqual(daemon.lastWarpKind, "primary", "true step edges stay directional")
     checkEqual(
         daemon.edgeWarpLanding(
             cursor: IntPoint(5759, 1200), displays: stairs,
@@ -1974,6 +1981,115 @@ do {
     checkEqual(
         daemon.committedSlot(of: 0), IntPoint(312, 34),
         "center holds after the reel"
+    )
+}
+
+// Maximized mark toggles on/off (host diagnostics read it back).
+do {
+    var daemon = DaemonCore()
+    let live = frames(slots: [0: IntPoint(0, 34)])
+    _ = daemon.tick(
+        events: [.appeared(id: 0, workspace: 1), .focus(id: 0)],
+        frames: live, viewport: viewport, focusedStyle: style
+    )
+    check(!daemon.isFullWidth(0), "unmarked before toggle")
+    _ = daemon.tick(
+        events: [.command(.window(.fullWidth))],
+        frames: live, viewport: viewport, focusedStyle: style
+    )
+    check(daemon.isFullWidth(0), "toggle marks")
+    _ = daemon.tick(
+        events: [.command(.window(.fullWidth))],
+        frames: live, viewport: viewport, focusedStyle: style
+    )
+    check(!daemon.isFullWidth(0), "toggle again clears")
+}
+
+// Transfer-out recenters the source strip on the neighbor now at the
+// hole (transfers only — same-workspace drops and closes keep scroll).
+do {
+    var daemon = DaemonCore()
+    daemon.workspaceRing = [1, 2]
+    let left = IntRect(0, 0, 1024, 768)
+    let right = IntRect(1024, 0, 2048, 768)
+    let live = frames(slots: [0: IntPoint(0, 34), 1: IntPoint(400, 34)])
+    _ = daemon.tick(
+        events: [
+            .appeared(id: 0, workspace: 1), .appeared(id: 1, workspace: 1),
+            .focus(id: 0),
+        ],
+        frames: live, viewports: [1: left, 2: right], focusedStyle: style
+    )
+    _ = daemon.tick(
+        events: [.drop(id: 0, x: 1500)],
+        frames: live, viewports: [1: left, 2: right], focusedStyle: style
+    )
+    checkEqual(
+        daemon.strips[1]?[0]?.allWindows, [1], "source keeps the neighbor"
+    )
+    // Fresh post-commit slot x=0, width 400: shift the strip so the
+    // neighbor centers at 512 → target +312.
+    checkEqual(
+        daemon.offsetTarget(for: 1), 312,
+        "transfer retargets the source onto its neighbor"
+    )
+    for _ in 0..<25 {
+        _ = daemon.tick(
+            events: [], frames: live,
+            viewports: [1: left, 2: right], focusedStyle: style
+        )
+    }
+    checkEqual(daemon.offsets[1], 312, "source glides onto its neighbor")
+    // Same-workspace reorder files nothing.
+    _ = daemon.tick(
+        events: [.drop(id: 1, x: 100)],
+        frames: live, viewports: [1: left, 2: right], focusedStyle: style
+    )
+    checkEqual(
+        daemon.offsetTarget(for: 1), 312, "same-workspace drops keep scroll"
+    )
+}
+
+// Rejected size intents re-drive on cooldown with backoff (the
+// Firefox class: one stuck write must not pin an oversize window),
+// then go quiet again instead of hammering.
+do {
+    var daemon = DaemonCore()
+    let huge: (Int32) -> IntRect? = { id in
+        guard id == 0 else { return nil }
+        return IntRect(min: IntPoint(0, 0), max: IntPoint(2000, 2000))
+    }
+    let first = daemon.tick(
+        events: [.appeared(id: 0, workspace: 1)],
+        frames: huge, viewport: viewport, focusedStyle: style
+    )
+    checkEqual(
+        first.axJobs.first(where: { $0.winID == 0 })?.size, IntSize(1024, 768),
+        "oversize windows shrink on sight"
+    )
+    // Live never converges (rejected writes): silence until cooldown.
+    for _ in 0..<29 {
+        let quiet = daemon.tick(
+            events: [], frames: huge, viewport: viewport, focusedStyle: style
+        )
+        check(
+            quiet.axJobs.allSatisfy { $0.winID != 0 || $0.size == nil },
+            "stuck sizes wait out the cooldown"
+        )
+    }
+    let retry = daemon.tick(
+        events: [], frames: huge, viewport: viewport, focusedStyle: style
+    )
+    checkEqual(
+        retry.axJobs.first(where: { $0.winID == 0 })?.size, IntSize(1024, 768),
+        "stuck sizes re-drive after cooldown"
+    )
+    let backed = daemon.tick(
+        events: [], frames: huge, viewport: viewport, focusedStyle: style
+    )
+    check(
+        backed.axJobs.allSatisfy { $0.winID != 0 || $0.size == nil },
+        "re-drive backs off instead of hammering"
     )
 }
 
