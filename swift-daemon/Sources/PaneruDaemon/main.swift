@@ -2347,13 +2347,13 @@ func tick() {
     if fullWidthToggled, let id = result.focus {
         let live = roster[CGWindowID(id)]?.frame
         let row = core.activeVirtual[core.activeWorkspace] ?? 0
-        let cols = core.strips[core.activeWorkspace]?[row]?.columns.count ?? -1
-        let slot = core.committedSlot(of: id)
+        let strip = core.strips[core.activeWorkspace]?[row]
         print(
             "fullwidth: window=\(id) marked=\(core.isFullWidth(id))"
                 + " live=\(live.map { "\($0.width)x\($0.height)" } ?? "?")"
-                + " stripCols=\(cols)"
-                + " slot=\(slot.map { "\($0.x),\($0.y)" } ?? "?")"
+                + " stripCols=\(strip?.columns.count ?? -1)"
+                + " inStrip=\(strip?.contains(id) ?? false)"
+                + " slot=\(core.committedSlot(of: id).map { "\($0.x),\($0.y)" } ?? "?")"
                 + " offsets=\(core.offsets[core.activeWorkspace] ?? 0)"
         )
     }

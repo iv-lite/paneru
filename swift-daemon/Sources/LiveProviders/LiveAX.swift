@@ -112,6 +112,11 @@ public final class LiveWindow {
     public var verticalPadding: Int32
     /// Pids whose apps lack the enhanced-UI workaround stay synchronous.
     public var enhancedUIAbsent: Bool
+    /// Last reported write failure, lock-guarded (writes run on the
+    /// worker): repeats stay silent, success clears. Answers "is the
+    /// app rejecting writes" without spamming on redrive backoff.
+    private let complaintLock = NSLock()
+    private var _lastComplaint: String?
 
     public init(
         id: WindowID, element: AXUIElement, frame: IntRect,
@@ -124,6 +129,24 @@ public final class LiveWindow {
         self.horizontalPadding = horizontalPadding
         self.verticalPadding = verticalPadding
         self.enhancedUIAbsent = enhancedUIAbsent
+    }
+
+    /// Report a write failure once per distinct signature; success
+    /// clears. Prints outside the lock (a rare duplicate line is
+    /// harmless, a deadlock is not).
+    private func complain(_ signature: String) {
+        let fresh = complaintLock.withLock { () -> Bool in
+            guard _lastComplaint != signature else { return false }
+            _lastComplaint = signature
+            return true
+        }
+        if fresh {
+            print("ax: window=\(id) \(signature)")
+        }
+    }
+
+    private func clearComplaint() {
+        complaintLock.withLock { _lastComplaint = nil }
     }
 
     /// Resolve an element's window id, nil on any failure.
@@ -267,6 +290,7 @@ public final class LiveWindow {
         let driftX = Double(origin.x + horizontalPadding) - Double(frame.min.x)
         let driftY = Double(origin.y + verticalPadding) - Double(frame.min.y)
         guard abs(driftX) > axDeadband || abs(driftY) > axDeadband else {
+            clearComplaint()
             return frame
         }
         var point = CGPoint(
@@ -274,13 +298,17 @@ public final class LiveWindow {
             y: Double(origin.y + verticalPadding)
         )
         guard let value = AXValueCreate(.cgPoint, &point) else {
+            complain("reposition encode failed to (\(origin.x),\(origin.y))")
             return frame
         }
         let status = withEnhancedUIDisabled {
             AXUIElementSetAttributeValue(element, kAXPositionAttribute as CFString, value)
         }
         if status == .success {
+            clearComplaint()
             _ = updateFrame()
+        } else {
+            complain("reposition denied (\(status.rawValue)) to (\(origin.x),\(origin.y))")
         }
         return frame
     }
@@ -296,9 +324,13 @@ public final class LiveWindow {
         )
         guard abs(target.width - Double(frame.width)) > axDeadband
             || abs(target.height - Double(frame.height)) > axDeadband
-        else { return frame }
+        else {
+            clearComplaint()
+            return frame
+        }
         var attempt = target
         guard let value = AXValueCreate(.cgSize, &attempt) else {
+            complain("resize encode failed to \(size.x)x\(size.y)")
             return frame
         }
         let previousWidth = Double(frame.width)
@@ -306,8 +338,14 @@ public final class LiveWindow {
             AXUIElementSetAttributeValue(element, kAXSizeAttribute as CFString, value)
         }
         guard status == .success, let landed = updateFrame() else {
+            if status == .success {
+                complain("resize confirm unreadable at \(size.x)x\(size.y)")
+            } else {
+                complain("resize denied (\(status.rawValue)) at \(size.x)x\(size.y)")
+            }
             return frame
         }
+        clearComplaint()
         let landedWidth = Double(landed.width)
         if landedWidth > previousWidth, landedWidth < target.width,
            let origin
