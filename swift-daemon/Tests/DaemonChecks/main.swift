@@ -76,6 +76,8 @@ do {
     checkEqual(focused.focus, 0, "focus lands")
     checkEqual(focused.borderPlan.added.map { $0.0 }, [0], "focused window gets a border")
 
+    // Armed grabs chase hand truth (content grabs track silently).
+    daemon.dragArmed = true
     let dragged = daemon.tick(
         events: [.dragMoved(id: 0, dx: 100)],
         frames: frames(slots: [0: IntPoint(0, 34), 1: IntPoint(400, 34)]),
@@ -1655,6 +1657,41 @@ do {
     }
     checkEqual(daemon.focus, 0, "latest focus holds")
     checkEqual(daemon.offsets[1], 0, "latest arrival reveals after churn")
+}
+
+// Unarmed (content) grabs track the model with zero AX chase, and
+// release never relocates (native selection stays intact).
+do {
+    var daemon = DaemonCore()
+    let live = frames(slots: [0: IntPoint(0, 34), 1: IntPoint(400, 34)])
+    _ = daemon.tick(
+        events: [.appeared(id: 0, workspace: 1), .appeared(id: 1, workspace: 1)],
+        frames: live, viewport: viewport, focusedStyle: style
+    )
+    let dragged = daemon.tick(
+        events: [.dragMoved(id: 0, dx: 100)],
+        frames: live, viewport: viewport, focusedStyle: style
+    )
+    checkEqual(daemon.positions[0], IntPoint(100, 34), "unarmed model still tracks the hand")
+    check(
+        !dragged.axJobs.contains { $0.winID == 0 },
+        "unarmed grabs never chase to AX"
+    )
+    // The OS window never moved (content drag): release restores the
+    // model silently — no reorder, no homing write.
+    let released = daemon.tick(
+        events: [.released],
+        frames: frames(slots: [0: IntPoint(0, 34), 1: IntPoint(400, 34)]),
+        viewport: viewport, focusedStyle: style
+    )
+    checkEqual(
+        daemon.strips[1]?[0]?.allWindows, [0, 1], "unarmed release never reorders"
+    )
+    checkEqual(daemon.positions[0], IntPoint(0, 34), "model truth snaps back")
+    check(
+        released.axJobs.allSatisfy { $0.winID != 0 },
+        "unarmed release glides home silently when live matches"
+    )
 }
 
 if failures == 0 {

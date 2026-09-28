@@ -887,8 +887,12 @@ func tapEvent(_ event: TapEvent) -> DaemonEvent? {
             return .command(.printState)
         }
     case .mouseDown(let point, let modifiers):
-        // Grab candidacy: press on a draggable window. Promotion
+        // Grab candidacy: press on a draggable window. Resize-modifier
+        // drags stay fully native (Rust reserves that path). Promotion
         // waits for the threshold in dragged events.
+        if dragResize(modifiers: modifiers) {
+            return nil
+        }
         if let hit = dragHitTest(point) {
             dragCandidate = hit
             dragPressPoint = point
@@ -920,6 +924,13 @@ func tapEvent(_ event: TapEvent) -> DaemonEvent? {
             lastGhostRect = nil
         }
         guard let grabbed = dragGrabbed, pending.count < 1024 else { return nil }
+        // Unarmed (content) releases never relocate: the app owned the
+        // drag natively (text selection), so glide home instead of
+        // dropping (Rust: `reordered = armed && …`).
+        guard dragPressArmed else {
+            pending.append(.released)
+            return nil
+        }
         // Flush the tail fold ahead of the drop so the column drives
         // from its live position, not a stale one.
         let tail = Int32(max(-dragFoldClamp, min(dragFoldClamp, dragFoldDX.rounded())))
@@ -1909,6 +1920,12 @@ func dragArmed(modifiers: TapModifiers) -> Bool {
     resolved.mouseDragDisplayModifiers.map { $0 == keyModifiers(modifiers) } ?? false
 }
 
+/// Resize-modifier presses stay fully native (edge resizes belong to
+/// the app; Rust reserves that path separately).
+func dragResize(modifiers: TapModifiers) -> Bool {
+    resolved.mouseResizeModifiers.map { $0 == keyModifiers(modifiers) } ?? false
+}
+
 /// Front-to-back hit test in Quartz screen space (the daemon's frame
 /// space — no flip needed).
 func dragHitTest(_ point: CGPoint) -> WindowID? {
@@ -2180,6 +2197,9 @@ func tick() {
             || core.unmanaged.contains(id)
             || roster[CGWindowID(id)] != nil
     }
+    // Grab-time arming into the core (fresh every tick, never stale):
+    // only armed grabs chase hand truth and relocate on release.
+    core.dragArmed = dragGrabbed != nil && dragPressArmed
     let result = core.tick(
         events: filteredEvents,
         frames: { roster[CGWindowID(bitPattern: $0)]?.frame },
@@ -2312,8 +2332,9 @@ func tick() {
     prevMffFocus = result.focus
     // Drop ghost: a full-height bar tracking the grabbed column's
     // landing slot (shared `dropSlot` math, so ghost == landing).
-    // Steady ticks skip the presenter instead of rewriting layers.
-    if let grabbed = dragGrabbed, let cursor = cursorAXPoint(),
+    // Armed grabs only — content drags show nothing. Steady ticks skip
+    // the presenter instead of rewriting layers.
+    if dragPressArmed, let grabbed = dragGrabbed, let cursor = cursorAXPoint(),
        let slot = core.dropSlot(
            pointerX: cursor.x, viewports: viewports, excluding: grabbed
        ),

@@ -142,6 +142,13 @@ public struct DaemonCore: Sendable {
     private var focusRaiseLatched = false
     /// Held drag target, if any.
     private var held: WindowID?
+    /// Grab-time arming for the held drag (host-owned): armed grabs
+    /// chase hand truth to the OS and may relocate on release; unarmed
+    /// (content) grabs track the model only — the app owns the drag
+    /// natively (text selection), and release glides home. Mirrors
+    /// Rust `Gesture::drives` (display-armed). Synced by the host
+    /// every tick; defaults off so unit checks pin the native path.
+    public var dragArmed = false
     /// This tick saw fresh swipe/scroll input: motion stays flagged past
     /// commit (the inertia tail), so the tick reads active like the Rust
     /// `Scrolling` state does. Cleared on ticks without gesture input.
@@ -362,14 +369,22 @@ public struct DaemonCore: Sendable {
         // write this tick, a held drag, fresh gestures, or a recent move
         // stand the reveal down into the pending set that fires once the
         // strip settles, so a flapping focus cannot yank mid-flight.
-        // Reveal writes offset TARGETS against this tick's fresh slots
-        // (commit just wrote them); the ease below glides there over
-        // the next ticks. Pure AX traffic (resizes, converged pushes)
-        // does not count as motion.
+        // Reveal drains here, pre-commit, and writes offset TARGETS:
+        // the commit head eases (or snaps, with animations off) them
+        // into this tick's slots, so snap-mode frames — including the
+        // frame-parity harness — observe the reveal synchronously.
+        // Pure AX traffic (resizes, converged pushes) does not count
+        // as motion.
         func rested() -> Bool {
             offsets == offsetsBeforeTick
                 && !gestureFresh && held == nil
                 && (lastOffsetMoveEpoch.map({ epoch &- $0 >= revealRestEpochs }) ?? true)
+        }
+        if !pendingReveals.isEmpty, rested() {
+            for id in pendingReveals.sorted() {
+                revealOwner(id, frames: frames, viewports: viewports)
+            }
+            pendingReveals.removeAll()
         }
         layoutPass()
         // NOTE: no orphan fallback here: an emptied active workspace is
@@ -383,12 +398,6 @@ public struct DaemonCore: Sendable {
             auditPass()
         }
         let jobs = commitPass(frames: frames, viewports: viewports, epoch: epoch)
-        if !pendingReveals.isEmpty, rested() {
-            for id in pendingReveals.sorted() {
-                revealOwner(id, frames: frames, viewports: viewports)
-            }
-            pendingReveals.removeAll()
-        }
         // Offset clock for the reveal gate: only actual strip travel
         // stands the next reveal down.
         if offsets != offsetsBeforeTick {
@@ -554,7 +563,7 @@ public struct DaemonCore: Sendable {
                 dirty.formUnion([.layout, .motion])
             case .released:
                 held = nil
-                settleReleased()
+                settleReleased(frames: frames)
             case .drop(let id, let x):
                 held = nil
                 // Relocate the whole column into the slot under the
@@ -584,7 +593,7 @@ public struct DaemonCore: Sendable {
                         }
                     }
                 }
-                settleReleased()
+                settleReleased(frames: frames)
             case .command(let command):
                 ingestCommand(command, frames: frames, viewports: viewports, epoch: epoch)
             case .swipe(let delta, _), .scroll(let delta):
@@ -1398,11 +1407,19 @@ public struct DaemonCore: Sendable {
         }
     }
 
-    /// Shared release settle (plain release and pointer drop): only
-    /// displaced members owe a home intent; untouched ones already
-    /// match their slots.
-    private mutating func settleReleased() {
+    /// Shared release settle (plain release and pointer drop): members
+    /// owe a home intent only where the OS actually drifted — a live
+    /// frame already on-slot needs no write (content grabs never moved
+    /// it), while unknown frames stay conservative and mark. Untouched
+    /// members already match their slots either way.
+    private mutating func settleReleased(frames: (WindowID) -> IntRect?) {
         for (id, slot) in committedSlots where positions[id] != slot {
+            if let live = frames(id),
+               abs(live.min.x - slot.x) <= axDeadbandPx
+                && abs(live.min.y - slot.y) <= axDeadbandPx
+            {
+                continue
+            }
             homing.insert(id)
         }
         glideHome()
@@ -1799,9 +1816,11 @@ public struct DaemonCore: Sendable {
             positions[member] = slot
             glides.removeValue(forKey: member)
         } else if heldMembers.contains(member) {
-            // Hand truth flows to the OS so mates follow; the
-            // slot waits for release.
-            if let hand = positions[member] {
+            // Armed hand truth flows to the OS so mates follow; the
+            // slot waits for release. Unarmed (content) grabs never
+            // chase — the app owns the drag natively, the model only
+            // tracks, and release glides home.
+            if dragArmed, let hand = positions[member] {
                 enqueueMove(member, to: hand, epoch: epoch)
             }
         } else if positions[member] != slot {

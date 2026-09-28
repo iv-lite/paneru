@@ -7,6 +7,7 @@
 import ApplicationServices
 import AppKit
 import CoreGraphics
+import Darwin
 import Foundation
 
 // MARK: - Constants
@@ -476,10 +477,29 @@ private let tapCallback: CGEventTapCallBack = { _, type, event, userInfo in
 
 // MARK: - Mouse warp
 
-/// Point the cursor. (The Rust path also zeroes the local-events
-/// suppression interval; that call is unavailable to Swift, so a warp
-/// during a suppression window can feel briefly stuck.)
+/// Point the cursor. Drops the local-event suppression interval to zero
+/// first (Rust `warp_mouse` parity): the default 250ms interval drops
+/// physical mouse motion right after a warp, making the cursor feel
+/// "stuck" at the landing. Left at zero deliberately — no suppression,
+/// ever — then the warp, then re-association so HID input drives the
+/// cursor immediately.
+///
+/// The setter resolves dynamically: the SDK marks
+/// `CGSetLocalEventsSuppressionInterval` unavailable, but the symbol
+/// still ships (Rust links it directly). A missing symbol on future
+/// OSes degrades to warp-without-zeroing, never a crash.
+private typealias SuppressionIntervalFn = @convention(c) (Double) -> Void
+
+private let setSuppressionInterval: SuppressionIntervalFn? = {
+    guard let raw = dlsym(
+        UnsafeMutableRawPointer(bitPattern: -2),
+        "CGSetLocalEventsSuppressionInterval"
+    ) else { return nil }
+    return unsafeBitCast(raw, to: SuppressionIntervalFn.self)
+}()
+
 public func warpMouse(to point: CGPoint) {
+    setSuppressionInterval?(0.0)
     CGWarpMouseCursorPosition(point)
     CGAssociateMouseAndMouseCursorPosition(boolean_t(1))
 }
