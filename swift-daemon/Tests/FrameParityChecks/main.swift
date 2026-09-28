@@ -107,6 +107,15 @@ private func runScenario(
 ) -> [SwiftFrame] {
     var daemon = DaemonCore()
     daemon.activeWorkspace = workspace
+    // Mirror the Rust trace harness (setup_world forces animations:false
+    // so 200ms command windows assert exact rest positions): snap instead
+    // of opening 250ms eased glides the 5-tick drain could never converge.
+    // Gaps stay 0: the corpus wants gap-free slot pitch (tiling col pitch
+    // exactly 400 = window width; Rust Position traces slot origins and
+    // applies gaps as frame inset, while DaemonCore advances slots by
+    // colWidth + gapHorizontal — gaps=8 would pitch 408/816 and miss).
+    daemon.animationsEnabled = false
+    daemon.glideBaseMs = 0
     // Seed tick (uncompared): harness spawns pre-run.
     _ = daemon.tick(
         events: windows.map { DaemonEvent.appeared(id: $0, workspace: workspace) },
