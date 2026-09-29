@@ -2362,8 +2362,24 @@ nonisolated(unsafe) var radiusRulesGen = 0
     exit(0)
 }
 
+/// Slow-tick phase timing switch (`PANERU_PERF=1`): full ticks past
+/// `perfSlowTickMs` log one `perf:` phase breakdown. Read once —
+/// toggling needs a restart, which keeps the hot path branch-only.
+nonisolated(unsafe) var perfTimingEnabled: Bool =
+    ProcessInfo.processInfo.environment["PANERU_PERF"] != nil
+/// Slow-tick threshold: half a 60Hz frame. Smaller would spam on
+/// animation-heavy ticks that are merely busy, not stuck.
+let perfSlowTickMs = 8.0
+
 @Sendable func tick() {
     tickCount += 1
+    // Slow-tick phase timing (diagnostics only): with PANERU_PERF set,
+    // full ticks slower than the threshold log one phase breakdown
+    // line (ack+warp / sync admin / lua drain / core / post+present),
+    // so live jank arrives pre-triaged instead of as "it stutters".
+    // Idle-skip ticks return before the print; disabled builds pay one
+    // predictable branch per stamp.
+    let t0: Date? = perfTimingEnabled ? Date() : nil
     // Process control lands here, never in the core (which ignores
     // `.quit`/`.restart` by contract): a pending quit/restart — or a
     // caught termination signal — saves and exits before any AX work.
@@ -2395,6 +2411,7 @@ nonisolated(unsafe) var radiusRulesGen = 0
             checkWarp(cursor: cursor)
         }
     }
+    let t1: Date? = perfTimingEnabled ? Date() : nil
     // Idle backoff: a fully quiet tick skips the scan/present work and
     // just advances the clock; every 30th tick still runs full (display
     // and state cadences). The pointer poll keeps its own 4Hz floor on
@@ -2452,6 +2469,7 @@ nonisolated(unsafe) var radiusRulesGen = 0
         }
         print("restore: grace expired (running live)")
     }
+    let t2: Date? = perfTimingEnabled ? Date() : nil
     // One viewport per workspace (display); the active display's rect
     // feeds the script snapshot, exactly as before.
     let viewports = workspaceViewports()
@@ -2462,6 +2480,7 @@ nonisolated(unsafe) var radiusRulesGen = 0
     )
     // Script hosting runs before the core consumes `pending`.
     drainLuaFrame()
+    let t3: Date? = perfTimingEnabled ? Date() : nil
     // Pointer-drag drive: fold the inter-tick travel into one clamped
     // delta ahead of the snapshot, so the column tracks the pointer
     // with one frame of lag instead of bursting per HID event.
@@ -2480,7 +2499,7 @@ nonisolated(unsafe) var radiusRulesGen = 0
     // lone-column centering decides on (live size, strip width,
     // offsets, committed slot). Rare user action, permanent value —
     // answers "why isn't it centered" in one log line.
-    let fullWidthToggled = pending.contains {
+    let fullWidthToggled = events.contains {
         if case .command(.window(.fullWidth)) = $0 { return true }
         return false
     }
@@ -2544,6 +2563,7 @@ nonisolated(unsafe) var radiusRulesGen = 0
         frames: { roster[CGWindowID(bitPattern: $0)]?.frame },
         viewports: viewports, focusedStyle: focusedStyle
     )
+    let t4: Date? = perfTimingEnabled ? Date() : nil
     // AX writes ride the serial worker, never the tick (the runloop also
     // owns the event tap — blocking it on AX round trips stalls all
     // input). Latest-per-window coalescing, then one dispatch; skipped
@@ -2999,12 +3019,14 @@ nonisolated(unsafe) var radiusRulesGen = 0
             lastDim = dimNow
         }
     } else {
+        // Transition-gated: hiding an already-hidden layer every tick
+        // is presenter churn at display rate during busy periods.
         if lastDim != nil {
             lastDim = nil
-        }
-        if !shadowMode {
-            MainActor.assumeIsolated {
-                Presenter.hideDim()
+            if !shadowMode {
+                MainActor.assumeIsolated {
+                    Presenter.hideDim()
+                }
             }
         }
     }
@@ -3100,6 +3122,21 @@ nonisolated(unsafe) var radiusRulesGen = 0
     }
     subscriptions.publish(fired)
     lastQuiescent = result.quiescent
+    if let t0, let t1, let t2, let t3, let t4 {
+        let t5 = Date()
+        let ms = { (a: Date, b: Date) in b.timeIntervalSince(a) * 1000.0 }
+        let total = ms(t0, t5)
+        if total > perfSlowTickMs {
+            print(
+                "perf: tick=\(tickCount) total=\(String(format: "%.2f", total))ms"
+                    + " ack=\(String(format: "%.2f", ms(t0, t1)))"
+                    + " sync=\(String(format: "%.2f", ms(t1, t2)))"
+                    + " lua=\(String(format: "%.2f", ms(t2, t3)))"
+                    + " core=\(String(format: "%.2f", ms(t3, t4)))"
+                    + " post=\(String(format: "%.2f", ms(t4, t5)))"
+            )
+        }
+    }
 }
 
 Timer.scheduledTimer(withTimeInterval: 1.0 / 60.0, repeats: true) { _ in
