@@ -2392,12 +2392,23 @@ public struct DaemonCore: Sendable {
 
     /// Backstop for non-stack members: shrink over-viewport windows to
     /// the viewport (Rust `clamp_managed_windows_to_viewport`); windows
-    /// that already fit record and rest.
+    /// that already fit record and rest. Maximized members are
+    /// model-sized to the viewport instead: the mark owns truth, so a
+    /// dropped or OS-clamped write redrives through `applySize`
+    /// (Firefox class) instead of the clamp adopting live truth as the
+    /// new size and silencing every retry path.
     private mutating func clampMemberSize(
         _ member: WindowID, home: IntRect, epoch: UInt64,
         frames: (WindowID) -> IntRect?
     ) {
         guard let live = frames(member) else { return }
+        if fullWidth[member] != nil {
+            applySize(
+                member, to: IntSize(home.width, home.height),
+                epoch: epoch, frames: frames
+            )
+            return
+        }
         applySize(
             member,
             to: clampSizeToViewport(

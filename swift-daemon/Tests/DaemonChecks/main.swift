@@ -2727,6 +2727,43 @@ do {
     check(daemon.overlapReport(frames: live).isEmpty, "settled tiled pair is overlap-free")
 }
 
+// Maximized size intent survives a dropped write: the fullWidth mark
+// owns model truth, so the viewport size redrives on cooldown instead
+// of the clamp adopting live truth (Firefox class).
+do {
+    var daemon = DaemonCore()
+    daemon.animationsEnabled = false
+    daemon.glideBaseMs = 0
+    let small = frames(slots: [0: IntPoint(312, 34)])
+    _ = daemon.tick(
+        events: [.appeared(id: 0, workspace: 1), .focus(id: 0)],
+        frames: small, viewport: viewport, focusedStyle: style
+    )
+    let full = daemon.tick(
+        events: [.command(.window(.fullWidth))],
+        frames: small, viewport: viewport, focusedStyle: style
+    )
+    checkEqual(
+        full.axJobs.first(where: { $0.winID == 0 })?.size, IntSize(1024, 768),
+        "maximize emits viewport size"
+    )
+    for job in full.axJobs {
+        daemon.acknowledge(winID: job.winID, seq: job.seq, epoch: job.epoch)
+    }
+    // Firefox drops every write: live frozen small, dispatches acked.
+    var redrove = false
+    for _ in 0..<40 {
+        let r = daemon.tick(events: [], frames: small, viewport: viewport, focusedStyle: style)
+        for job in r.axJobs {
+            daemon.acknowledge(winID: job.winID, seq: job.seq, epoch: job.epoch)
+        }
+        if r.axJobs.contains(where: { $0.winID == 0 && $0.size == IntSize(1024, 768) }) {
+            redrove = true
+        }
+    }
+    check(redrove, "dropped maximize size redrives on cooldown")
+}
+
 if failures == 0 {
     print("DaemonChecks: all checks passed")
 } else {
