@@ -233,6 +233,21 @@ public func borderWindowRect(_ window: CGRect, width: CGFloat) -> CGRect {
     )
 }
 
+/// Absolute CG rect of a layout frame, corrected for window padding.
+/// Mirrors Rust `abs_cg_rect` (`src/ecs/systems.rs`): the layout frame
+/// carries the per-window gap inset on every side, while the glass the
+/// compositor shows is inset by exactly that padding. Borders and dim
+/// cutouts must hug the glass, not the slot — otherwise a gap of
+/// `hPad`/`vPad` opens between decoration and window.
+public func glassRect(_ padded: CGRect, hPad: CGFloat, vPad: CGFloat) -> CGRect {
+    CGRect(
+        x: padded.origin.x + hPad,
+        y: padded.origin.y + vPad,
+        width: max(0, padded.size.width - 2 * hPad),
+        height: max(0, padded.size.height - 2 * vPad)
+    )
+}
+
 // MARK: - Drop preview
 
 /// The drop-preview ghost for a landing slot: full viewport height,

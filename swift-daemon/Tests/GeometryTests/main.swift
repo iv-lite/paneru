@@ -128,6 +128,28 @@ do {
     checkEqual(slotPreviewRect(slotX: 100, viewport: view, size: IntSize(2000, 300)), IntRect(0, 20, 2000, 768), "preview oversized")
 }
 
+// abs_cg_rect parity: padded slot minus per-window insets hugs glass.
+do {
+    let glass = glassRect(
+        CGRect(origin: CGPoint(x: 0.0, y: 34.0), size: CGSize(width: 416.0, height: 734.0)),
+        hPad: 8.0, vPad: 8.0
+    )
+    checkClose(glass.origin.x, 8.0, "glass x")
+    checkClose(glass.origin.y, 42.0, "glass y")
+    checkClose(glass.size.width, 400.0, "glass w")
+    checkClose(glass.size.height, 718.0, "glass h")
+}
+
+// Degenerate padding clamps instead of inverting.
+do {
+    let glass = glassRect(
+        CGRect(origin: CGPoint(x: 0.0, y: 0.0), size: CGSize(width: 10.0, height: 10.0)),
+        hPad: 8.0, vPad: 8.0
+    )
+    checkClose(glass.size.width, 0.0, "glass clamps w")
+    checkClose(glass.size.height, 0.0, "glass clamps h")
+}
+
 if failures == 0 {
     print("GeometryChecks: all checks passed")
 } else {

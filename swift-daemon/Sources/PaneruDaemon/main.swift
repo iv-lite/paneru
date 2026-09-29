@@ -2885,17 +2885,28 @@ nonisolated(unsafe) var radiusRulesGen = 0
     // Present borders. An empty plan means steady state: the pool already
     // shows exactly this set, so skip the sync — resolving deltas-only
     // into a full sync would prune every resting border.
+    // Borders hug glass, not slots: shrink padded plan rects by each
+    // window's own insets (mirrors Rust abs_cg_rect at the bridge —
+    // without this the border floats hPad/vPad off the glass).
+    let glassForBorder: (WindowID, CGRect) -> CGRect = { id, rect in
+        guard let window = roster[CGWindowID(id)] else { return rect }
+        return glassRect(
+            rect,
+            hPad: CGFloat(window.horizontalPadding),
+            vPad: CGFloat(window.verticalPadding)
+        )
+    }
     if !result.borderPlan.isEmpty {
         for id in result.borderPlan.removed {
             borderRects.removeValue(forKey: id)
             borderStyles.removeValue(forKey: id)
         }
         for (id, rect, style) in result.borderPlan.added {
-            borderRects[id] = rect
+            borderRects[id] = glassForBorder(id, rect)
             borderStyles[id] = style
         }
         for (id, rect) in result.borderPlan.moved {
-            borderRects[id] = rect
+            borderRects[id] = glassForBorder(id, rect)
         }
         for (id, style) in result.borderPlan.reskinned {
             borderStyles[id] = style
@@ -2914,7 +2925,17 @@ nonisolated(unsafe) var radiusRulesGen = 0
     // color (a composite) at display rate even at rest.
     let dimRatio = resolved.windowDimRatio(isDark: false)
     if resolved.dimActive, dimRatio > 0 {
-        let cutout = result.focus.flatMap { roster[CGWindowID($0)]?.frame }.map(cgRect)
+        // Dim cutout hugs glass too: shrink the padded roster frame by
+        // the focused window's own insets (same abs_cg_rect mirror).
+        let cutout: CGRect? = result.focus.flatMap { id in
+            roster[CGWindowID(id)].map { window in
+                glassRect(
+                    cgRect(window.frame),
+                    hPad: CGFloat(window.horizontalPadding),
+                    vPad: CGFloat(window.verticalPadding)
+                )
+            }
+        }
         let dimNow: (opacity: Float, r: Double, g: Double, b: Double, cutout: CGRect?, radius: Double) = (
             Float(dimRatio), resolved.dimColor.0, resolved.dimColor.1,
             resolved.dimColor.2, cutout, focusedStyle.radius
