@@ -62,15 +62,23 @@ public func xpcIsError(_ reply: String) -> Bool {
 public final class PaneruXPCClient {
     private let connection: NSXPCConnection
 
-    public init(serviceName: String) {
+    public init(serviceName: String, sink: XPCEventSink? = nil) {
         connection = NSXPCConnection(machServiceName: serviceName, options: [])
         connection.remoteObjectInterface = NSXPCInterface(with: PaneruXPCProtocol.self)
+        if let sink {
+            connection.exportedInterface = NSXPCInterface(with: PaneruXPCClientProtocol.self)
+            connection.exportedObject = sink
+        }
         connection.resume()
     }
 
-    public init(endpoint: NSXPCListenerEndpoint) {
+    public init(endpoint: NSXPCListenerEndpoint, sink: XPCEventSink? = nil) {
         connection = NSXPCConnection(listenerEndpoint: endpoint)
         connection.remoteObjectInterface = NSXPCInterface(with: PaneruXPCProtocol.self)
+        if let sink {
+            connection.exportedInterface = NSXPCInterface(with: PaneruXPCClientProtocol.self)
+            connection.exportedObject = sink
+        }
         connection.resume()
     }
 
@@ -112,6 +120,28 @@ public final class PaneruXPCClient {
             RunLoop.current.run(mode: .default, before: Date().addingTimeInterval(0.005))
         }
         return value()
+    }
+}
+
+/// Event sink for `pq subscribe`: the daemon pushes batches onto the
+/// exported object (callback thread), the CLI drains on main.
+/// Lock-guarded handoff, Sendable by that lock; delivery order is
+/// FIFO per connection.
+public final class XPCEventSink: NSObject, PaneruXPCClientProtocol, @unchecked Sendable {
+    private let lock = NSLock()
+    private var lines: [String] = []
+
+    public func deliverEvents(_ json: [String]) {
+        lock.withLock { lines.append(contentsOf: json) }
+    }
+
+    /// Take everything delivered so far, in order.
+    public func drain() -> [String] {
+        lock.withLock {
+            let out = lines
+            lines.removeAll(keepingCapacity: true)
+            return out
+        }
     }
 }
 

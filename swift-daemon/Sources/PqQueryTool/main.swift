@@ -9,8 +9,10 @@ import Scripting
 //   pq state | active | virtual-workspaces | on-screen
 //   pq run window focus east
 //   pq apply '[{"focus":1}]'
+//   pq subscribe                      (streams event JSON until interrupted)
 //   pq state-get <key>
 //   pq state-write <key> <json-value|null> [--exactly <json>]
+//   pq state-remove <key>
 //
 // Exit nonzero with the daemon-side error (or a timeout) on stderr.
 
@@ -61,7 +63,7 @@ func parseJSONValue(_ word: String, what: String) -> ScriptValue? {
 
 let args = Array(CommandLine.arguments.dropFirst())
 guard !args.isEmpty else {
-    fail("usage: pq <state|active|virtual-workspaces|on-screen> | pq run <argv...> | pq apply '<ops>' | pq state-get <key> | pq state-write <key> <json> [--exactly <json>]")
+    fail("usage: pq <state|active|virtual-workspaces|on-screen> | pq run <argv...> | pq apply '<ops>' | pq subscribe | pq state-get <key> | pq state-write <key> <json> [--exactly <json>] | pq state-remove <key>")
 }
 
 /// Single-threaded CLI (synchronous runloop-spin per call): the
@@ -106,6 +108,32 @@ if args[0] == "state-write" {
         expected = .exactly(parseJSONValue(args[4], what: "expected"))
     }
     ask(.scriptState(.write(ScriptStateWrite(key: key, value: value, expected: expected))))
+}
+
+if args[0] == "state-remove" {
+    guard args.count == 2 else { fail("usage: pq state-remove <key>") }
+    ask(.scriptState(.write(.remove(args[1]))))
+}
+
+if args[0] == "subscribe" {
+    guard args.count == 1 else { fail("usage: pq subscribe") }
+    // Stream event JSON, one object per line with per-line flush like
+    // the Rust subscriber, until interrupted (the daemon prunes dead
+    // connections itself, so Ctrl-C needs no goodbye).
+    let sink = XPCEventSink()
+    let subscriber = PaneruXPCClient(serviceName: paneruServiceNameResolved(), sink: sink)
+    guard let token = subscriber.subscribeSync(), !xpcIsError(token) else {
+        fail("no subscription (daemon not listening on \(paneruServiceNameResolved()))")
+    }
+    withExtendedLifetime(subscriber) {
+        while true {
+            RunLoop.current.run(mode: .default, before: Date().addingTimeInterval(0.05))
+            for line in sink.drain() {
+                print(line)
+                fflush(stdout)
+            }
+        }
+    }
 }
 
 guard let kind = QueryKind.parse(args[0]) else {

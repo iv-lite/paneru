@@ -19,15 +19,16 @@ private func checkEqual<T: Equatable>(_ a: T, _ b: T, _ message: String) {
     check(a == b, "\(message) (got \(a), want \(b))")
 }
 
-private func pair() -> (PaneruLoopbackListener, PaneruXPCClient) {
+private func pair() -> (PaneruLoopbackListener, PaneruXPCClient, XPCEventSink) {
     let listener = PaneruLoopbackListener()
-    let client = PaneruXPCClient(endpoint: listener.listener.endpoint)
-    return (listener, client)
+    let sink = XPCEventSink()
+    let client = PaneruXPCClient(endpoint: listener.listener.endpoint, sink: sink)
+    return (listener, client, sink)
 }
 
 // Command dispatch round-trips argv and replies.
 do {
-    let (listener, client) = pair()
+    let (listener, client, _) = pair()
     listener.server.onCommand = { argv in
         argv == ["window", "focus", "east"] ? "ok" : xpcError("unknown command")
     }
@@ -44,7 +45,7 @@ do {
 
 // Query bytes echo back untouched (payload shapes live in IPC).
 do {
-    let (listener, client) = pair()
+    let (listener, client, _) = pair()
     let request = Data("{\"type\":\"query\",\"kind\":\"active\"}".utf8)
     listener.server.onQuery = { $0 }
     checkEqual(client.answerQuerySync(request), request, "query bytes echo")
@@ -53,7 +54,7 @@ do {
 
 // Unhandled server degrades to an error string, never a hang.
 do {
-    let (listener, client) = pair()
+    let (listener, client, _) = pair()
     let reply = client.runCommandSync(["anything"], timeout: 5)
     checkEqual(reply, "error: unhandled", "default handler errors loudly")
     withExtendedLifetime((listener, client)) {}
@@ -89,7 +90,7 @@ do {
 
 // Subscribe round-trips an id; unsubscribe drops it server-side.
 do {
-    let (listener, client) = pair()
+    let (listener, client, _) = pair()
     var removed: [String] = []
     listener.server.onSubscribe = { "sub-1" }
     listener.server.onUnsubscribe = { removed.append($0) }
@@ -102,6 +103,29 @@ do {
     }
     checkEqual(removed, ["sub-1"], "unsubscribe lands server-side")
     withExtendedLifetime((listener, client)) {}
+}
+
+// Event sink: batches drain FIFO, empty drains stay empty. The sink is
+// what `pq subscribe` exports for server pushes.
+do {
+    let sink = XPCEventSink()
+    checkEqual(sink.drain(), [], "fresh sinks drain empty")
+    sink.deliverEvents([#"{"event":"a"}"#, #"{"event":"b"}"#])
+    sink.deliverEvents([#"{"event":"c"}"#])
+    checkEqual(
+        sink.drain(),
+        [#"{"event":"a"}"#, #"{"event":"b"}"#, #"{"event":"c"}"#],
+        "batches drain in delivery order"
+    )
+    checkEqual(sink.drain(), [], "drained sinks stay empty")
+}
+
+// Exported sinks ride the client connection: the loopback pair carries
+// one without disturbing any existing round trip.
+do {
+    let (listener, client, sink) = pair()
+    checkEqual(sink.drain(), [], "loopback sinks start empty")
+    withExtendedLifetime((listener, client, sink)) {}
 }
 
 if failures == 0 {
