@@ -497,6 +497,8 @@ nonisolated(unsafe) var workspaceSpaceObserver: NSObjectProtocol?
 nonisolated(unsafe) var workspaceTerminateObserver: NSObjectProtocol?
 /// Newcomers with an AX probe in flight (see `syncRoster`).
 nonisolated(unsafe) var probing: Set<CGWindowID> = []
+/// Syncs since the last full flip-check pass (see `syncRoster`).
+nonisolated(unsafe) var flipCheckCounter = 0
 
 /// Serial AX worker: every Accessibility round trip runs here, never on
 /// the main runloop (which also owns the event tap — blocking it stalls
@@ -811,7 +813,16 @@ nonisolated(unsafe) var spaceVotes: [WorkspaceID: (space: SpaceID, seen: Int)] =
 @Sendable func syncRoster() {
     guard let onScreen = onScreenWindowIDs() else { return }
     lastRosterSync = Date()
+    // Signal- vs backstop-driven: notificationless backstops still
+    // vanish-drop and adopt, but skip the per-window AX flip reads
+    // (fullscreen/minimize probes across the whole roster). Missed
+    // notifications backstop on every 10th sync (~10s); the normal
+    // observer path stays immediate.
+    let signaled = rosterDirty
     rosterDirty = false
+    flipCheckCounter += 1
+    let fullFlips = signaled || flipCheckCounter >= 10
+    if fullFlips { flipCheckCounter = 0 }
     refreshSpaces()
     let known = Set(roster.keys)
     let current = Set(onScreen)
@@ -826,7 +837,7 @@ nonisolated(unsafe) var spaceVotes: [WorkspaceID: (space: SpaceID, seen: Int)] =
     let refresh = roster.map { ($0.key, $0.value) }
     if !newcomers.isEmpty || !refresh.isEmpty {
         probing.formUnion(newcomers.map { $0.0 })
-        axWorker.async { [newcomers, refresh] in
+        axWorker.async { [newcomers, refresh, fullFlips] in
             var adopted: [(AdoptedWindow, AXUIElement)] = []
             for (wid, pid) in newcomers {
                 let app = LiveApp(pid: pid)
@@ -854,15 +865,19 @@ nonisolated(unsafe) var spaceVotes: [WorkspaceID: (space: SpaceID, seen: Int)] =
                 ))
             }
             let attempted = Set(newcomers.map { $0.0 })
-            // Fullscreen flips of already-adopted windows ride along:
-            // entering/leaving native fullscreen re-floats or re-tiles.
-            // (Worker-side AX reads over the main-taken snapshot only;
-            // the roster itself stays main-owned.)
+            // Fullscreen flips of already-adopted windows ride along on
+            // signaled syncs and the periodic safety net only (see
+            // `syncRoster`): two AX reads per window per sync is the
+            // steady-state tax this removes. Worker-side AX reads run
+            // over the main-taken snapshot only; the roster itself stays
+            // main-owned.
             var flips: [(WindowID, Bool)] = []
             var minFlips: [(WindowID, Bool)] = []
-            for (wid, window) in refresh {
-                flips.append((windowID(wid), window.isFullscreen))
-                minFlips.append((windowID(wid), window.isMinimized))
+            if fullFlips {
+                for (wid, window) in refresh {
+                    flips.append((windowID(wid), window.isFullscreen))
+                    minFlips.append((windowID(wid), window.isMinimized))
+                }
             }
             DispatchQueue.main.async { [flips, minFlips] in
                 // Main queue means main thread by construction, so
@@ -921,6 +936,12 @@ nonisolated(unsafe) var spaceVotes: [WorkspaceID: (space: SpaceID, seen: Int)] =
         radiusCache.removeValue(forKey: id)
         focusHistory.forget(id)
         stableFrames.removeValue(forKey: wid)
+        // Recycle-unsafe latches: WindowIDs recycle across distinct
+        // windows, so a new window with this id must actuate and reveal
+        // fresh instead of matching the closed window's memory.
+        if prevActuatedFocus == id { prevActuatedFocus = nil }
+        if prevMffFocus == id { prevMffFocus = nil }
+        if lastHoverID == id { lastHoverID = nil }
         pending.append(.disappeared(id: id))
         print("window: closed \(id)")
     }
@@ -1935,7 +1956,7 @@ nonisolated(unsafe) var lastWarpEval = Date.distantPast
 @Sendable func pollPointer(viewports: [WorkspaceID: IntRect]) {
     guard tap.lastMouseMovedAt > lastPointerPoll else { return }
     lastPointerPoll = Date()
-    guard let cursor = cursorAXPoint() else { return }
+    guard let cursor = tickCursor() else { return }
     // Shadow never warps (the evaluation only feeds warps); hover focus
     // below still runs so arrivals replicate.
     if !shadowMode {
@@ -2254,6 +2275,18 @@ func workspaceContaining(point: IntPoint) -> WorkspaceID? {
     guard let point = CGEvent(source: nil)?.location else { return nil }
     return IntPoint(Int32(point.x.rounded()), Int32(point.y.rounded()))
 }
+/// Per-tick memoized cursor: the snappy warp path, the pointer poll,
+/// follow-focus, and the drop ghost each sampled separately (up to
+/// four CGEvent creations per tick). One sample per tick number;
+/// nil-ness memoizes too. Main thread only (all callers run in tick).
+nonisolated(unsafe) var tickCursorTick = 0
+nonisolated(unsafe) var tickCursorPoint: IntPoint?
+@Sendable func tickCursor() -> IntPoint? {
+    if tickCursorTick == tickCount { return tickCursorPoint }
+    tickCursorTick = tickCount
+    tickCursorPoint = cursorAXPoint()
+    return tickCursorPoint
+}
 /// State snapshot path for hand-run diagnostics.
 /// State snapshot path for hand-run diagnostics. Shadow observers write
 /// a separate file so readers never mix replicated truth with live truth.
@@ -2453,7 +2486,7 @@ let perfSlowTickMs = 8.0
     // below stays as hover + backstop.
     if tap.lastMouseMovedAt > lastWarpEval {
         lastWarpEval = tap.lastMouseMovedAt
-        if !shadowMode, let cursor = cursorAXPoint() {
+        if !shadowMode, let cursor = tickCursor() {
             checkWarp(cursor: cursor)
         }
     }
@@ -2811,7 +2844,7 @@ let perfSlowTickMs = 8.0
                 ? .keyboard : .ambient
             // An unknown cursor still recenters for keyboard arrivals
             // (the pure decision ignores it there); ambient ones hold.
-            let cursor = cursorAXPoint()
+            let cursor = tickCursor()
             if cause == .keyboard || cursor != nil,
                let target = core.followWarpTarget(
                    focusFrame: frame, viewport: view,
@@ -2834,7 +2867,7 @@ let perfSlowTickMs = 8.0
     // landing slot (shared `dropSlot` math, so ghost == landing).
     // Armed grabs only — content drags show nothing. Steady ticks skip
     // the presenter instead of rewriting layers.
-    if dragPressArmed, let grabbed = dragGrabbed, let cursor = cursorAXPoint(),
+    if dragPressArmed, let grabbed = dragGrabbed, let cursor = tickCursor(),
        let slot = core.dropSlot(
            pointer: cursor, viewports: viewports, excluding: grabbed
        ),

@@ -2924,6 +2924,34 @@ do {
     checkEqual(reversed, -256, "reversed mirrors natural")
 }
 
+// Vanish drops recycle-unsafe state: WindowIDs recycle across distinct
+// windows, so a closed maximized window's id must return unmarked.
+do {
+    var daemon = DaemonCore()
+    daemon.animationsEnabled = false
+    daemon.glideBaseMs = 0
+    let live = frames(slots: [0: IntPoint(312, 34)])
+    _ = daemon.tick(
+        events: [.appeared(id: 0, workspace: 1), .focus(id: 0)],
+        frames: live, viewport: viewport, focusedStyle: style
+    )
+    _ = daemon.tick(
+        events: [.command(.window(.fullWidth))],
+        frames: live, viewport: viewport, focusedStyle: style
+    )
+    check(daemon.isFullWidth(0), "toggle marks maximized")
+    _ = daemon.tick(
+        events: [.disappeared(id: 0)],
+        frames: live, viewport: viewport, focusedStyle: style
+    )
+    check(!daemon.isFullWidth(0), "vanish clears the mark")
+    _ = daemon.tick(
+        events: [.appeared(id: 0, workspace: 1), .focus(id: 0)],
+        frames: live, viewport: viewport, focusedStyle: style
+    )
+    check(!daemon.isFullWidth(0), "recycled id starts unmarked")
+}
+
 if failures == 0 {
     print("DaemonChecks: all checks passed")
 } else {

@@ -643,6 +643,16 @@ public struct DaemonCore: Sendable {
                 // Positions survive disappearance: a space return restores
                 // silently when the model still matches live truth. The
                 // parked-row sweep below reaps truly closed windows.
+                // Everything else is recycle-unsafe and drops here:
+                // WindowIDs recycle across distinct windows, so a stale
+                // maximize mark, homing flag, or redrive memory would
+                // misattach to the next window with this id. Geometry
+                // (not marks) restores on space return. Border entries
+                // stay: paintPass reports their removal through the plan
+                // (clearing here would silence the prune).
+                homing.remove(id)
+                redriveLastLive.removeValue(forKey: id)
+                fullWidth.removeValue(forKey: id)
                 if pendingReveals.remove(id) != nil { /* dropped with it */ }
                 lastRedrive.removeValue(forKey: id)
                 redriveStreak.removeValue(forKey: id)
