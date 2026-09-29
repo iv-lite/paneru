@@ -2470,6 +2470,182 @@ do {
     )
 }
 
+// Maximized focus with carried scroll: the lone marked column centers
+// absolutely and the offset target reels home; a same-tick reveal must
+// not flap it back out.
+do {
+    var daemon = DaemonCore()
+    daemon.animationsEnabled = false
+    daemon.glideBaseMs = 0
+    _ = daemon.tick(
+        events: [.appeared(id: 0, workspace: 1), .focus(id: 0)],
+        frames: frames(slots: [0: IntPoint(0, 0)]),
+        viewport: viewport, focusedStyle: style
+    )
+    _ = daemon.tick(
+        events: [.command(.window(.fullWidth))],
+        frames: frames(slots: [0: IntPoint(312, 34)]),
+        viewport: viewport, focusedStyle: style
+    )
+    check(daemon.isFullWidth(0), "toggle marks maximized")
+    // Carried scroll, then a focus arrival on the maximized window.
+    _ = daemon.tick(
+        events: [.swipe(delta: -0.5, fingers: 3)],
+        frames: frames(slots: [0: IntPoint(312, 34)]),
+        viewport: viewport, focusedStyle: style
+    )
+    let carried = daemon.offsets[1] ?? 0
+    check(carried != 0, "swipe parks carried scroll (got \(carried))")
+    _ = daemon.tick(
+        events: [.focus(id: 0)],
+        frames: frames(slots: [0: IntPoint(312, 34)]),
+        viewport: viewport, focusedStyle: style
+    )
+    for _ in 0..<30 {
+        _ = daemon.tick(
+            events: [], frames: frames(slots: [0: IntPoint(312, 34)]),
+            viewport: viewport, focusedStyle: style
+        )
+    }
+    checkEqual(daemon.offsets[1], 0, "reel wins and settles at zero")
+    if let slot = daemon.committedSlot(of: 0) {
+        check(
+            slot.x >= viewport.min.x && slot.x + 400 <= viewport.max.x,
+            "maximized window rests fully in viewport (slot \(slot))"
+        )
+    } else {
+        check(false, "maximized window keeps a slot")
+    }
+    // Settles without flapping: further quiet ticks move nothing.
+    let rest = daemon.tick(
+        events: [], frames: frames(slots: [0: IntPoint(312, 34)]),
+        viewport: viewport, focusedStyle: style
+    )
+    check(rest.quiescent, "maximized rest is quiescent")
+    checkEqual(daemon.offsets[1], 0, "no post-settle drift")
+}
+
+// Transfer-centering filed before a focus arrival must not strand the
+// reveal: drop, then focus the maximized window — final rest must still
+// show it fully in viewport.
+do {
+    var daemon = DaemonCore()
+    daemon.animationsEnabled = false
+    daemon.glideBaseMs = 0
+    _ = daemon.tick(
+        events: [
+            .appeared(id: 0, workspace: 1), .appeared(id: 1, workspace: 1),
+            .focus(id: 0),
+        ],
+        frames: frames(slots: [0: IntPoint(0, 34), 1: IntPoint(400, 34)]),
+        viewport: viewport, focusedStyle: style
+    )
+    _ = daemon.tick(
+        events: [.command(.window(.fullWidth))],
+        frames: frames(slots: [0: IntPoint(0, 34), 1: IntPoint(400, 34)]),
+        viewport: viewport, focusedStyle: style
+    )
+    // Drop files a pending centering; focusing before it drains must
+    // still converge with the window fully visible.
+    _ = daemon.tick(
+        events: [.drop(id: 1, x: 900)],
+        frames: frames(slots: [0: IntPoint(0, 34), 1: IntPoint(400, 34)]),
+        viewport: viewport, focusedStyle: style
+    )
+    _ = daemon.tick(
+        events: [.focus(id: 0)],
+        frames: frames(slots: [0: IntPoint(0, 34), 1: IntPoint(400, 34)]),
+        viewport: viewport, focusedStyle: style
+    )
+    for _ in 0..<30 {
+        _ = daemon.tick(
+            events: [], frames: frames(slots: [0: IntPoint(0, 34), 1: IntPoint(400, 34)]),
+            viewport: viewport, focusedStyle: style
+        )
+    }
+    if let slot = daemon.committedSlot(of: 0) {
+        check(
+            slot.x >= viewport.min.x && slot.x + 400 <= viewport.max.x,
+            "post-transfer focus rests fully in viewport (slot \(slot))"
+        )
+    } else {
+        check(false, "focused window keeps a slot after transfer")
+    }
+}
+
+// Resize-aware reveal: a visibility verdict belongs to a width. Focus
+// lands window 2 edge-visible at 624 (minimal expose for its 400px
+// frame); as it grows in place, each width change re-pends the arrival
+// so the strip tracks to -800 instead of stranding the grown window
+// off-screen on the stale target. Maximized growth is one producer of
+// mid-focus resizes; the mark itself is covered by the toggle tests,
+// so this pins the mechanism without it.
+do {
+    var daemon = DaemonCore()
+    daemon.animationsEnabled = false
+    daemon.glideBaseMs = 0
+    _ = daemon.tick(
+        events: [
+            .appeared(id: 0, workspace: 1), .appeared(id: 1, workspace: 1),
+            .appeared(id: 2, workspace: 1),
+        ],
+        frames: frames(slots: [0: IntPoint(0, 0), 1: IntPoint(0, 0), 2: IntPoint(0, 0)]),
+        viewport: viewport, focusedStyle: style
+    )
+    _ = daemon.tick(
+        events: [.focus(id: 2)],
+        frames: frames(slots: [0: IntPoint(0, 34), 1: IntPoint(400, 34), 2: IntPoint(800, 34)]),
+        viewport: viewport, focusedStyle: style
+    )
+    for _ in 0..<10 {
+        let pos = daemon.positions
+        _ = daemon.tick(
+            events: [],
+            frames: { id in
+                let origin = pos[id] ?? IntPoint(0, 0)
+                return IntRect(min: origin, max: IntPoint(origin.x + 400, origin.y + 700))
+            },
+            viewport: viewport, focusedStyle: style
+        )
+    }
+    checkEqual(daemon.offsets[1], -176, "minimal expose parks at the edge")
+    // Grow window 2 in place; no new arrivals. Live origins track model
+    // slots (converged glass) — only the width is independent.
+    for width in [550, 700, 850, 1024] as [Int32] {
+        let pos = daemon.positions
+        _ = daemon.tick(
+            events: [],
+            frames: { id in
+                let origin = pos[id] ?? IntPoint(0, 0)
+                let w: Int32 = id == 2 ? width : 400
+                return IntRect(min: origin, max: IntPoint(origin.x + w, origin.y + 700))
+            },
+            viewport: viewport, focusedStyle: style
+        )
+    }
+    for _ in 0..<20 {
+        let pos = daemon.positions
+        _ = daemon.tick(
+            events: [],
+            frames: { id in
+                let origin = pos[id] ?? IntPoint(0, 0)
+                let w: Int32 = id == 2 ? 1024 : 400
+                return IntRect(min: origin, max: IntPoint(origin.x + w, origin.y + 700))
+            },
+            viewport: viewport, focusedStyle: style
+        )
+    }
+    checkEqual(daemon.offsets[1], -800, "strip tracks growth to full visibility")
+    if let slot = daemon.committedSlot(of: 2) {
+        check(
+            slot.x >= viewport.min.x && slot.x + 1024 <= viewport.max.x,
+            "grown window rests fully in viewport (slot \(slot))"
+        )
+    } else {
+        check(false, "grown window keeps a slot")
+    }
+}
+
 if failures == 0 {
     print("DaemonChecks: all checks passed")
 } else {

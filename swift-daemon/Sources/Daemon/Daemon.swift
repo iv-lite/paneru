@@ -225,6 +225,12 @@ public struct DaemonCore: Sendable {
     /// rests. A set (not a slot): flapping arrivals accumulate instead
     /// of overwriting each other.
     private var pendingReveals = Set<WindowID>()
+    /// Live width of the focused window at the last reveal evaluation.
+    /// Resizes invalidate visibility verdicts computed for a stale width
+    /// (expose for a narrow frame strands the grown window, and vice
+    /// versa), so a material change re-pends the arrival below. Width
+    /// only: reveal math is x-axis.
+    private var lastRevealWidth: (id: WindowID, width: Int32)?
     /// Transfer reveals (cross-display moves with unchanged focus):
     /// drained POST-commit against fresh slots — pre-commit slots here
     /// still describe the pre-transfer layout and would scroll from
@@ -412,6 +418,23 @@ public struct DaemonCore: Sendable {
         }
         if focus != prevFocus {
             focusRaiseLatched = (focus != nil && lastFocusRaise)
+        }
+        // Resize-aware reveal: the visibility verdict belongs to a width.
+        // If the held focus's live width changed since it was evaluated
+        // (maximize growth, app clamp-back, padding reload), re-pend the
+        // arrival so reveal/center recompute against fresh geometry
+        // instead of stranding the window on a stale target. Skipped
+        // mid-drag (the pointer owns the layout there) and on focus
+        // change (already pended above); silent unless the target moves.
+        if let id = focus, id == prevFocus, held == nil,
+           let width = frames(id)?.width
+        {
+            if let last = lastRevealWidth, last.id == id, last.width != width {
+                pendingReveals.insert(id)
+            }
+            lastRevealWidth = (id, width)
+        } else {
+            lastRevealWidth = focus.flatMap { id in frames(id).map { (id, $0.width) } }
         }
         // Focus arrival reveals: scroll the minimal shortfall so the
         // focused window is fully visible (mirrors ensure_visible; the
@@ -1651,11 +1674,16 @@ public struct DaemonCore: Sendable {
     private mutating func revealFocus(
         _ id: WindowID, frames: (WindowID) -> IntRect?, viewport: IntRect
     ) {
-        guard let owner = workspaceOf(id),
-              strips[owner]?[activeVirtual[owner] ?? 0]?.contains(id) == true,
-              let slot = committedSlots[id]
-        else {
-            print("focus: reveal skipped window=\(id) (not on shown row or slotless)")
+        guard let owner = workspaceOf(id) else {
+            print("focus: reveal skipped window=\(id) (unknown workspace)")
+            return
+        }
+        guard strips[owner]?[activeVirtual[owner] ?? 0]?.contains(id) == true else {
+            print("focus: reveal skipped window=\(id) (not on shown row)")
+            return
+        }
+        guard let slot = committedSlots[id] else {
+            print("focus: reveal skipped window=\(id) (slotless)")
             return
         }
         let width = frames(id)?.width ?? 0
