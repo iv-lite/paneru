@@ -1148,7 +1148,7 @@ func tapEvent(_ event: TapEvent) -> DaemonEvent? {
             pending.append(.released)
             print("mouse: drop window=\(grabbed) glides home (unarmed cross-display)")
         } else {
-            pending.append(.drop(id: grabbed, x: up.x))
+            pending.append(.drop(id: grabbed, point: up))
             print("mouse: drop window=\(grabbed) x=\(up.x) armed=\(dragPressArmed)")
         }
         return nil
@@ -2730,7 +2730,7 @@ nonisolated(unsafe) var radiusRulesGen = 0
     // the presenter instead of rewriting layers.
     if dragPressArmed, let grabbed = dragGrabbed, let cursor = cursorAXPoint(),
        let slot = core.dropSlot(
-           pointerX: cursor.x, viewports: viewports, excluding: grabbed
+           pointer: cursor, viewports: viewports, excluding: grabbed
        ),
        let view = viewports[slot.workspace]
     {

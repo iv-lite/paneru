@@ -50,10 +50,10 @@ public enum DaemonEvent: Equatable, Sendable {
     case dragMoved(id: WindowID, dx: Int32)
     /// Button released: held columns glide home.
     case released
-    /// Pointer drop of a grabbed column at a screen x: reorder into
+    /// Pointer drop of a grabbed column at a screen point: reorder into
     /// the slot under the pointer (same strip) or transfer whole to
     /// the display under the pointer (cross-display, host-armed).
-    case drop(id: WindowID, x: Int32)
+    case drop(id: WindowID, point: IntPoint)
     /// A parsed command (hotkey, socket, script, replay).
     case command(PaneruCommand)
     /// Trackpad swipe: fractional viewport widths, signed by finger travel.
@@ -676,13 +676,13 @@ public struct DaemonCore: Sendable {
             case .released:
                 held = nil
                 settleReleased(frames: frames)
-            case .drop(let id, let x):
+            case .drop(let id, let point):
                 held = nil
                 // Relocate the whole column into the slot under the
                 // pointer (same strip reorder or armed cross-display
                 // transfer — the host gates arming; unarmed crosses
                 // arrive as .released and glide home instead).
-                if let slot = dropSlot(pointerX: x, viewports: viewports, excluding: id) {
+                if let slot = dropSlot(pointer: point, viewports: viewports, excluding: id) {
                     var moving: LayoutColumn?
                     var source: (ws: WorkspaceID, row: UInt32, index: Int)?
                     for ws in Array(strips.keys) {
@@ -3207,20 +3207,24 @@ public struct DaemonCore: Sendable {
         spaceStash = spaceStash.filter { live.contains($0.key) }
     }
 
-    /// Drop slot for a pointer x (readout, pure): the workspace
-    /// whose viewport spans x, its active row, and the insertion
-    /// index — first column strictly right of x. Columns sort by
-    /// committed slot x (unknown slots last, strip order kept for
-    /// ties); the dragged column is excluded and the index is
-    /// removal-adjusted, so host ghost and drop commit agree. Nil
-    /// when x names no workspace (drop there glides home).
+    /// Drop slot for a pointer release (readout, pure): the workspace
+    /// whose viewport contains the point, its active row, and the
+    /// insertion index — first column strictly right of the pointer x.
+    /// Containment is x AND y: x-only matching is ambiguous on
+    /// stair-step rows with overlapping x ranges and drops by
+    /// dictionary order there. Columns sort by committed slot x
+    /// (unknown slots last, strip order kept for ties); the dragged
+    /// column is excluded and the index is removal-adjusted, so host
+    /// ghost and drop commit agree. Nil when the point names no
+    /// workspace (stair voids, off-rig — the release glides home).
     public func dropSlot(
-        pointerX x: Int32, viewports: [WorkspaceID: IntRect],
+        pointer: IntPoint, viewports: [WorkspaceID: IntRect],
         excluding: WindowID?
     ) -> (workspace: WorkspaceID, row: UInt32, index: Int)? {
         guard let (ws, _) = viewports.first(where: {
-            x >= $0.value.min.x && x < $0.value.max.x
+            $0.value.contains(pointer)
         }) else { return nil }
+        let x = pointer.x
         let row = activeVirtual[ws] ?? 0
         guard let strip = strips[ws]?[row] else { return (ws, row, 0) }
         let selfIndex: Int? = excluding.flatMap { strip.index(of: $0) }

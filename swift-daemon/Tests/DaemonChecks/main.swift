@@ -1145,15 +1145,15 @@ do {
         viewports: [1: left, 2: right], focusedStyle: style
     )
     checkEqual(
-        daemon.dropSlot(pointerX: 5000, viewports: [1: left, 2: right], excluding: nil)?.workspace,
+        daemon.dropSlot(pointer: IntPoint(5000, 400), viewports: [1: left, 2: right], excluding: nil)?.workspace,
         nil, "drops outside every viewport name nothing"
     )
     checkEqual(
-        daemon.dropSlot(pointerX: 100, viewports: [9: left], excluding: nil)?.workspace,
+        daemon.dropSlot(pointer: IntPoint(100, 400), viewports: [9: left], excluding: nil)?.workspace,
         9, "empty strips take drops at row zero"
     )
     _ = daemon.tick(
-        events: [.drop(id: 0, x: 1023)],
+        events: [.drop(id: 0, point: IntPoint(1023, 400))],
         frames: frames(slots: [
             0: IntPoint(0, 0), 1: IntPoint(0, 0),
             2: IntPoint(0, 0), 3: IntPoint(1024, 0),
@@ -1165,7 +1165,7 @@ do {
         "far-right drops land last"
     )
     _ = daemon.tick(
-        events: [.drop(id: 0, x: 1500)],
+        events: [.drop(id: 0, point: IntPoint(1500, 400))],
         frames: frames(slots: [
             0: IntPoint(0, 0), 1: IntPoint(0, 0),
             2: IntPoint(0, 0), 3: IntPoint(1024, 0),
@@ -1176,6 +1176,49 @@ do {
     check(rightRow.contains(0) && rightRow.contains(3), "cross-display drops transfer")
     checkEqual(daemon.activeWorkspace, 2, "transfer follows the column")
     checkEqual(daemon.focus, 0, "transfer focuses the column head")
+}
+
+// Stair-step drops resolve by full-point containment: stacked
+// viewports share the whole x range, so x-only matching drops by
+// dictionary order onto the wrong display.
+do {
+    var daemon = DaemonCore()
+    daemon.animationsEnabled = false
+    daemon.glideBaseMs = 0
+    let upper = IntRect(0, 0, 1024, 768)
+    let lower = IntRect(0, 768, 1024, 1536)
+    let stacked: [WorkspaceID: IntRect] = [1: upper, 2: lower]
+    let live = frames(slots: [0: IntPoint(0, 34)])
+    _ = daemon.tick(
+        events: [.appeared(id: 0, workspace: 1), .focus(id: 0)],
+        frames: live, viewports: stacked, focusedStyle: style
+    )
+    checkEqual(
+        daemon.dropSlot(
+            pointer: IntPoint(500, 1000), viewports: stacked, excluding: nil
+        )?.workspace,
+        2, "stacked x-overlap drops by y containment"
+    )
+    checkEqual(
+        daemon.dropSlot(
+            pointer: IntPoint(500, 100), viewports: stacked, excluding: nil
+        )?.workspace,
+        1, "upper point stays upper"
+    )
+    check(
+        daemon.dropSlot(
+            pointer: IntPoint(500, 2000), viewports: stacked, excluding: nil
+        ) == nil,
+        "void points still glide home"
+    )
+    _ = daemon.tick(
+        events: [.drop(id: 0, point: IntPoint(500, 1000))],
+        frames: live, viewports: stacked, focusedStyle: style
+    )
+    checkEqual(daemon.activeWorkspace, 2, "stair drop transfers displays")
+    checkEqual(
+        daemon.strips[2]?[0]?.allWindows, [0], "column lands on the lower display"
+    )
 }
 
 // Restore placement relocates whole columns into planned slots,
@@ -2042,7 +2085,7 @@ do {
     )
     // Already focused: cross-display drop still refocuses + reveals.
     let dropped = daemon.tick(
-        events: [.drop(id: 0, x: 1500)],
+        events: [.drop(id: 0, point: IntPoint(1500, 400))],
         frames: live, viewports: [1: left, 2: right], focusedStyle: style
     )
     checkEqual(dropped.focus, 0, "transfer keeps model focus")
@@ -2053,7 +2096,7 @@ do {
     )
     // Same-workspace reorder: no refocus.
     let same = daemon.tick(
-        events: [.drop(id: 0, x: 1100)],
+        events: [.drop(id: 0, point: IntPoint(1100, 400))],
         frames: frames(slots: [0: IntPoint(1024, 34)]),
         viewports: [1: left, 2: right], focusedStyle: style
     )
@@ -2161,7 +2204,7 @@ do {
         frames: live, viewports: [1: left, 2: right], focusedStyle: style
     )
     _ = daemon.tick(
-        events: [.drop(id: 0, x: 1500)],
+        events: [.drop(id: 0, point: IntPoint(1500, 400))],
         frames: live, viewports: [1: left, 2: right], focusedStyle: style
     )
     checkEqual(
@@ -2182,7 +2225,7 @@ do {
     checkEqual(daemon.offsets[1], 312, "source glides onto its neighbor")
     // Same-workspace reorder files nothing.
     _ = daemon.tick(
-        events: [.drop(id: 1, x: 100)],
+        events: [.drop(id: 1, point: IntPoint(100, 400))],
         frames: live, viewports: [1: left, 2: right], focusedStyle: style
     )
     checkEqual(
@@ -2548,7 +2591,7 @@ do {
     // Drop files a pending centering; focusing before it drains must
     // still converge with the window fully visible.
     _ = daemon.tick(
-        events: [.drop(id: 1, x: 900)],
+        events: [.drop(id: 1, point: IntPoint(900, 400))],
         frames: frames(slots: [0: IntPoint(0, 34), 1: IntPoint(400, 34)]),
         viewport: viewport, focusedStyle: style
     )
