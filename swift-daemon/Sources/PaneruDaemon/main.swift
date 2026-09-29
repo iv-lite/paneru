@@ -490,6 +490,10 @@ nonisolated(unsafe) var rosterDirty = true
 /// Swift is Space-blind — off-Space windows read as vanished — so a
 /// switch re-resolves immediately instead of waiting the backstop.
 nonisolated(unsafe) var workspaceSpaceObserver: NSObjectProtocol?
+/// App-termination observer token (retained: dropping it unregisters).
+/// A quitting app takes its observer with it, so without this the
+/// vanish (and its border prune) waits for the 1s backstop.
+nonisolated(unsafe) var workspaceTerminateObserver: NSObjectProtocol?
 /// Newcomers with an AX probe in flight (see `syncRoster`).
 nonisolated(unsafe) var probing: Set<CGWindowID> = []
 
@@ -1038,6 +1042,15 @@ workspaceSpaceObserver = NSWorkspace.shared.notificationCenter.addObserver(
     rosterDirty = true
     spaceChangedAt = Date()
     print("display: space changed (resyncing)")
+}
+// App quit resyncs at once for the same reason: the dead app's observer
+// dies with it, so without this the vanish (and border prune) waits for
+// the backstop while orphaned borders linger on screen.
+workspaceTerminateObserver = NSWorkspace.shared.notificationCenter.addObserver(
+    forName: NSWorkspace.didTerminateApplicationNotification,
+    object: nil, queue: .main
+) { _ in
+    rosterDirty = true
 }
 
 /// Tap callback results with no daemon analog (pointer motion, touchpad
