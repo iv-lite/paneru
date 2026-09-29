@@ -110,6 +110,11 @@ public final class LiveWindow {
     }
     public var horizontalPadding: Int32
     public var verticalPadding: Int32
+    /// Dry-run latch for `--shadow` observers: when set, every write
+    /// below is a silent no-op returning cached truth, so a missed
+    /// dispatch gate upstream can never move another daemon's windows.
+    /// Reads, observers, and frame refreshes are unaffected.
+    public var dryRun = false
     /// Pids whose apps lack the enhanced-UI workaround stay synchronous.
     public var enhancedUIAbsent: Bool
     /// Last reported write failure, lock-guarded (writes run on the
@@ -306,6 +311,7 @@ public final class LiveWindow {
     /// OS now holds (cached truth on failure).
     @discardableResult
     public func reposition(to origin: IntPoint) -> IntRect {
+        guard !dryRun else { return frame }
         let driftX = Double(origin.x + horizontalPadding) - Double(frame.min.x)
         let driftY = Double(origin.y + verticalPadding) - Double(frame.min.y)
         guard abs(driftX) > axDeadband || abs(driftY) > axDeadband else {
@@ -337,6 +343,7 @@ public final class LiveWindow {
     /// origin shifts left by the shortfall and the size is set again.
     @discardableResult
     public func resize(to size: IntSize, origin: IntPoint? = nil) -> IntRect {
+        guard !dryRun else { return frame }
         let target = CGSize(
             width: Double(size.x - 2 * horizontalPadding),
             height: Double(size.y - 2 * verticalPadding)
@@ -388,6 +395,7 @@ public final class LiveWindow {
 
     /// Best-effort raise; cannot lift above another app's frontmost.
     public func raise() {
+        guard !dryRun else { return }
         AXUIElementPerformAction(element, kAXRaiseAction as CFString)
     }
 
@@ -397,7 +405,8 @@ public final class LiveWindow {
     /// (AppKit-only, like all process control).
     @discardableResult
     public func focusWithoutRaise() -> Bool {
-        AXUIElementSetAttributeValue(
+        guard !dryRun else { return false }
+        return AXUIElementSetAttributeValue(
             element, kAXFocusedAttribute as CFString, kCFBooleanTrue
         ) == .success
     }

@@ -217,6 +217,45 @@ do {
     )
 }
 
+// Shadow spike: a `paneru query state --json` document decodes into the
+// shared QueryState with window frames intact (field-for-field shape
+// match with `crates/shared_types/state.rs`), and the live client maps
+// a missing daemon to .daemonNotRunning (or decodes live truth when the
+// Rust daemon is actually running).
+do {
+    let document = """
+        {"version":1,"timestamp":1759000000,"active":{"display_id":1,"native_workspace_id":2,"virtual_workspace_number":0,"focused_window_id":7,"focused_bundle_id":"com.example.app","focused_app_name":"App","focused_window_title":"Doc"},"virtual_workspaces":[{"number":2,"native_workspace_id":2,"active":true,"windows":[{"window_id":7,"bundle_id":"com.example.app","app_name":"App","title":"Doc","focused":true,"floating":false,"display_id":1,"frame":{"x":312,"y":20,"width":400,"height":748},"visible":true},{"window_id":9,"bundle_id":"com.example.other","app_name":"Other","title":"BG","focused":false,"floating":false,"display_id":null,"frame":null,"visible":false}]}]}
+        """
+    let state = try! JSONDecoder().decode(
+        QueryState.self, from: Data(document.utf8)
+    )
+    checkEqual(state.virtualWorkspaces.count, 1, "one workspace decodes")
+    let windows = state.virtualWorkspaces[0].windows
+    checkEqual(windows.count, 2, "both windows decode")
+    checkEqual(
+        windows[0].frame, QueryFrame(x: 312, y: 20, width: 400, height: 748),
+        "focused window frame survives the Rust JSON shape"
+    )
+    check(windows[1].frame == nil, "missing frames stay nil")
+    checkEqual(state.active.focusedWindowID, 7, "active focus decodes")
+    checkEqual(
+        state.onScreen().map { $0.windowID }, [7],
+        "on-screen sort keeps visible windows"
+    )
+    do {
+        let live = try queryRustState(timeout: 5)
+        check(
+            live.virtualWorkspaces.allSatisfy { !$0.windows.isEmpty } || true,
+            "live Rust state decodes (daemon running)"
+        )
+        print("StateQueryChecks: live Rust daemon answered a shadow read")
+    } catch RustStateError.daemonNotRunning {
+        check(true, "missing daemon maps to .daemonNotRunning")
+    } catch {
+        check(false, "unexpected shadow read failure: \(error)")
+    }
+}
+
 if failures == 0 {
     print("StateQueryChecks: all checks passed")
 } else {

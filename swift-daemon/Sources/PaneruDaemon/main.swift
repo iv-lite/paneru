@@ -276,6 +276,18 @@ func keyModifiers(_ tap: TapModifiers) -> KeyModifiers {
 
 // MARK: - State
 
+/// Shadow-observer mode (`--shadow`): replicate the Rust daemon's
+/// decisions from live AX reads with zero side effects — no AX writes
+/// (dropped at dispatch AND latched in `LiveWindow.dryRun`), no raise
+/// or focus actuation, no cursor warps, no overlay paint, no menubar,
+/// no XPC command serving, no session saves, separate state file.
+/// Reads, observers, model, Lua binds, and restore planning run
+/// normally so the replication stays faithful.
+let shadowMode = CommandLine.arguments.contains("--shadow")
+
+/// AX intents dropped while shadowing (diagnostic counter).
+var shadowDroppedJobs = 0
+
 var core = DaemonCore()
 // Resize presets follow the resolved config.
 core.presetWidths = resolved.presetColumnWidths
@@ -395,6 +407,10 @@ func adoptNewcomers(_ adopted: [(AdoptedWindow, AXUIElement)]) {
         // (Rust `set_padding`). The probe frame is raw CG truth, so the
         // cached frame expands by exactly the insets here.
         window.setPadding(hPad: resolved.gapHorizontal, vPad: resolved.gapVertical)
+        // Shadow observers latch dry-run at adoption (defense in depth
+        // behind the dispatch gates: adopted windows can never be
+        // written, raised, or focused).
+        window.dryRun = shadowMode
         // Window rules: manage forces adoption past role rejection and
         // dont_focus suppresses focus arrival. Floating and width replay
         // focus-free through LayoutOps; index waits on a strip-position
@@ -980,7 +996,8 @@ func tapEvent(_ event: TapEvent) -> DaemonEvent? {
     }
 }
 
-let menubar = MenuBarController { command in
+/// No status item in shadow mode: the observer must be invisible.
+let menubar: MenuBarController? = shadowMode ? nil : MenuBarController { command in
     switch command {
     case .setWidth(let ratio):
         pending.append(.command(.window(.setWidth(ratio))))
@@ -1706,7 +1723,11 @@ func pollPointer(viewports: [WorkspaceID: IntRect]) {
     guard tap.lastMouseMovedAt > lastPointerPoll else { return }
     lastPointerPoll = Date()
     guard let cursor = cursorAXPoint() else { return }
-    checkWarp(cursor: cursor)
+    // Shadow never warps (the evaluation only feeds warps); hover focus
+    // below still runs so arrivals replicate.
+    if !shadowMode {
+        checkWarp(cursor: cursor)
+    }
     guard !tap.leftButtonHeld,
           Date().timeIntervalSince(tap.lastSwipe) >= mouseFollowSwipeQuiet,
           restorePlanner == nil
@@ -2003,7 +2024,10 @@ func cursorAXPoint() -> IntPoint? {
     return IntPoint(Int32(point.x.rounded()), Int32(point.y.rounded()))
 }
 /// State snapshot path for hand-run diagnostics.
-let stateFilePath = "/tmp/paneru-swift-state.json"
+/// State snapshot path for hand-run diagnostics. Shadow observers write
+/// a separate file so readers never mix replicated truth with live truth.
+let stateFilePath =
+    shadowMode ? "/tmp/paneru-swift-shadow.json" : "/tmp/paneru-swift-state.json"
 
 /// Write core truth for external observers: active workspace, focus,
 /// per-workspace offsets and strips, roster size. Atomic swap; failures
@@ -2167,7 +2191,7 @@ func tick() {
     // below stays as hover + backstop.
     if tap.lastMouseMovedAt > lastWarpEval {
         lastWarpEval = tap.lastMouseMovedAt
-        if let cursor = cursorAXPoint() {
+        if !shadowMode, let cursor = cursorAXPoint() {
             checkWarp(cursor: cursor)
         }
     }
@@ -2219,7 +2243,10 @@ func tick() {
         // Crash-gated prune (Rust `tick_restore_grace`): a previous
         // unclean run preserves the file instead of cementing the
         // degraded post-crash layout as the next boot's baseline.
-        if hadPlan, resolved.restoreMissingWindows == .close, !didCrashLastRun {
+        // Never in shadow mode (the live daemon owns the file).
+        if hadPlan, resolved.restoreMissingWindows == .close, !didCrashLastRun,
+           !shadowMode
+        {
             saveSessionState()
             print("restore: pruned missing windows (re-saved)")
         }
@@ -2303,7 +2330,16 @@ func tick() {
         }
         batch.append((window, job))
     }
-    if !batch.isEmpty {
+    if shadowMode {
+        // Dry run: acknowledge everything immediately so unacked state
+        // never grows (the stall watchdog must stay meaningful), count
+        // the dropped intents, issue nothing. `LiveWindow.dryRun` latches
+        // the same guarantee one layer down.
+        for job in drainOrder(latest) {
+            core.acknowledge(winID: job.winID, seq: job.seq, epoch: job.epoch)
+        }
+        shadowDroppedJobs += latest.count
+    } else if !batch.isEmpty {
         axWorker.async {
             for (window, job) in batch {
                 if let origin = job.origin {
@@ -2325,10 +2361,13 @@ func tick() {
     if let gap = core.pollWriterStall() {
         print("ax: writer stall (gap \(gap) epochs, focused-only repair)")
     }
-    // Raise intents go straight to AX.
-    for id in core.raised {
-        if let window = roster[CGWindowID(id)] {
-            window.raise()
+    // Raise intents go straight to AX — unless shadowing, where the
+    // observer never touches another daemon's windows.
+    if !shadowMode {
+        for id in core.raised {
+            if let window = roster[CGWindowID(id)] {
+                window.raise()
+            }
         }
     }
     // Focus actuation (Rust `focus_with/without_raise`): the core owns
@@ -2339,7 +2378,11 @@ func tick() {
     // One-shot cross-display refocus (`refocus`) actuates unconditionally
     // — the moved window must key and raise on its new display even
     // though model focus never changed hands.
-    if let id = result.refocus, let window = roster[CGWindowID(id)] {
+    // Shadow tracks the latch without actuating (no retries storm: the
+    // latch follows the model either way).
+    if shadowMode {
+        prevActuatedFocus = result.refocus ?? result.focus
+    } else if let id = result.refocus, let window = roster[CGWindowID(id)] {
         if let pid = windowPIDs[id] {
             NSRunningApplication(processIdentifier: pid)?
                 .activate(options: [.activateIgnoringOtherApps])
@@ -2379,9 +2422,14 @@ func tick() {
         )
     }
     // Cursor warp requests (display hops) go straight to the tap layer.
+    // Shadow drains the request but never moves the cursor.
     if let warp = core.takeMouseWarp() {
-        warpMouse(to: CGPoint(x: Double(warp.x), y: Double(warp.y)))
-        print("mouse: hop warp \(warp.x),\(warp.y)")
+        if shadowMode {
+            print("shadow: hop warp \(warp.x),\(warp.y) (dropped)")
+        } else {
+            warpMouse(to: CGPoint(x: Double(warp.x), y: Double(warp.y)))
+            print("mouse: hop warp \(warp.x),\(warp.y)")
+        }
     }
     // Mouse-follows-focus: a focus arrival the pointer didn't cause
     // warps to the window's visible center (simplified
@@ -2421,8 +2469,12 @@ func tick() {
                    cause: cause, enabled: true
                )
             {
-                warpMouse(to: CGPoint(x: Double(target.x), y: Double(target.y)))
-                print("mouse: follow warp \(target.x),\(target.y) window=\(id) cause=\(cause)")
+                if shadowMode {
+                    print("shadow: follow warp \(target.x),\(target.y) window=\(id) cause=\(cause) (dropped)")
+                } else {
+                    warpMouse(to: CGPoint(x: Double(target.x), y: Double(target.y)))
+                    print("mouse: follow warp \(target.x),\(target.y) window=\(id) cause=\(cause)")
+                }
             }
         }
     }
@@ -2444,11 +2496,15 @@ func tick() {
         )
         if lastGhostRect != rect {
             lastGhostRect = rect
-            Presenter.showDrop(rect: rect, style: focusedStyle)
+            if !shadowMode {
+                Presenter.showDrop(rect: rect, style: focusedStyle)
+            }
         }
     } else if lastGhostRect != nil {
         lastGhostRect = nil
-        Presenter.hideDrop()
+        if !shadowMode {
+            Presenter.hideDrop()
+        }
     }
     // Focus history records every arrival (idempotent on steady
     // focus); the reader below spends it on focusless workspace
@@ -2492,7 +2548,7 @@ func tick() {
         stateDirty = true
     }
     // Clipboard delivery for copyRule, edge-triggered.
-    if let rule = core.lastCopiedRule, rule != copiedRuleSent {
+    if let rule = core.lastCopiedRule, rule != copiedRuleSent, !shadowMode {
         NSPasteboard.general.clearContents()
         NSPasteboard.general.setString(rule, forType: .string)
         copiedRuleSent = rule
@@ -2507,13 +2563,17 @@ func tick() {
     }
     pendingFlashes.removeAll()
     if let message = flashState.visible(now: Date()) {
-        Presenter.showFlash(
-            message: message, opacity: 1,
-            topRight: CGPoint(x: Double(flashAnchor.max.x), y: Double(flashAnchor.min.y))
-        )
+        if !shadowMode {
+            Presenter.showFlash(
+                message: message, opacity: 1,
+                topRight: CGPoint(x: Double(flashAnchor.max.x), y: Double(flashAnchor.min.y))
+            )
+        }
         lastFlashMessage = message
     } else if lastFlashMessage != nil {
-        Presenter.removeFlash()
+        if !shadowMode {
+            Presenter.removeFlash()
+        }
         lastFlashMessage = nil
     }
     // Frame refresh on the AX worker, staggered halves (~1Hz per
@@ -2554,6 +2614,14 @@ func tick() {
             jobs: result.axJobs.count, events: events.count
         )
     }
+    // Shadow heartbeat (30s): dropped-intent count proves the observer
+    // keeps deciding while writing nothing.
+    if shadowMode, tickCount % 1800 == 0 {
+        print(
+            "shadow: tick=\(tickCount) droppedJobs=\(shadowDroppedJobs)"
+                + " roster=\(roster.count) focus=\(result.focus.map(String.init) ?? "-")"
+        )
+    }
     // Tap health ladder, on the same ~2Hz cadence as the frame refresh:
     // a tap the OS disabled (timeout/user-input) re-arms here instead of
     // silently going deaf. Matches `tapHealthCheckInterval` order.
@@ -2568,8 +2636,9 @@ func tick() {
         }
     }
     // Saved-state persistence, Rust 30s dirty cadence: a quiet
-    // interval skips the write entirely.
-    if tickCount % 1800 == 0, stateDirty {
+    // interval skips the write entirely. Shadow never saves (restore
+    // reads stay on for fidelity, but the live daemon owns the file).
+    if tickCount % 1800 == 0, stateDirty, !shadowMode {
         stateDirty = false
         saveSessionState()
     }
@@ -2591,10 +2660,12 @@ func tick() {
         for (id, style) in result.borderPlan.reskinned {
             borderStyles[id] = style
         }
-        Presenter.syncBorders(resolveOverlayItems(
-            plan: result.borderPlan,
-            currentRects: borderRects, currentStyles: borderStyles
-        ))
+        if !shadowMode {
+            Presenter.syncBorders(resolveOverlayItems(
+                plan: result.borderPlan,
+                currentRects: borderRects, currentStyles: borderStyles
+            ))
+        }
     }
     // Dim the world behind the focused window when configured. Steady
     // ticks skip the presenter: the old code rewrote the background
@@ -2614,27 +2685,32 @@ func tick() {
                 || !dimCutoutEqual(last.cutout, dimNow.cutout)
         }()
         if dimChanged {
-            Presenter.updateDim(
-                opacity: dimNow.opacity,
-                r: dimNow.r, g: dimNow.g, b: dimNow.b,
-                cutout: dimNow.cutout as NSRect?, cutoutRadius: dimNow.radius
-            )
+            if !shadowMode {
+                Presenter.updateDim(
+                    opacity: dimNow.opacity,
+                    r: dimNow.r, g: dimNow.g, b: dimNow.b,
+                    cutout: dimNow.cutout as NSRect?, cutoutRadius: dimNow.radius
+                )
+            }
             lastDim = dimNow
         }
     } else {
         if lastDim != nil {
             lastDim = nil
         }
-        Presenter.hideDim()
+        if !shadowMode {
+            Presenter.hideDim()
+        }
     }
     // Menubar: rows of the active workspace, current row marked. Gated
     // to live frames — the update walks the status item every call.
+    // Absent in shadow mode (nil controller: no status item ever).
     if !result.quiescent || !events.isEmpty {
         let ws = core.activeWorkspace
         let rows = (core.strips[ws] ?? [:]).keys.sorted()
         let currentRow = core.activeVirtual[ws] ?? 0
         let position = rows.firstIndex(of: currentRow).map(UInt32.init) ?? 0
-        menubar.update(
+        menubar?.update(
             cells: buildIndicatorCells(
                 style: resolved.menubarIndicatorStyle,
                 format: resolved.menubarIndicatorFormat,
@@ -3141,8 +3217,12 @@ final class CommandListener: NSObject, NSXPCListenerDelegate {
 
 let commandListener = CommandListener()
 let machListener = NSXPCListener(machServiceName: paneruServiceNameResolved())
-machListener.delegate = commandListener
-machListener.resume()
+// Shadow never serves: no external control may move the replicated model,
+// and the live daemon owns the service name.
+if !shadowMode {
+    machListener.delegate = commandListener
+    machListener.resume()
+}
 // Controlled shutdown on launchd stop / Ctrl-C (Rust `Event::Exit`
 // semantics): ignore the default disposition and save on the main queue,
 // where session state and the crash mark are safe to touch.
@@ -3155,6 +3235,9 @@ let terminationSourceINT = DispatchSource.makeSignalSource(signal: SIGINT, queue
 terminationSourceINT.setEventHandler { terminationRequested = true }
 terminationSourceINT.resume()
 print("paneru-swift running (60Hz tick, menubar commands live)")
+if shadowMode {
+    print("shadow: observer mode — replicating only (no AX writes, raise, focus, warps, paint, menubar, XPC, or saves)")
+}
 // Build stamp: which binary is actually live (answers "stale install"
 // confusion in one log line).
 if let exe = Bundle.main.executablePath,
