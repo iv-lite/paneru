@@ -260,6 +260,7 @@ public final class MenuBarController {
     private var copyRuleItem: NSMenuItem?
     private var current = MenuBarContent()
 
+    @MainActor
     public init(commands: @escaping (MenuBarCommand) -> Void) {
         target.sink = commands
         statusItem = NSStatusBar.system.statusItem(withLength: NSStatusItem.variableLength)
@@ -274,6 +275,7 @@ public final class MenuBarController {
     }
 
     /// Show a plain text badge (accessibility boot path shows `"!"`).
+    @MainActor
     public func showText(_ text: String) {
         dispatchPrecondition(condition: .onQueue(.main))
         guard let button = statusItem.button else { return }
@@ -283,6 +285,7 @@ public final class MenuBarController {
     }
 
     /// Rebuild the command menu; width items carry their percentage tag.
+    @MainActor
     public func rebuildMenu(widths: [Int]) {
         dispatchPrecondition(condition: .onQueue(.main))
         menu.removeAllItems()
@@ -332,6 +335,7 @@ public final class MenuBarController {
 
     /// Refresh enablement, checkmarks, and the indicator image. Skips the
     /// bitmap when content is unchanged.
+    @MainActor
     public func update(
         cells: [String], descriptor: [DescriptorCell]? = nil,
         orientation: MenuBarOrientation = .default,
@@ -369,6 +373,7 @@ public final class MenuBarController {
     }
 
     /// The pre-grant menu: setup instructions, settings shortcut, quit.
+    @MainActor
     public func rebuildAccessibilityMenu() {
         dispatchPrecondition(condition: .onQueue(.main))
         menu.removeAllItems()
@@ -400,6 +405,7 @@ public final class MenuBarController {
 
     /// Baked bitmap for descriptor plus space-joined cells at the
     /// button's scale. Symbols draw from their system image at 14pt.
+    @MainActor
     private func indicatorImage(
         cells: [String], descriptor: [DescriptorCell]?,
         orientation: MenuBarOrientation, fontSize: Double

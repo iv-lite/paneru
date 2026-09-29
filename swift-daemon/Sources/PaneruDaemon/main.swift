@@ -1079,7 +1079,10 @@ func tapEvent(_ event: TapEvent) -> DaemonEvent? {
             dragCandidate = nil
             dragGrabbed = nil
             dragFoldDX = 0
-            Presenter.hideDrop()
+            // Tap callbacks arrive on the installing (main) runloop.
+            MainActor.assumeIsolated {
+                Presenter.hideDrop()
+            }
             lastGhostRect = nil
         }
         guard let grabbed = dragGrabbed, pending.count < 1024 else { return nil }
@@ -1115,8 +1118,13 @@ func tapEvent(_ event: TapEvent) -> DaemonEvent? {
 }
 
 /// No status item in shadow mode: the observer must be invisible.
-/// Main-owned like every AppKit object here.
-nonisolated(unsafe) let menubar: MenuBarController? = shadowMode ? nil : MenuBarController { command in
+/// Main-owned like every AppKit object here. Constructed on the main
+/// thread at startup; assigned (never returned) inside the assumed
+/// actor so nothing non-Sendable crosses a domain.
+nonisolated(unsafe) var menubar: MenuBarController?
+if !shadowMode {
+    MainActor.assumeIsolated {
+        menubar = MenuBarController { command in
     switch command {
     case .setWidth(let ratio):
         pending.append(.command(.window(.setWidth(ratio))))
@@ -1131,6 +1139,8 @@ nonisolated(unsafe) let menubar: MenuBarController? = shadowMode ? nil : MenuBar
     case .openAccessibilitySettings, .showAccessibilityInstructions:
         break
     }
+    }
+}
 }
 
 // MARK: - Query snapshot
@@ -2632,13 +2642,20 @@ nonisolated(unsafe) var radiusRulesGen = 0
         if lastGhostRect != rect {
             lastGhostRect = rect
             if !shadowMode {
-                Presenter.showDrop(rect: rect, style: focusedStyle)
+                // Tick runs on the main runloop, so assuming the actor is
+                // sound (traps loudly otherwise) — and it keeps the
+                // nonisolated tick free of actor hops on every frame.
+                MainActor.assumeIsolated {
+                    Presenter.showDrop(rect: rect, style: focusedStyle)
+                }
             }
         }
     } else if lastGhostRect != nil {
         lastGhostRect = nil
         if !shadowMode {
-            Presenter.hideDrop()
+            MainActor.assumeIsolated {
+                Presenter.hideDrop()
+            }
         }
     }
     // Focus history records every arrival (idempotent on steady
@@ -2699,15 +2716,19 @@ nonisolated(unsafe) var radiusRulesGen = 0
     pendingFlashes.removeAll()
     if let message = flashState.visible(now: Date()) {
         if !shadowMode {
-            Presenter.showFlash(
-                message: message, opacity: 1,
-                topRight: CGPoint(x: Double(flashAnchor.max.x), y: Double(flashAnchor.min.y))
-            )
+            MainActor.assumeIsolated {
+                Presenter.showFlash(
+                    message: message, opacity: 1,
+                    topRight: CGPoint(x: Double(flashAnchor.max.x), y: Double(flashAnchor.min.y))
+                )
+            }
         }
         lastFlashMessage = message
     } else if lastFlashMessage != nil {
         if !shadowMode {
-            Presenter.removeFlash()
+            MainActor.assumeIsolated {
+                Presenter.removeFlash()
+            }
         }
         lastFlashMessage = nil
     }
@@ -2804,10 +2825,12 @@ nonisolated(unsafe) var radiusRulesGen = 0
             borderStyles[id] = style
         }
         if !shadowMode {
-            Presenter.syncBorders(resolveOverlayItems(
-                plan: result.borderPlan,
-                currentRects: borderRects, currentStyles: borderStyles
-            ))
+            MainActor.assumeIsolated {
+                Presenter.syncBorders(resolveOverlayItems(
+                    plan: result.borderPlan,
+                    currentRects: borderRects, currentStyles: borderStyles
+                ))
+            }
         }
     }
     // Dim the world behind the focused window when configured. Steady
@@ -2829,11 +2852,13 @@ nonisolated(unsafe) var radiusRulesGen = 0
         }()
         if dimChanged {
             if !shadowMode {
-                Presenter.updateDim(
-                    opacity: dimNow.opacity,
-                    r: dimNow.r, g: dimNow.g, b: dimNow.b,
-                    cutout: dimNow.cutout as NSRect?, cutoutRadius: dimNow.radius
-                )
+                MainActor.assumeIsolated {
+                    Presenter.updateDim(
+                        opacity: dimNow.opacity,
+                        r: dimNow.r, g: dimNow.g, b: dimNow.b,
+                        cutout: dimNow.cutout as NSRect?, cutoutRadius: dimNow.radius
+                    )
+                }
             }
             lastDim = dimNow
         }
@@ -2842,7 +2867,9 @@ nonisolated(unsafe) var radiusRulesGen = 0
             lastDim = nil
         }
         if !shadowMode {
-            Presenter.hideDim()
+            MainActor.assumeIsolated {
+                Presenter.hideDim()
+            }
         }
     }
     // Menubar: rows of the active workspace, current row marked. Gated
@@ -2853,26 +2880,28 @@ nonisolated(unsafe) var radiusRulesGen = 0
         let rows = (core.strips[ws] ?? [:]).keys.sorted()
         let currentRow = core.activeVirtual[ws] ?? 0
         let position = rows.firstIndex(of: currentRow).map(UInt32.init) ?? 0
-        menubar?.update(
-            cells: buildIndicatorCells(
-                style: resolved.menubarIndicatorStyle,
-                format: resolved.menubarIndicatorFormat,
-                current: rows.isEmpty ? nil : position,
-                all: rows.indices.map { UInt32($0) },
-                activeCharacter: resolved.menubarActiveCharacter,
-                inactiveCharacter: resolved.menubarInactiveCharacter
-            ) ?? [],
-            descriptor: buildDescriptor(
-                style: resolved.menubarDescriptorStyle,
-                text: resolved.menubarDescriptorText,
-                symbol: resolved.menubarDescriptorSymbol
-            ),
-            orientation: resolved.menubarOrientation,
-            widths: [],
-            focusedWidthRatio: nil,
-            hasFocusedWindow: result.focus != nil,
-            fontSize: resolved.menubarFontSize
-        )
+        MainActor.assumeIsolated {
+            menubar?.update(
+                cells: buildIndicatorCells(
+                    style: resolved.menubarIndicatorStyle,
+                    format: resolved.menubarIndicatorFormat,
+                    current: rows.isEmpty ? nil : position,
+                    all: rows.indices.map { UInt32($0) },
+                    activeCharacter: resolved.menubarActiveCharacter,
+                    inactiveCharacter: resolved.menubarInactiveCharacter
+                ) ?? [],
+                descriptor: buildDescriptor(
+                    style: resolved.menubarDescriptorStyle,
+                    text: resolved.menubarDescriptorText,
+                    symbol: resolved.menubarDescriptorSymbol
+                ),
+                orientation: resolved.menubarOrientation,
+                widths: [],
+                focusedWidthRatio: nil,
+                hasFocusedWindow: result.focus != nil,
+                fontSize: resolved.menubarFontSize
+            )
+        }
     }
     // Focused passthrough: the focused window's rules name chords the
     // tap must deliver natively.

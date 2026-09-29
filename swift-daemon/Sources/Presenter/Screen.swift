@@ -15,6 +15,7 @@ enum Screens {
     private nonisolated(unsafe) static var cachedKey = ""
     private nonisolated(unsafe) static var cachedHeight: CGFloat = 0
 
+    @MainActor
     static func primaryHeight() -> CGFloat {
         let screens = NSScreen.screens
         let key = screens
@@ -44,6 +45,7 @@ enum Screens {
         return fallback
     }
 
+    @Sendable
     static func cocoa(_ cg: NSRect, primaryHeight: CGFloat) -> NSRect {
         NSRect(
             x: cg.origin.x,
@@ -53,10 +55,12 @@ enum Screens {
         )
     }
 
+    @Sendable
     static func intersects(_ a: NSRect, _ b: NSRect) -> Bool {
         a.maxX > b.minX && b.maxX > a.minX && a.maxY > b.minY && b.maxY > a.minY
     }
 
+    @MainActor
     static func makeOverlayWindow(frame: NSRect) -> NSWindow {
         let window = NSWindow(
             contentRect: frame,

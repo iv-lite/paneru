@@ -1,6 +1,10 @@
 import AppKit
 import QuartzCore
 
+/// Main-thread paint styling (layer writes need the main actor, like
+/// every AppKit touch in this layer). Callers are the @MainActor
+/// manager methods.
+@MainActor
 extension NSView {
     func applyBorder(style: BorderStyle) {
         wantsLayer = true

@@ -23,6 +23,7 @@ final class BorderPool {
     private var entries: [Int32: Entry] = [:]
     private var hidden = false
 
+    @MainActor
     func sync(items: [(id: Int32, rect: NSRect, style: BorderStyle)]) {
         dispatchPrecondition(condition: .onQueue(.main))
         let wanted = Set(items.map(\.id))
@@ -75,6 +76,7 @@ final class BorderPool {
         }
     }
 
+    @MainActor
     func hide() {
         dispatchPrecondition(condition: .onQueue(.main))
         if hidden {

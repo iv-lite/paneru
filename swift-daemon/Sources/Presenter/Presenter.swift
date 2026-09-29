@@ -48,16 +48,19 @@ public func resolveOverlayItems(
 /// The presenter: thin forwarding over the pooled managers, main thread
 /// only.
 public enum Presenter {
+    @MainActor
     public static func syncBorders(_ items: [OverlayBorderItem]) {
         BorderPool.shared.sync(items: items.map {
             (id: $0.id, rect: $0.rect as NSRect, style: paintStyle($0.style))
         })
     }
 
+    @MainActor
     public static func hideBorders() {
         BorderPool.shared.hide()
     }
 
+    @MainActor
     public static func showFlash(
         message: String, opacity: Float, topRight: CGPoint
     ) {
@@ -66,18 +69,22 @@ public enum Presenter {
         )
     }
 
+    @MainActor
     public static func removeFlash() {
         FlashManager.shared.remove()
     }
 
+    @MainActor
     public static func showDrop(rect: CGRect, style: Presentation.BorderStyle) {
         DropPreviewManager.shared.show(rect as NSRect, style: paintStyle(style))
     }
 
+    @MainActor
     public static func hideDrop() {
         DropPreviewManager.shared.hide()
     }
 
+    @MainActor
     public static func updateDim(
         opacity: Float, r: Double, g: Double, b: Double,
         cutout: CGRect?, cutoutRadius: Double
@@ -88,10 +95,12 @@ public enum Presenter {
         )
     }
 
+    @MainActor
     public static func hideDim() {
         DimManager.shared.hide()
     }
 
+    @MainActor
     public static func removeDim() {
         DimManager.shared.remove()
     }

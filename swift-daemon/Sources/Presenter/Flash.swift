@@ -58,6 +58,7 @@ final class FlashManager {
     private var window: NSWindow?
     private var shown: (msg: String, bucket: UInt8, frame: NSRect)?
 
+    @MainActor
     func show(message: String, opacity: Float, topRight: NSPoint) {
         dispatchPrecondition(condition: .onQueue(.main))
         let isBadge = message.count <= 2
@@ -109,6 +110,7 @@ final class FlashManager {
         }
     }
 
+    @MainActor
     func remove() {
         dispatchPrecondition(condition: .onQueue(.main))
         if let window = window.take() {

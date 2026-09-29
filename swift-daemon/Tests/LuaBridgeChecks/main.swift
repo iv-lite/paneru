@@ -43,7 +43,7 @@ do {
 // Snapshot in, commands out: the handler protocol.
 do {
     let lua = freshBridge()
-    try! lua.pushStore(ScriptState(["count": .int(41), "name": .str("term")]))
+    lua.pushStore(ScriptState(["count": .int(41), "name": .str("term")]))
     try! lua.load("""
         function on_space_changed()
           local n = paneru_state["count"] + 1
@@ -64,7 +64,7 @@ do {
         "pads": .map(["term": .map(["window": .int(4611686018427387904), "open": .bool(true)])]),
         "names": .list([.str("a"), .str("b")]),
     ])
-    try! lua.pushStore(nested)
+    lua.pushStore(nested)
     let back = lua.readStore()
     checkEqual(back.get("pads"), nested.get("pads"), "nested maps round-trip")
     checkEqual(back.get("names"), nested.get("names"), "lists round-trip")

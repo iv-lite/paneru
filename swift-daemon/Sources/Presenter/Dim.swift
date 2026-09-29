@@ -25,6 +25,7 @@ final class DimManager {
     private var surfaces: [Surface] = []
     private var hidden = false
 
+    @MainActor
     func update(
         opacity: Float, r: Double, g: Double, b: Double,
         cutout: NSRect?, cutoutRadius: Double
@@ -114,6 +115,7 @@ final class DimManager {
         hidden = false
     }
 
+    @MainActor
     func hide() {
         dispatchPrecondition(condition: .onQueue(.main))
         if hidden {
@@ -125,6 +127,7 @@ final class DimManager {
         hidden = true
     }
 
+    @MainActor
     func remove() {
         dispatchPrecondition(condition: .onQueue(.main))
         for s in surfaces {

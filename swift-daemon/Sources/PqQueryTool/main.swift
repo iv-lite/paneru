@@ -64,10 +64,12 @@ guard !args.isEmpty else {
     fail("usage: pq <state|active|virtual-workspaces|on-screen> | pq run <argv...> | pq apply '<ops>' | pq state-get <key> | pq state-write <key> <json> [--exactly <json>]")
 }
 
-/// The Mach service only resolves for launchd-bootstrapped runs; a
-/// hand-run daemon answers file-state instead (see `writeStateFile`).
-/// For live state without launchd: `cat /tmp/paneru-swift-state.json`.
-let client = PaneruXPCClient(serviceName: paneruServiceNameResolved())
+/// Single-threaded CLI (synchronous runloop-spin per call): the
+/// non-Sendable client is vouched rather than synchronized. The Mach
+/// service only resolves for launchd-bootstrapped runs; a hand-run
+/// daemon answers file-state instead (see `writeStateFile`). For live
+/// state without launchd: `cat /tmp/paneru-swift-state.json`.
+nonisolated(unsafe) let client = PaneruXPCClient(serviceName: paneruServiceNameResolved())
 
 if args[0] == "run" {
     let argv = Array(args.dropFirst())

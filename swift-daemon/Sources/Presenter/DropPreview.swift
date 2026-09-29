@@ -16,6 +16,7 @@ final class DropPreviewManager {
     private var rect: NSRect?
     private var params: BorderStyle?
 
+    @MainActor
     func show(_ absCG: NSRect, style: BorderStyle) {
         dispatchPrecondition(condition: .onQueue(.main))
         let cocoa = Screens.cocoa(absCG, primaryHeight: Screens.primaryHeight())
@@ -41,6 +42,7 @@ final class DropPreviewManager {
         params = style
     }
 
+    @MainActor
     func hide() {
         dispatchPrecondition(condition: .onQueue(.main))
         if let window = window.take() {
