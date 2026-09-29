@@ -29,9 +29,11 @@ private func decoded(_ data: Data?) -> [String: Any] {
     return object
 }
 
-// Service identity mirrors wire::SERVICE_NAME / SERVICE_ENV.
+// Service identity diverges from wire::SERVICE_NAME on purpose (see
+// IPC.swift): the Swift daemon owns the suffixed Mach name so both
+// daemons can coexist during cutover.
 do {
-    checkEqual(paneruServiceName, "com.github.karinushka.paneru", "service name")
+    checkEqual(paneruServiceName, "com.github.karinushka.paneru.swift", "service name")
     checkEqual(paneruServiceNameResolved(environment: [:]), paneruServiceName, "default service")
     checkEqual(
         paneruServiceNameResolved(environment: [paneruServiceEnv: "com.example.dev"]),

@@ -17,8 +17,12 @@ import Scripting
 
 // MARK: - Service identity
 
-/// Mach service / launchd label. Mirrors `wire::SERVICE_NAME`.
-public let paneruServiceName = "com.github.karinushka.paneru"
+/// Mach service / launchd label. Deliberately suffixed (NOT Rust's
+/// `wire::SERVICE_NAME`): the installed daemon listens under the
+/// install label, and the two daemons must never share a Mach name —
+/// a base default here once left fresh installs deaf while `pq`
+/// looked somewhere else entirely.
+public let paneruServiceName = "com.github.karinushka.paneru.swift"
 /// Env override so a dev build runs beside an installed one.
 /// Mirrors `wire::SERVICE_ENV`.
 public let paneruServiceEnv = "PANERU_MACH_SERVICE"
