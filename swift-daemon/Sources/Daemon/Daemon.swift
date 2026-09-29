@@ -301,6 +301,11 @@ public struct DaemonCore: Sendable {
     /// `set_ax_size`), never as slot pitch — so the core holds no gap
     /// state at all.
     public var autoCenter = false
+    /// Swipe/scroll direction sign (Rust `swipe_gesture_direction`):
+    /// Natural (-1) moves the strip left for finger-left travel,
+    /// Reversed (+1) mirrors it. Host-pushed from config; the ingest
+    /// multiplies gesture deltas by this instead of a baked constant.
+    public var swipeDirectionSign: Double = -1.0
     /// Center a lone column in the viewport (Rust `center_single_column`).
     public var centerSingleColumn = false
     /// Minimum stacked-item height for `binpackHeights` (Rust 200px).
@@ -734,14 +739,14 @@ public struct DaemonCore: Sendable {
             case .command(let command):
                 ingestCommand(command, frames: frames, viewports: viewports, epoch: epoch)
             case .swipe(let delta, _), .scroll(let delta):
-                // Fractional viewport widths, natural direction (finger-left
-                // moves the strip left). Integer truncation matches the
-                // pixel-quantized model elsewhere. The active display's
-                // width scales the gesture (a union would overdrive every
-                // smaller screen).
+                // Fractional viewport widths, direction-signed (Natural:
+                // finger-left moves the strip left; Reversed mirrors).
+                // Integer truncation matches the pixel-quantized model
+                // elsewhere. The active display's width scales the
+                // gesture (a union would overdrive every smaller screen).
                 let active = viewport(for: activeWorkspace, in: viewports)
                 let width = Double(max(active.width, 1))
-                let step = Int32((delta * width * -1.0).rounded())
+                let step = Int32((delta * width * swipeDirectionSign).rounded())
                 let ws = activeWorkspace
                 // Zero steps (sub-pixel deltas) must not touch the dict:
                 // key creation alone reads as motion to the rest gate.

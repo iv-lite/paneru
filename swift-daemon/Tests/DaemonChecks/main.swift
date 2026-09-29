@@ -2898,6 +2898,32 @@ do {
     check(redrove, "dropped maximize size redrives on cooldown")
 }
 
+// Swipe direction sign: natural moves the strip opposite finger
+// travel, reversed mirrors it (Rust `swipe_gesture_direction`).
+func swipeOffset(sign: Double) -> Int32 {
+    var daemon = DaemonCore()
+    daemon.animationsEnabled = false
+    daemon.glideBaseMs = 0
+    daemon.swipeDirectionSign = sign
+    let live = frames(slots: [0: IntPoint(0, 34), 1: IntPoint(400, 34)])
+    _ = daemon.tick(
+        events: [.appeared(id: 0, workspace: 1), .appeared(id: 1, workspace: 1), .focus(id: 0)],
+        frames: live, viewport: viewport, focusedStyle: style
+    )
+    _ = daemon.tick(
+        events: [.swipe(delta: -0.25, fingers: 3)],
+        frames: live, viewport: viewport, focusedStyle: style
+    )
+    return daemon.offsets[1] ?? 0
+}
+
+do {
+    let natural = swipeOffset(sign: -1.0)
+    let reversed = swipeOffset(sign: 1.0)
+    checkEqual(natural, 256, "natural signs the swipe step")
+    checkEqual(reversed, -256, "reversed mirrors natural")
+}
+
 if failures == 0 {
     print("DaemonChecks: all checks passed")
 } else {

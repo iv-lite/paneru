@@ -434,6 +434,7 @@ core.continuousSwipe = resolved.swipeContinuous
 core.windowHiddenRatio = resolved.windowHiddenRatio
 core.createWorkspaceAutomatically = resolved.createWorkspaceAutomatically
 core.autoCenter = resolved.autoCenter
+core.swipeDirectionSign = resolved.swipeDirection == .reversed ? 1.0 : -1.0
 // Slots abut; gaps live in per-window AX padding (see applyWindowPadding).
 core.centerSingleColumn = resolved.centerSingleColumn
 core.animationsEnabled = resolved.animationsEnabled
@@ -665,8 +666,9 @@ nonisolated(unsafe) var fullscreenFloated: Set<WindowID> = []
 /// Minimized windows, edge-triggered off the same per-sync comparison
 /// as fullscreen flips (miniaturize notifications already mark the
 /// roster dirty). They keep strip membership and layout — only query
-/// visibility and hover candidacy change; focus healing on minimize
-/// stays an open gap.
+/// visibility and hover candidacy change; the post-tick
+/// focus-stranding guard heals focus resting on one (transition flips
+/// heal the minimize moment itself).
 nonisolated(unsafe) var minimizedWindows = Set<WindowID>()
 /// Windows parked on inactive SLS spaces (refreshed every sync from
 /// the stash): invisible but rostered, so Space returns skip the
@@ -1094,9 +1096,8 @@ func tapEvent(_ event: TapEvent) -> DaemonEvent? {
     switch event {
     case .swipe(let delta, _):
         // Raw finger travel scaled like the Rust fold (`total_delta *
-        // sensitivity`; the core's ingest carries the Natural -1, matching
-        // the Rust default — `reversed` stays a documented gap until the
-        // core takes config).
+        // sensitivity`); the direction sign lives in the core
+        // (`swipeDirectionSign`, host-pushed from config).
         return .swipe(delta: delta * resolved.swipeSensitivity, fingers: 3)
     case .scroll(let delta):
         // Wheel deltas ride the sensitivity-scaled fold, same as Rust
@@ -1551,6 +1552,7 @@ func watchTuning(_ path: String) {
     core.windowHiddenRatio = resolved.windowHiddenRatio
     core.createWorkspaceAutomatically = resolved.createWorkspaceAutomatically
     core.autoCenter = resolved.autoCenter
+core.swipeDirectionSign = resolved.swipeDirection == .reversed ? 1.0 : -1.0
     // Slots abut; gaps live in per-window AX padding (see applyWindowPadding).
     core.centerSingleColumn = resolved.centerSingleColumn
     core.animationsEnabled = resolved.animationsEnabled
@@ -2684,6 +2686,31 @@ let perfSlowTickMs = 8.0
             if let window = roster[CGWindowID(id)] {
                 window.raise()
             }
+        }
+    }
+    // Focus-stranding guard (Rust `give_away_focus`, steady-state):
+    // the minimize flip heals transitions, but restore, space return,
+    // and arrival races can still rest model focus on a hidden window
+    // (minimized, or stashed on an inactive Space) with keybinds
+    // stranded. Heal once to the nearest visible neighbor; no visible
+    // neighbor clears. Picks already hidden are refused (no flap);
+    // a healed tick clears the guard by construction.
+    if let lost = result.focus,
+       minimizedWindows.contains(lost) || stashedMembers.contains(lost),
+       let ws = workspaceOfWindow(lost),
+       let view = viewports[ws]
+    {
+        let strip = core.strips[ws]?[core.activeVirtual[ws] ?? 0]
+            ?? LayoutStrip(id: ws, virtualIndex: 0)
+        if let target = core.healFocusTarget(
+            strip: strip, viewport: view,
+            frames: { roster[CGWindowID(bitPattern: $0)]?.frame }, lost: lost
+        ), !minimizedWindows.contains(target), !stashedMembers.contains(target) {
+            pending.append(.focus(id: target))
+            print("focus: healed to \(target) from hidden \(lost)")
+        } else {
+            pending.append(.focus(id: nil))
+            print("focus: cleared from hidden \(lost) (no visible neighbor)")
         }
     }
     // Focus actuation (Rust `focus_with/without_raise`): the core owns
