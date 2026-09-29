@@ -1,5 +1,6 @@
 pub mod argv;
 pub mod commands;
+pub mod handoff;
 pub mod json;
 pub mod script_state;
 pub mod script_value;

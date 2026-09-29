@@ -114,6 +114,22 @@ pub async fn subscribe() -> Result<()> {
     Ok(())
 }
 
+/// Asks for the cutover handoff document and prints it as JSON.
+///
+/// # Errors
+///
+/// If the daemon cannot be reached or answers with a failure.
+pub async fn handoff() -> Result<String> {
+    let response: Response = connect()?.call(&Request::Handoff).await?;
+
+    match response {
+        Response::Handoff(doc) => {
+            serde_json::to_string(&doc).map_err(|err| Error::Generic(err.to_string()))
+        }
+        other => Err(unexpected(&other)),
+    }
+}
+
 /// Runs one client subcommand to completion.
 ///
 /// The single place the CLI blocks; everything above is `async`.
@@ -127,6 +143,10 @@ pub fn run(command: ClientCommand) -> Result<()> {
             ClientCommand::Send(argv) => send_command(argv).await,
             ClientCommand::Query(kind) => {
                 println!("{}", query(kind).await?);
+                Ok(())
+            }
+            ClientCommand::Handoff => {
+                println!("{}", handoff().await?);
                 Ok(())
             }
             ClientCommand::ScriptState(request) => {
@@ -144,6 +164,7 @@ pub fn run(command: ClientCommand) -> Result<()> {
 pub enum ClientCommand {
     Send(Vec<String>),
     Query(StateQueryKind),
+    Handoff,
     ScriptState(ScriptStateRequest),
     Subscribe,
 }

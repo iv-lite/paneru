@@ -300,6 +300,34 @@ let shadowMode = CommandLine.arguments.contains("--shadow")
 /// AX intents dropped while shadowing (diagnostic counter).
 nonisolated(unsafe) var shadowDroppedJobs = 0
 
+// MARK: - Flip adoption
+
+/// Cutover handoff (`--flip-from <path>`): adopt the live Rust session
+/// without moving a window. The document loads once at startup; the
+/// tick applies it when every referenced window is rostered (or after
+/// ~10s, logging stragglers), then snaps truth so the first live tick
+/// issues nothing for converged windows. Fresh-start only: a running
+/// model is never reseeded.
+nonisolated(unsafe) var pendingFlipDoc: HandoffDoc?
+nonisolated(unsafe) var flipDeadlineTick = 600
+
+/// Load the handoff file, if requested. Version/shape mismatch is a
+/// loud line and no flip (a half-adopted session is worse than none).
+do {
+    let argv = CommandLine.arguments
+    if let flag = argv.firstIndex(of: "--flip-from"), flag + 1 < argv.count {
+        let path = argv[flag + 1]
+        if let data = try? Data(contentsOf: URL(fileURLWithPath: path)),
+           let doc = HandoffDoc.decode(data)
+        {
+            pendingFlipDoc = doc
+            print("flip: handoff loaded (\(doc.workspaces.count) workspaces, focus \(doc.focus.map(String.init) ?? "-"))")
+        } else {
+            print("flip: warning: unreadable handoff at \(path) (running fresh)")
+        }
+    }
+}
+
 // MARK: - Shadow poll
 
 let shadowQueue = DispatchQueue(label: "com.github.karinushka.paneru.swift.shadow")
@@ -2439,6 +2467,46 @@ nonisolated(unsafe) var radiusRulesGen = 0
         return workspaceOfWindow(id) != nil
             || core.unmanaged.contains(id)
             || roster[CGWindowID(id)] != nil
+    }
+    // Flip adoption: seed the model from the handoff once the roster
+    // covers it (quiet desktop at flip time converges in a sync or
+    // two). Stragglers past the deadline glide home and get logged;
+    // the seeded focus suppresses first-tick actuation like any
+    // already-actuated arrival.
+    if let doc = pendingFlipDoc {
+        let wanted = Set(
+            doc.workspaces.flatMap { workspace in
+                workspace.rows.flatMap { row in
+                    row.columns.flatMap { column in
+                        switch column {
+                        case .single(let id), .fullscreen(let id): [id]
+                        case .tabs(let ids): ids
+                        case .stack(let items):
+                            items.flatMap { item in
+                                switch item {
+                                case .single(let id): [id]
+                                case .tabs(let ids): ids
+                                }
+                            }
+                        }
+                    }
+                } + workspace.floating
+            } + (doc.focus.map { [$0] } ?? [])
+        )
+        let missing = wanted.filter { roster[CGWindowID(bitPattern: $0)] == nil }
+        if missing.isEmpty || tickCount >= flipDeadlineTick {
+            if !missing.isEmpty {
+                print("flip: warning: \(missing.count) window(s) never adopted, seeding without them")
+            }
+            core.applyHandoff(
+                doc,
+                frames: { roster[CGWindowID(bitPattern: $0)]?.frame },
+                viewports: viewports
+            )
+            prevActuatedFocus = core.focus
+            print("flip: adopted (\(core.strips.values.flatMap { $0.values.flatMap { $0.allWindows } }.count) windows, focus \(core.focus.map(String.init) ?? "-"))")
+            pendingFlipDoc = nil
+        }
     }
     // Grab-time arming into the core (fresh every tick, never stale):
     // only armed grabs chase hand truth and relocate on release.

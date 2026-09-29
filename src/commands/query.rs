@@ -12,6 +12,7 @@ use tracing::warn;
 
 use super::{Command, Operation};
 
+use crate::ecs::handoff::HandoffParams;
 use crate::ecs::state::{
     PaneruActiveState, PaneruQueryState, PaneruVirtualWorkspaceState, PaneruWindowState,
     QueryStateParams, StateEvent,
@@ -200,11 +201,17 @@ pub(super) fn register_query_commands(app: &mut App) {
     );
 }
 
-/// Answers socket queries that read the world: state documents and the window
-/// set. Both live in one system so only one system holds [`QueryStateParams`]'s
-/// world access. The window set is a separate variant rather than folded into
-/// [`StateQueryKind`] since it projects a different value (the layout tree).
-fn state_query_handler(mut messages: MessageReader<Event>, state: QueryStateParams) {
+/// Answers socket queries that read the world: state documents, the window
+/// set, and the cutover handoff. All live in one system so only one system
+/// holds [`QueryStateParams`]'s world access. The window set is a separate
+/// variant rather than folded into [`StateQueryKind`] since it projects a
+/// different value (the layout tree); the handoff likewise projects strip
+/// structure plus offsets, which no state slice carries.
+fn state_query_handler(
+    mut messages: MessageReader<Event>,
+    state: QueryStateParams,
+    handoff: HandoffParams,
+) {
     /// Sends an answer without ever waiting for it to be taken. The reply
     /// channel holds one message and exactly one is sent, so this cannot fill;
     /// a client that hung up in the meantime is simply gone.
@@ -227,6 +234,10 @@ fn state_query_handler(mut messages: MessageReader<Event>, state: QueryStatePara
                     .extract_window_set()
                     .map_err(|err| err.to_string())
                     .map(|set| Response::WindowSet(Box::new(set))),
+            ),
+            Event::HandoffQuery { respond_to } => reply(
+                respond_to,
+                Ok(Response::Handoff(Box::new(handoff.extract_handoff()))),
             ),
             _ => {}
         }

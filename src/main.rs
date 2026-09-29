@@ -182,6 +182,11 @@ pub enum SubCmd {
         cmd: Vec<String>,
     },
 
+    /// Dumps the cutover handoff document (strip structure, offsets,
+    /// focus) as JSON for the Swift daemon to adopt. Always JSON: this
+    /// is a migration document, not human output.
+    Handoff,
+
     /// Queries structured state from the running daemon.
     Query {
         #[clap(subcommand)]
@@ -315,6 +320,7 @@ fn main() -> Result<()> {
         SubCmd::Stop => service()?.stop()?,
         SubCmd::Restart => service()?.restart()?,
         SubCmd::SendCmd { cmd } => client::run(ClientCommand::Send(cmd))?,
+        SubCmd::Handoff => client::run(ClientCommand::Handoff)?,
         SubCmd::Query { query } => client::run(ClientCommand::Query(query.kind()))?,
         SubCmd::Subscribe { json: _ } => client::run(ClientCommand::Subscribe)?,
         SubCmd::State { state } => client::run(ClientCommand::ScriptState(state.request()?))?,

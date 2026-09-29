@@ -2446,6 +2446,68 @@ public struct DaemonCore: Sendable {
         committedSlots[id]
     }
 
+    /// Adopt a cutover handoff document: rebuild strips verbatim, restore
+    /// offsets/focus, and snap truth so the first live tick issues
+    /// nothing for converged windows. Runs the real `commitPass` for
+    /// slot math (no second layout truth), then unwinds everything
+    /// commit would have actuated: issued sequences are invalidated
+    /// (never sent, never acked — the watchdog never sees them),
+    /// returned jobs are dropped, and glide legs are removed with
+    /// positions snapped to their slots. Sizes record through the pass,
+    /// so no resize intents fire either. No-op when `frames` misses a
+    /// member (unknown widths make degenerate slots): callers gate on
+    /// roster coverage and log stragglers instead.
+    public mutating func applyHandoff(
+        _ doc: HandoffDoc,
+        frames: (WindowID) -> IntRect?,
+        viewports: [WorkspaceID: IntRect]
+    ) {
+        strips.removeAll(keepingCapacity: true)
+        offsets.removeAll(keepingCapacity: true)
+        offsetTargets.removeAll()
+        offsetLegs.removeAll()
+        glides.removeAll()
+        unmanaged.removeAll()
+        activeVirtual.removeAll()
+        for workspace in doc.workspaces {
+            var rows: [UInt32: LayoutStrip] = [:]
+            var rowOffsets: [UInt32: Int32] = [:]
+            var shown: UInt32?
+            for row in workspace.rows {
+                var strip = LayoutStrip(id: workspace.workspaceID, virtualIndex: row.virtualIndex)
+                for column in row.columns {
+                    strip.insertColumn(at: strip.len, column.layoutColumn())
+                }
+                if row.active, shown == nil {
+                    shown = row.virtualIndex
+                }
+                if rows[row.virtualIndex] == nil {
+                    rows[row.virtualIndex] = strip
+                    rowOffsets[row.virtualIndex] = row.offsetX
+                }
+            }
+            guard !rows.isEmpty else { continue }
+            let homeRow = shown ?? rows.keys.min() ?? 0
+            strips[workspace.workspaceID] = rows
+            activeVirtual[workspace.workspaceID] = homeRow
+            offsets[workspace.workspaceID] = rowOffsets[homeRow] ?? 0
+            for id in workspace.floating {
+                unmanaged.insert(id)
+            }
+        }
+        activeWorkspace = doc.activeWorkspace
+        focus = doc.focus
+        let jobs = commitPass(frames: frames, viewports: viewports, epoch: currentEpoch)
+        for job in jobs {
+            ax.invalidateSent(job.winID)
+        }
+        for (id, slot) in committedSlots {
+            positions[id] = slot
+            glides.removeValue(forKey: id)
+        }
+        dirty.formUnion([.layout, .paint])
+    }
+
     /// Re-home one window's whole column into another workspace (row of
     /// the target's active virtual): display drags, space returns, and
     /// stale adoptions that settled outside their strip. No focus or

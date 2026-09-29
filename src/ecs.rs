@@ -49,6 +49,7 @@ use crate::snapshot::SnapshotStore;
 pub mod animation;
 pub mod display;
 pub mod focus;
+pub mod handoff;
 pub mod layout;
 #[cfg(feature = "lua")]
 pub mod layout_ops;

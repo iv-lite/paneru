@@ -254,6 +254,7 @@ impl TryFrom<&Event> for LuaEvent {
             | Event::Command { .. }
             | Event::StateQuery { .. }
             | Event::WindowSetQuery { .. }
+            | Event::HandoffQuery { .. }
             | Event::StateSubscribe { .. }
             | Event::ScriptState { .. } => return Err(NotMarshallable),
         })

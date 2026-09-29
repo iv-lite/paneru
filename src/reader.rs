@@ -108,6 +108,11 @@ impl CommandReader {
                     Event::WindowSetQuery { respond_to }
                 });
             }
+            Request::Handoff => {
+                answer(events, reply, "handoff query", |respond_to| {
+                    Event::HandoffQuery { respond_to }
+                });
+            }
             Request::ScriptState(request) => {
                 answer(events, reply, "script state request", move |respond_to| {
                     Event::ScriptState {

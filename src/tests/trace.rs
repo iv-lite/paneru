@@ -339,6 +339,44 @@ mod tests {
             .expect("centered config parses")
     }
 
+    /// The handoff query answers through the real handler: typed
+    /// `Response::Handoff` with the live strip structure, not just the
+    /// pure builder.
+    #[test]
+    fn handoff_query_answers_through_the_handler() {
+        use std::time::Duration;
+
+        let mut harness = TestHarness::new().with_windows(2);
+        // Let spawns join the strip before asking (mirrors the settle a
+        // command window provides).
+        harness.advance(Duration::from_millis(200));
+        let (tx, rx) = async_channel::bounded(1);
+        harness
+            .world()
+            .write_message(Event::HandoffQuery { respond_to: tx });
+        harness.advance(Duration::from_millis(40));
+        let response = rx.try_recv().expect("handoff answered");
+        let paneru_shared_types::wire::Response::Handoff(doc) = response else {
+            panic!("expected a handoff document, got {response:?}");
+        };
+        assert_eq!(
+            doc.workspaces.len(),
+            1,
+            "one workspace with two tiled windows"
+        );
+        let workspace = &doc.workspaces[0];
+        assert_eq!(workspace.workspace_id, TEST_WORKSPACE_ID);
+        assert_eq!(workspace.rows.len(), 1);
+        assert_eq!(
+            workspace.rows[0].columns,
+            vec![
+                paneru_shared_types::handoff::HandoffColumn::Single(0),
+                paneru_shared_types::handoff::HandoffColumn::Single(1),
+            ]
+        );
+        assert!(workspace.floating.is_empty());
+    }
+
     #[test]
     fn tiling_gaps_trace_matches_default() {
         let control = TestHarness::new()

@@ -348,6 +348,27 @@ until cutover:
    `FrameParityChecks` green.
 5. Only then: flip `PANERU_SWIFT_DAEMON` and retire `src/` batches.
 
+### Cold flip runbook (cutover day)
+
+The flip moves authority without moving a window: Rust dumps fresh
+truth, quits, and Swift adopts it verbatim (strips, offsets, focus).
+Unresolved version/shape in the handoff is a loud line and a fresh
+start — never a half-adopted session.
+
+1. On a quiet desktop: `paneru handoff > /tmp/paneru-handoff.json`
+   (fresh on demand — never the periodic session file, which is stale
+   by design and carries no scroll offsets).
+2. Quit the Rust daemon (windows freeze in place; no manager moves them).
+3. Start `paneru-swift --flip-from /tmp/paneru-handoff.json`. It adopts
+   the live roster, seeds strips/offsets/focus when every referenced
+   window is adopted (or after ~10s, logging stragglers), snaps truth,
+   and paints the focus border. The first live tick must issue no AX
+   moves for converged windows (verifying reads only).
+4. Verify: strips/focus match the Rust session, no window glides,
+   then soak under Swift authority.
+5. Rollback (no new code paths): quit Swift, start Rust — its own
+   session restore replays and windows glide home.
+
 Supporting seams already in the Rust daemon: `src/replay.rs` (v2 session
 capture behind `PANERU_REPLAY_RECORD`: frame sequence plus commands,
 spaces, displays, menus — not just pointer input), snapshot-only Lua

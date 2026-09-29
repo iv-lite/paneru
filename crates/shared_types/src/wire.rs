@@ -30,6 +30,7 @@ pub fn service_name() -> String {
 use crate::commands::Command;
 pub use crate::script_state::WriteOutcome;
 
+use crate::handoff::HandoffDoc;
 use crate::script_state::ScriptStateWrite;
 use crate::script_value::ScriptValue;
 use crate::state::{ActiveState, QueryState, StateQueryKind, VirtualWorkspaceState, WindowState};
@@ -44,6 +45,8 @@ pub enum Request {
     Command(Command),
     /// Read part of the state document.
     Query(StateQueryKind),
+    /// Read the cutover handoff document (strip structure, offsets, focus).
+    Handoff,
     /// Read the window set — the same layout tree a `paneru.windows` handler is
     /// given inside the daemon, so a client script transforms an identical tree.
     WindowSet,
@@ -71,6 +74,7 @@ pub enum ScriptStateRequest {
 pub enum Response {
     Query(QueryPayload),
     WindowSet(Box<WindowSet>),
+    Handoff(Box<HandoffDoc>),
     ScriptState(ScriptStateResponse),
     /// The request could not be answered. Carries the message a client should
     /// show.
@@ -134,6 +138,7 @@ mod tests {
             Direction::East,
         ))));
         round_trip(&Request::Query(StateQueryKind::Active));
+        round_trip(&Request::Handoff);
         round_trip(&Request::WindowSet);
         round_trip(&Request::WindowSetApply(vec![LayoutOp::Focus(7)]));
         round_trip(&Request::Subscribe);
@@ -217,6 +222,29 @@ mod tests {
         // Ops are deliberately not carried: a set off the wire is one nothing
         // has been asked of yet.
         assert!(decoded.ops().is_empty());
+    }
+
+    #[test]
+    fn the_handoff_doc_survives_the_wire() {
+        use crate::handoff::{HandoffColumn, HandoffDoc, HandoffRow, HandoffWorkspace};
+        let doc = HandoffDoc {
+            v: crate::handoff::HANDOFF_VERSION,
+            active_workspace: 2,
+            focus: Some(1),
+            workspaces: vec![HandoffWorkspace {
+                workspace_id: 2,
+                active_row: Some(0),
+                rows: vec![HandoffRow {
+                    virtual_index: 0,
+                    offset_x: -88,
+                    offset_y: 20,
+                    active: true,
+                    columns: vec![HandoffColumn::Single(0), HandoffColumn::Tabs(vec![1, 2])],
+                }],
+                floating: vec![3],
+            }],
+        };
+        round_trip(&Response::Handoff(Box::new(doc)));
     }
 
     #[test]

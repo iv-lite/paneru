@@ -2255,6 +2255,60 @@ do {
     checkEqual(daemon.offsets[1], -488, "centered strip does not jog")
 }
 
+// Handoff seed: a Rust flip document lands strips, offsets, and focus
+// verbatim; a tick over converged frames issues no AX jobs (zero-motion
+// flip), while the focus border still plans (borders paint on day one).
+// Version mismatch and shape drift decode to nil, never half-adopted.
+do {
+    var daemon = DaemonCore()
+    daemon.animationsEnabled = false
+    daemon.glideBaseMs = 0
+    let document = """
+        {"v":1,"active_workspace":2,"focus":1,"workspaces":[{"workspace_id":2,"active_row":0,"rows":[{"virtual_index":0,"offset_x":-88,"offset_y":20,"active":true,"columns":[{"Single":0},{"Stack":[{"Single":1},{"Tabs":[2]}]}]}],"floating":[]}]}
+        """
+    guard let doc = HandoffDoc.decode(Data(document.utf8)) else {
+        check(false, "handoff fixture decodes")
+        exit(1)
+    }
+    checkEqual(doc.activeWorkspace, 2, "handoff workspace decodes")
+    checkEqual(doc.focus, 1, "handoff focus decodes")
+    let home = IntRect(0, 0, 1024, 768)
+    let live: (Int32) -> IntRect? = { id in
+        switch id {
+        case 0: return IntRect(min: IntPoint(-88, 34), max: IntPoint(312, 734))
+        case 1: return IntRect(min: IntPoint(312, 0), max: IntPoint(712, 384))
+        case 2: return IntRect(min: IntPoint(312, 384), max: IntPoint(712, 768))
+        default: return nil
+        }
+    }
+    daemon.applyHandoff(doc, frames: live, viewports: [2: home])
+    checkEqual(daemon.strips[2]?[0]?.allWindows, [0, 1, 2], "seeded strip holds all members")
+    checkEqual(daemon.offsets[2], -88, "seeded offset lands verbatim")
+    checkEqual(daemon.activeWorkspace, 2, "seeded workspace activates")
+    checkEqual(daemon.focus, 1, "seeded focus lands without actuation")
+    checkEqual(
+        daemon.positions,
+        [0: IntPoint(-88, 34), 1: IntPoint(312, 0), 2: IntPoint(312, 384)],
+        "seeded positions snap to slots"
+    )
+    let settled = daemon.tick(
+        events: [], frames: live, viewport: home, focusedStyle: style
+    )
+    check(settled.axJobs.isEmpty, "converged flip issues no AX writes")
+    checkEqual(
+        settled.borderPlan.added.map { $0.0 }, [1],
+        "focus border still plans on flip"
+    )
+    check(
+        HandoffDoc.decode(Data("{\"v\":999}".utf8)) == nil,
+        "version mismatch decodes to nil"
+    )
+    check(
+        HandoffDoc.decode(Data("{\"v\":1}".utf8)) == nil,
+        "shape drift decodes to nil"
+    )
+}
+
 if failures == 0 {
     print("DaemonChecks: all checks passed")
 } else {
