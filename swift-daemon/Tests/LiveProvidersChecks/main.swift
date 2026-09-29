@@ -6,7 +6,7 @@ import LiveProviders
 // order, drain coalescing, plist rendering. AX calls, tap creation, and
 // launchd/XPC activation run on the permissioned host.
 
-private var failures = 0
+private nonisolated(unsafe) var failures = 0 // straight-line runner: nothing concurrent
 
 private func check(_ condition: Bool, _ message: String) {
     if !condition {

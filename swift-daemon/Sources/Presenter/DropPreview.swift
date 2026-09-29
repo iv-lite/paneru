@@ -4,8 +4,14 @@ import AppKit
 /// slot during armed display drags. Layer-backed (GPU-composited fill and
 /// stroke): moves never repaint, only rect/param changes rewrite layer
 /// properties. Single reused window.
+/// Main-thread-only: every entry asserts `.onQueue(.main)`, so
+/// misuse crashes loudly instead of racing silently. The shared
+/// accessor vouches this explicitly; the class itself stays
+/// non-`Sendable` so its AppKit bodies keep checking exactly as
+/// before (an `@unchecked` class would make every call inside
+/// suspect instead).
 final class DropPreviewManager {
-    static let shared = DropPreviewManager()
+    nonisolated(unsafe) static let shared = DropPreviewManager()
     private var window: NSWindow?
     private var rect: NSRect?
     private var params: BorderStyle?

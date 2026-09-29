@@ -99,7 +99,15 @@ public enum WindowQualification: Equatable, Sendable {
 /// threads (the AX worker refreshes it, the main tick reads it), so it
 /// is lock-guarded; the element itself is only ever touched on one lane
 /// at a time (worker for probes/refreshes, main for ordered writes).
-public final class LiveWindow {
+/// `Sendable` is unchecked by design, and the vouch is exactly the two
+/// rules above plus main-thread publication: `dryRun` and
+/// `enhancedUIAbsent` are set at adoption before any worker use, and
+/// the complaints below stay behind their own lock. Padding is also
+/// main-published (adoption, config reload); a worker read racing a
+/// reload observes one aligned word mid-flight at worst — transient
+/// for a single intent, re-read on the next — never torn. Do not add
+/// cross-lane mutable state outside a lock.
+public final class LiveWindow: @unchecked Sendable {
     public let id: WindowID
     public let element: AXUIElement
     private let frameLock = NSLock()
@@ -521,7 +529,9 @@ public func hasAccessibilityGrant() -> Bool {
 /// Prompt once for the grant; polling must use the check variant.
 @discardableResult
 public func requestAccessibilityGrant() -> Bool {
-    AXIsProcessTrustedWithOptions(
-        [kAXTrustedCheckOptionPrompt.takeUnretainedValue() as String: true] as CFDictionary
-    )
+    // The documented option key, spelled literally: the imported
+    // `kAXTrustedCheckOptionPrompt` global is a shared mutable var by
+    // declaration, and v6 flags even a read of it.
+    let promptKey = "AXTrustedCheckOptionPrompt"
+    return AXIsProcessTrustedWithOptions([promptKey: true] as CFDictionary)
 }

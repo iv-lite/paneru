@@ -4,7 +4,7 @@ import SkyBridge
 // Managed-space dump parsing (`SLSCopyManagedDisplaySpaces` shapes):
 // display UUIDs with id64 space lists. Exits nonzero on mismatch.
 
-private var failures = 0
+private nonisolated(unsafe) var failures = 0 // straight-line runner: nothing concurrent
 
 private func check(_ condition: Bool, _ message: String) {
     if !condition {

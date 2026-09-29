@@ -1,9 +1,14 @@
-// swift-tools-version: 5.9
+// swift-tools-version: 6.0
 import PackageDescription
 
 // PaneruDaemon: native Swift port of the Paneru window-manager daemon.
 // Grows slice by slice (Geometry -> Layout -> AXClient -> EventCore -> ...);
 // the Rust daemon remains the shipped binary until cutover.
+//
+// Language mode is v6: complete concurrency checking is on, and the
+// code vouches for its discipline explicitly (`@unchecked Sendable`
+// only where lane confinement makes it true, `@MainActor` for the
+// main-thread host layer). Needs Xcode 16+ / Swift 6 toolchain.
 let package = Package(
     name: "PaneruDaemon",
     platforms: [.macOS(.v13)],
@@ -447,5 +452,6 @@ let package = Package(
             dependencies: ["Geometry"],
             path: "Sources/LiveProviders"
         ),
-    ]
+    ],
+    swiftLanguageModes: [.v6]
 )

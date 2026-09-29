@@ -25,7 +25,7 @@ import Presentation
 //   borders, and a focus tick legitimately plans one).
 // - Strips compare by the `"workspace:row"` key verbatim.
 
-private var failures = 0
+private nonisolated(unsafe) var failures = 0 // straight-line runner: nothing concurrent
 
 private func check(_ condition: Bool, _ message: String) {
     if !condition {

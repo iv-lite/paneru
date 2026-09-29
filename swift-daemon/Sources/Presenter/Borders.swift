@@ -7,8 +7,14 @@ struct BorderStyle: Equatable {
 
 /// Per-window border pool: O(changed) sync — retain vanished, move via
 /// setFrame only, reskin only on param change, orderFront only when hidden.
+/// Main-thread-only: every entry asserts `.onQueue(.main)`, so
+/// misuse crashes loudly instead of racing silently. The shared
+/// accessor vouches this explicitly; the class itself stays
+/// non-`Sendable` so its AppKit bodies keep checking exactly as
+/// before (an `@unchecked` class would make every call inside
+/// suspect instead).
 final class BorderPool {
-    static let shared = BorderPool()
+    nonisolated(unsafe) static let shared = BorderPool()
     private struct Entry {
         var window: NSWindow
         var rect: NSRect
@@ -23,7 +29,9 @@ final class BorderPool {
         // In-place prune: the old `filter` rebuilt the whole dictionary
         // every tick (O(n) alloc at display rate during glides).
         for id in entries.keys where !wanted.contains(id) {
-            entries[id]?.window.orderOut(nil)
+            if let __paneruWindow = entries[id]?.window {
+                MainActor.assumeIsolated { __paneruWindow.orderOut(nil) }
+            }
             entries.removeValue(forKey: id)
         }
         if entries.isEmpty {
@@ -50,7 +58,7 @@ final class BorderPool {
                     entry.params = item.style
                 }
                 if !entry.window.isVisible {
-                    entry.window.orderFront(nil)
+                    MainActor.assumeIsolated { entry.window.orderFront(nil) }
                     hidden = false
                 }
                 entries[item.id] = entry
@@ -60,7 +68,7 @@ final class BorderPool {
                 view.wantsLayer = true
                 window.contentView = view
                 view.applyBorder(style: item.style)
-                window.orderFront(nil)
+                MainActor.assumeIsolated { window.orderFront(nil) }
                 entries[item.id] = Entry(window: window, rect: cocoa, params: item.style)
                 hidden = false
             }
@@ -73,7 +81,7 @@ final class BorderPool {
             return
         }
         for entry in entries.values {
-            entry.window.orderOut(nil)
+            MainActor.assumeIsolated { entry.window.orderOut(nil) }
         }
         hidden = true
     }

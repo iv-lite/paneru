@@ -6,14 +6,22 @@ enum Screens {
     /// Cached primary height: `NSScreen.screens` walks every screen on the
     /// main thread, so only re-probe when the set changes (count, origins,
     /// heights). Display add/remove invalidates implicitly next sync.
-    private static var cachedKey = ""
-    private static var cachedHeight: CGFloat = 0
+    /// Lock-guarded rather than main-thread-vouched: `NSScreen.screens`
+    /// must run on the main thread, but the cache itself stays sound
+    /// for any caller.
+    private static let cacheLock = NSLock()
+    // Explicitly vouched (the lock below does the actual protecting):
+    // declaration-site checking cannot see lock discipline.
+    private nonisolated(unsafe) static var cachedKey = ""
+    private nonisolated(unsafe) static var cachedHeight: CGFloat = 0
 
     static func primaryHeight() -> CGFloat {
         let screens = NSScreen.screens
         let key = screens
             .map { "\($0.frame.origin.x),\($0.frame.origin.y),\($0.frame.size.height)" }
             .joined(separator: ";")
+        cacheLock.lock()
+        defer { cacheLock.unlock() }
         if key == cachedKey, cachedHeight > 0 {
             return cachedHeight
         }

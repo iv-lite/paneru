@@ -146,7 +146,7 @@ public func planBorderSync(
 ) -> (plan: BorderSyncPlan, hiddenReset: Bool) {
     let wanted = Set(desired.map { $0.0 })
     var plan = BorderSyncPlan(removed: [], added: [], moved: [], reskinned: [])
-    for (id, entry) in current where !wanted.contains(id) {
+    for (id, _) in current where !wanted.contains(id) {
         plan.removed.append(id)
     }
     plan.removed.sort()

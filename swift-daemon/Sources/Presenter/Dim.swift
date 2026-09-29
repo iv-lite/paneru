@@ -6,8 +6,14 @@ import QuartzCore
 /// is a `CAShapeLayer` even-odd mask (fullscreen rect + rounded cutout), so
 /// cutout motion updates a path — never re-rasters. Indexed lockstep with
 /// `NSScreen.screens`; rebuilt when the count changes.
+/// Main-thread-only: every entry asserts `.onQueue(.main)`, so
+/// misuse crashes loudly instead of racing silently. The shared
+/// accessor vouches this explicitly; the class itself stays
+/// non-`Sendable` so its AppKit bodies keep checking exactly as
+/// before (an `@unchecked` class would make every call inside
+/// suspect instead).
 final class DimManager {
-    static let shared = DimManager()
+    nonisolated(unsafe) static let shared = DimManager()
     private struct Surface {
         var window: NSWindow
         var opacity: Float
@@ -28,7 +34,7 @@ final class DimManager {
         let primaryH = Screens.primaryHeight()
         if surfaces.count != screens.count {
             for s in surfaces {
-                s.window.orderOut(nil)
+                MainActor.assumeIsolated { s.window.orderOut(nil) }
             }
             surfaces = []
         }
@@ -40,7 +46,7 @@ final class DimManager {
             } else {
                 let window = Screens.makeOverlayWindow(frame: frame)
                 window.contentView?.wantsLayer = true
-                window.orderFront(nil)
+                MainActor.assumeIsolated { window.orderFront(nil) }
                 let mask = CAShapeLayer()
                 mask.frame = CGRect(x: 0, y: 0, width: frame.width, height: frame.height)
                 mask.fillRule = .evenOdd
@@ -100,7 +106,7 @@ final class DimManager {
                 surfaces[idx].radius = cutoutRadius
             }
             if !window.isVisible {
-                window.orderFront(nil)
+                MainActor.assumeIsolated { window.orderFront(nil) }
             }
             surfaces[idx].opacity = opacity
             surfaces[idx].color = (r, g, b)
@@ -114,7 +120,7 @@ final class DimManager {
             return
         }
         for s in surfaces {
-            s.window.orderOut(nil)
+            MainActor.assumeIsolated { s.window.orderOut(nil) }
         }
         hidden = true
     }
@@ -122,7 +128,7 @@ final class DimManager {
     func remove() {
         dispatchPrecondition(condition: .onQueue(.main))
         for s in surfaces {
-            s.window.orderOut(nil)
+            MainActor.assumeIsolated { s.window.orderOut(nil) }
         }
         surfaces = []
         hidden = false

@@ -69,7 +69,7 @@ let env = ConfigSearchEnv(
     xdgConfigHome: ProcessInfo.processInfo.environment["XDG_CONFIG_HOME"],
     xdgConfigDirs: []
 )
-let fm = FileManager.default
+nonisolated(unsafe) let fm = FileManager.default
 let discoveredTOML = discoverTOML(env) { fm.fileExists(atPath: $0) }
 let discoveredLua = discoverLua(env) { fm.fileExists(atPath: $0) }
 let (source, note) = selectConfigSource(
@@ -92,18 +92,18 @@ if let note { print("config: \(note)") }
 // when it owns the launch) <- swift.toml fallback <- `paneru.setup`.
 // Each layer only fills what it sets; re-resolve from scratch on every
 // load so removed keys revert instead of sticking.
-var bindings: [ResolvedBinding] = []
-var windowRules: [WindowRule] = []
-var resolved = ResolvedConfig()
-var fallbackOptions = DaemonOptions()
-var fallbackBindings: [ResolvedBinding] = []
-var fallbackRules: [WindowRule] = []
-var setupOptions: DaemonOptions?
-var setupBindings: [ResolvedBinding]?
-var setupRules: [WindowRule]?
+nonisolated(unsafe) var bindings: [ResolvedBinding] = []
+nonisolated(unsafe) var windowRules: [WindowRule] = []
+nonisolated(unsafe) var resolved = ResolvedConfig()
+nonisolated(unsafe) var fallbackOptions = DaemonOptions()
+nonisolated(unsafe) var fallbackBindings: [ResolvedBinding] = []
+nonisolated(unsafe) var fallbackRules: [WindowRule] = []
+nonisolated(unsafe) var setupOptions: DaemonOptions?
+nonisolated(unsafe) var setupBindings: [ResolvedBinding]?
+nonisolated(unsafe) var setupRules: [WindowRule]?
 
 /// Re-resolve base config from the stored layers (pure: no owners).
-func rebuildBaseConfig() {
+@Sendable func rebuildBaseConfig() {
     resolved = ResolvedConfig()
     fallbackOptions.apply(to: &resolved)
     if let setupOptions {
@@ -150,7 +150,7 @@ func fallbackTOMLPath() -> String? {
 
 /// Parse a tuning TOML document into its three layers. Table failures
 /// warn and yield empty tables; scalar decode is infallible.
-func parseTuningLayers(_ text: String) -> (DaemonOptions, [ResolvedBinding], [WindowRule]) {
+@Sendable func parseTuningLayers(_ text: String) -> (DaemonOptions, [ResolvedBinding], [WindowRule]) {
     var tableBindings: [ResolvedBinding] = []
     var tableRules: [WindowRule] = []
     do {
@@ -164,19 +164,19 @@ func parseTuningLayers(_ text: String) -> (DaemonOptions, [ResolvedBinding], [Wi
 
 /// Restore plan + saved state while the startup grace window is open
 /// (nil = inactive). Declared with the other top-level state.
-var restorePlanner: RestorePlanner?
-var restoreState: PaneruSessionState?
-var restoreDeadline = Date.distantPast
+nonisolated(unsafe) var restorePlanner: RestorePlanner?
+nonisolated(unsafe) var restoreState: PaneruSessionState?
+nonisolated(unsafe) var restoreDeadline = Date.distantPast
 /// Adopted windows awaiting restore placement (CGWindowID refs).
 /// Drained after the core tick ingests their `.appeared` events.
-var restorePending = Set<Int>()
+nonisolated(unsafe) var restorePending = Set<Int>()
 /// Grace starts on first arrival, not process start: set when the first
 /// window enters `restorePending` (see `adoptNewcomers`), so slow AX
 /// probing no longer burns the window before anything is matchable —
 /// mirroring Rust, which starts grace on the first restore trigger.
-var restoreGraceStarted = false
+nonisolated(unsafe) var restoreGraceStarted = false
 
-var tuningPath: String? = fallbackTOMLPath()
+nonisolated(unsafe) var tuningPath: String? = fallbackTOMLPath()
 if let path = tuningPath {
     // Stored, not applied: `rebuildBaseConfig` below folds it once the
     // layer set is complete (a later `paneru.setup` wins over it).
@@ -195,21 +195,21 @@ if let path = tuningPath {
 
 /// Display state lives with the other top-level state (above first
 /// use): reads-before-declaration crashed this process at startup.
-var displayScreens: [(id: UInt32, frame: NSRect)] = []
-var workspaceDisplay: [WorkspaceID: UInt32] = [:]
+nonisolated(unsafe) var displayScreens: [(id: UInt32, frame: NSRect)] = []
+nonisolated(unsafe) var workspaceDisplay: [WorkspaceID: UInt32] = [:]
 /// Stable display UUIDs by display id (EDID identity, surviving reboots
 /// and numeric-id rotation). Populated beside `displayScreens`; session
 /// save/restore keys off these first, numeric ids second — mirroring
 /// Rust's UUID → numeric → active pick (`src/ecs/restore.rs`).
-var displayUUIDs: [UInt32: String] = [:]
+nonisolated(unsafe) var displayUUIDs: [UInt32: String] = [:]
 /// Usable (visible-frame) rects by display id, flipped to top-left
 /// AX space like `displayScreens`. `visibleFrame` excludes the menu bar,
 /// notch, and Dock — viewports build on these so tiles never slide under
 /// chrome; routing still uses the full frames.
-var displayUsable: [UInt32: NSRect] = [:]
+nonisolated(unsafe) var displayUsable: [UInt32: NSRect] = [:]
 
 /// Stable UUID string for a display id, nil when unreadable.
-func displayUUID(for id: UInt32) -> String? {
+@Sendable func displayUUID(for id: UInt32) -> String? {
     guard let unmanaged = CGDisplayCreateUUIDFromDisplayID(id) else { return nil }
     let uuid = unmanaged.takeRetainedValue()
     return CFUUIDCreateString(nil, uuid) as String?
@@ -218,7 +218,7 @@ func displayUUID(for id: UInt32) -> String? {
 /// single layout per display, exactly as before). Resolved once at
 /// startup; separate-spaces mode is required, anything else keeps
 /// the legacy model.
-var skyCID: Int32? = {
+nonisolated(unsafe) var skyCID: Int32? = {
     guard let cid = skyConnection(), skySpaceManagementMode() == 1 else { return nil }
     print("space: SLS connected (strip-per-Space layouts live)")
     return cid
@@ -226,7 +226,7 @@ var skyCID: Int32? = {
 
 /// Effective input tuning, logged once so `swift.toml` layering (or its
 /// absence) is observable without guessing from behavior.
-func logEffectiveTuning() {
+@Sendable func logEffectiveTuning() {
     let fingers = resolved.swipeFingers.map(String.init) ?? "off"
     let scroll = resolved.swipeScrollModifiers.map { "0x\(String($0.rawValue, radix: 16))" } ?? "off"
     let vscroll = resolved.swipeScrollVerticalModifiers.map { "0x\(String($0.rawValue, radix: 16))" } ?? "off"
@@ -241,7 +241,7 @@ func logEffectiveTuning() {
 /// Config modifier bits onto NX tap bits (either side counts). Nil in,
 /// nil out: an unset config field disables interception downstream
 /// instead of collapsing to an empty set that matches everything.
-func tapModifiers(_ held: KeyModifiers?) -> TapModifiers? {
+@Sendable func tapModifiers(_ held: KeyModifiers?) -> TapModifiers? {
     guard let held else { return nil }
     var mods = TapModifiers()
     if held.contains(.leftAlt) || held.contains(.rightAlt) {
@@ -276,6 +276,18 @@ func keyModifiers(_ tap: TapModifiers) -> KeyModifiers {
 
 // MARK: - State
 
+// Concurrency vouch for this file (Swift 6): every global below is
+// main-thread-confined by architecture — AppKit, the event tap, XPC
+// delegate delivery, timers, and signal sources all run on the main
+// thread/runloop, and the two worker lanes (AX, shadow fetch) touch
+// shared state only through Sendable boxes (`AckBox`,
+// `ShadowPollBox`) or Sendable values (`LiveWindow`). `nonisolated(unsafe)`
+// marks that vouch explicitly: it silences checking without changing
+// behavior, so audit thread-affinity (not the annotation) when touching
+// dispatch. The one known audit item is `ConnectionHandler`, whose
+// listener queue macOS chooses — its body only appends model events,
+// exactly as before.
+
 /// Shadow-observer mode (`--shadow`): replicate the Rust daemon's
 /// decisions from live AX reads with zero side effects — no AX writes
 /// (dropped at dispatch AND latched in `LiveWindow.dryRun`), no raise
@@ -286,29 +298,58 @@ func keyModifiers(_ tap: TapModifiers) -> KeyModifiers {
 let shadowMode = CommandLine.arguments.contains("--shadow")
 
 /// AX intents dropped while shadowing (diagnostic counter).
-var shadowDroppedJobs = 0
+nonisolated(unsafe) var shadowDroppedJobs = 0
 
 // MARK: - Shadow poll
 
+let shadowQueue = DispatchQueue(label: "com.github.karinushka.paneru.swift.shadow")
+
 /// Async Rust-state fetch plumbing: the 60Hz thread never blocks on the
 /// CLI subprocess (a wedged Rust daemon must stall nothing but the
-/// diff); results land in the box for the tick to consume.
-let shadowQueue = DispatchQueue(label: "com.github.karinushka.paneru.swift.shadow")
-let shadowBox = NSLock()
-/// Delivered fetch outcome (document or typed failure), taken once.
-var pendingShadowResult: (QueryState?, RustStateError?)?
-var shadowFetchInflight = false
+/// diff). A Sendable box (not loose globals) so the handoff is sound:
+///
+/// - `requestShadowPoll` (main) starts at most one fetch;
+/// - the worker delivers the outcome into the box;
+/// - `consumeShadowPoll` (main) takes it once.
+final class ShadowPollBox: @unchecked Sendable {
+    private let lock = NSLock()
+    private var inflight = false
+    private var result: (QueryState?, RustStateError?)?
+
+    /// Claim a fetch slot; false when one is already running.
+    func beginFetch() -> Bool {
+        lock.withLock {
+            guard !inflight else { return false }
+            inflight = true
+            return true
+        }
+    }
+
+    func finishFetch(_ delivered: (QueryState?, RustStateError?)) {
+        lock.withLock {
+            result = delivered
+            inflight = false
+        }
+    }
+
+    func takeResult() -> (QueryState?, RustStateError?)? {
+        lock.withLock {
+            let out = result
+            result = nil
+            return out
+        }
+    }
+}
+
+let shadowPollBox = ShadowPollBox()
 /// Last Rust document (settle gate: diff only against a repeated doc).
-var lastRustDoc: QueryState?
+nonisolated(unsafe) var lastRustDoc: QueryState?
 /// Latched outage log (one line per outage, not per poll).
-var shadowDownLatched = false
+nonisolated(unsafe) var shadowDownLatched = false
 
 /// Request one async Rust read (coalesced while one is in flight).
-func requestShadowPoll() {
-    shadowBox.lock()
-    defer { shadowBox.unlock() }
-    guard !shadowFetchInflight else { return }
-    shadowFetchInflight = true
+@Sendable func requestShadowPoll() {
+    guard shadowPollBox.beginFetch() else { return }
     shadowQueue.async {
         let delivered: (QueryState?, RustStateError?)
         do {
@@ -318,21 +359,14 @@ func requestShadowPoll() {
         } catch {
             delivered = (nil, .launchFailed("\(error)"))
         }
-        shadowBox.lock()
-        pendingShadowResult = delivered
-        shadowFetchInflight = false
-        shadowBox.unlock()
+        shadowPollBox.finishFetch(delivered)
     }
 }
 
 /// Consume a delivered fetch: settle-gate, diff at rest, report in
 /// parity-FAIL format (capped per poll so transitions never flood).
-func consumeShadowPoll(swiftQuiet: Bool) {
-    shadowBox.lock()
-    let delivered = pendingShadowResult
-    pendingShadowResult = nil
-    shadowBox.unlock()
-    guard let delivered else { return }
+@Sendable func consumeShadowPoll(swiftQuiet: Bool) {
+    guard let delivered = shadowPollBox.takeResult() else { return }
     guard let doc = delivered.0 else {
         if !shadowDownLatched {
             print("shadow: rust unreachable (\(delivered.1.map { "\($0)" } ?? "unknown"))")
@@ -363,7 +397,7 @@ func consumeShadowPoll(swiftQuiet: Bool) {
     }
 }
 
-var core = DaemonCore()
+nonisolated(unsafe) var core = DaemonCore()
 // Resize presets follow the resolved config.
 core.presetWidths = resolved.presetColumnWidths
 core.presetHeights = resolved.presetStackHeights
@@ -376,18 +410,18 @@ core.autoCenter = resolved.autoCenter
 core.centerSingleColumn = resolved.centerSingleColumn
 core.animationsEnabled = resolved.animationsEnabled
 core.glideBaseMs = resolved.animationDurationMs
-var apps: [pid_t: LiveApp] = [:]
-var roster: [CGWindowID: LiveProviders.LiveWindow] = [:]
-var observers: [pid_t: LiveObserver] = [:]
-var pending: [DaemonEvent] = []
+nonisolated(unsafe) var apps: [pid_t: LiveApp] = [:]
+nonisolated(unsafe) var roster: [CGWindowID: LiveProviders.LiveWindow] = [:]
+nonisolated(unsafe) var observers: [pid_t: LiveObserver] = [:]
+nonisolated(unsafe) var pending: [DaemonEvent] = []
 /// Windows whose rules suppress focus arrival.
-var dontFocus: Set<WindowID> = []
-var borderRects: [WindowID: CGRect] = [:]
-var borderStyles: [WindowID: BorderStyle] = [:]
+nonisolated(unsafe) var dontFocus: Set<WindowID> = []
+nonisolated(unsafe) var borderRects: [WindowID: CGRect] = [:]
+nonisolated(unsafe) var borderStyles: [WindowID: BorderStyle] = [:]
 
 /// Focused-window paint from resolved border config. Recomputed on
 /// tuning reload; the `auto` radius matches the Rust-side default.
-func makeFocusedStyle(_ resolved: ResolvedConfig) -> BorderStyle {
+@Sendable func makeFocusedStyle(_ resolved: ResolvedConfig) -> BorderStyle {
     BorderStyle(
         r: resolved.borderColor.0, g: resolved.borderColor.1, b: resolved.borderColor.2,
         opacity: resolved.borderOpacity * resolved.borderAlpha,
@@ -401,15 +435,15 @@ func makeFocusedStyle(_ resolved: ResolvedConfig) -> BorderStyle {
     )
 }
 
-var focusedStyle = makeFocusedStyle(resolved)
+nonisolated(unsafe) var focusedStyle = makeFocusedStyle(resolved)
 
 logEffectiveTuning()
 
-func windowID(_ wid: CGWindowID) -> WindowID {
+@Sendable func windowID(_ wid: CGWindowID) -> WindowID {
     WindowID(truncatingIfNeeded: wid)
 }
 
-func cgRect(_ rect: IntRect) -> CGRect {
+@Sendable func cgRect(_ rect: IntRect) -> CGRect {
     CGRect(
         x: Double(rect.min.x), y: Double(rect.min.y),
         width: Double(rect.width), height: Double(rect.height)
@@ -421,15 +455,15 @@ func cgRect(_ rect: IntRect) -> CGRect {
 /// wedged app). Running that at 60Hz on the main runloop — which also
 /// owns the event tap — starves all input delivery. Sync on observer
 /// signal (see `observeFired`) plus a 1Hz backstop instead.
-var lastRosterSync = Date.distantPast
+nonisolated(unsafe) var lastRosterSync = Date.distantPast
 let rosterSyncInterval: TimeInterval = 1.0
-var rosterDirty = true
+nonisolated(unsafe) var rosterDirty = true
 /// Space-switch observer token (retained: dropping it unregisters).
 /// Swift is Space-blind — off-Space windows read as vanished — so a
 /// switch re-resolves immediately instead of waiting the backstop.
-var workspaceSpaceObserver: NSObjectProtocol?
+nonisolated(unsafe) var workspaceSpaceObserver: NSObjectProtocol?
 /// Newcomers with an AX probe in flight (see `syncRoster`).
-var probing: Set<CGWindowID> = []
+nonisolated(unsafe) var probing: Set<CGWindowID> = []
 
 /// Serial AX worker: every Accessibility round trip runs here, never on
 /// the main runloop (which also owns the event tap — blocking it stalls
@@ -461,7 +495,7 @@ struct AdoptedWindow: Sendable {
 /// Adopt probed newcomers into the roster (main thread): metadata, rules,
 /// role qualification, observer wiring. `elements` carries the live
 /// `AXUIElement` per adopted window for roster ownership.
-func adoptNewcomers(_ adopted: [(AdoptedWindow, AXUIElement)]) {
+@Sendable func adoptNewcomers(_ adopted: [(AdoptedWindow, AXUIElement)]) {
     for (probe, element) in adopted {
         let wid = probe.wid
         probing.remove(wid)
@@ -595,26 +629,26 @@ func adoptNewcomers(_ adopted: [(AdoptedWindow, AXUIElement)]) {
 
 /// Windows currently floated by native-fullscreen state (not by rule):
 /// clearing fullscreen re-tiles them; rule-floated windows stay floating.
-var fullscreenFloated: Set<WindowID> = []
+nonisolated(unsafe) var fullscreenFloated: Set<WindowID> = []
 /// Minimized windows, edge-triggered off the same per-sync comparison
 /// as fullscreen flips (miniaturize notifications already mark the
 /// roster dirty). They keep strip membership and layout — only query
 /// visibility and hover candidacy change; focus healing on minimize
 /// stays an open gap.
-var minimizedWindows = Set<WindowID>()
+nonisolated(unsafe) var minimizedWindows = Set<WindowID>()
 /// Windows parked on inactive SLS spaces (refreshed every sync from
 /// the stash): invisible but rostered, so Space returns skip the
 /// re-adopt storm. Same treatment as minimized.
-var stashedMembers = Set<WindowID>()
+nonisolated(unsafe) var stashedMembers = Set<WindowID>()
 /// Last sync's cached frame per window (re-home stability detection).
 /// Declared with the other top-level state: reads-before-declaration
 /// crashed this process at startup.
-var stableFrames: [CGWindowID: IntRect] = [:]
+nonisolated(unsafe) var stableFrames: [CGWindowID: IntRect] = [:]
 
 /// Apply minimize flips collected on the worker: entering records,
 /// leaving clears. Membership and layout never move (Rust keeps
 /// minimized windows in their strips too — only visibility changes).
-func applyMinimizeFlips(_ flips: [(WindowID, Bool)]) {
+@Sendable func applyMinimizeFlips(_ flips: [(WindowID, Bool)]) {
     for (id, minimized) in flips {
         guard roster[CGWindowID(id)] != nil else {
             minimizedWindows.remove(id)
@@ -649,7 +683,7 @@ func applyMinimizeFlips(_ flips: [(WindowID, Bool)]) {
 /// fullscreen floats unmanaged (never relocated, like Rust's
 /// `NativeFullscreenMarker` strip); leaving re-tiles unless a window
 /// rule independently keeps it floating.
-func applyFullscreenFlips(_ flips: [(WindowID, Bool)]) {
+@Sendable func applyFullscreenFlips(_ flips: [(WindowID, Bool)]) {
     for (id, isFullscreen) in flips {
         guard roster[CGWindowID(id)] != nil else {
             fullscreenFloated.remove(id)
@@ -686,7 +720,7 @@ func applyFullscreenFlips(_ flips: [(WindowID, Bool)]) {
 /// stashes. Main thread; SLS calls are cheap C queries, parsed
 /// without AX. Runs inside every roster sync, so the NSWorkspace
 /// signal and the 1Hz backstop share one path.
-func refreshSpaces() {
+@Sendable func refreshSpaces() {
     guard skyCID != nil else { return }
     var live = Set<SpaceID>()
     for ws in displayWorkspaceRing() {
@@ -706,7 +740,7 @@ func refreshSpaces() {
     }
 }
 
-func syncRoster() {
+@Sendable func syncRoster() {
     guard let onScreen = onScreenWindowIDs() else { return }
     lastRosterSync = Date()
     rosterDirty = false
@@ -763,11 +797,18 @@ func syncRoster() {
                 minFlips.append((windowID(wid), window.isMinimized))
             }
             DispatchQueue.main.async { [flips, minFlips] in
-                // Clear in-flight first: failures retry on the next pass.
-                probing.subtract(attempted)
-                adoptNewcomers(adopted)
-                applyFullscreenFlips(flips)
-                applyMinimizeFlips(minFlips)
+                // Main queue means main thread by construction, so
+                // assuming the actor is sound (and traps loudly if the
+                // premise ever breaks) — and it keeps the called global
+                // functions nonisolated instead of cascading @Sendable
+                // through half the file.
+                MainActor.assumeIsolated {
+                    // Clear in-flight first: failures retry on the next pass.
+                    probing.subtract(attempted)
+                    adoptNewcomers(adopted)
+                    applyFullscreenFlips(flips)
+                    applyMinimizeFlips(minFlips)
+                }
             }
         }
     }
@@ -873,7 +914,7 @@ struct WindowInfo {
     var ownerPID: pid_t
 }
 
-func windowInfo(_ wid: CGWindowID) -> WindowInfo? {
+@Sendable func windowInfo(_ wid: CGWindowID) -> WindowInfo? {
     guard let list = CGWindowListCopyWindowInfo(
         [.optionIncludingWindow], wid
     ) as? [[String: Any]],
@@ -883,7 +924,7 @@ func windowInfo(_ wid: CGWindowID) -> WindowInfo? {
     return WindowInfo(ownerPID: pid)
 }
 
-func observeFired(app: LiveApp) {
+@Sendable func observeFired(app: LiveApp) {
     // Cheap re-read: focus may have moved; roster sync heals the rest on
     // its own cadence (never inline here — observer callbacks arrive on
     // the main runloop, and a synchronous WindowServer + AX walk per
@@ -911,7 +952,9 @@ func observeFired(app: LiveApp) {
 
 // MARK: - Input
 
-let tap = LiveTap()
+/// Main-owned event tap (observed callback lane is the main runloop
+/// that installs it).
+nonisolated(unsafe) let tap = LiveTap()
 // The sink shares the main runloop with the tick (the tap's Mach-port
 // source lives there), so appends are serialized with `tick()` — but a
 // tap burst must never wedge a tick: `tapEvent` returns nil for
@@ -959,7 +1002,7 @@ if tap.install() {
 // at once: waiting the backstop leaves a full second of churn.
 // `spaceChangedAt` opens the fast re-home path (single slot-converged
 // observation instead of two stable syncs) for 2s after each switch.
-var spaceChangedAt: Date?
+nonisolated(unsafe) var spaceChangedAt: Date?
 workspaceSpaceObserver = NSWorkspace.shared.notificationCenter.addObserver(
     forName: NSWorkspace.activeSpaceDidChangeNotification,
     object: nil, queue: .main
@@ -1072,7 +1115,8 @@ func tapEvent(_ event: TapEvent) -> DaemonEvent? {
 }
 
 /// No status item in shadow mode: the observer must be invisible.
-let menubar: MenuBarController? = shadowMode ? nil : MenuBarController { command in
+/// Main-owned like every AppKit object here.
+nonisolated(unsafe) let menubar: MenuBarController? = shadowMode ? nil : MenuBarController { command in
     switch command {
     case .setWidth(let ratio):
         pending.append(.command(.window(.setWidth(ratio))))
@@ -1093,7 +1137,7 @@ let menubar: MenuBarController? = shadowMode ? nil : MenuBarController { command
 
 /// AX-space display frames for geometry: `displayScreens` already
 /// stores flipped (top-left) rects, so this only rounds.
-func axDisplayFrames() -> [(id: UInt32, frame: IntRect)] {
+@Sendable func axDisplayFrames() -> [(id: UInt32, frame: IntRect)] {
     displayScreens.map { entry in
         (id: entry.id, frame: IntRect(
             min: IntPoint(
@@ -1119,7 +1163,7 @@ func queryFrame(id: WindowID) -> QueryFrame? {
 
 /// The query document from core strips plus live roster frames: every
 /// workspace (display) with its real display ID, not just the active one.
-func buildQueryState() -> QueryState {
+@Sendable func buildQueryState() -> QueryState {
     let orderedWorkspaces = displayWorkspaceRing().filter {
         core.strips[$0] != nil || $0 == core.activeWorkspace
     }
@@ -1203,25 +1247,25 @@ func answerQueryDocument(_ data: Data) -> Data {
 
 // MARK: - Script host
 
-var mailbox = ScriptMailbox()
-var scriptStore = ScriptState()
-var luaBridge: LuaBridge?
-var scriptPath: String?
-var scriptHandlers: [(name: String, ref: Int32)] = []
+nonisolated(unsafe) var mailbox = ScriptMailbox()
+nonisolated(unsafe) var scriptStore = ScriptState()
+nonisolated(unsafe) var luaBridge: LuaBridge?
+nonisolated(unsafe) var scriptPath: String?
+nonisolated(unsafe) var scriptHandlers: [(name: String, ref: Int32)] = []
 /// Compiled `paneru.match` filters by handler registry ref. Reset with
 /// the handlers on every publish.
-var handlerMatchers: [Int32: WindowMatcher] = [:]
-var bindRefs: [UInt32: Int32] = [:]
-var keybindEntries: [(code: UInt8, mods: KeyModifiers, id: UInt32)] = []
-var needScriptReload = false
-var scriptWatcher: DispatchSourceFileSystemObject?
+nonisolated(unsafe) var handlerMatchers: [Int32: WindowMatcher] = [:]
+nonisolated(unsafe) var bindRefs: [UInt32: Int32] = [:]
+nonisolated(unsafe) var keybindEntries: [(code: UInt8, mods: KeyModifiers, id: UInt32)] = []
+nonisolated(unsafe) var needScriptReload = false
+nonisolated(unsafe) var scriptWatcher: DispatchSourceFileSystemObject?
 
 /// Publish one loaded script: keybinds, binds, handlers. Match-filter
 /// compile failures and unknown event names throw per handler: a bad
 /// filter fails the load (keeping old runtime, like Rust), while a
 /// typo'd event name warns and skips just that handler (a dead silent
 /// handler is worse than a loud skip on a live WM).
-func publishScript(_ bridge: LuaBridge) throws {
+@Sendable func publishScript(_ bridge: LuaBridge) throws {
     var matchers: [Int32: WindowMatcher] = [:]
     var registrations = bridge.listHandlers()
     var kept: [LuaBridge.HandlerRegistration] = []
@@ -1281,7 +1325,7 @@ func publishScript(_ bridge: LuaBridge) throws {
 /// pass `quiet` (binds publish and the console logs, but no toast —
 /// Rust only announces inside `reload()`); watcher-driven reloads
 /// announce. Error toasts are always actionable, quiet or not.
-func loadScript(from path: String, quiet: Bool = false) {
+@Sendable func loadScript(from path: String, quiet: Bool = false) {
     guard let bridge = LuaBridge() else {
         print("lua: warning: could not allocate Lua state (keeping previous runtime)")
         mailbox.applyReload(success: false, error: "could not allocate Lua state")
@@ -1329,7 +1373,7 @@ func loadScript(from path: String, quiet: Bool = false) {
 }
 
 /// Modification time of a path, nil when unreadable.
-func fileMtime(_ path: String) -> Date? {
+@Sendable func fileMtime(_ path: String) -> Date? {
     try? FileManager.default.attributesOfItem(atPath: path)[.modificationDate] as? Date
 }
 
@@ -1340,7 +1384,7 @@ func fileMtime(_ path: String) -> Date? {
 /// by its own file's mtime; atomic saves (write temp + rename) never
 /// match the watched fd itself, which is why the file's directory is
 /// watched instead.
-func fileMtimeChanged(_ path: String, last: inout Date?) -> Bool {
+@Sendable func fileMtimeChanged(_ path: String, last: inout Date?) -> Bool {
     guard let mtime = fileMtime(path) else { return false }
     if last == mtime {
         return false
@@ -1382,7 +1426,7 @@ func watchFileAndDirectory(_ path: String, onWrite: @escaping () -> Void) -> Dis
     return dirSource
 }
 
-private var retainedWatchers: [DispatchSourceFileSystemObject] = []
+nonisolated(unsafe) private var retainedWatchers: [DispatchSourceFileSystemObject] = []
 
 func watchScript(_ path: String) {
     lastScriptMtime = fileMtime(path)
@@ -1391,8 +1435,8 @@ func watchScript(_ path: String) {
     }
 }
 
-var needTuningReload = false
-var tuningWatcher: DispatchSourceFileSystemObject?
+nonisolated(unsafe) var needTuningReload = false
+nonisolated(unsafe) var tuningWatcher: DispatchSourceFileSystemObject?
 
 /// Watch the swift.toml fallback for hot-reloads (mirrors `watchScript`).
 func watchTuning(_ path: String) {
@@ -1408,13 +1452,13 @@ func watchTuning(_ path: String) {
 ///
 /// Retargets every rostered window's gap insets from the resolved config
 /// (Rust `set_padding`): pure cached-frame re-basing, no AX round trips.
-func applyWindowPadding() {
+@Sendable func applyWindowPadding() {
     for window in roster.values {
         window.setPadding(hPad: resolved.gapHorizontal, vPad: resolved.gapVertical)
     }
 }
 
-func refreshDerivedConfig() {
+@Sendable func refreshDerivedConfig() {
     core.presetWidths = resolved.presetColumnWidths
     core.presetHeights = resolved.presetStackHeights
     core.resizeCycle = resolved.windowResizeCycle
@@ -1440,7 +1484,7 @@ func refreshDerivedConfig() {
 
 /// Re-read the fallback document and rebuild all layers (setup keeps
 /// winning over it). Parse-then-apply: failures keep the running tuning.
-func reloadTuning() {
+@Sendable func reloadTuning() {
     guard let path = tuningPath else { return }
     guard let text = try? String(contentsOfFile: path, encoding: .utf8) else {
         print("config: warning: cannot read \(path) (keeping current tuning)")
@@ -1457,7 +1501,7 @@ func reloadTuning() {
 
 /// The script tree for handlers: one display per workspace, core
 /// strips plus unmanaged floats on the active one.
-func scriptWindowSet() -> WindowSet {
+@Sendable func scriptWindowSet() -> WindowSet {
     func wsWindow(_ id: WindowID) -> WSWindow {
         WSWindow(id: id)
     }
@@ -1514,7 +1558,7 @@ func scriptWindowSet() -> WindowSet {
 
 /// Daemon events with a script analog. Commands ride the lua-command
 /// path instead (no loops); drags have no payload yet.
-func scriptEvents(for events: [DaemonEvent]) -> [ScriptEvent] {
+@Sendable func scriptEvents(for events: [DaemonEvent]) -> [ScriptEvent] {
     var out: [ScriptEvent] = []
     for event in events {
         switch event {
@@ -1554,7 +1598,7 @@ func scriptEvents(for events: [DaemonEvent]) -> [ScriptEvent] {
 /// it directly, other window events resolve through host metadata.
 /// Events without identity never match a filtered handler (unfiltered
 /// handlers fire as before).
-func matchWindow(for event: ScriptEvent) -> MatchWindow? {
+@Sendable func matchWindow(for event: ScriptEvent) -> MatchWindow? {
     switch event {
     case .windowSpawned(let payload):
         return MatchWindow(
@@ -1578,7 +1622,7 @@ func matchWindow(for event: ScriptEvent) -> MatchWindow? {
     }
 }
 
-func parseScriptCommand(_ line: String) -> PaneruCommand? {
+@Sendable func parseScriptCommand(_ line: String) -> PaneruCommand? {
     let argv = line.split(whereSeparator: { $0.isWhitespace }).map(String.init)
     guard !argv.isEmpty else { return nil }
     do {
@@ -1591,7 +1635,7 @@ func parseScriptCommand(_ line: String) -> PaneruCommand? {
 
 /// One frame of script hosting: reloads, bind dispatch, events, store,
 /// outbox. Runs before the core tick consumes `pending`.
-func drainLuaFrame() {
+@Sendable func drainLuaFrame() {
     guard let bridge = luaBridge else { return }
     if needScriptReload, let path = scriptPath {
         needScriptReload = false
@@ -1710,25 +1754,25 @@ func drainLuaFrame() {
     }
 }
 
-var pendingFlashes: [(String, Double)] = []
+nonisolated(unsafe) var pendingFlashes: [(String, Double)] = []
 /// OSD toast arbitration (Rust `update_flash_messages`): newest wins,
 /// expiry hides. The manager only paints — this clock decides.
-var flashState = FlashState()
+nonisolated(unsafe) var flashState = FlashState()
 /// Last presented toast: transitions to nil remove the window (every
 /// quiet tick would otherwise pay an order-out).
-var lastFlashMessage: String?
+nonisolated(unsafe) var lastFlashMessage: String?
 
 // MARK: - Tick
 
 /// Last-seen mtimes for the hot-reload watchers. Plain eager-nil vars
 /// (the only global pattern this process trusts).
-var lastScriptMtime: Date?
-var lastTuningMtime: Date?
+nonisolated(unsafe) var lastScriptMtime: Date?
+nonisolated(unsafe) var lastTuningMtime: Date?
 
 /// Full display frames in top-left AX space (unlike viewports: no
 /// padding, no Dock/menubar insets). Edge warp tests against these —
 /// Rust `Display::bounds()` — so physical edges always contain.
-func fullDisplayFrames() -> [IntRect] {
+@Sendable func fullDisplayFrames() -> [IntRect] {
     displayScreens.map { screen in
         IntRect(
             min: IntPoint(
@@ -1745,21 +1789,21 @@ func fullDisplayFrames() -> [IntRect] {
 
 /// Last full-tick viewports, so the pointer poll samples on idle-skip
 /// ticks without paying the display walk every time.
-var lastViewports: [WorkspaceID: IntRect] = [:]
+nonisolated(unsafe) var lastViewports: [WorkspaceID: IntRect] = [:]
 /// Last warp-sampled cursor (point + time): 80ms-fresh samples yield
 /// horizontal velocity for warp carry (Rust `WarpVelocityState`); the
 /// sample rebases to each landing so post-warp motion measures from
 /// the new position, not the pre-warp one.
-var lastWarpSample = (point: IntPoint(0, 0), at: Date.distantPast)
+nonisolated(unsafe) var lastWarpSample = (point: IntPoint(0, 0), at: Date.distantPast)
 
 /// Last motion signal consumed by the snappy warp path below.
-var lastWarpEval = Date.distantPast
+nonisolated(unsafe) var lastWarpEval = Date.distantPast
 
 /// Edge-warp evaluation for one cursor sample: velocity from the
 /// trail, landing decision in core, warp + rebase on success.
 /// Shared by the 4Hz poll (backstop) and the movement-triggered fast
 /// path (response). Drags, fresh swipes, and the restore window hold.
-func checkWarp(cursor: IntPoint) {
+@Sendable func checkWarp(cursor: IntPoint) {
     guard !tap.leftButtonHeld,
           Date().timeIntervalSince(tap.lastSwipe) >= mouseFollowSwipeQuiet,
           restorePlanner == nil
@@ -1794,7 +1838,7 @@ func checkWarp(cursor: IntPoint) {
 /// focus. A still cursor costs nothing past the timestamp check;
 /// drags, fresh swipes, and the restore window all hold (a teleported
 /// cursor skips hover until the next motion).
-func pollPointer(viewports: [WorkspaceID: IntRect]) {
+@Sendable func pollPointer(viewports: [WorkspaceID: IntRect]) {
     guard tap.lastMouseMovedAt > lastPointerPoll else { return }
     lastPointerPoll = Date()
     guard let cursor = cursorAXPoint() else { return }
@@ -1828,7 +1872,7 @@ func pollPointer(viewports: [WorkspaceID: IntRect]) {
 // (displayScreens/workspaceDisplay live above with the other state.)
 
 /// NSScreenNumber for a screen, nil when unreadable.
-func displayID(of screen: NSScreen) -> UInt32? {
+@Sendable func displayID(of screen: NSScreen) -> UInt32? {
     (screen.deviceDescription[NSDeviceDescriptionKey("NSScreenNumber")] as? NSNumber)
         .map { $0.uint32Value }
 }
@@ -1842,7 +1886,7 @@ func displayID(of screen: NSScreen) -> UInt32? {
 /// across systems routes every spawn to ws1. The flip anchors on the
 /// union's top edge, so slots, routing, and presentation (which already
 /// assumes y-down) all agree.
-func refreshDisplays() {
+@Sendable func refreshDisplays() {
     let screens = NSScreen.screens
     var cocoa: [(id: UInt32, frame: NSRect)] = []
     var usableCocoa: [(id: UInt32, frame: NSRect)] = []
@@ -1903,7 +1947,7 @@ func refreshDisplays() {
 }
 
 /// Workspace ring in spatial display order (1-based, main first).
-func displayWorkspaceRing() -> [WorkspaceID] {
+@Sendable func displayWorkspaceRing() -> [WorkspaceID] {
     (1...max(displayScreens.count, 1)).map { WorkspaceID($0) }
 }
 
@@ -1912,7 +1956,7 @@ func displayWorkspaceRing() -> [WorkspaceID] {
 /// exclude menubar/notch/Dock, so no extra reserve applies on top.
 /// Orphan workspaces (unplugged displays) fall back to the main
 /// viewport so their parked windows stay reachable.
-func workspaceViewports() -> [WorkspaceID: IntRect] {
+@Sendable func workspaceViewports() -> [WorkspaceID: IntRect] {
     refreshDisplays()
     var out: [WorkspaceID: IntRect] = [:]
     let mainFrame = displayScreens.first?.frame
@@ -1934,7 +1978,7 @@ func workspaceViewports() -> [WorkspaceID: IntRect] {
 /// One display's usable rect: padding over the visible frame (which
 /// already excludes menubar, notch, and Dock). Callers passing a full
 /// screen frame set `menubarReserve` to keep the legacy reserve.
-func viewportForScreen(_ bounds: NSRect, menubarReserve: Bool = false) -> IntRect {
+@Sendable func viewportForScreen(_ bounds: NSRect, menubarReserve: Bool = false) -> IntRect {
     var view = IntRect(
         min: IntPoint(Int32(bounds.minX.rounded()), Int32(bounds.minY.rounded())),
         max: IntPoint(Int32(bounds.maxX.rounded()), Int32(bounds.maxY.rounded()))
@@ -1947,7 +1991,7 @@ func viewportForScreen(_ bounds: NSRect, menubarReserve: Bool = false) -> IntRec
 }
 
 /// Active display's viewport (startup log, script snapshot).
-func viewport() -> IntRect {
+@Sendable func viewport() -> IntRect {
     let viewports = workspaceViewports()
     return viewports[core.activeWorkspace] ?? viewports[1] ?? IntRect(
         min: IntPoint(0, 0), max: IntPoint(0, 0)
@@ -1958,7 +2002,7 @@ func viewport() -> IntRect {
 /// space, same system as the flipped screen frames). Off-screen frames
 /// resolve to the NEAREST display, never the merely-active workspace
 /// (that teleports cascade spawns onto the neighbor display).
-func workspaceForFrame(_ rect: IntRect) -> WorkspaceID {
+@Sendable func workspaceForFrame(_ rect: IntRect) -> WorkspaceID {
     let frames = displayScreens.map { screen in
         IntRect(
             min: IntPoint(
@@ -1981,7 +2025,7 @@ func workspaceForFrame(_ rect: IntRect) -> WorkspaceID {
 }
 
 /// Workspace owning a window id, if it sits in any strip.
-func workspaceOfWindow(_ id: WindowID) -> WorkspaceID? {
+@Sendable func workspaceOfWindow(_ id: WindowID) -> WorkspaceID? {
     for (ws, rows) in core.strips {
         for strip in rows.values where strip.contains(id) {
             return ws
@@ -1990,41 +2034,41 @@ func workspaceOfWindow(_ id: WindowID) -> WorkspaceID? {
     return nil
 }
 
-var tickCount = 0
+nonisolated(unsafe) var tickCount = 0
 /// Quiescence of the last full tick: gates the idle backoff (quiet ticks
 /// skip the scan/present work). Starts false so boot runs fully.
-var lastQuiescent = false
+nonisolated(unsafe) var lastQuiescent = false
 /// Set by the SIGTERM/SIGINT sources below; the next tick saves and exits.
 /// (Polled, never written, from the tick — the sources themselves only flip
 /// this flag on the main queue, where the tick also runs.)
-var terminationRequested = false
-var copiedRuleSent: String?
+nonisolated(unsafe) var terminationRequested = false
+nonisolated(unsafe) var copiedRuleSent: String?
 /// Focused passthrough chords as `code:mask` strings.
-var tapPassthrough: Set<String> = []
+nonisolated(unsafe) var tapPassthrough: Set<String> = []
 /// Owner pid per adopted window (for spawn payloads).
-var windowPIDs: [WindowID: pid_t] = [:]
-var prevTickFocus: WindowID?
+nonisolated(unsafe) var windowPIDs: [WindowID: pid_t] = [:]
+nonisolated(unsafe) var prevTickFocus: WindowID?
 /// Last focus the host actuated (OS-side): retries until rostered so
 /// late-adopted arrivals still land (the core latches the raise cause
 /// while focus holds).
-var prevActuatedFocus: WindowID?
-var prevTickRow: UInt32?
-var prevTickRosterSig = 0
+nonisolated(unsafe) var prevActuatedFocus: WindowID?
+nonisolated(unsafe) var prevTickRow: UInt32?
+nonisolated(unsafe) var prevTickRosterSig = 0
 /// Last keybind fire (any resolved key command) and last focus seen
 /// by the mouse-follow drain: arrivals within the key window count as
 /// keyboard-caused and always recenter.
-var lastKeyCommandAt = Date.distantPast
-var prevMffFocus: WindowID?
+nonisolated(unsafe) var lastKeyCommandAt = Date.distantPast
+nonisolated(unsafe) var prevMffFocus: WindowID?
 /// Session persistence dirtied since the last save (Rust 30s
 /// dirty-gated cadence, simplified: any busy tick or focus/row/
 /// roster drift marks it; the interval below does the write).
-var stateDirty = false
+nonisolated(unsafe) var stateDirty = false
 /// Previous-window memory per workspace (read on workspace switches
 /// that land focusless, so keybinds never die on an empty arrival).
-var focusHistory = FocusHistory()
+nonisolated(unsafe) var focusHistory = FocusHistory()
 /// Active workspace seen by the history reader (nil until the first
 /// tick, so startup never "switches").
-var prevActiveWS: WorkspaceID?
+nonisolated(unsafe) var prevActiveWS: WorkspaceID?
 
 /// Press arrivals never yank the click point; keyboard arrivals count
 /// for half a second after the keybind (Rust `PRESS_FOCUS_CAUSE` /
@@ -2034,20 +2078,20 @@ let mouseFollowKeyWindow = 0.5
 let mouseFollowSwipeQuiet = 0.6
 /// Last pointer-poll time: hover and edge checks run ~4Hz but only
 /// after motion, so a still cursor costs no WindowServer round trips.
-var lastPointerPoll = Date.distantPast
+nonisolated(unsafe) var lastPointerPoll = Date.distantPast
 /// Pointer-drag grab state: press candidate → promoted grab past the
 /// 4px click threshold → per-tick folded drive → drop or release.
 /// Folds accumulate between ticks; the tick flushes them ahead of the
 /// event snapshot so drive lands the next frame. An unpromoted
 /// press+release stays a native click (nothing enqueued, ever).
-var dragCandidate: WindowID?
-var dragPressPoint = CGPoint.zero
-var dragPressArmed = false
-var dragGrabbed: WindowID?
-var dragFoldDX = 0.0
-var dragLastX = 0.0
+nonisolated(unsafe) var dragCandidate: WindowID?
+nonisolated(unsafe) var dragPressPoint = CGPoint.zero
+nonisolated(unsafe) var dragPressArmed = false
+nonisolated(unsafe) var dragGrabbed: WindowID?
+nonisolated(unsafe) var dragFoldDX = 0.0
+nonisolated(unsafe) var dragLastX = 0.0
 /// Last shown drop ghost (retained to skip steady-state rewrites).
-var lastGhostRect: CGRect?
+nonisolated(unsafe) var lastGhostRect: CGRect?
 /// Click-vs-drag travel, per axis (Rust `CLICK_RELEASE_MAX_TRAVEL_PX`).
 let dragClickThreshold = 4.0
 /// Per-tick drive clamp (Rust folds the same ±512px).
@@ -2094,7 +2138,7 @@ func workspaceContaining(point: IntPoint) -> WorkspaceID? {
 
 /// Live cursor in Quartz screen space (the daemon's frame space, so
 /// no flip is needed for frame hit tests or warp targets).
-func cursorAXPoint() -> IntPoint? {
+@Sendable func cursorAXPoint() -> IntPoint? {
     guard let point = CGEvent(source: nil)?.location else { return nil }
     return IntPoint(Int32(point.x.rounded()), Int32(point.y.rounded()))
 }
@@ -2107,7 +2151,7 @@ let stateFilePath =
 /// Write core truth for external observers: active workspace, focus,
 /// per-workspace offsets and strips, roster size. Atomic swap; failures
 /// are silent (diagnostics must never disturb the tick).
-func writeStateFile(
+@Sendable func writeStateFile(
     tick: Int, focus: WindowID?, quiescent: Bool, jobs: Int, events: Int
 ) {
     var strips: [String: Any] = [:]
@@ -2138,7 +2182,7 @@ func writeStateFile(
 }
 
 /// Render one event for subscribers, if it serializes.
-func eventJSON(_ event: StateEvent) -> (name: String, json: String)? {
+@Sendable func eventJSON(_ event: StateEvent) -> (name: String, json: String)? {
     guard let name = event.eventName,
           let object = event.toJSON(),
           let data = try? JSONSerialization.data(withJSONObject: object),
@@ -2149,11 +2193,11 @@ func eventJSON(_ event: StateEvent) -> (name: String, json: String)? {
 
 /// Last presented dim state: steady ticks skip the presenter entirely
 /// instead of rewriting layer properties at display rate.
-var lastDim: (opacity: Float, r: Double, g: Double, b: Double, cutout: CGRect?, radius: Double)?
+nonisolated(unsafe) var lastDim: (opacity: Float, r: Double, g: Double, b: Double, cutout: CGRect?, radius: Double)?
 
 /// Sub-pixel rest epsilon shared with the presenters: cutout dither at
 /// or below it counts as unchanged.
-func dimCutoutEqual(_ a: CGRect?, _ b: CGRect?) -> Bool {
+@Sendable func dimCutoutEqual(_ a: CGRect?, _ b: CGRect?) -> Bool {
     switch (a, b) {
     case (nil, nil):
         return true
@@ -2172,25 +2216,43 @@ func dimCutoutEqual(_ a: CGRect?, _ b: CGRect?) -> Bool {
 /// stay queued for the next frame (lifecycle heals via roster sync).
 let maxEventsPerTick = 256
 
-/// Worker-completion mailbox: the AX worker appends under lock, the tick
-/// drains on main (the core is main-thread-owned and never crosses the
-/// queue). Plain data only — never windows or elements.
-let ackBox = NSLock()
-var pendingAcks: [AXWriteAck] = []
+/// Worker-completion mailbox: the AX worker appends, the tick drains on
+/// main (the core is main-thread-owned and never crosses the queue).
+/// Plain data only — never windows or elements. A single Sendable box
+/// (not a lock plus a loose array) so the discipline is visible to the
+/// checker instead of shared mutable state.
+final class AckBox: @unchecked Sendable {
+    private let lock = NSLock()
+    private var acks: [AXWriteAck] = []
+
+    func append(_ ack: AXWriteAck) {
+        lock.withLock { acks.append(ack) }
+    }
+
+    func drain() -> [AXWriteAck] {
+        lock.withLock {
+            let out = acks
+            acks.removeAll(keepingCapacity: true)
+            return out
+        }
+    }
+}
+
+let ackBox = AckBox()
 
 /// Per-window detected corner radii (SLS, macOS 26+): probed on demand,
 /// coarse-cleared past the cap like the read side. Configured radii
 /// (global numeric or per-window rule) bypass the cache entirely;
 /// `auto` resolves per window. Entries pin the rules generation they
 /// were resolved under, so tuning reloads re-resolve.
-var radiusCache: [WindowID: (radius: Double, gen: Int)] = [:]
+nonisolated(unsafe) var radiusCache: [WindowID: (radius: Double, gen: Int)] = [:]
 /// Rules generation: bumped on every derived-config refresh so cached
 /// radii (and any rule-derived truth) re-resolve after reloads.
-var radiusRulesGen = 0
+nonisolated(unsafe) var radiusRulesGen = 0
 
 /// Per-window rule radius override, if any rule names one for this
 /// window (Rust `WindowProperties::border_radius`).
-func ruleRadiusFor(_ id: WindowID) -> Double? {
+@Sendable func ruleRadiusFor(_ id: WindowID) -> Double? {
     guard let meta = core.windowMetadata[id] else { return nil }
     return ruleBorderRadius(title: meta.title, bundleID: meta.bundleID, in: windowRules)
         .map { max($0, 0) }
@@ -2200,7 +2262,7 @@ func ruleRadiusFor(_ id: WindowID) -> Double? {
 /// per-window rule override, else the SLS-detected corner, else the
 /// 10.0 default — mirroring Rust `border_radius_for`
 /// (`configured.unwrap_or(base)` per window, not a global constant).
-func borderRadiusFor(_ id: WindowID?) -> Double {
+@Sendable func borderRadiusFor(_ id: WindowID?) -> Double {
     switch resolved.borderRadius {
     case .value(let v): return v
     case .auto:
@@ -2228,13 +2290,13 @@ func borderRadiusFor(_ id: WindowID?) -> Double {
 /// clear the crash mark, then exit. Serves menubar quit, `.quit`/`.restart`
 /// commands, and SIGTERM/SIGINT delivery alike — every controlled shutdown
 /// leaves a fresh snapshot behind instead of a stale 30s-dirty write.
-func cleanExit() -> Never {
+@Sendable func cleanExit() -> Never {
     saveSessionState()
     clearSessionRunning(statePath: sessionStatePath())
     exit(0)
 }
 
-func tick() {
+@Sendable func tick() {
     tickCount += 1
     // Process control lands here, never in the core (which ignores
     // `.quit`/`.restart` by contract): a pending quit/restart — or a
@@ -2253,10 +2315,7 @@ func tick() {
     // Worker completions land here (main thread): the async AX writes
     // dispatched below acknowledge through the box, so unacked state
     // tracks real flight and the stall watchdog means something.
-    ackBox.lock()
-    let acks = pendingAcks
-    pendingAcks.removeAll(keepingCapacity: true)
-    ackBox.unlock()
+    let acks = ackBox.drain()
     for ack in acks {
         core.acknowledge(winID: ack.winID, seq: ack.seq, epoch: ack.epoch)
     }
@@ -2389,8 +2448,10 @@ func tick() {
     for job in result.axJobs {
         coalesceJobs(&latest, job)
     }
-    var batch: [(LiveProviders.LiveWindow, AXWriteJob)] = []
-    batch.reserveCapacity(latest.count)
+    // Frozen before the worker takes it: a captured `var` warns even
+    // for reads, and the batch never mutates after this point.
+    var batchBuilder: [(LiveProviders.LiveWindow, AXWriteJob)] = []
+    batchBuilder.reserveCapacity(latest.count)
     for job in drainOrder(latest) {
         guard let window = roster[CGWindowID(job.winID)] else {
             core.acknowledge(winID: job.winID, seq: job.seq, epoch: job.epoch)
@@ -2403,8 +2464,9 @@ func tick() {
             core.acknowledge(winID: job.winID, seq: job.seq, epoch: job.epoch)
             continue
         }
-        batch.append((window, job))
+        batchBuilder.append((window, job))
     }
+    let batch = batchBuilder
     if shadowMode {
         // Dry run: acknowledge everything immediately so unacked state
         // never grows (the stall watchdog must stay meaningful), count
@@ -2423,11 +2485,9 @@ func tick() {
                 if let size = job.size {
                     _ = window.resize(to: size, origin: job.origin)
                 }
-                ackBox.lock()
-                pendingAcks.append(AXWriteAck(
+                ackBox.append(AXWriteAck(
                     winID: job.winID, seq: job.seq, epoch: job.epoch, ok: true
                 ))
-                ackBox.unlock()
             }
         }
     }
@@ -2923,7 +2983,7 @@ loadRestoreState()
 // cleanly (its snapshot may lag up to one interval). Gated on
 // restore like the saves themselves. `didCrashLastRun` gates the
 // grace-expiry prune: unclean runs preserve the file.
-var didCrashLastRun = false
+nonisolated(unsafe) var didCrashLastRun = false
 if resolved.restoreEnabled {
     if sessionCrashedPreviously(statePath: sessionStatePath()) {
         didCrashLastRun = true
@@ -2943,7 +3003,7 @@ if resolved.restoreEnabled {
 
 /// Rust `default_state_file_path`, honoring this launch's home (the
 /// helper defaults to the process home).
-func sessionStatePath() -> String {
+@Sendable func sessionStatePath() -> String {
     defaultSessionStatePath(homeDirectory: home)
 }
 
@@ -2975,7 +3035,7 @@ func loadRestoreState() {
 /// One saved window from live state: probed AX identity where known,
 /// struct defaults elsewhere (so a Swift-written file
 /// fallback-matches after restart, like a Rust one).
-func savedWindow(
+@Sendable func savedWindow(
     id: WindowID, displayID: UInt32?, frame: SavedRect?
 ) -> SavedWindow {
     let meta = core.windowMetadata[id]
@@ -2989,7 +3049,7 @@ func savedWindow(
     )
 }
 
-func savedRect(_ frame: IntRect) -> SavedRect {
+@Sendable func savedRect(_ frame: IntRect) -> SavedRect {
     SavedRect(
         minX: frame.min.x, minY: frame.min.y,
         maxX: frame.max.x, maxY: frame.max.y
@@ -3000,7 +3060,7 @@ func savedRect(_ frame: IntRect) -> SavedRect {
 /// with row-sorted strips, per-window display and AX frame for the
 /// geometry tie-break. Only strip membership persists (floats carry
 /// no flag — like Rust, they reappear only if still in a strip).
-func extractSessionState() -> PaneruSessionState {
+@Sendable func extractSessionState() -> PaneruSessionState {
     let savedFrame: (WindowID) -> SavedRect? = { id in
         guard let frame = roster[CGWindowID(bitPattern: id)]?.frame else { return nil }
         return savedRect(frame)
@@ -3078,7 +3138,7 @@ func extractSessionState() -> PaneruSessionState {
 /// Persist the live layout (atomic tmp+rename with `.bak` rotation).
 /// Failures warn; the next interval retries. Gated on restore like
 /// the load: a disabled restore leaves no files behind.
-func saveSessionState() {
+@Sendable func saveSessionState() {
     guard resolved.restoreEnabled else { return }
     do {
         try writeSessionStateFile(extractSessionState(), at: sessionStatePath())
@@ -3089,7 +3149,7 @@ func saveSessionState() {
 
 /// Snapshot the adopted roster for the restore planner. Refs are window
 /// ids (stable across calls, so consumed tracking lines up).
-func restoreSnapshot() -> [Session.LiveWindow] {
+@Sendable func restoreSnapshot() -> [Session.LiveWindow] {
     roster.map { (wid, window) in
         let id = windowID(wid)
         let meta = core.windowMetadata[id]
@@ -3119,7 +3179,7 @@ func restoreSnapshot() -> [Session.LiveWindow] {
 /// the post-tick drain retries; everything else is final. `ref` is the
 /// CGWindowID int, matching the planner's live refs.
 @discardableResult
-func restoreAdopted(ref: Int) -> Bool {
+@Sendable func restoreAdopted(ref: Int) -> Bool {
     guard let planner = restorePlanner, Date() < restoreDeadline else { return true }
     return restoreAdopted(ref: ref, plan: planner.plan(current: restoreSnapshot()))
 }
@@ -3128,7 +3188,7 @@ func restoreAdopted(ref: Int) -> Bool {
 /// re-plan scattered tabs/stacks (each call re-ran `plan()` with its own
 /// consumed set), while a single plan accumulates consumption across the
 /// whole batch — mirroring Rust's single-plan `consumed_entities`.
-func drainRestorePending() {
+@Sendable func drainRestorePending() {
     guard let planner = restorePlanner, !restorePending.isEmpty else { return }
     guard Date() < restoreDeadline else {
         restorePending.removeAll()
@@ -3145,7 +3205,7 @@ func drainRestorePending() {
 }
 
 /// Members of a planned column, flattened (stack items concatenate).
-func restoreColumnMembers(_ column: PlannedColumn) -> [Int] {
+@Sendable func restoreColumnMembers(_ column: PlannedColumn) -> [Int] {
     switch column {
     case .single(let ref): return [ref]
     case .fullscreen(let ref): return [ref]
@@ -3160,7 +3220,7 @@ func restoreColumnMembers(_ column: PlannedColumn) -> [Int] {
     }
 }
 
-func restoreAdopted(ref: Int, plan: RestorePlan) -> Bool {
+@Sendable func restoreAdopted(ref: Int, plan: RestorePlan) -> Bool {
     let id = WindowID(truncatingIfNeeded: ref)
     guard workspaceOfWindow(id) != nil else { return false }
     for strip in plan.strips {
@@ -3179,7 +3239,7 @@ func restoreAdopted(ref: Int, plan: RestorePlan) -> Bool {
 /// surviving strip), remapped onto live workspaces. Runs once at grace
 /// expiry, when the roster is complete; the saved state wins over any
 /// live row switches inside the startup window.
-func applyRestoreActiveRows() {
+@Sendable func applyRestoreActiveRows() {
     guard let planner = restorePlanner else { return }
     let plan = planner.plan(current: restoreSnapshot())
     var remapped: [WorkspaceID: UInt32] = [:]
@@ -3202,7 +3262,7 @@ func applyRestoreActiveRows() {
 /// workspace. Live UUIDs now resolve (see `displayUUIDs`), so the UUID
 /// arm fires across reboots — mirroring Rust's UUID → numeric → active
 /// pick (`src/ecs/restore.rs:select_display`).
-func restoreWorkspace(for strip: PlannedStrip) -> WorkspaceID {
+@Sendable func restoreWorkspace(for strip: PlannedStrip) -> WorkspaceID {
     let live = axDisplayFrames()
     let liveEntries = live.map { entry in
         (id: entry.id, uuid: displayUUIDs[entry.id], frame: entry.frame)

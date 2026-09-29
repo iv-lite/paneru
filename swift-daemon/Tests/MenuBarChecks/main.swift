@@ -4,7 +4,7 @@ import MenuBar
 // Menubar string rules: labels, assembly, widths, enablement, titles.
 // The live NSStatusItem shell is main-thread AppKit, proven on the host.
 
-private var failures = 0
+private nonisolated(unsafe) var failures = 0 // straight-line runner: nothing concurrent
 
 private func check(_ condition: Bool, _ message: String) {
     if !condition {

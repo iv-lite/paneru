@@ -7,7 +7,7 @@ import Session
 // recording, and the state-file version gate.
 // Exits nonzero on the first mismatch.
 
-private var failures = 0
+private nonisolated(unsafe) var failures = 0 // straight-line runner: nothing concurrent
 
 private func check(_ condition: Bool, _ message: String) {
     if !condition {

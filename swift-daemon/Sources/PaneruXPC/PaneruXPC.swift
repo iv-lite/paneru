@@ -55,7 +55,11 @@ public func xpcIsError(_ reply: String) -> Bool {
 /// Connect to the daemon's Mach/XPC service name. In production the name
 /// is the launchd job label (`paneruServiceName`); tests pass an
 /// anonymous listener endpoint instead.
-public final class PaneruXPCClient: Sendable {
+///
+/// Deliberately not `Sendable`: `NSXPCConnection` never will be, and
+/// every use is main-thread or CLI-confined — an `@unchecked`
+/// conformance would promise what the type cannot keep.
+public final class PaneruXPCClient {
     private let connection: NSXPCConnection
 
     public init(serviceName: String) {

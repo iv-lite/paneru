@@ -47,8 +47,14 @@ final class FlashView: NSView {
     }
 }
 
+/// Main-thread-only: every entry asserts `.onQueue(.main)`, so
+/// misuse crashes loudly instead of racing silently. The shared
+/// accessor vouches this explicitly; the class itself stays
+/// non-`Sendable` so its AppKit bodies keep checking exactly as
+/// before (an `@unchecked` class would make every call inside
+/// suspect instead).
 final class FlashManager {
-    static let shared = FlashManager()
+    nonisolated(unsafe) static let shared = FlashManager()
     private var window: NSWindow?
     private var shown: (msg: String, bucket: UInt8, frame: NSRect)?
 

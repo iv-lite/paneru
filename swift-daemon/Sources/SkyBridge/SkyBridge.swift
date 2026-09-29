@@ -19,29 +19,50 @@ private typealias SpaceModeFn = @convention(c) (Int32) -> Int32
 private typealias CurrentSpaceFn = @convention(c) (Int32, CFString) -> UInt64
 private typealias ManagedSpacesFn = @convention(c) (Int32) -> Unmanaged<CFArray>?
 
-private var skyHandle: UnsafeMutableRawPointer?
-private var skyCID: Int32?
-private var skyProbed = false
+/// Lazily-opened SkyLight handle + connection. Logically main-thread
+/// use, but the once-cache is lock-guarded so the soundness does not
+/// depend on which thread probes first.
+private final class SkyCache: @unchecked Sendable {
+    private let lock = NSLock()
+    private var handle: UnsafeMutableRawPointer?
+    private var cid: Int32?
+    private var probed = false
+
+    fileprivate func symbol<T>(_ name: String) -> T? {
+        lock.lock()
+        defer { lock.unlock() }
+        guard let handle else { return nil }
+        guard let symbol = dlsym(handle, name) else { return nil }
+        return unsafeBitCast(symbol, to: T.self)
+    }
+
+    fileprivate func connection() -> Int32? {
+        lock.lock()
+        defer { lock.unlock() }
+        if probed { return cid }
+        probed = true
+        guard let handle = dlopen(
+            "/System/Library/PrivateFrameworks/SkyLight.framework/SkyLight", RTLD_NOW
+        ) else { return nil }
+        self.handle = handle
+        guard let symbol = dlsym(handle, "SLSMainConnectionID") else { return nil }
+        let mainCID: MainCIDFn = unsafeBitCast(symbol, to: MainCIDFn.self)
+        cid = mainCID()
+        return cid
+    }
+}
+
+private let skyCache = SkyCache()
 
 private func skySymbol<T>(_ name: String) -> T? {
-    guard let handle = skyHandle else { return nil }
-    guard let symbol = dlsym(handle, name) else { return nil }
-    return unsafeBitCast(symbol, to: T.self)
+    skyCache.symbol(name)
 }
 
 /// Open SkyLight and resolve a connection id (cached; nil when
 /// unavailable). The mode gate lives with the caller: separate
 /// spaces (`SLSGetSpaceManagementMode == 1`) or legacy behavior.
 public func skyConnection() -> Int32? {
-    if skyProbed { return skyCID }
-    skyProbed = true
-    guard let handle = dlopen(
-        "/System/Library/PrivateFrameworks/SkyLight.framework/SkyLight", RTLD_NOW
-    ) else { return nil }
-    skyHandle = handle
-    guard let mainCID: MainCIDFn = skySymbol("SLSMainConnectionID") else { return nil }
-    skyCID = mainCID()
-    return skyCID
+    skyCache.connection()
 }
 
 /// Space management mode, if SkyLight answers (1 = separate spaces).
