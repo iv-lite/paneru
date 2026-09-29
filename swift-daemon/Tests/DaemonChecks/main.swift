@@ -2008,6 +2008,97 @@ do {
     checkEqual(daemon.activeWorkspace, 1, "settled ambient arrivals hop")
 }
 
+// Wrap trigger: edge crossings evaluate at the crossing, so fast and
+// diagonal flings that jump the 3px band still warp both directions.
+do {
+    var daemon = DaemonCore()
+    let left = IntRect(0, 0, 1024, 768)
+    let right = IntRect(1024, 0, 2048, 768)
+    let side = [left, right]
+    // Crossing unit: exit, entry, and vertical travel.
+    let cross = DaemonCore.firstExitCrossing(
+        prev: IntPoint(2, 400), cur: IntPoint(-6, 400), displays: side
+    )
+    checkEqual(cross?.rect, left, "crossing exits the source")
+    checkEqual(cross?.left, true, "crossing names the left edge")
+    checkEqual(cross?.at, IntPoint(1, 400), "eval sits just inside")
+    check(
+        DaemonCore.firstExitCrossing(
+            prev: IntPoint(-6, 400), cur: IntPoint(2, 400), displays: side
+        ) == nil,
+        "native entries never cross"
+    )
+    check(
+        DaemonCore.firstExitCrossing(
+            prev: IntPoint(500, 100), cur: IntPoint(500, 200), displays: side
+        ) == nil,
+        "vertical travel never crosses"
+    )
+    // Dwell in the band (no crossing) still warps via the direct sample.
+    let dwelled = daemon.warpForMovement(
+        prev: IntPoint(1, 400), prevAge: 0.016,
+        cur: IntPoint(1, 400), displays: side,
+        warpDirection: -1, yOffset: 0
+    )
+    checkEqual(dwelled, IntPoint(2042, 400), "dwell wraps around the row")
+    checkEqual(daemon.lastWarpKind, "row", "dwell takes the row path")
+}
+
+// Diagonal exit into a stair void: the direct sample lands nowhere,
+// the crossing carries the source edge and wraps.
+do {
+    var daemon = DaemonCore()
+    let upper = IntRect(0, 0, 1024, 768)
+    let lower = IntRect(1024, 300, 2048, 1068)
+    let stairs = [upper, lower]
+    let direct = daemon.edgeWarpLanding(
+        cursor: IntPoint(1100, 40), displays: stairs,
+        warpDirection: -1, yOffset: 0
+    )
+    check(direct == nil, "void sample misses directly")
+    checkEqual(daemon.lastWarpKind, "none:outside", "void names outside")
+    let landing = daemon.warpForMovement(
+        prev: IntPoint(1020, 100), prevAge: 0.016,
+        cur: IntPoint(1100, 40), displays: stairs,
+        warpDirection: -1, yOffset: 0
+    )
+    checkEqual(landing, IntPoint(1030, 397), "diagonal exit wraps onto the step")
+    checkEqual(daemon.lastWarpKind, "primary", "step maps via polarity")
+    checkEqual(
+        daemon.lastCrossPoint, IntPoint(1023, 97), "miss logs carry the crossing"
+    )
+}
+
+// Mirror direction: lower display exits left below its neighbor into
+// the void and wraps back up.
+do {
+    var daemon = DaemonCore()
+    let upper = IntRect(0, 0, 1024, 768)
+    let lower = IntRect(1024, 300, 2048, 1068)
+    let stairs = [upper, lower]
+    let landing = daemon.warpForMovement(
+        prev: IntPoint(1030, 800), prevAge: 0.016,
+        cur: IntPoint(1000, 850), displays: stairs,
+        warpDirection: -1, yOffset: 0
+    )
+    checkEqual(landing, IntPoint(1018, 510), "right-to-left wraps around the row")
+}
+
+// Shared edges still suppress even when found via crossing.
+do {
+    var daemon = DaemonCore()
+    let left = IntRect(0, 0, 1024, 768)
+    let right = IntRect(1024, 0, 2048, 768)
+    let side = [left, right]
+    let landing = daemon.warpForMovement(
+        prev: IntPoint(1020, 400), prevAge: 0.016,
+        cur: IntPoint(1100, 460), displays: side,
+        warpDirection: -1, yOffset: 0
+    )
+    check(landing == nil, "native seam crossings stay native")
+    checkEqual(daemon.lastWarpKind, "none:seam", "seam verdict survives")
+}
+
 // Maximized lone columns center horizontally; unmarked narrow
 // lones stay left-anchored (center_single_column stays opt-in).
 do {

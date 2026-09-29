@@ -3028,6 +3028,52 @@ public struct DaemonCore: Sendable {
         return nil
     }
 
+    /// Last crossing point examined by `warpForMovement` (nil when the
+    /// direct sample decided): miss logs print it so band-jump samples
+    /// diagnose with coordinates, not silence.
+    public private(set) var lastCrossPoint: IntPoint?
+
+    /// Warp decision for one cursor sample given the previous evaluated
+    /// sample: a display edge crossed between samples evaluates at the
+    /// crossing (just inside the exited display), so fast and diagonal
+    /// flings that jump the 3px edge band still warp — no perfect
+    /// horizontal aim required. Entry crossings (outside → inside)
+    /// never evaluate: arriving natively is not a warp. Falls back to
+    /// the direct sample (slow dwells inside the band cross nothing).
+    /// A crossing miss on an edge-adjacent branch (seam/nomap) survives
+    /// a quiet direct miss so the verdict stays diagnosable.
+    public mutating func warpForMovement(
+        prev: IntPoint, prevAge: Double, cur: IntPoint, displays: [IntRect],
+        warpDirection: Int16, yOffset: Int32, velocityX: Double? = nil
+    ) -> IntPoint? {
+        lastCrossPoint = nil
+        var crossKind: String?
+        if prevAge <= 1.0,
+           let cross = Self.firstExitCrossing(prev: prev, cur: cur, displays: displays)
+        {
+            lastCrossPoint = cross.at
+            if let landing = edgeWarpLanding(
+                cursor: cross.at, displays: displays,
+                warpDirection: warpDirection, yOffset: yOffset, velocityX: velocityX
+            ) {
+                return landing
+            }
+            crossKind = lastWarpKind
+        }
+        guard let landing = edgeWarpLanding(
+            cursor: cur, displays: displays,
+            warpDirection: warpDirection, yOffset: yOffset, velocityX: velocityX
+        ) else {
+            if let crossKind, lastWarpKind != "none:seam", lastWarpKind != "none:nomap",
+               crossKind == "none:seam" || crossKind == "none:nomap"
+            {
+                lastWarpKind = crossKind
+            }
+            return nil
+        }
+        return landing
+    }
+
     /// One landing attempt on a fixed target: relative Y with signed
     /// offset, velocity carry, opposite-edge inset. Strict mode keeps
     /// the range guard (nil when the equivalent Y falls off the target,
@@ -3104,7 +3150,45 @@ public struct DaemonCore: Sendable {
         return wrapTo
     }
 
-    // MARK: - Re-home decision (pure, free function below)
+    /// First display-edge exit along a cursor segment, in travel order:
+/// the exited rect, which side, and the just-inside eval point (1px
+/// inside the edge, at the crossing Y). Nil when the segment exits
+/// nowhere outward: dwells, vertical travel, and native entries
+/// (outside → inside) all miss. Pure — the wrap trigger pins here.
+public static func firstExitCrossing(
+    prev: IntPoint, cur: IntPoint, displays: [IntRect]
+) -> (rect: IntRect, left: Bool, at: IntPoint)? {
+    guard prev.x != cur.x else { return nil }
+    let dx = Double(cur.x - prev.x)
+    let dy = Double(cur.y - prev.y)
+    var best: (t: Double, rect: IntRect, left: Bool, at: IntPoint)?
+    func consider(edgeX: Int32, exiting: Bool, rect: IntRect, left: Bool) {
+        guard exiting else { return }
+        let t = (Double(edgeX) - Double(prev.x)) / dx
+        guard t >= 0, t <= 1 else { return }
+        let y = Int32((Double(prev.y) + t * dy).rounded())
+        guard y >= rect.min.y, y < rect.max.y else { return }
+        let at = IntPoint(left ? rect.min.x + 1 : rect.max.x - 1, y)
+        if best.map({ t < $0.t }) ?? true {
+            best = (t, rect, left, at)
+        }
+    }
+    for rect in displays {
+        consider(
+            edgeX: rect.min.x,
+            exiting: prev.x >= rect.min.x && cur.x < rect.min.x,
+            rect: rect, left: true
+        )
+        consider(
+            edgeX: rect.max.x,
+            exiting: prev.x < rect.max.x && cur.x >= rect.max.x,
+            rect: rect, left: false
+        )
+    }
+    return best.map { ($0.rect, $0.left, $0.at) }
+}
+
+// MARK: - Re-home decision (pure, free function below)
 
     /// Vanish triage (pure): split roster ids missing from the
     /// on-screen list into hidden (still listed, on another Space —

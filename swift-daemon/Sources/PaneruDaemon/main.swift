@@ -1894,23 +1894,30 @@ nonisolated(unsafe) var lastWarpEval = Date.distantPast
           restorePlanner == nil
     else { return }
     // Velocity from the previous sample (stale samples carry nothing).
+    // The previous sample doubles as the crossing trigger's segment
+    // start (see `warpForMovement`): band-jumping flings evaluate at
+    // the crossed edge instead of missing silently.
     let now = Date()
     let dt = now.timeIntervalSince(lastWarpSample.at)
+    let prev = lastWarpSample.point
     let velocityX: Double? =
         (dt > 0 && dt <= 0.08) ? Double(cursor.x - lastWarpSample.point.x) / dt : nil
     lastWarpSample = (cursor, now)
     guard let warp = resolved.horizontalMouseWarp else { return }
-    guard let landing = core.edgeWarpLanding(
-        cursor: cursor, displays: fullDisplayFrames(),
+    guard let landing = core.warpForMovement(
+        prev: prev, prevAge: dt, cur: cursor, displays: fullDisplayFrames(),
         warpDirection: warp,
         yOffset: resolved.horizontalMouseWarpOffset,
         velocityX: velocityX
     ) else {
         // Name the killer branch on edge-adjacent misses (seam vs nomap):
         // interior/lone/outside samples are the common quiet case.
+        // Crossing-triggered evals append the crossing point so
+        // band-jump samples diagnose with coordinates.
         let kind = core.lastWarpKind
         if kind == "none:seam" || kind == "none:nomap" {
-            print("mouse: edge warp missed via \(kind) at \(cursor.x),\(cursor.y)")
+            let cross = core.lastCrossPoint.map { " cross \($0.x),\($0.y)" } ?? ""
+            print("mouse: edge warp missed via \(kind) at \(cursor.x),\(cursor.y)\(cross)")
         }
         return
     }
@@ -2014,6 +2021,9 @@ nonisolated(unsafe) var lastWarpEval = Date.distantPast
             < ($1.frame.origin.x, $1.frame.origin.y, $1.id)
     }
     displayScreens = (main.map { [$0] } ?? []) + ordered
+    // Fresh geometry invalidates the warp segment: crossings measured
+    // against retired edges would warp off stale travel.
+    lastWarpSample.at = Date.distantPast
     workspaceDisplay = [:]
     for (index, entry) in displayScreens.enumerated() {
         workspaceDisplay[WorkspaceID(index + 1)] = entry.id
@@ -2723,6 +2733,9 @@ let perfSlowTickMs = 8.0
             print("shadow: hop warp \(warp.x),\(warp.y) (dropped)")
         } else {
             warpMouse(to: CGPoint(x: Double(warp.x), y: Double(warp.y)))
+            // Teleports rebase the warp segment: the next evaluation
+            // must measure from the landing, not across the jump.
+            lastWarpSample = (IntPoint(warp.x, warp.y), Date())
             print("mouse: hop warp \(warp.x),\(warp.y)")
         }
     }
@@ -2772,6 +2785,7 @@ let perfSlowTickMs = 8.0
                     print("shadow: follow warp \(target.x),\(target.y) window=\(id) cause=\(cause) (dropped)")
                 } else {
                     warpMouse(to: CGPoint(x: Double(target.x), y: Double(target.y)))
+                    lastWarpSample = (target, Date())
                     print("mouse: follow warp \(target.x),\(target.y) window=\(id) cause=\(cause)")
                 }
             }
