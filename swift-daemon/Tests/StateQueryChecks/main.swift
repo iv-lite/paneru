@@ -256,6 +256,64 @@ do {
     }
 }
 
+// Shadow differ: rest-state agreement is silent, epsilon absorbs AX/CG
+// rounding on both sides, wider drift / one-sided windows / focus
+// disagreement (nil included) all report. Invisible Rust windows never
+// false-positive.
+do {
+    func rustDoc(_ windows: [QueryWindow], focus: Int32?) -> QueryState {
+        QueryState(
+            active: ActiveState(focusedWindowID: focus),
+            virtualWorkspaces: [
+                QueryWorkspace(number: 2, nativeWorkspaceID: 2, active: true, windows: windows),
+            ]
+        )
+    }
+    func win(_ id: Int32, x: Int32, y: Int32, visible: Bool = true) -> QueryWindow {
+        QueryWindow(
+            windowID: id, frame: QueryFrame(x: x, y: y, width: 400, height: 748),
+            visible: visible
+        )
+    }
+    let swift = [ShadowPosition(id: 7, x: 312, y: 20), ShadowPosition(id: 9, x: 712, y: 20)]
+    checkEqual(
+        diffShadow(swift: swift, focus: 7, rust: rustDoc([win(7, x: 312, y: 20), win(9, x: 712, y: 20)], focus: 7)),
+        [], "agreement is silent"
+    )
+    checkEqual(
+        diffShadow(swift: swift, focus: 7, rust: rustDoc([win(7, x: 313, y: 21), win(9, x: 712, y: 20)], focus: 7)),
+        [], "epsilon absorbs rounding"
+    )
+    checkEqual(
+        diffShadow(swift: swift, focus: 7, rust: rustDoc([win(7, x: 320, y: 20), win(9, x: 712, y: 20)], focus: 7)),
+        [.origin(windowID: 7, swiftX: 312, swiftY: 20, rustX: 320, rustY: 20)],
+        "wider drift reports with both truths"
+    )
+    checkEqual(
+        diffShadow(swift: swift, focus: 7, rust: rustDoc([win(7, x: 312, y: 20)], focus: 7)),
+        [.missingInRust(windowID: 9)],
+        "Swift-only windows report"
+    )
+    checkEqual(
+        diffShadow(swift: [swift[0]], focus: 7, rust: rustDoc([win(7, x: 312, y: 20), win(9, x: 712, y: 20)], focus: 7)),
+        [.missingInSwift(windowID: 9)],
+        "Rust-only windows report"
+    )
+    checkEqual(
+        diffShadow(swift: swift, focus: 9, rust: rustDoc([win(7, x: 312, y: 20), win(9, x: 712, y: 20)], focus: 7)),
+        [.focus(swift: 9, rust: 7)],
+        "focus disagreement reports"
+    )
+    checkEqual(
+        diffShadow(swift: swift, focus: nil, rust: rustDoc([win(7, x: 312, y: 20), win(9, x: 712, y: 20)], focus: nil)),
+        [], "nil focus agrees with nil"
+    )
+    checkEqual(
+        diffShadow(swift: swift, focus: 7, rust: rustDoc([win(7, x: 312, y: 20), win(9, x: 0, y: 0, visible: false)], focus: 7)),
+        [], "invisible Rust windows never false-positive"
+    )
+}
+
 if failures == 0 {
     print("StateQueryChecks: all checks passed")
 } else {

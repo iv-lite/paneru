@@ -288,6 +288,81 @@ let shadowMode = CommandLine.arguments.contains("--shadow")
 /// AX intents dropped while shadowing (diagnostic counter).
 var shadowDroppedJobs = 0
 
+// MARK: - Shadow poll
+
+/// Async Rust-state fetch plumbing: the 60Hz thread never blocks on the
+/// CLI subprocess (a wedged Rust daemon must stall nothing but the
+/// diff); results land in the box for the tick to consume.
+let shadowQueue = DispatchQueue(label: "com.github.karinushka.paneru.swift.shadow")
+let shadowBox = NSLock()
+/// Delivered fetch outcome (document or typed failure), taken once.
+var pendingShadowResult: (QueryState?, RustStateError?)?
+var shadowFetchInflight = false
+/// Last Rust document (settle gate: diff only against a repeated doc).
+var lastRustDoc: QueryState?
+/// Latched outage log (one line per outage, not per poll).
+var shadowDownLatched = false
+
+/// Request one async Rust read (coalesced while one is in flight).
+func requestShadowPoll() {
+    shadowBox.lock()
+    defer { shadowBox.unlock() }
+    guard !shadowFetchInflight else { return }
+    shadowFetchInflight = true
+    shadowQueue.async {
+        let delivered: (QueryState?, RustStateError?)
+        do {
+            delivered = (try queryRustState(timeout: 2), nil)
+        } catch let error as RustStateError {
+            delivered = (nil, error)
+        } catch {
+            delivered = (nil, .launchFailed("\(error)"))
+        }
+        shadowBox.lock()
+        pendingShadowResult = delivered
+        shadowFetchInflight = false
+        shadowBox.unlock()
+    }
+}
+
+/// Consume a delivered fetch: settle-gate, diff at rest, report in
+/// parity-FAIL format (capped per poll so transitions never flood).
+func consumeShadowPoll(swiftQuiet: Bool) {
+    shadowBox.lock()
+    let delivered = pendingShadowResult
+    pendingShadowResult = nil
+    shadowBox.unlock()
+    guard let delivered else { return }
+    guard let doc = delivered.0 else {
+        if !shadowDownLatched {
+            print("shadow: rust unreachable (\(delivered.1.map { "\($0)" } ?? "unknown"))")
+            shadowDownLatched = true
+        }
+        lastRustDoc = nil
+        return
+    }
+    shadowDownLatched = false
+    defer { lastRustDoc = doc }
+    guard let prev = lastRustDoc, prev == doc, swiftQuiet else { return }
+    // Raw-CG estimates: slots are padded-logical, Rust frames are raw.
+    var windows: [ShadowPosition] = []
+    windows.reserveCapacity(core.positions.count)
+    for (id, origin) in core.positions {
+        guard let window = roster[CGWindowID(bitPattern: id)] else { continue }
+        windows.append(ShadowPosition(
+            id: id,
+            x: origin.x + window.horizontalPadding,
+            y: origin.y + window.verticalPadding
+        ))
+    }
+    let mismatches = diffShadow(swift: windows, focus: core.focus, rust: doc)
+    if mismatches.isEmpty { return }
+    print("shadow: DIFF \(mismatches.count) item(s)")
+    for mismatch in mismatches.prefix(10) {
+        print("shadow: DIFF \(mismatch)")
+    }
+}
+
 var core = DaemonCore()
 // Resize presets follow the resolved config.
 core.presetWidths = resolved.presetColumnWidths
@@ -2613,6 +2688,14 @@ func tick() {
             tick: tickCount, focus: result.focus, quiescent: result.quiescent,
             jobs: result.axJobs.count, events: events.count
         )
+    }
+    // Shadow observer poll (tick-cadenced): fetch async off-thread,
+    // diff at rest on-thread. The normal path never pays for this.
+    if shadowMode {
+        if tickCount % 60 == 0 {
+            requestShadowPoll()
+        }
+        consumeShadowPoll(swiftQuiet: result.quiescent)
     }
     // Shadow heartbeat (30s): dropped-intent count proves the observer
     // keeps deciding while writing nothing.
