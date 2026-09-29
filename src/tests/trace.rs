@@ -149,6 +149,7 @@ pub(crate) fn window_table(world: &mut World) -> Vec<(Entity, WinID)> {
 mod tests {
     use super::*;
     use crate::commands::{Command, Direction, MoveFocus, Operation};
+    use crate::config::Config;
     use objc2_core_foundation::CGPoint;
 
     use crate::platform::Modifiers;
@@ -323,5 +324,142 @@ mod tests {
         );
         assert!(last.quiescent, "release must settle: {last:?}");
         dump_corpus("drag", &snapshots);
+    }
+
+    /// Non-default gaps must not move slot origins: gaps are per-window
+    /// AX insets, never slot pitch. Runs each scenario under `[gaps] 12/6`
+    /// and pins the positions identical to the default-gaps control run.
+    fn gaps_config() -> Config {
+        Config::try_from("[options]\nanimations = false\n[gaps]\nhorizontal = 12\nvertical = 6\n")
+            .expect("gaps config parses")
+    }
+
+    fn centered_config() -> Config {
+        Config::try_from("[options]\nanimations = false\nauto_center = true\n")
+            .expect("centered config parses")
+    }
+
+    #[test]
+    fn tiling_gaps_trace_matches_default() {
+        let control = TestHarness::new()
+            .with_windows(3)
+            .run_with_trace(tiling_commands());
+        let mut harness = TestHarness::new()
+            .with_config(gaps_config())
+            .with_windows(3);
+        let snapshots = harness.run_with_trace(tiling_commands());
+        let last = snapshots.last().expect("non-empty trace");
+        let control_last = control.last().expect("control non-empty");
+        assert!(last.quiescent, "gaps trace must settle: {last:?}");
+        for id in [0, 1, 2] {
+            assert!(last.positions.contains_key(&id), "window {id} placed");
+        }
+        assert_eq!(
+            last.positions, control_last.positions,
+            "slot origins ignore gaps: {last:?} vs {control_last:?}"
+        );
+        dump_corpus("tiling_gaps", &snapshots);
+    }
+
+    #[test]
+    fn virtual_gaps_trace_matches_default() {
+        let control = TestHarness::new()
+            .with_windows(2)
+            .run_with_trace(virtual_commands());
+        let mut harness = TestHarness::new()
+            .with_config(gaps_config())
+            .with_windows(2);
+        let snapshots = harness.run_with_trace(virtual_commands());
+        let last = snapshots.last().expect("non-empty trace");
+        let control_last = control.last().expect("control non-empty");
+        assert!(last.quiescent, "gaps trace must settle: {last:?}");
+        assert_eq!(
+            last.positions, control_last.positions,
+            "slot origins ignore gaps: {last:?} vs {control_last:?}"
+        );
+        dump_corpus("virtual_gaps", &snapshots);
+    }
+
+    #[test]
+    fn drag_gaps_trace_matches_default() {
+        let control = TestHarness::new()
+            .with_windows(2)
+            .run_with_trace(drag_commands());
+        let mut harness = TestHarness::new()
+            .with_config(gaps_config())
+            .with_windows(2);
+        let snapshots = harness.run_with_trace(drag_commands());
+        let last = snapshots.last().expect("non-empty trace");
+        let control_last = control.last().expect("control non-empty");
+        assert!(last.quiescent, "gaps trace must settle: {last:?}");
+        assert_eq!(
+            last.positions, control_last.positions,
+            "slot origins ignore gaps: {last:?} vs {control_last:?}"
+        );
+        dump_corpus("drag_gaps", &snapshots);
+    }
+    /// Focus arrivals center the strip under `auto_center`. Two 400-wide
+    /// windows stay fully onscreen throughout (three would push a sibling
+    /// offscreen into sliver parking, which the Swift core does not model
+    /// yet): focus lands on id 1 (slot 400), so the strip rests at
+    /// 512 - 200 - 400 = -88.
+    #[test]
+    fn pair_centered_trace() {
+        let mut harness = TestHarness::new()
+            .with_config(centered_config())
+            .with_windows(2);
+        let snapshots = harness.run_with_trace(tiling_commands());
+        let last = snapshots.last().expect("non-empty trace");
+        assert!(last.quiescent, "centered trace must settle: {last:?}");
+        assert_eq!(last.focus, Some(1), "focus lands last: {last:?}");
+        assert_eq!(
+            last.positions.get(&0),
+            Some(&(-88, last.positions[&0].1)),
+            "strip centers the focused window: {last:?}"
+        );
+        assert_eq!(
+            last.positions.get(&1),
+            Some(&(312, last.positions[&1].1)),
+            "focused window sits at viewport center: {last:?}"
+        );
+        dump_corpus("pair_centered", &snapshots);
+    }
+
+    /// A followed virtual move centers the arrival on its new row: id 1
+    /// alone on row 1 (slot 0), so the strip rests at 512 - 200 - 0 = 312.
+    #[test]
+    fn virtual_centered_trace() {
+        let mut harness = TestHarness::new()
+            .with_config(centered_config())
+            .with_windows(2);
+        let snapshots = harness.run_with_trace(virtual_commands());
+        let last = snapshots.last().expect("non-empty trace");
+        assert!(last.quiescent, "centered trace must settle: {last:?}");
+        assert_eq!(last.focus, Some(1), "focus follows the move: {last:?}");
+        assert_eq!(
+            last.positions.get(&1),
+            Some(&(312, last.positions[&1].1)),
+            "moved window centers on its row: {last:?}"
+        );
+        dump_corpus("virtual_centered", &snapshots);
+    }
+
+    /// Drag release homes to the centered slot: focus stays on id 0 from
+    /// the menu arrival (slot 0), so the strip rests at 512 - 200 = 312
+    /// and id 0 homes to 312.
+    #[test]
+    fn drag_centered_trace() {
+        let mut harness = TestHarness::new()
+            .with_config(centered_config())
+            .with_windows(2);
+        let snapshots = harness.run_with_trace(drag_commands());
+        let last = snapshots.last().expect("non-empty trace");
+        assert!(last.quiescent, "release must settle: {last:?}");
+        assert_eq!(
+            last.positions.get(&0),
+            Some(&(312, last.positions[&0].1)),
+            "drag homes to the centered slot: {last:?}"
+        );
+        dump_corpus("drag_centered", &snapshots);
     }
 }

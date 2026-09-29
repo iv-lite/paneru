@@ -103,18 +103,21 @@ private func snapshot(of daemon: DaemonCore) -> SwiftFrame {
 }
 
 private func runScenario(
-    workspace: UInt64, windows: [Int32], ticks: [[DaemonEvent]]
+    workspace: UInt64, windows: [Int32], ticks: [[DaemonEvent]],
+    autoCenter: Bool = false
 ) -> [SwiftFrame] {
     var daemon = DaemonCore()
     daemon.activeWorkspace = workspace
     // Mirror the Rust trace harness (setup_world forces animations:false
     // so 200ms command windows assert exact rest positions): snap instead
     // of opening 250ms eased glides the 5-tick drain could never converge.
-    // Slots abut on both sides now (gaps are host-side AX insets, never
-    // slot pitch), so gap-free geometry agrees exactly; the mock frames
-    // below stand in for padded truth with zero insets.
+    // Slots abut on both sides (gaps are host-side AX insets, never slot
+    // pitch), so gap-configured corpora replay with the same geometry;
+    // the mock frames below stand in for padded truth with zero insets.
+    // autoCenter mirrors the Rust trace config per scenario.
     daemon.animationsEnabled = false
     daemon.glideBaseMs = 0
+    daemon.autoCenter = autoCenter
     // Seed tick (uncompared): harness spawns pre-run.
     _ = daemon.tick(
         events: windows.map { DaemonEvent.appeared(id: $0, workspace: workspace) },
@@ -239,6 +242,95 @@ if let rust = loadCorpus(traceDir, "drag") {
         [], [], [], [], [], [],
     ])
     checkParity(name: "drag", rust: rust, swift: swift, finalOnly: true)
+}
+
+// tiling_gaps: same script as tiling under non-default gaps — slot
+// origins must not move (insets only, never pitch).
+if let rust = loadCorpus(traceDir, "tiling_gaps") {
+    ran += 1
+    let swift = runScenario(workspace: 2, windows: [0, 1, 2], ticks: [
+        [.focus(id: 0)],
+        [.command(.window(.focus(.last)))],
+        [],
+    ])
+    checkParity(name: "tiling_gaps", rust: rust, swift: swift)
+}
+
+// virtual_gaps: same script as virtual under non-default gaps.
+if let rust = loadCorpus(traceDir, "virtual_gaps") {
+    ran += 1
+    let swift = runScenario(workspace: 2, windows: [0, 1], ticks: [
+        [.focus(id: 0)],
+        [.command(.window(.focus(.last)))],
+        [.command(.window(.virtualMoveNumber(1, .follow)))],
+        [],
+    ])
+    checkParity(name: "virtual_gaps", rust: rust, swift: swift)
+}
+
+// drag_gaps: same script as drag under non-default gaps, final only.
+if let rust = loadCorpus(traceDir, "drag_gaps") {
+    ran += 1
+    let swift = runScenario(workspace: 2, windows: [0, 1], ticks: [
+        [.focus(id: 0)],
+        [],
+        [.dragMoved(id: 0, dx: 100)],
+        [.released],
+        [], [], [], [], [], [],
+    ])
+    checkParity(name: "drag_gaps", rust: rust, swift: swift, finalOnly: true)
+}
+
+// pair_centered: menu, focus-last, print — 2 windows under auto_center.
+// Both windows stay onscreen throughout (a third would park offscreen in
+// the sliver, which the Swift core does not model yet), so the strip
+// centers id 1 at -88 with no divergence.
+if let rust = loadCorpus(traceDir, "pair_centered") {
+    ran += 1
+    let swift = runScenario(
+        workspace: 2, windows: [0, 1],
+        ticks: [
+            [.focus(id: 0)],
+            [.command(.window(.focus(.last)))],
+            [],
+        ],
+        autoCenter: true
+    )
+    checkParity(name: "pair_centered", rust: rust, swift: swift)
+}
+
+// virtual_centered: same script as virtual under auto_center — the
+// followed arrival centers on its new row.
+if let rust = loadCorpus(traceDir, "virtual_centered") {
+    ran += 1
+    let swift = runScenario(
+        workspace: 2, windows: [0, 1],
+        ticks: [
+            [.focus(id: 0)],
+            [.command(.window(.focus(.last)))],
+            [.command(.window(.virtualMoveNumber(1, .follow)))],
+            [],
+        ],
+        autoCenter: true
+    )
+    checkParity(name: "virtual_centered", rust: rust, swift: swift)
+}
+
+// drag_centered: same script as drag under auto_center, final only.
+if let rust = loadCorpus(traceDir, "drag_centered") {
+    ran += 1
+    let swift = runScenario(
+        workspace: 2, windows: [0, 1],
+        ticks: [
+            [.focus(id: 0)],
+            [],
+            [.dragMoved(id: 0, dx: 100)],
+            [.released],
+            [], [], [], [], [], [],
+        ],
+        autoCenter: true
+    )
+    checkParity(name: "drag_centered", rust: rust, swift: swift, finalOnly: true)
 }
 
 if ran == 0 {

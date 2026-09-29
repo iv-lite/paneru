@@ -415,14 +415,21 @@ public struct DaemonCore: Sendable {
         }
         // Focus arrival reveals: scroll the minimal shortfall so the
         // focused window is fully visible (mirrors ensure_visible; the
-        // strip never chases anything else). Only at rest — an offset
-        // write this tick, a held drag, fresh gestures, or a recent move
-        // stand the reveal down into the pending set that fires once the
-        // strip settles, so a flapping focus cannot yank mid-flight.
-        // Reveal drains here, pre-commit, and writes offset TARGETS:
-        // the commit head eases (or snaps, with animations off) them
-        // into this tick's slots, so snap-mode frames — including the
-        // frame-parity harness — observe the reveal synchronously.
+        // strip never chases anything else). Minimal-expose waits for
+        // rest — an offset write this tick, a held drag, fresh gestures,
+        // or a recent move stand the reveal down into the pending set
+        // that fires once the strip settles, so a flapping focus cannot
+        // yank mid-flight. Centering (autoCenter) instead drains
+        // arrival-immediately like Rust's autocenter_window_on_focus:
+        // the already-placed check inside centerFocus absorbs repeats,
+        // and the window rides the strip rigidly, so mid-flight arrivals
+        // bend the glide instead of yanking it. Only held drags and
+        // fresh gestures stand centering down (Rust skips centering
+        // while the mouse holds the layout).
+        // Both drains write offset TARGETS pre-commit: the commit head
+        // eases (or snaps, with animations off) them into this tick's
+        // slots, so snap-mode frames — including the frame-parity
+        // harness — observe the arrival synchronously.
         // Pure AX traffic (resizes, converged pushes) does not count
         // as motion.
         func rested() -> Bool {
@@ -430,7 +437,15 @@ public struct DaemonCore: Sendable {
                 && !gestureFresh && held == nil
                 && (lastOffsetMoveEpoch.map({ epoch &- $0 >= revealRestEpochs }) ?? true)
         }
-        if !pendingReveals.isEmpty, rested() {
+        func arrivalReady() -> Bool {
+            offsets == offsetsBeforeTick && !gestureFresh && held == nil
+        }
+        if !pendingReveals.isEmpty, autoCenter, arrivalReady() {
+            for id in pendingReveals.sorted() {
+                revealOwner(id, frames: frames, viewports: viewports)
+            }
+            pendingReveals.removeAll()
+        } else if !pendingReveals.isEmpty, rested() {
             for id in pendingReveals.sorted() {
                 revealOwner(id, frames: frames, viewports: viewports)
             }
@@ -449,8 +464,15 @@ public struct DaemonCore: Sendable {
         }
         let jobs = commitPass(frames: frames, viewports: viewports, epoch: epoch)
         // Transfer reveals land on fresh slots (commit just wrote them);
-        // the ease below glides there over the next ticks.
-        if !transferReveals.isEmpty, rested() {
+        // the ease below glides there over the next ticks. Same split
+        // as arrivals above: centering drains arrival-ready, expose
+        // waits for rest.
+        if !transferReveals.isEmpty, autoCenter, arrivalReady() {
+            for id in transferReveals.sorted() {
+                revealOwner(id, frames: frames, viewports: viewports)
+            }
+            transferReveals.removeAll()
+        } else if !transferReveals.isEmpty, rested() {
             for id in transferReveals.sorted() {
                 revealOwner(id, frames: frames, viewports: viewports)
             }
@@ -919,6 +941,14 @@ public struct DaemonCore: Sendable {
         target.insertColumn(at: Int.max, column)
         strips[ws, default: [:]][targetRow] = target
         activeVirtual[ws] = targetRow
+        // Refocus-equivalent: Rust re-focuses the moved window on follow,
+        // so the arrival path (reveal, and centering under autoCenter)
+        // runs against the new row's fresh slots. Post-commit drain reads
+        // committedSlots written by this tick's layout, never stale ones.
+        // No focusTouch: same display, already key — nothing to actuate.
+        // Harmless when the window is not on the shown row (revealFocus
+        // requires shown-row membership).
+        transferReveals.insert(id)
         dirty.formUnion([.layout, .paint])
     }
 
