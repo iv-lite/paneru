@@ -2691,6 +2691,42 @@ do {
     )
 }
 
+// Overlap detector: abutting edges stay silent, interior pixels report.
+do {
+    let a = IntRect(0, 0, 400, 700)
+    let b = IntRect(400, 0, 800, 700)
+    check(findOverlaps([(0, a), (1, b)]).isEmpty, "abutting pair is silent")
+    let seam = IntRect(399, 0, 800, 700)
+    check(findOverlaps([(0, a), (1, seam)]).isEmpty, "1px rounding seam is silent")
+    let over = IntRect(200, 0, 600, 700)
+    let hits = findOverlaps([(1, over), (0, a)])
+    checkEqual(hits.count, 1, "interior overlap reports once")
+    checkEqual(hits.first?.first, 0, "pairs sort first")
+    checkEqual(hits.first?.second, 1, "pairs sort second")
+    checkEqual(hits.first?.inter.width, 200, "intersection width")
+}
+
+// Wiring: a settled tiled pair reports no rest-state overlap (jobs
+// acked so no in-flight excuse masks the geometry).
+do {
+    var daemon = DaemonCore()
+    daemon.animationsEnabled = false
+    daemon.glideBaseMs = 0
+    let live = frames(slots: [0: IntPoint(0, 34), 1: IntPoint(400, 34)])
+    let r1 = daemon.tick(
+        events: [.appeared(id: 0, workspace: 1), .appeared(id: 1, workspace: 1)],
+        frames: live, viewport: viewport, focusedStyle: style
+    )
+    for job in r1.axJobs {
+        daemon.acknowledge(winID: job.winID, seq: job.seq, epoch: job.epoch)
+    }
+    let r2 = daemon.tick(events: [], frames: live, viewport: viewport, focusedStyle: style)
+    for job in r2.axJobs {
+        daemon.acknowledge(winID: job.winID, seq: job.seq, epoch: job.epoch)
+    }
+    check(daemon.overlapReport(frames: live).isEmpty, "settled tiled pair is overlap-free")
+}
+
 if failures == 0 {
     print("DaemonChecks: all checks passed")
 } else {

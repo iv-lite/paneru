@@ -123,6 +123,42 @@ public struct IntRect: Equatable, Hashable, Sendable {
     }
 }
 
+// MARK: - Overlap detection
+
+/// One interior overlap between two live frames. Shared edges (abutting
+/// slots) and 1px rounding seams never qualify, so tiled neighbors stay
+/// silent — a hit means real glass-on-glass.
+public struct FrameOverlap: Equatable, Sendable {
+    public var first: WindowID
+    public var second: WindowID
+    public var inter: IntRect
+
+    public init(first: WindowID, second: WindowID, inter: IntRect) {
+        self.first = first
+        self.second = second
+        self.inter = inter
+    }
+}
+
+/// Pairwise interior overlaps over live frames, pairs in sorted order.
+/// Pure (directly unit-testable); callers scope the input to co-visible
+/// windows so parked slivers and drag flights never report.
+public func findOverlaps(_ rects: [(WindowID, IntRect)]) -> [FrameOverlap] {
+    var hits: [FrameOverlap] = []
+    for i in rects.indices {
+        for j in rects.indices where j > i {
+            let inter = rects[i].1.intersected(with: rects[j].1)
+            guard inter.width > 1, inter.height > 1 else { continue }
+            let a = rects[i].0, b = rects[j].0
+            hits.append(FrameOverlap(
+                first: Swift.min(a, b), second: Swift.max(a, b), inter: inter
+            ))
+        }
+    }
+    hits.sort { $0.first != $1.first ? $0.first < $1.first : $0.second < $1.second }
+    return hits
+}
+
 // MARK: - Pixel rounding
 
 /// Round to whole pixels, clamped to `Int32` range so the conversion is

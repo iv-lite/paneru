@@ -2858,6 +2858,13 @@ nonisolated(unsafe) var radiusRulesGen = 0
         for line in core.divergenceReport(frames: { roster[CGWindowID(bitPattern: $0)]?.frame }) {
             print("drift: \(line)")
         }
+        // Rest-state overlap watch (same cadence): silent when tiled,
+        // one capped block when glass shares interior pixels — slots
+        // ride along so the verdict (slot math vs write path) is in
+        // the log, not a forensic session.
+        for line in core.overlapReport(frames: { roster[CGWindowID(bitPattern: $0)]?.frame }) {
+            print("\(line)")
+        }
     }
     // Shadow observer poll (tick-cadenced): fetch async off-thread,
     // diff at rest on-thread. The normal path never pays for this.

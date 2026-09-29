@@ -1888,6 +1888,48 @@ public struct DaemonCore: Sendable {
         return lines
     }
 
+    /// Rest-state overlap snapshot: pairs of co-visible managed windows
+    /// whose live frames share interior pixels. Committed slots ride
+    /// along so the verdict is immediate — equal slots blame slot math,
+    /// split slots blame the write/ack path or an outside actor.
+    /// Members with an in-flight excuse (glide leg, homing, held hand,
+    /// unacked job), fullscreen columns, and parked rows never report —
+    /// only unexplained rest-state glass. Empty means no two visible
+    /// windows overlap. Callers print throttled, like `divergenceReport`.
+    public func overlapReport(frames: (WindowID) -> IntRect?) -> [String] {
+        var visible: [(WindowID, IntRect)] = []
+        for ws in strips.keys.sorted() {
+            let shownRow = activeVirtual[ws] ?? 0
+            for (rowIndex, strip) in (strips[ws] ?? [:]) {
+                guard rowIndex == shownRow else { continue }
+                for column in strip.columns {
+                    if case .fullscreen = column { continue }
+                    for member in column.windows {
+                        guard !unmanaged.contains(member),
+                              !homing.contains(member),
+                              held != member,
+                              glides[member] == nil,
+                              !ax.unackedLive(member),
+                              let live = frames(member)
+                        else { continue }
+                        visible.append((member, live))
+                    }
+                }
+            }
+        }
+        var lines: [String] = []
+        for hit in findOverlaps(visible).prefix(8) {
+            let aSlot = committedSlots[hit.first].map { "\($0.x),\($0.y)" } ?? "?"
+            let bSlot = committedSlots[hit.second].map { "\($0.x),\($0.y)" } ?? "?"
+            lines.append(
+                "overlap: a=\(hit.first) b=\(hit.second)"
+                    + " inter=\(hit.inter.width)x\(hit.inter.height)"
+                    + " slots=(\(aSlot))/(\(bSlot))"
+            )
+        }
+        return lines
+    }
+
     /// Slow consistency repair (runs on the audit cadence): re-homes
     /// managed windows whose live frames drifted off their slots while
     /// the fast path rests. The commit redrive backs off to 8s and
