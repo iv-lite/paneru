@@ -1636,10 +1636,13 @@ public struct DaemonCore: Sendable {
     /// the window, so the arrival rides rigidly with its siblings.
     /// Uses last committed slots (layout is unchanged by focus itself).
     /// Only fires for windows in the shown row (revealing a parked slot
-    /// is meaningless motion), and — on the minimal-expose path only —
-    /// when the hidden fraction exceeds `windowHiddenRatio`: with the
-    /// shipped 1.0, clicks (always on visible windows) never scroll, while
-    /// keyboard focus into fully-hidden windows still reveals. Slots are
+    /// is meaningless motion). Like Rust's `ensure_focused_visible`, the
+    /// arrival guarantees full visibility regardless of path — the
+    /// `windowHiddenRatio` threshold does not apply here (it governs
+    /// unfocused windows only, and there is no unfocused-reveal path):
+    /// a fully visible window is already home, so the shared assign-only
+    /// machinery below stays silent for it — that, not the ratio, is
+    /// what keeps settled clicks from scrolling. Slots are
     /// absolute (they bake the offset), so the layout arm passes the
     /// offset-free position — passing the absolute slot double-counts the
     /// offset on settled strips.
@@ -1660,17 +1663,12 @@ public struct DaemonCore: Sendable {
             min: IntPoint(viewport.min.x, 0),
             max: IntPoint(viewport.max.x, viewport.height)
         )
-        if windowHiddenRatio > 0 {
+        // Fully visible arrivals rest: degenerate (zero-width) frames
+        // fall through to the expose below, as before.
+        if width > 0 {
             let lo = max(slot.x, view.min.x)
             let hi = min(slot.x + width, view.max.x)
-            let visible = max(hi - lo, 0)
-            let hidden: Double
-            if width <= 0 {
-                hidden = 1.0
-            } else {
-                hidden = 1.0 - Double(visible) / Double(width)
-            }
-            guard hidden >= windowHiddenRatio, hidden > 0 else { return }
+            guard min(hi - lo, width) < width else { return }
         }
         let next = originExposing(
             layout: IntPoint(slot.x - offset, 0), size: IntSize(width, 0),

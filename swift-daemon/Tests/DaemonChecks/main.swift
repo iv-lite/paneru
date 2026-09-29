@@ -560,8 +560,11 @@ do {
     check(rested.quiescent, "space return rests")
 }
 
-// Hidden-ratio reveal: clicks on visible windows never scroll (1.0),
-// while focus into fully-hidden windows still reveals after rest.
+// Arrival reveal: clicks on visible windows never scroll, while focus
+// into hidden windows reveals after rest — fully AND partially hidden
+// alike. The ratio gate is gone (Rust `ensure_focused_visible` parity:
+// arrivals guarantee full visibility); `windowHiddenRatio` stays set
+// here to pin that it no longer suppresses arrivals.
 do {
     var daemon = DaemonCore()
     daemon.windowHiddenRatio = 1.0
@@ -620,6 +623,52 @@ do {
         )
     }
     checkEqual(daemon.offsets[1], 0, "reveal glides the hidden window home")
+    // Partially-hidden focus reveals too (the 95%-hung arrival used to
+    // strand under the ratio gate): park window 0 halfway out, rest,
+    // focus elsewhere and back (a same-value focus is no arrival), then
+    // focus it home.
+    _ = daemon.tick(
+        events: [.swipe(delta: 0.2, fingers: 3)],
+        frames: frames(slots: settled),
+        viewports: [1: viewport], focusedStyle: style
+    )
+    let parked = daemon.offsets[1] ?? 0
+    check(parked < 0 && parked > -400, "setup leaves window 0 partially out")
+    let partial: [Int32: IntPoint] = [
+        0: IntPoint(parked, 0), 1: IntPoint(400 + parked, 0), 2: IntPoint(800 + parked, 0),
+    ]
+    for _ in 0..<40 {
+        _ = daemon.tick(
+            events: [], frames: frames(slots: partial),
+            viewports: [1: viewport], focusedStyle: style
+        )
+    }
+    _ = daemon.tick(
+        events: [.focus(id: 1)],
+        frames: frames(slots: partial),
+        viewports: [1: viewport], focusedStyle: style
+    )
+    for _ in 0..<5 {
+        _ = daemon.tick(
+            events: [], frames: frames(slots: partial),
+            viewports: [1: viewport], focusedStyle: style
+        )
+    }
+    _ = daemon.tick(
+        events: [.focus(id: 0)],
+        frames: frames(slots: partial),
+        viewports: [1: viewport], focusedStyle: style
+    )
+    checkEqual(
+        daemon.offsetTarget(for: 1), 0, "partially-hidden focus retargets after rest"
+    )
+    for _ in 0..<25 {
+        _ = daemon.tick(
+            events: [], frames: frames(slots: partial),
+            viewports: [1: viewport], focusedStyle: style
+        )
+    }
+    checkEqual(daemon.offsets[1], 0, "reveal glides the partial window home")
 }
 
 // East/west at the strip edge steps across displays: nearest viewport

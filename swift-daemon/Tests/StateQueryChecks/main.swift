@@ -251,6 +251,12 @@ do {
         print("StateQueryChecks: live Rust daemon answered a shadow read")
     } catch RustStateError.daemonNotRunning {
         check(true, "missing daemon maps to .daemonNotRunning")
+    } catch let error as RustStateError {
+        // A present-but-unanswering daemon (still waiting on its own
+        // Accessibility grant, wedged queries): the client must fail
+        // typed, never trap — the soak triages the cause live.
+        print("StateQueryChecks: rust unreachable (\(error)), mapping holds")
+        check(true, "unreachable daemons fail typed")
     } catch {
         check(false, "unexpected shadow read failure: \(error)")
     }
