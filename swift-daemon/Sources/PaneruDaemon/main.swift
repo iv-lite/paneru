@@ -1914,6 +1914,8 @@ nonisolated(unsafe) var lastWarpEval = Date.distantPast
            cursor: cursor
        ), hovered != core.focus
     {
+        lastHoverID = hovered
+        lastHoverAt = Date()
         pending.append(.focus(id: hovered))
     }
 }
@@ -2110,6 +2112,13 @@ nonisolated(unsafe) var prevTickRosterSig = 0
 /// keyboard-caused and always recenter.
 nonisolated(unsafe) var lastKeyCommandAt = Date.distantPast
 nonisolated(unsafe) var prevMffFocus: WindowID?
+/// Last hover-sourced focus (id + poll time): the mouse already sits on
+/// a hovered window, so warping to it only feeds the hover/reveal/warp
+/// flap loop (warp moves the cursor, motion re-polls hover, reveal has
+/// meanwhile scrolled new glass under the point). Arrivals matching a
+/// fresh hover never warp — Rust's skip-reshuffle generation, host-side.
+nonisolated(unsafe) var lastHoverID: WindowID?
+nonisolated(unsafe) var lastHoverAt = Date.distantPast
 /// Session persistence dirtied since the last save (Rust 30s
 /// dirty-gated cadence, simplified: any busy tick or focus/row/
 /// roster drift marks it; the interval below does the write).
@@ -2127,6 +2136,12 @@ nonisolated(unsafe) var prevActiveWS: WorkspaceID?
 let mouseFollowPressWindow = 0.4
 let mouseFollowKeyWindow = 0.5
 let mouseFollowSwipeQuiet = 0.6
+/// Hover echoes never warp: the pointer already caused this arrival, so
+/// a warp only moves the cursor onto post-reveal glass and re-polls a
+/// new hover (the flap loop). Covers the arrival tick plus reveal
+/// settle; a later keyboard arrival for the same window still warps
+/// once the echo ages out.
+let mouseFollowHoverEcho = 1.0
 /// Last pointer-poll time: hover and edge checks run ~4Hz but only
 /// after motion, so a still cursor costs no WindowServer round trips.
 nonisolated(unsafe) var lastPointerPoll = Date.distantPast
@@ -2659,14 +2674,18 @@ nonisolated(unsafe) var radiusRulesGen = 0
     }
     // Mouse-follows-focus: a focus arrival the pointer didn't cause
     // warps to the window's visible center (simplified
-    // `Added<FocusedMarker>` arrival system — no skip-reshuffle
-    // generation, so an FFM hover echo can round-trip; hovers never
-    // warp, only keyboard and ambient arrivals do). Display hops above
-    // land first; the window center then wins, like Rust's arrival
-    // pass running after the move commands.
+    // `Added<FocusedMarker>` arrival system). Hover echoes never warp —
+    // the pointer already sits on the window, and warping onto
+    // pre-reveal geometry round-trips into a new hover once reveal
+    // scrolls (the flap loop). Only keyboard and non-hover ambient
+    // arrivals warp. Display hops above land first; the window center
+    // then wins, like Rust's arrival pass running after the move
+    // commands.
     if resolved.mouseFollowsFocus,
        let id = result.focus, id != prevMffFocus,
        !tap.leftButtonHeld,
+       !(id == lastHoverID
+           && Date().timeIntervalSince(lastHoverAt) < mouseFollowHoverEcho),
        Date().timeIntervalSince(tap.lastSwipe) >= mouseFollowSwipeQuiet,
        let window = roster[CGWindowID(bitPattern: id)],
        let ws = workspaceOfWindow(id),
