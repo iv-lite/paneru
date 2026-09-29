@@ -2646,6 +2646,51 @@ do {
     }
 }
 
+// Native OS move re-tiles: live frames jump with no model events and
+// the drifted window gets a corrective intent back to its slot.
+do {
+    var daemon = DaemonCore()
+    daemon.animationsEnabled = false
+    daemon.glideBaseMs = 0
+    _ = daemon.tick(
+        events: [
+            .appeared(id: 0, workspace: 1), .appeared(id: 1, workspace: 1),
+            .focus(id: 0),
+        ],
+        frames: frames(slots: [0: IntPoint(0, 0), 1: IntPoint(0, 0)]),
+        viewport: viewport, focusedStyle: style
+    )
+    for _ in 0..<10 {
+        let pos = daemon.positions
+        _ = daemon.tick(
+            events: [],
+            frames: { id in
+                let origin = pos[id] ?? IntPoint(0, 0)
+                return IntRect(min: origin, max: IntPoint(origin.x + 400, origin.y + 700))
+            },
+            viewport: viewport, focusedStyle: style
+        )
+    }
+    // Window 0 natively dragged 200px right, overlapping window 1.
+    // Model never moved: positions still read the old slots.
+    checkEqual(daemon.positions[0], IntPoint(0, 34), "model pristine before native move")
+    let p1 = daemon.positions[1] ?? IntPoint(0, 0)
+    let drifted = daemon.tick(
+        events: [],
+        frames: { id in
+            if id == 0 {
+                return IntRect(min: IntPoint(200, 34), max: IntPoint(600, 734))
+            }
+            return IntRect(min: p1, max: IntPoint(p1.x + 400, p1.y + 700))
+        },
+        viewport: viewport, focusedStyle: style
+    )
+    check(
+        drifted.axJobs.contains(where: { $0.winID == 0 && $0.origin == IntPoint(0, 34) }),
+        "native drift re-drives home immediately"
+    )
+}
+
 if failures == 0 {
     print("DaemonChecks: all checks passed")
 } else {
