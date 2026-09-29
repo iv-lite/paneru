@@ -33,7 +33,7 @@ private func decoded(_ data: Data?) -> [String: Any] {
 // IPC.swift): the Swift daemon owns the suffixed Mach name so both
 // daemons can coexist during cutover.
 do {
-    checkEqual(paneruServiceName, "com.github.karinushka.paneru.swift", "service name")
+    checkEqual(paneruServiceName, "com.github.iv-lite.paneru-swift", "service name")
     checkEqual(paneruServiceNameResolved(environment: [:]), paneruServiceName, "default service")
     checkEqual(
         paneruServiceNameResolved(environment: [paneruServiceEnv: "com.example.dev"]),

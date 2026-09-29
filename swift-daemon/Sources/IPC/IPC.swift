@@ -22,7 +22,7 @@ import Scripting
 /// install label, and the two daemons must never share a Mach name —
 /// a base default here once left fresh installs deaf while `pq`
 /// looked somewhere else entirely.
-public let paneruServiceName = "com.github.karinushka.paneru.swift"
+public let paneruServiceName = "com.github.iv-lite.paneru-swift"
 /// Env override so a dev build runs beside an installed one.
 /// Mirrors `wire::SERVICE_ENV`.
 public let paneruServiceEnv = "PANERU_MACH_SERVICE"

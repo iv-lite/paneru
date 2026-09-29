@@ -202,7 +202,7 @@ $ swift-daemon/install-service.sh stop
 $ swift-daemon/install-service.sh uninstall
 ```
 
-Logs land in `/tmp/com.github.karinushka.paneru.swift_<uid>.out.log`
+Logs land in `/tmp/com.github.iv-lite.paneru-swift_<uid>.out.log`
 (and `.err.log`). The agent runs beside the Rust one under its own
 label and Mach port, so both can be installed during the transition;
 quit the Rust daemon before trying the Swift one over the same windows.

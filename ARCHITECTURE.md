@@ -324,8 +324,10 @@ until cutover:
   (`Tests/LuaBridgeChecks`).
 - **Service bundle** (done): `Program`-style plist models consolidated,
   `RenderPlist` helper, `swift-daemon/install-service.sh`
-  (build/sign/install/start/stop/uninstall) under the suffixed
-  `com.github.karinushka.paneru.swift` label.
+  (build/sign/install/start/stop/uninstall) under the
+  `com.github.iv-lite.paneru-swift` label (Swift identity; the Rust
+  `com.github.karinushka.paneru` agent is untouched — install migrates
+  the previous `...karinushka.paneru.swift` Swift label away).
 - **nix removal** (done): `nix/`, `flake.nix`/`flake.lock`, `.envrc`
   deleted; README documents the Swift install. `src/` retires batch by
   batch behind `PANERU_SWIFT_DAEMON` — nothing there is deleted before

@@ -7,13 +7,17 @@
 #   swift-daemon/install-service.sh stop      - stop a running agent
 #
 # Per-user agent (never a system daemon: AX grants and config live in the
-# login session). The label is suffixed so the Swift agent runs beside the
-# Rust one during the transition. Ad-hoc signature with a stable
-# identifier keeps the Accessibility grant across rebuilds.
+# login session). Swift identity only — the Rust agent
+# (`com.github.karinushka.paneru`, no suffix) is never touched.
+# Ad-hoc signature with a stable identifier keeps the Accessibility
+# grant across rebuilds (renaming the identifier re-prompts once).
 set -eu
 
-LABEL="com.github.karinushka.paneru.swift"
-IDENTIFIER="com.github.karinushka.paneru.swift"
+LABEL="com.github.iv-lite.paneru-swift"
+IDENTIFIER="com.github.iv-lite.paneru-swift"
+# Previous Swift label: one-time migration below stops it and removes
+# its plist/logs on install. The Rust label is not matched.
+OLD_LABEL="com.github.karinushka.paneru.swift"
 BIN_DIR="$HOME/.local/bin"
 BIN="$BIN_DIR/paneru-swift"
 PLIST="$HOME/Library/LaunchAgents/$LABEL.plist"
@@ -28,6 +32,16 @@ bootstrapped() {
 }
 
 do_install() {
+    # Migrate the previous Swift label once: stop it and remove its
+    # plist/logs so two Swift agents never overlap. Rust (unsuffixed)
+    # is out of scope and keeps running.
+    if launchctl print "gui/$UID_NUM/$OLD_LABEL" >/dev/null 2>&1; then
+        launchctl bootout "gui/$UID_NUM" "$HOME/Library/LaunchAgents/$OLD_LABEL.plist" 2>/dev/null || \
+            launchctl kill SIGTERM "gui/$UID_NUM/$OLD_LABEL" 2>/dev/null || true
+        echo "migrated away from $OLD_LABEL"
+    fi
+    rm -f "$HOME/Library/LaunchAgents/$OLD_LABEL.plist"
+    rm -f "/tmp/${OLD_LABEL}_${UID_NUM}.out.log" "/tmp/${OLD_LABEL}_${UID_NUM}.err.log"
     # One product per invocation: swift build silently honors only the
     # last --product flag. Bin dir resolves via --show-bin-path so the
     # script tracks whatever layout the active toolchain uses.
