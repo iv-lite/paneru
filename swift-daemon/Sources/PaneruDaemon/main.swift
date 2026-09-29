@@ -2602,6 +2602,17 @@ let perfSlowTickMs = 8.0
     // Grab-time arming into the core (fresh every tick, never stale):
     // only armed grabs chase hand truth and relocate on release.
     core.dragArmed = dragGrabbed != nil && dragPressArmed
+    // Focused-frame boost before the core reads frames: borders track
+    // the roster's cached frame (halves refresh each window at ~1Hz),
+    // so a just-focused or still-gliding window wears a stale border
+    // until the next refresh — most visible when focus hops displays.
+    // One synchronous read while anything moves or focus just changed;
+    // quiescent ticks rest on exact cached truth.
+    if let focus = core.focus, focus != prevTickFocus || !lastQuiescent,
+       let window = roster[CGWindowID(focus)]
+    {
+        _ = window.updateFrame()
+    }
     let result = core.tick(
         events: filteredEvents,
         frames: { roster[CGWindowID(bitPattern: $0)]?.frame },
