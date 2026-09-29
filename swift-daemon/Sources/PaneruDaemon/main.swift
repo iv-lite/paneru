@@ -330,7 +330,7 @@ do {
 
 // MARK: - Shadow poll
 
-let shadowQueue = DispatchQueue(label: "com.github.karinushka.paneru.swift.shadow")
+let shadowQueue = DispatchQueue(label: "com.github.iv-lite.paneru-swift.shadow")
 
 /// Async Rust-state fetch plumbing: the 60Hz thread never blocks on the
 /// CLI subprocess (a wedged Rust daemon must stall nothing but the
@@ -502,7 +502,7 @@ nonisolated(unsafe) var probing: Set<CGWindowID> = []
 /// all input delivery). Results hop back to main for roster/model
 /// application. One lane keeps per-app ordering sane.
 let axWorker = DispatchQueue(
-    label: "com.github.karinushka.paneru.swift.ax", qos: .userInitiated
+    label: "com.github.iv-lite.paneru-swift.ax", qos: .userInitiated
 )
 
 /// Newcomer probe results: plain data across the queue boundary (the live
@@ -744,6 +744,12 @@ nonisolated(unsafe) var stableFrames: [CGWindowID: IntRect] = [:]
     }
 }
 
+/// Pending space-rotation votes per workspace: one flaky SLS read
+/// must never rotate layouts (stash + empty strips + re-adopt storm =
+/// lost window positions). A fresh NSWorkspace switch signal
+/// corroborates immediately; silent changes need two agreeing syncs.
+nonisolated(unsafe) var spaceVotes: [WorkspaceID: (space: SpaceID, seen: Int)] = [:]
+
 /// Reconcile the roster with the on-screen list. Vanished windows drop
 /// inline (no AX involved); newcomers probe on the AX worker and adopt
 /// back on main, so a wedged app's 0.25s timeouts never stall the tap.
@@ -754,6 +760,10 @@ nonisolated(unsafe) var stableFrames: [CGWindowID: IntRect] = [:]
 /// signal and the 1Hz backstop share one path.
 @Sendable func refreshSpaces() {
     guard skyCID != nil else { return }
+    // A fresh switch signal corroborates the read (same 2s window as
+    // the fast re-home path); silent changes vote below instead.
+    let corroborated =
+        spaceChangedAt.map { Date().timeIntervalSince($0) < 2.0 } ?? false
     var live = Set<SpaceID>()
     for ws in displayWorkspaceRing() {
         guard let display = workspaceDisplay[ws],
@@ -761,8 +771,32 @@ nonisolated(unsafe) var stableFrames: [CGWindowID: IntRect] = [:]
         else { continue }
         live.insert(space)
         let old = core.spaceOfWorkspace[ws] ?? 0
-        if core.resolveSpace(workspace: ws, space: space), old != 0 {
-            print("space: ws=\(ws) \(old) → \(space)")
+        // First resolution only records (nothing stashed yet);
+        // agreeing reads clear stale votes.
+        guard old != 0, old != space else {
+            if old == 0 {
+                core.resolveSpace(workspace: ws, space: space)
+            } else {
+                spaceVotes.removeValue(forKey: ws)
+            }
+            continue
+        }
+        if corroborated {
+            spaceVotes.removeValue(forKey: ws)
+            if core.resolveSpace(workspace: ws, space: space) {
+                print("space: ws=\(ws) \(old) → \(space)")
+            }
+            continue
+        }
+        let seen = spaceVotes[ws]?.space == space
+            ? (spaceVotes[ws]?.seen ?? 0) + 1 : 1
+        if seen >= 2 {
+            spaceVotes.removeValue(forKey: ws)
+            if core.resolveSpace(workspace: ws, space: space) {
+                print("space: ws=\(ws) \(old) → \(space) (voted)")
+            }
+        } else {
+            spaceVotes[ws] = (space, seen)
         }
     }
     if let managed = skyManagedSpaces() {
