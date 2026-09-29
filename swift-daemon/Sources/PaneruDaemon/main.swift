@@ -2838,6 +2838,14 @@ nonisolated(unsafe) var radiusRulesGen = 0
             jobs: result.axJobs.count, events: events.count
         )
     }
+    // Model/glass divergence watch (audit cadence): silent when
+    // converged, one capped block when not — the next "it didn't move"
+    // diagnoses itself instead of needing a forensic session.
+    if tickCount % 300 == 0 {
+        for line in core.divergenceReport(frames: { roster[CGWindowID(bitPattern: $0)]?.frame }) {
+            print("drift: \(line)")
+        }
+    }
     // Shadow observer poll (tick-cadenced): fetch async off-thread,
     // diff at rest on-thread. The normal path never pays for this.
     if shadowMode {

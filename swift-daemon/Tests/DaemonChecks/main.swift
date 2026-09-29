@@ -2358,6 +2358,118 @@ do {
     )
 }
 
+// Focus cycling never strands members: after every settled arrival each
+// position equals its committed slot (animations on, like live). Catches
+// ride/retarget divergence where a member rests off-slot with no marker.
+do {
+    var daemon = DaemonCore()
+    _ = daemon.tick(
+        events: [
+            .appeared(id: 0, workspace: 1), .appeared(id: 1, workspace: 1),
+            .appeared(id: 2, workspace: 1),
+        ],
+        frames: frames(slots: [0: IntPoint(0, 0), 1: IntPoint(0, 0), 2: IntPoint(0, 0)]),
+        viewport: viewport, focusedStyle: style
+    )
+    func assertHomed(_ daemon: DaemonCore, _ label: String) {
+        for id in [0, 1, 2] as [Int32] {
+            checkEqual(
+                daemon.positions[id], daemon.committedSlot(of: id),
+                "window \(id) rests on its slot (\(label))"
+            )
+        }
+    }
+    for focus in [0, 1, 2, 0, 2, 1] as [Int32] {
+        _ = daemon.tick(
+            events: [.focus(id: focus)],
+            frames: frames(slots: [
+                0: daemon.positions[0] ?? IntPoint(0, 0),
+                1: daemon.positions[1] ?? IntPoint(0, 0),
+                2: daemon.positions[2] ?? IntPoint(0, 0),
+            ]),
+            viewport: viewport, focusedStyle: style
+        )
+        for _ in 0..<30 {
+            _ = daemon.tick(
+                events: [],
+                frames: frames(slots: [
+                    0: daemon.positions[0] ?? IntPoint(0, 0),
+                    1: daemon.positions[1] ?? IntPoint(0, 0),
+                    2: daemon.positions[2] ?? IntPoint(0, 0),
+                ]),
+                viewport: viewport, focusedStyle: style
+            )
+        }
+        assertHomed(daemon, "after focusing \(focus)")
+    }
+}
+
+// Audit re-homes drifted windows the fast path rests on: live frames
+// frozen off-slot (stuck glass) keep a corrective intent flowing on the
+// audit cadence even degraded, on both displays. The divergence report
+// names the drifter while it disagrees.
+do {
+    var daemon = DaemonCore()
+    daemon.animationsEnabled = false
+    daemon.glideBaseMs = 0
+    daemon.workspaceRing = [1, 2]
+    let left = IntRect(0, 0, 1024, 768)
+    let right = IntRect(1024, 0, 2048, 768)
+    _ = daemon.tick(
+        events: [.appeared(id: 0, workspace: 1), .appeared(id: 1, workspace: 2)],
+        frames: { _ in IntRect(min: IntPoint(0, 0), max: IntPoint(400, 700)) },
+        viewports: [1: left, 2: right], focusedStyle: style
+    )
+    for _ in 0..<10 {
+        _ = daemon.tick(
+            events: [],
+            frames: { _ in IntRect(min: IntPoint(0, 0), max: IntPoint(400, 700)) },
+            viewports: [1: left, 2: right], focusedStyle: style
+        )
+    }
+    // Slots settle viewport-anchored on both displays; snapshot them for
+    // the frozen-glass closures below (which must not borrow the daemon
+    // the tick mutates).
+    let slot0 = daemon.committedSlot(of: 0) ?? IntPoint(-1, -1)
+    let slot1 = daemon.committedSlot(of: 1) ?? IntPoint(-1, -1)
+    checkEqual(slot0, IntPoint(0, 34), "ws1 slots at its origin")
+    checkEqual(slot1, IntPoint(1024, 34), "ws2 slots at its origin")
+    let live: (Int32) -> IntRect? = { id in
+        let slot = id == 0 ? slot0 : slot1
+        return IntRect(min: slot, max: IntPoint(slot.x + 400, slot.y + 700))
+    }
+    // Freeze id 1's glass off-slot; id 0 stays converged as the control.
+    let stuck: (Int32) -> IntRect? = { id in
+        if id == 1 {
+            return IntRect(min: IntPoint(0, 34), max: IntPoint(400, 734))
+        }
+        return live(id)
+    }
+    var degradedSeen = false
+    var repairedAfterDegrade = false
+    for _ in 0..<700 {
+        let result = daemon.tick(
+            events: [], frames: stuck,
+            viewports: [1: left, 2: right], focusedStyle: style
+        )
+        _ = daemon.pollWriterStall()
+        degradedSeen = degradedSeen || daemon.writerDegraded
+        if degradedSeen, result.axJobs.contains(where: { $0.winID == 1 && $0.origin?.x == 1024 }) {
+            repairedAfterDegrade = true
+        }
+    }
+    check(degradedSeen, "stuck glass degrades the writer (nothing acked in-harness)")
+    check(repairedAfterDegrade, "audit re-homes drifted windows even degraded")
+    check(
+        daemon.divergenceReport(frames: stuck).contains(where: { $0.contains("window=1") }),
+        "divergence report names the drifter"
+    )
+    check(
+        !daemon.divergenceReport(frames: live).contains(where: { $0.contains("window=1") }),
+        "converged windows stay silent"
+    )
+}
+
 if failures == 0 {
     print("DaemonChecks: all checks passed")
 } else {

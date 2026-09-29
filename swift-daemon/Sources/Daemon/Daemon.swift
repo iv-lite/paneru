@@ -457,10 +457,12 @@ public struct DaemonCore: Sendable {
         // looking at that display). Focus arrival retargets naturally;
         // yanking active away breaks stay semantics.
         sweepParkedRows(epoch: epoch)
-        // 5s membership audit (300 epochs at 60Hz): dedup + prune only,
-        // mirroring Rust's `audit_window_positions` cadence.
+        // 5s audit (300 epochs at 60Hz): membership dedup/prune plus
+        // drift re-homing, mirroring Rust's `audit_window_positions`
+        // cadence and scope.
         if epoch % 300 == 0 {
             auditPass()
+            auditRehome(frames: frames, epoch: epoch)
         }
         let jobs = commitPass(frames: frames, viewports: viewports, epoch: epoch)
         // Transfer reveals land on fresh slots (commit just wrote them);
@@ -1652,7 +1654,10 @@ public struct DaemonCore: Sendable {
         guard let owner = workspaceOf(id),
               strips[owner]?[activeVirtual[owner] ?? 0]?.contains(id) == true,
               let slot = committedSlots[id]
-        else { return }
+        else {
+            print("focus: reveal skipped window=\(id) (not on shown row or slotless)")
+            return
+        }
         let width = frames(id)?.width ?? 0
         let offset = offsets[owner] ?? 0
         if autoCenter {
@@ -1680,6 +1685,7 @@ public struct DaemonCore: Sendable {
         if next.x != (offsetTargets[owner] ?? offset) {
             offsetTargets[owner] = next.x
             dirty.formUnion([.layout, .motion])
+            print("focus: reveal window=\(id) target=\(next.x) (was \(offset))")
         }
     }
 
@@ -1705,6 +1711,7 @@ public struct DaemonCore: Sendable {
         }
         offsetTargets[owner] = target
         dirty.formUnion([.layout, .motion])
+        print("focus: center window target=\(target) (was \(offset))")
     }
 
     /// Row holding a vanished window in this workspace, if its parked
@@ -1758,8 +1765,8 @@ public struct DaemonCore: Sendable {
     /// Periodic audit backstop (Rust `audit_window_positions`, 5s): drop
     /// cross-strip duplicates (first occurrence wins, later ones collapse
     /// like removals) and prune rows left empty outside the active
-    /// selection. Drift and re-homing stay with the commit redrive;
-    /// this only repairs membership the event path cannot produce.
+    /// selection. Position repair lives in `auditRehome` below; this only
+    /// repairs membership the event path cannot produce.
     public mutating func auditPass() {
         var seen = Set<WindowID>()
         var changed = false
@@ -1790,6 +1797,145 @@ public struct DaemonCore: Sendable {
     private func inAnyStrip(_ id: WindowID) -> Bool {
         strips.values.contains { rows in
             rows.values.contains { $0.contains(id) }
+        }
+    }
+
+    /// Rest-state divergence snapshot for diagnostics: per managed
+    /// window, model position vs committed slot vs live frame, plus the
+    /// flags that excuse each (glide leg, homing, held hand, unacked
+    /// job, backoff streak, degraded writer). Empty when converged.
+    /// Callers print throttled; quiet ticks cost one pass over members.
+    public func divergenceReport(frames: (WindowID) -> IntRect?) -> [String] {
+        var lines: [String] = []
+        var skipped = 0
+        for ws in strips.keys.sorted() {
+            for row in (strips[ws] ?? [:]).keys.sorted() {
+                guard let strip = strips[ws]?[row] else { continue }
+                for member in strip.allWindows.sorted() {
+                    guard !unmanaged.contains(member),
+                          let slot = committedSlots[member],
+                          let live = frames(member)
+                    else {
+                        skipped += 1
+                        continue
+                    }
+                    let position = positions[member]
+                    let size = sizes[member]
+                    var flags: [String] = []
+                    if glides[member] != nil { flags.append("leg") }
+                    if homing.contains(member) { flags.append("homing") }
+                    if held == member { flags.append("held") }
+                    if isUnacked(member) { flags.append("unacked") }
+                    if redriveStreak[member, default: 0] > 0 {
+                        flags.append("streak\(redriveStreak[member] ?? 0)")
+                    }
+                    if writerDegraded, member != focus { flags.append("degraded") }
+                    let posOff = position.map {
+                        abs($0.x - slot.x) + abs($0.y - slot.y)
+                    } ?? -1
+                    let liveOff = abs(live.min.x - slot.x) + abs(live.min.y - slot.y)
+                    let sizeOff: Int32
+                    if let size {
+                        sizeOff = abs(live.width - size.x) + abs(live.height - size.y)
+                    } else {
+                        sizeOff = -1
+                    }
+                    if posOff > 1 || liveOff > 1 || sizeOff > 1 {
+                        lines.append(
+                            "window=\(member) pos=\(position.map { "\($0.x),\($0.y)" } ?? "?")"
+                                + " slot=\(slot.x),\(slot.y) live=\(live.min.x),\(live.min.y)"
+                                + " liveSize=\(live.width)x\(live.height)"
+                                + (flags.isEmpty ? "" : " [\(flags.joined(separator: ","))]")
+                        )
+                    }
+                    if lines.count >= 8 {
+                        skipped += 1
+                    }
+                }
+            }
+        }
+        if skipped > 0 {
+            lines.append("(\(skipped) more unchecked/skipped)")
+        }
+        return lines
+    }
+
+    /// Slow consistency repair (runs on the audit cadence): re-homes
+    /// managed windows whose live frames drifted off their slots while
+    /// the fast path rests. The commit redrive backs off to 8s and
+    /// degrades to focused-only, so a chronically unwritable window can
+    /// sit wrong with no marker in flight and nothing scheduled — this
+    /// guarantees one corrective intent per audit window regardless of
+    /// streaks or degrade state (Rust `audit_window_positions` parity).
+    ///
+    /// Skipped, like Rust: homing members (restore themselves), held
+    /// members (the hand owns truth until release), members with glide
+    /// legs in flight (the commit owns them), fullscreen members (the
+    /// OS owns their geometry — repositioning would fight it), and
+    /// whole workspaces with an unreached offset target (mid-scroll
+    /// strips are moving targets). Sizes re-home alongside origins so
+    /// the Firefox class (OS-clamped dimensions) cannot strand either.
+    private mutating func auditRehome(frames: (WindowID) -> IntRect?, epoch: UInt64) {
+        for (ws, rows) in strips {
+            // Mid-scroll workspaces are moving targets: an unreached
+            // offset target means slots are still traveling.
+            let resting = (offsetTargets[ws] ?? offsets[ws] ?? 0) == (offsets[ws] ?? 0)
+            if !resting {
+                continue
+            }
+            for strip in rows.values {
+                for column in strip.columns {
+                    if case .fullscreen = column {
+                        continue
+                    }
+                    for member in column.windows {
+                        guard !unmanaged.contains(member),
+                              !homing.contains(member),
+                              held != member,
+                              glides[member] == nil,
+                              // Traveling intents may still land: only
+                              // repair what the TTL already gave up on.
+                              !ax.unackedLive(member),
+                              let slot = committedSlots[member],
+                              let live = frames(member)
+                        else { continue }
+                        var repaired = false
+                        // Model and glass disagree with no flight:
+                        // re-issue unconditionally (streaks only
+                        // throttle the fast path, never this one).
+                        // Covers both converged-model drift
+                        // (positions == slot, OS behind) and markerless
+                        // model drift (positions off slot, nothing
+                        // scheduled — the commit path only sees these
+                        // when a trigger rebuilds its contexts).
+                        if abs(live.min.x - slot.x) > axDeadbandPx
+                            || abs(live.min.y - slot.y) > axDeadbandPx
+                        {
+                            ax.invalidateSent(member)
+                            enqueueMove(member, to: slot, epoch: epoch)
+                            repaired = true
+                        }
+                        if let target = sizes[member],
+                           abs(live.width - target.x) > 1 || abs(live.height - target.y) > 1
+                        {
+                            ax.invalidateSent(member)
+                            enqueueResize(member, to: target, epoch: epoch)
+                            repaired = true
+                        }
+                        if repaired {
+                            // Restart backoff fresh (don't clear): the fast
+                            // path keeps its normal cadence from here, and
+                            // static-live detection continues against the
+                            // current frame instead of relearning it.
+                            redriveStreak[member] = 0
+                            redriveLastLive[member] = live
+                            lastRedrive[member] = epoch
+                            sizeStreak[member] = 0
+                            lastSizeRedrive[member] = epoch
+                        }
+                    }
+                }
+            }
         }
     }
 
