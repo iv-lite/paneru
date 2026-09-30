@@ -902,11 +902,23 @@ do {
         ), IntPoint(1914, 410), "negative warp: left edge goes up with signed offset"
     )
     let short = IntRect(1920, 1080, 3840, 1500)
+    // Strict offset math misses (1080+1000 off the 420-tall target), so
+    // the proportional branch maps fractional height instead of
+    // corner-clamping: 1000/1080 of 420 rounds to 389.
     checkEqual(
         daemon.edgeWarpLanding(
             cursor: IntPoint(1, 1000), displays: [upper, short],
             warpDirection: 1, yOffset: 0
-        ), IntPoint(3834, 1499), "unmappable heights clamp into range"
+        ), IntPoint(3834, 1469), "unmappable heights map proportionally"
+    )
+    checkEqual(daemon.lastWarpKind, "proportional:primary", "proportional landing reports its stage")
+    // A large configured offset pushes even the proportional mapping
+    // out of range, so the clamped chain still always lands.
+    checkEqual(
+        daemon.edgeWarpLanding(
+            cursor: IntPoint(1, 1000), displays: [upper, short],
+            warpDirection: 1, yOffset: 500
+        ), IntPoint(3834, 1499), "offset-pushed heights clamp into range"
     )
     checkEqual(daemon.lastWarpKind, "clamp:primary", "clamped landing reports its stage")
 }
@@ -1002,6 +1014,249 @@ do {
     )
 }
 
+// Stairs with no shared Y band at the cursor (builtin above an
+// ultrawide step corner): the strict offset math cannot map, so the
+// proportional branch lands by fractional height instead of sticking.
+do {
+    var daemon = DaemonCore()
+    let builtin = IntRect(0, 0, 1512, 944)
+    let wide = IntRect(1512, 944, 4952, 1582)
+    let steps = [builtin, wide]
+    // Strict misses (944+900 off the 638-tall target); proportional maps
+    // 900/944 of 638 onto the step: 944+608.
+    checkEqual(
+        daemon.edgeWarpLanding(
+            cursor: IntPoint(1511, 900), displays: steps,
+            warpDirection: 1, yOffset: 0
+        ), IntPoint(1518, 1552), "stairs step maps proportionally"
+    )
+    checkEqual(daemon.lastWarpKind, "proportional:fallback", "stairs landing reports its stage")
+    // The way back still maps strictly (556 lands inside the builtin).
+    checkEqual(
+        daemon.edgeWarpLanding(
+            cursor: IntPoint(1513, 1500), displays: steps,
+            warpDirection: -1, yOffset: 0
+        ), IntPoint(1506, 556), "stairs step back maps strictly"
+    )
+    checkEqual(daemon.lastWarpKind, "primary", "return landing reports its stage")
+}
+
+// Stairs-void notch (live geometry: builtin above-left, ultrawide
+// below-right): no display under the cursor, builtin hugging within
+// 8px — evaluates as its right edge instead of sticking silent.
+do {
+    var daemon = DaemonCore()
+    let builtin = IntRect(-1512, 0, 0, 982)
+    let wide = IntRect(0, 982, 3360, 1928)
+    let steps = [builtin, wide]
+    // Strict misses (982+950 off the 946-tall target); proportional
+    // maps 950/982 of 946 onto the step: 982+915.
+    checkEqual(
+        daemon.edgeWarpLanding(
+            cursor: IntPoint(5, 950), displays: steps,
+            warpDirection: -1, yOffset: 0
+        ), IntPoint(6, 1897), "void notch warps onto the step"
+    )
+    checkEqual(
+        daemon.lastWarpKind, "void:proportional:primary",
+        "void landing reports its stage")
+    // Far void stays silent.
+    checkEqual(
+        daemon.edgeWarpLanding(
+            cursor: IntPoint(200, 500), displays: steps,
+            warpDirection: -1, yOffset: 0
+        ), nil, "far void never warps"
+    )
+    checkEqual(daemon.lastWarpKind, "none:outside", "far void reports outside")
+}
+
+// Approach zone: 18px inside the ultrawide's left edge moving outward
+// evaluates as the edge (strict maps 1200-982 onto the builtin;
+// carry -15 lands at -6-15). Stillness, inward motion, and the
+// immunity flag all stay silent; the direct band ignores the flag.
+do {
+    var daemon = DaemonCore()
+    let builtin = IntRect(-1512, 0, 0, 982)
+    let wide = IntRect(0, 982, 3360, 1928)
+    let steps = [builtin, wide]
+    checkEqual(
+        daemon.edgeWarpLanding(
+            cursor: IntPoint(18, 1200), displays: steps,
+            warpDirection: -1, yOffset: 0, velocityX: -500
+        ), IntPoint(-21, 218), "approach zone warps outward motion"
+    )
+    checkEqual(
+        daemon.lastWarpKind, "approach:primary", "approach landing reports its stage")
+    checkEqual(
+        daemon.edgeWarpLanding(
+            cursor: IntPoint(18, 1200), displays: steps,
+            warpDirection: -1, yOffset: 0, velocityX: nil
+        ), nil, "stillness in the zone stays silent"
+    )
+    checkEqual(daemon.lastWarpKind, "none:interior", "stillness reports interior")
+    checkEqual(
+        daemon.edgeWarpLanding(
+            cursor: IntPoint(18, 1200), displays: steps,
+            warpDirection: -1, yOffset: 0, velocityX: 500
+        ), nil, "inward motion stays silent"
+    )
+    checkEqual(
+        daemon.edgeWarpLanding(
+            cursor: IntPoint(18, 1200), displays: steps,
+            warpDirection: -1, yOffset: 0, velocityX: -500,
+            approachAllowed: false
+        ), nil, "immunity suppresses the approach zone"
+    )
+    checkEqual(
+        daemon.edgeWarpLanding(
+            cursor: IntPoint(1, 1200), displays: steps,
+            warpDirection: -1, yOffset: 0, velocityX: -500,
+            approachAllowed: false
+        ), IntPoint(-21, 218), "direct band ignores immunity"
+    )
+    checkEqual(daemon.lastWarpKind, "primary", "direct landing keeps its kind")
+}
+
+// Warp loop breaker: repeated identical landings cool down evaluation
+// (a held push then carries through natively); leaving the radius,
+// expiry, spread-out repeats, or a moved landing all stay live.
+do {
+    var daemon = DaemonCore()
+    let spot = IntPoint(4, 1893)
+    var now: UInt64 = 1_000_000
+    for _ in 0..<4 {
+        check(!daemon.warpLoopNote(landing: spot, nowMs: now), "early repeats stay live")
+        now += 100
+    }
+    check(daemon.warpLoopNote(landing: spot, nowMs: now), "fifth identical landing cools down")
+    check(!daemon.warpLoopAllow(cursor: spot, nowMs: now + 100), "cooldown suppresses at the spot")
+    check(
+        daemon.warpLoopAllow(cursor: IntPoint(500, 500), nowMs: now + 100),
+        "leaving the radius re-arms")
+    for _ in 0..<5 {
+        _ = daemon.warpLoopNote(landing: spot, nowMs: now)
+        now += 100
+    }
+    check(!daemon.warpLoopAllow(cursor: spot, nowMs: now), "recool suppresses again")
+    check(
+        !daemon.warpLoopAllow(cursor: spot, nowMs: now + 60_000),
+        "expiry alone never re-arms a dwelling cursor")
+    check(
+        daemon.warpLoopAllow(cursor: IntPoint(500, 500), nowMs: now + 60_000),
+        "motion past expiry re-arms")
+    var slow = DaemonCore()
+    var t: UInt64 = 2_000_000
+    var tripped = false
+    for _ in 0..<5 {
+        tripped = tripped || slow.warpLoopNote(landing: spot, nowMs: t)
+        t += 20_000
+    }
+    check(!tripped, "spread-out repeats stay live")
+    var drift = DaemonCore()
+    var u: UInt64 = 3_000_000
+    for _ in 0..<4 {
+        _ = drift.warpLoopNote(landing: spot, nowMs: u)
+        u += 100
+    }
+    _ = drift.warpLoopNote(landing: IntPoint(900, 100), nowMs: u)
+    check(!drift.warpLoopNote(landing: spot, nowMs: u + 100), "moved landing restarts the run")
+}
+
+// Honest acks: an answered refusal converges the sequence, feeds the
+// watch list, and parks at threshold with live glass known.
+do {
+    var daemon = DaemonCore()
+    daemon.auditParkAfter = 2
+    let frame: (Int32) -> IntRect? = { _ in
+        IntRect(min: IntPoint(200, 200), max: IntPoint(600, 900))
+    }
+    daemon.noteWriteFailed(0, seq: 1, epoch: 1, frames: frame)
+    checkEqual(daemon.auditSurvivors[0], 1, "refusal feeds the watch list")
+    check(daemon.auditParkedLive[0] == nil, "below threshold stays unparked")
+    check(!daemon.isUnacked(0), "refusal converges the sequence")
+    daemon.noteWriteFailed(0, seq: 2, epoch: 2, frames: frame)
+    check(daemon.auditParkedLive[0] != nil, "threshold parks with live glass")
+}
+
+// Timed-out unacked members count toward parking (hung lane: nothing
+// acked, ever) while the audit keeps repairing below threshold — the
+// degraded recovery path. No focus: post-degrade redrive stays silent,
+// so only audits move the count.
+do {
+    var daemon = DaemonCore()
+    daemon.animationsEnabled = false
+    daemon.glideBaseMs = 0
+    daemon.auditCadenceEpochs = 40
+    daemon.auditParkAfter = 4
+    let live = frames(slots: [0: IntPoint(0, 34)])
+    _ = daemon.tick(
+        events: [.appeared(id: 0, workspace: 1)],
+        frames: live, viewport: viewport, focusedStyle: style
+    )
+    // Freeze the glass off-slot; never acknowledge (hung lane).
+    let drifted: (Int32) -> IntRect? = { _ in
+        IntRect(min: IntPoint(200, 200), max: IntPoint(600, 900))
+    }
+    var repaired = false
+    for _ in 0..<500 {
+        let r = daemon.tick(events: [], frames: drifted, viewport: viewport, focusedStyle: style)
+        _ = daemon.pollWriterStall()
+        repaired = repaired || r.axJobs.contains(where: { $0.winID == 0 })
+        // NOTE: no acknowledge — completions never arrive.
+    }
+    check(repaired, "timed-out members still get audit repairs below threshold")
+    check(daemon.auditParkedLive[0] != nil, "chronic unacked parks")
+}
+
+// Heal-cleared hidden windows rest: refocus arrivals drop and intents
+// skip until the block lapses, then focus lands normally.
+do {
+    var daemon = DaemonCore()
+    daemon.animationsEnabled = false
+    daemon.glideBaseMs = 0
+    let live = frames(slots: [0: IntPoint(0, 34)])
+    _ = daemon.tick(
+        events: [.appeared(id: 0, workspace: 1)],
+        frames: live, viewport: viewport, focusedStyle: style
+    )
+    daemon.noteHiddenCleared(0, epoch: daemon.currentEpoch)
+    _ = daemon.tick(
+        events: [.focus(id: 0)],
+        frames: live, viewport: viewport, focusedStyle: style
+    )
+    check(daemon.focus != 0, "blocked refocus never lands")
+    for _ in 0..<70 {
+        _ = daemon.tick(events: [], frames: live, viewport: viewport, focusedStyle: style)
+    }
+    _ = daemon.tick(
+        events: [.focus(id: 0)],
+        frames: live, viewport: viewport, focusedStyle: style
+    )
+    checkEqual(daemon.focus, 0, "lapsed block refocuses")
+}
+
+// Off-union origins never reach AX: the commit drain strips the bogus
+// origin (a surviving resize still issues) and parks the window.
+do {
+    var daemon = DaemonCore()
+    daemon.animationsEnabled = false
+    daemon.glideBaseMs = 0
+    let live = frames(slots: [0: IntPoint(0, 34)])
+    _ = daemon.tick(
+        events: [.appeared(id: 0, workspace: 1), .focus(id: 0)],
+        frames: live, viewport: viewport, focusedStyle: style
+    )
+    let r = daemon.tick(
+        events: [.command(.layout([.setFrame(
+            window: 0, frame: WSFrame(x: -14672, y: 43, width: 512, height: 700))]))],
+        frames: live, viewport: viewport, focusedStyle: style
+    )
+    let job = r.axJobs.first(where: { $0.winID == 0 })
+    check(job?.origin == nil, "off-union origin stripped before AX")
+    checkEqual(job?.size, IntSize(512, 700), "surviving resize still issues")
+    check(daemon.auditParkedLive[0] != nil, "stripped window parks")
+}
+
 // Healing focus picks the surviving column nearest the viewport
 // center, skipping tabs and the lost window.
 do {
@@ -1088,6 +1343,10 @@ do {
     )
     check(daemon.resolveSpace(workspace: 1, space: 11), "switching back rotates")
     checkEqual(daemon.strips[1]?[0]?.allWindows, [0], "incoming layout restores")
+    checkEqual(
+        daemon.spaceStash[11], nil,
+        "restored spaces leave no stash duplicate (no false hidden)"
+    )
     daemon.pruneSpaces(keeping: [11, 22])
     checkEqual(
         daemon.spaceStash[22]?.rows[0]?.allWindows, [1],
@@ -1095,14 +1354,65 @@ do {
     )
     daemon.pruneSpaces(keeping: [11])
     checkEqual(daemon.spaceStash[22], nil, "destroyed spaces prune")
-    checkEqual(
-        daemon.spaceStash[11]?.rows[0]?.allWindows, [0],
-        "live spaces survive pruning"
-    )
+    checkEqual(daemon.strips[1]?[0]?.allWindows, [0], "live strips survive pruning")
     daemon.pruneSpaces(keeping: nil)
+    check(daemon.spaceStash.isEmpty, "nil enumeration skips pruning")
+}
+
+// Visible windows are never stashed: on-screen ids drop out of every
+// stash row, and strip-less survivors report for re-management (strips
+// otherwise stay empty forever — nothing re-appends a window whose
+// `.appeared` fired while it was stashed).
+do {
+    var daemon = DaemonCore()
+    _ = daemon.tick(
+        events: [.appeared(id: 0, workspace: 1), .appeared(id: 1, workspace: 1)],
+        frames: frames(slots: [0: IntPoint(0, 0), 1: IntPoint(0, 0)]),
+        viewport: viewport, focusedStyle: style
+    )
+    _ = daemon.resolveSpace(workspace: 1, space: 11)
+    check(daemon.resolveSpace(workspace: 1, space: 22), "switch stashes")
     checkEqual(
-        daemon.spaceStash[11]?.rows[0]?.allWindows, [0],
-        "nil enumeration skips pruning"
+        daemon.spaceStash[11]?.rows[0]?.allWindows.sorted(), [0, 1],
+        "both windows stashed"
+    )
+    checkEqual(
+        daemon.unstashVisible([0]), Set<WindowID>([0]),
+        "visible strip-less window reports homeless"
+    )
+    checkEqual(
+        daemon.spaceStash[11]?.rows[0]?.allWindows, [1],
+        "visible id leaves the stash row"
+    )
+    _ = daemon.tick(
+        events: [.appeared(id: 0, workspace: 1)],
+        frames: frames(slots: [0: IntPoint(0, 0), 1: IntPoint(0, 0)]),
+        viewport: viewport, focusedStyle: style
+    )
+    checkEqual(
+        daemon.unstashVisible([0, 1]), Set<WindowID>([1]),
+        "re-managed window no longer homeless"
+    )
+    checkEqual(
+        daemon.spaceStash[11]?.rows[0]?.allWindows, [],
+        "second visible id leaves the stash row"
+    )
+}
+
+// Unknown live frames top-align instead of centering by zero height:
+// a fresh window with no readable frame must not start mid-viewport
+// (any later growth would hang past the bottom edge).
+do {
+    var daemon = DaemonCore()
+    daemon.animationsEnabled = false
+    _ = daemon.tick(
+        events: [.appeared(id: 0, workspace: 1)],
+        frames: { (_: Int32) -> IntRect? in nil },
+        viewport: viewport, focusedStyle: style
+    )
+    checkEqual(
+        daemon.committedSlot(of: 0), IntPoint(0, 0),
+        "nil frame top-aligns"
     )
 }
 
@@ -2123,8 +2433,8 @@ do {
         frames: live, viewport: viewport, focusedStyle: style
     )
     checkEqual(
-        daemon.committedSlot(of: 0), IntPoint(312, 34),
-        "maximized narrow lone centers: (1024-400)/2"
+        daemon.committedSlot(of: 0), IntPoint(312, 0),
+        "maximized narrow lone centers horizontally, top-aligns full height"
     )
 }
 
@@ -2245,7 +2555,7 @@ do {
         frames: live, viewport: viewport, focusedStyle: style
     )
     checkEqual(
-        daemon.committedSlot(of: 0), IntPoint(312, 34),
+        daemon.committedSlot(of: 0), IntPoint(312, 0),
         "maximized centers absolutely despite carried scroll"
     )
     checkEqual(
@@ -2259,7 +2569,7 @@ do {
     }
     checkEqual(daemon.offsets[1], 0, "carried scroll settles out")
     checkEqual(
-        daemon.committedSlot(of: 0), IntPoint(312, 34),
+        daemon.committedSlot(of: 0), IntPoint(312, 0),
         "center holds after the reel"
     )
 }
@@ -2991,6 +3301,53 @@ do {
     }
     check(daemon.survivorReport(frames: live).isEmpty, "convergence clears survivors")
     check(daemon.auditSurvivors.isEmpty, "survivor map drains")
+}
+
+// Write circuit breaker: chronic no-progress windows park (no AX
+// writes from audit or redrive) until their glass moves, which
+// re-arms them; still-stuck drift re-parks.
+do {
+    var daemon = DaemonCore()
+    daemon.animationsEnabled = false
+    daemon.glideBaseMs = 0
+    daemon.auditCadenceEpochs = 5
+    daemon.auditParkAfter = 3
+    let live = frames(slots: [0: IntPoint(0, 34)])
+    _ = daemon.tick(
+        events: [.appeared(id: 0, workspace: 1), .focus(id: 0)],
+        frames: live, viewport: viewport, focusedStyle: style
+    )
+    // Freeze the glass off-slot; acks flow so nothing is in flight.
+    let drifted: (Int32) -> IntRect? = { _ in
+        IntRect(min: IntPoint(200, 200), max: IntPoint(600, 900))
+    }
+    for _ in 0..<30 {
+        let r = daemon.tick(events: [], frames: drifted, viewport: viewport, focusedStyle: style)
+        for job in r.axJobs {
+            daemon.acknowledge(winID: job.winID, seq: job.seq, epoch: job.epoch)
+        }
+    }
+    check(daemon.auditParkedLive[0] != nil, "chronic window parks")
+    // Parked ticks issue no further intents for the stuck window.
+    let parked = daemon.tick(events: [], frames: drifted, viewport: viewport, focusedStyle: style)
+    check(!parked.axJobs.contains(where: { $0.winID == 0 }), "parked window eats no AX writes")
+    // Glass moves elsewhere (user drag): the breaker re-arms…
+    let dragged = frames(slots: [0: IntPoint(300, 300)])
+    for _ in 0..<6 {
+        let r = daemon.tick(events: [], frames: dragged, viewport: viewport, focusedStyle: style)
+        for job in r.axJobs {
+            daemon.acknowledge(winID: job.winID, seq: job.seq, epoch: job.epoch)
+        }
+    }
+    check(daemon.auditParkedLive[0] == nil, "moved glass re-arms the breaker")
+    // …and still-stuck drift re-parks on the same threshold.
+    for _ in 0..<15 {
+        let r = daemon.tick(events: [], frames: dragged, viewport: viewport, focusedStyle: style)
+        for job in r.axJobs {
+            daemon.acknowledge(winID: job.winID, seq: job.seq, epoch: job.epoch)
+        }
+    }
+    check(daemon.auditParkedLive[0] != nil, "unmoved chronic drift re-parks")
 }
 
 // Binpack failure stacks at minimum height instead of piling members

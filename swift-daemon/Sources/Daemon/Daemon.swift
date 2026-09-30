@@ -150,7 +150,28 @@ public struct DaemonCore: Sendable {
     private var focusTouch: WindowID?
     /// Current frame epoch (stamped each tick; the single-threaded
     /// contract makes it safe for arrival sites to read).
-    private var currentEpoch: UInt64 = 0
+    public private(set) var currentEpoch: UInt64 = 0
+    /// Windows whose focus was just healed away as hidden, with the
+    /// epoch: intents and refocus arrivals pause briefly, breaking
+    /// click→focus→clear→denied cycles. TTL'd — legitimate returns
+    /// re-fire naturally past it (≈1s).
+    public var hiddenRefocusBlockEpochs: UInt64 = 60
+    public private(set) var hiddenCleared: [WindowID: UInt64] = [:]
+
+    /// Note a heal-cleared hidden window (host focus guard).
+    public mutating func noteHiddenCleared(_ id: WindowID, epoch: UInt64) {
+        hiddenCleared[id] = epoch
+    }
+
+    /// Whether a heal-cleared window still rests (lazily expiry-swept).
+    private mutating func hiddenBlocked(_ id: WindowID, epoch: UInt64) -> Bool {
+        guard let at = hiddenCleared[id] else { return false }
+        if epoch &- at >= hiddenRefocusBlockEpochs {
+            hiddenCleared.removeValue(forKey: id)
+            return false
+        }
+        return true
+    }
     /// Epoch of the latest raise-arrival. Ambient arrivals skip the
     /// display-hop inside this window so a stale echo during a transfer
     /// (old app reporting while activation is in flight) cannot yank
@@ -361,6 +382,27 @@ public struct DaemonCore: Sendable {
     /// fires but glass never follows. Read by the host quiescence gate
     /// (chronic divergence keeps full ticks coming).
     public private(set) var auditSurvivors: [WindowID: Int] = [:]
+    /// Windows parked by the write circuit breaker, with the live frame
+    /// seen at parking: chronic no-progress members stop eating AX
+    /// writes until their glass moves (user drag, grant return), which
+    /// re-arms them. Surfaced as `parked` in survivor flags.
+    public private(set) var auditParkedLive: [WindowID: IntRect] = [:]
+    /// Slot seen at parking alongside it: scrolling, offset clamps, and
+    /// retiles move slots without touching glass, and that must re-arm
+    /// too — otherwise a scrolled-in-union slot stays parked forever.
+    /// Nil when the parked job had no slot (direct surgery moves).
+    public private(set) var auditParkedSlot: [WindowID: IntPoint] = [:]
+    /// Consecutive no-progress audits before parking (audit cadence is
+    /// 5s, so 10 ≈ a minute of failed writes). Injectable for tests;
+    /// production leaves 10.
+    public var auditParkAfter: Int = 10
+    /// Release every circuit-breaker park (grant restored): the next
+    /// audit repairs parked windows normally instead of waiting for
+    /// glass movement that denial may have frozen.
+    public mutating func unparkAllWrites() {
+        auditParkedLive.removeAll()
+        auditParkedSlot.removeAll()
+    }
     /// Audit cadence in epochs (5s at 60Hz). Injectable for tests;
     /// production leaves the Rust-parity 300.
     public var auditCadenceEpochs: UInt64 = 300
@@ -433,6 +475,11 @@ public struct DaemonCore: Sendable {
         let prevFocus = focus
         gestureFresh = false
         raised = []
+        // Record strip-owning workspaces the host left viewport-less:
+        // their slots fall back (see `viewport(for:)`) and can land on
+        // the wrong display — visible in the state file instead of
+        // silent.
+        viewportFallbacks = Set(strips.keys.filter { viewports[$0] == nil })
         // One frame clock for ingest and commit alike: surgery intents
         // enqueued during ingest carry this tick's epoch.
         let epoch = ax.beginFrame()
@@ -565,6 +612,16 @@ public struct DaemonCore: Sendable {
         )
     }
 
+    /// Strip-owning workspaces missing from the host-supplied viewports
+    /// on the last tick: those strips tiled against a fallback rect
+    /// (active workspace's, or empty), so their slots can sit on the
+    /// wrong display. Empty means every strip used its own display.
+    /// Read by host diagnostics (state file).
+    public private(set) var viewportFallbacks: Set<WorkspaceID> = []
+    /// Committed slot origins for external diagnostics (state file):
+    /// window id → slot origin. Read-only snapshot.
+    public func committedSlotMap() -> [WindowID: IntPoint] { committedSlots }
+
     /// Viewport for a workspace: its own when the host supplied one, else
     /// the active workspace's, else an empty rect (callers guard widths).
     private func viewport(
@@ -678,6 +735,11 @@ public struct DaemonCore: Sendable {
                 redriveLastLive.removeValue(forKey: id)
                 fullWidth.removeValue(forKey: id)
                 auditSurvivors.removeValue(forKey: id)
+                auditParkedLive.removeValue(forKey: id)
+                auditParkedSlot.removeValue(forKey: id)
+                // committedSlots deliberately survive: space returns
+                // restore silently against the frozen slot (positions
+                // walk the eased curve toward it).
                 if pendingReveals.remove(id) != nil { /* dropped with it */ }
                 lastRedrive.removeValue(forKey: id)
                 redriveStreak.removeValue(forKey: id)
@@ -707,7 +769,9 @@ public struct DaemonCore: Sendable {
                 // Ambient arrival class (hover/refill/echo): claim only,
                 // never raise. The host filters strays and suppressed ids
                 // before ingest (see tick); same-value echoes short-circuit
-                // inside `setFocus` (no reveal churn).
+                // inside `setFocus` (no reveal churn). Heal-cleared hidden
+                // windows rest briefly instead of refocus→clear looping.
+                if let hid = id, hiddenBlocked(hid, epoch: epoch) { continue }
                 setFocus(id, raise: false)
             case .dragMoved(let id, let dx):
                 held = id
@@ -1287,6 +1351,9 @@ public struct DaemonCore: Sendable {
             if strip.contains(id) {
                 strip.remove(id)
                 setActiveStrip(strip)
+                // Stale slots drive writes for unmanaged windows:
+                // recompute on re-manage.
+                committedSlots.removeValue(forKey: id)
             }
         }
         dirty.formUnion([.layout, .motion, .paint])
@@ -1612,6 +1679,34 @@ public struct DaemonCore: Sendable {
         }
     }
 
+    /// Sanity clamp for strip offsets (all writers, every commit):
+    /// content plus one viewport of overscroll on each side. Swipe snap
+    /// bounds and reveal composition live inside this generously; only
+    /// accumulation drift (stale restore offsets, transfer ping-pong)
+    /// reaches beyond it. Narrower fill-range clamping would destroy
+    /// carried offsets the checks pin — this only vetoes the absurd.
+    private mutating func clampOffsetSanity(
+        _ ws: WorkspaceID, viewport: IntRect,
+        frames: (WindowID) -> IntRect?
+    ) {
+        let row = activeVirtual[ws] ?? 0
+        guard let strip = strips[ws]?[row], !strip.columns.isEmpty else { return }
+        var total: Int32 = 0
+        for column in strip.columns {
+            total += column.windows.compactMap { frames($0)?.width }.max() ?? 0
+        }
+        let width = max(viewport.width, 1)
+        let span = max(total, width)
+        let lo = -(span + width)
+        let hi = width + span
+        if let offset = offsets[ws], offset < lo || offset > hi {
+            offsets[ws] = min(max(offset, lo), hi)
+        }
+        if let target = offsetTargets[ws], target < lo || target > hi {
+            offsetTargets[ws] = min(max(target, lo), hi)
+        }
+    }
+
     /// Drives a held window's whole column by `dx` (stacked mates follow).
     private mutating func driveColumn(of id: WindowID, dx: Int32) {
         for ws in Array(strips.keys) {
@@ -1824,6 +1919,7 @@ public struct DaemonCore: Sendable {
                             glides.removeValue(forKey: member)
                             sizeStreak.removeValue(forKey: member)
                             lastSizeRedrive.removeValue(forKey: member)
+                            committedSlots.removeValue(forKey: member)
                         }
                     }
                     parkedRows[ws]?.removeValue(forKey: row)
@@ -1941,6 +2037,7 @@ public struct DaemonCore: Sendable {
         if redriveStreak[member, default: 0] > 0 {
             flags.append("streak\(redriveStreak[member] ?? 0)")
         }
+        if auditParkedLive[member] != nil { flags.append("parked") }
         if writerDegraded, member != focus { flags.append("degraded") }
         return flags
     }
@@ -2041,16 +2138,59 @@ public struct DaemonCore: Sendable {
                         continue
                     }
                     for member in column.windows {
+                        // Timed-out unacked: the intent may never complete
+                        // (hung call, lost ack) — count it toward parking
+                        // like any chronic failure instead of skipping
+                        // audits forever (which also freezes the survivor
+                        // count below threshold). Below threshold the
+                        // audit still repairs: timed-out reads as
+                        // acked-for-reading, and the audit is the recovery
+                        // path when the lane heals (degraded writers
+                        // especially — the fast path only serves focus).
+                        if !unmanaged.contains(member),
+                           ax.unackedTimedOut(member),
+                           frames(member) != nil {
+                            auditSurvivors[member, default: 0] += 1
+                            if (auditSurvivors[member] ?? 0) >= auditParkAfter,
+                               let live = frames(member) {
+                                auditParkedLive[member] = live
+                                if let slot = committedSlots[member] {
+                                    auditParkedSlot[member] = slot
+                                }
+                                continue
+                            }
+                        }
                         guard !unmanaged.contains(member),
                               !homing.contains(member),
                               held != member,
                               glides[member] == nil,
                               // Traveling intents may still land: only
                               // repair what the TTL already gave up on.
-                              !ax.unackedLive(member),
-                              let slot = committedSlots[member],
-                              let live = frames(member)
+                               !ax.unackedLive(member),
+                               let slot = committedSlots[member],
+                               let live = frames(member)
                         else { continue }
+                        // Circuit breaker re-arm: parked glass moved (user
+                        // drag, grant return) or the slot itself moved
+                        // (scroll, offset clamp, retile) — resume repair
+                        // attempts from scratch.
+                        if auditParkedLive[member] != nil,
+                           auditParkedLive[member] != live
+                            || auditParkedSlot[member].map({ $0 != slot }) ?? false {
+                            auditParkedLive.removeValue(forKey: member)
+                            auditParkedSlot.removeValue(forKey: member)
+                            auditSurvivors.removeValue(forKey: member)
+                        }
+                        // Chronic no-progress: stop writing until glass
+                        // moves. The survivor count only grows on
+                        // consecutive repairs, so reaching the threshold
+                        // proves ~a minute of failed writes (lost grant,
+                        // wedged app) rather than a slow convergence.
+                        if (auditSurvivors[member] ?? 0) >= auditParkAfter {
+                            auditParkedLive[member] = live
+                            auditParkedSlot[member] = slot
+                            continue
+                        }
                         var repaired = false
                         // Model and glass disagree with no flight:
                         // re-issue unconditionally (streaks only
@@ -2091,11 +2231,31 @@ public struct DaemonCore: Sendable {
             }
         }
         // Survivor roll: consecutive audits that repaired this window.
-        // Converged (or vanished) members drop out; three running
-        // lands the watch list (`survivorReport`).
+        // Flaky reads (nil frames, unacked skips, homing) must not
+        // forgive chronic divergence, so un-repaired ids drain only on
+        // proven convergence — or strip loss (windows that left every
+        // strip can't converge to a slot). Vanish cleanup drops them
+        // outright. Three running lands the watch list
+        // (`survivorReport`).
         for id in repairedNow { auditSurvivors[id, default: 0] += 1 }
         for id in Array(auditSurvivors.keys) where !repairedNow.contains(id) {
-            auditSurvivors.removeValue(forKey: id)
+            // Parked members keep their count: dropping it would re-arm
+            // the breaker every other audit (repair, park, repair…).
+            guard auditParkedLive[id] == nil else { continue }
+            guard workspaceOf(id) != nil else {
+                auditSurvivors.removeValue(forKey: id)
+                continue
+            }
+            if let live = frames(id),
+               let slot = committedSlots[id],
+               abs(live.min.x - slot.x) <= axDeadbandPx,
+               abs(live.min.y - slot.y) <= axDeadbandPx,
+               sizes[id].map({
+                   abs(live.width - $0.x) <= 1 && abs(live.height - $0.y) <= 1
+               }) ?? true {
+                auditSurvivors.removeValue(forKey: id)
+            }
+            // else: unassessed, not forgiven — the count stands.
         }
     }
 
@@ -2150,6 +2310,12 @@ public struct DaemonCore: Sendable {
         easeOffsets(epoch: epoch)
         for (ws, rows) in strips {
             let home = viewport(for: ws, in: viewports)
+            // Sanity-clamp offsets every commit: swipe snap bounds and
+            // reveal composition legitimately rest outside the fill range
+            // (see the NOTE below), but thousands of px past the content
+            // edge can only be accumulation drift (stale restore offset,
+            // transfer ping-pong) — and it bakes off-union slots.
+            clampOffsetSanity(ws, viewport: home, frames: frames)
             let parked = parkedOrigin(viewport: home)
             let shownRow = activeVirtual[ws] ?? 0
             for (rowIndex, strip) in rows {
@@ -2214,6 +2380,13 @@ public struct DaemonCore: Sendable {
         var batch: [WindowID: AXWriteJob] = [:]
         for (_, job) in inbox { coalesceJobs(&batch, job) }
         inbox.removeAll()
+        // Off-union guard: origins outside every display (stale offsets,
+        // wrong-display homes) are rejected by the OS with denial spam —
+        // drop them and park the window instead of writing. Legit sliver
+        // parking sits 10px off-viewport and always passes (tolerance).
+        dropOffUnionJobs(
+            &batch, union: writeUnion(Array(viewports.values)), frames: frames,
+            held: held)
         var ordered = drainOrder(batch)
         for i in ordered.indices {
             let seq = ax.issue(ordered[i].winID, epoch: ordered[i].epoch)
@@ -2227,6 +2400,65 @@ public struct DaemonCore: Sendable {
             dirty.subtract(.motion)
         }
         return ordered
+    }
+
+    /// Display-union rect for write-target vetting, with sliver tolerance
+    /// so legitimate off-viewport parking always passes.
+    private func writeUnion(_ rects: [IntRect]) -> IntRect? {
+        guard var union = rects.first else { return nil }
+        for rect in rects.dropFirst() {
+            union = IntRect(
+                min: IntPoint(
+                    min(union.min.x, rect.min.x), min(union.min.y, rect.min.y)),
+                max: IntPoint(
+                    max(union.max.x, rect.max.x), max(union.max.y, rect.max.y)))
+        }
+        return IntRect(
+            min: IntPoint(
+                union.min.x - parkedStripSliver, union.min.y - parkedStripSliver),
+            max: IntPoint(
+                union.max.x + parkedStripSliver, union.max.y + parkedStripSliver))
+    }
+
+    /// Strip origins outside the display union (bogus targets the OS
+    /// rejects): park the window when its live frame is known so the
+    /// write circuit breaker owns it until glass moves. A surviving
+    /// resize still issues (positionless); a fully empty job drops.
+    private mutating func dropOffUnionJobs(
+        _ batch: inout [WindowID: AXWriteJob],
+        union: IntRect?, frames: (WindowID) -> IntRect?,
+        held: WindowID?
+    ) {
+        guard let union else { return }
+        for (id, job) in batch {
+            // Armed hand truth transiently leaves the union mid-drag
+            // (mates follow the hand), and glide legs interpolate from
+            // off-screen glass toward the slot: never strip or park
+            // either — the leg converges in-bounds and the hand is
+            // user-driven. Only glideless, handless jobs can be bogus.
+            guard id != held, glides[id] == nil else { continue }
+            guard let origin = job.origin,
+                  origin.x < union.min.x || origin.x >= union.max.x
+                    || origin.y < union.min.y || origin.y >= union.max.y
+            else { continue }
+            var stripped = job
+            stripped.origin = nil
+            if stripped.size == nil {
+                batch.removeValue(forKey: id)
+            } else {
+                batch[id] = stripped
+            }
+            if let live = frames(id) {
+                auditParkedLive[id] = live
+                if let slot = committedSlots[id] {
+                    auditParkedSlot[id] = slot
+                }
+                // Feed the survivor count so the systemic verdict and
+                // watch list see drain-parked windows too (capped; the
+                // audit roll preserves parked entries).
+                auditSurvivors[id] = min((auditSurvivors[id] ?? 0) + 1, 100)
+            }
+        }
     }
 
     /// Tile one column: multi-item stacks split the viewport height
@@ -2261,8 +2493,17 @@ public struct DaemonCore: Sendable {
             // Singles, tabs, and single-item stacks vertically center
             // when shorter than the viewport (stacks keep full-height
             // binpack fill; user drags recenter on the next layout).
+            // Full-viewport members (fullWidth mark) top-align instead:
+            // their target height IS the viewport, so centering by the
+            // live (short) height would park them low with the bottom
+            // hanging past the viewport edge.
             for member in column.windows {
-                let slot = centeredSlot(member, x: x, home: home, frames: frames)
+                let slot: IntPoint
+                if fullWidth[member] != nil {
+                    slot = IntPoint(x, home.min.y)
+                } else {
+                    slot = centeredSlot(member, x: x, home: home, frames: frames)
+                }
                 committedSlots[member] = slot
                 applyMove(
                     member, to: slot, epoch: epoch,
@@ -2352,13 +2593,17 @@ public struct DaemonCore: Sendable {
 
     /// Vertically centered slot for short singles/tabs: content sits at
     /// `min.y + (viewport − content) / 2`; full-height or taller content
-    /// top-aligns like the preserved path. Sizes are untouched (the
-    /// size backstop clamps separately) — only the origin centers.
+    /// top-aligns like the preserved path. Unknown frames top-align too:
+    /// centering by a zero height would park the slot mid-viewport and
+    /// any later growth hangs past the bottom edge. Sizes are untouched
+    /// (the size backstop clamps separately) — only the origin centers.
     private func centeredSlot(
         _ member: WindowID, x: Int32, home: IntRect,
         frames: (WindowID) -> IntRect?
     ) -> IntPoint {
-        let liveH = max(frames(member)?.height ?? 0, 0)
+        guard let liveH = frames(member)?.height, liveH >= 0 else {
+            return IntPoint(x, home.min.y)
+        }
         guard liveH < home.height else {
             return IntPoint(x, home.min.y)
         }
@@ -2371,6 +2616,9 @@ public struct DaemonCore: Sendable {
         _ member: WindowID, to slot: IntPoint, epoch: UInt64,
         frames: (WindowID) -> IntRect?, heldMembers: Set<WindowID>
     ) {
+        // Heal-cleared hidden windows rest: the guard already decided
+        // they drive nothing until the block lapses.
+        guard !hiddenBlocked(member, epoch: epoch) else { return }
         if homing.contains(member) {
             // Release homing restores the slot immediately (the animated
             // glide lives in presentation); snap truth so the next tick
@@ -2422,7 +2670,11 @@ public struct DaemonCore: Sendable {
                                 || abs(live.min.y - slot.y) > axDeadbandPx,
                                // Degraded writer: repair only the focused
                                // window (Rust `STUCK_DEGRADE` rung).
-                               !writerDegraded || member == focus
+                               !writerDegraded || member == focus,
+                               // Parked by the write circuit breaker: the
+                               // audit watches (read-only) for glass
+                               // movement and re-arms; no intents fire.
+                               auditParkedLive[member] == nil
                             {
                 // Stuck windows (the OS clamps or rejects
                 // the placement: success status, zero
@@ -2474,6 +2726,7 @@ public struct DaemonCore: Sendable {
         _ member: WindowID, to target: IntSize, epoch: UInt64,
         frames: (WindowID) -> IntRect?
     ) {
+        guard !hiddenBlocked(member, epoch: epoch) else { return }
         guard let live = frames(member) else { return }
         guard abs(live.width - target.x) > 1 || abs(live.height - target.y) > 1 else {
             sizes[member] = target
@@ -2483,6 +2736,10 @@ public struct DaemonCore: Sendable {
         }
         if sizes[member] == target {
             guard !writerDegraded || member == focus else { return }
+            // Parked by the write circuit breaker: the audit watches
+            // (read-only) for glass movement and re-arms; no repeat
+            // writes fire. Fresh targets below still send once.
+            guard auditParkedLive[member] == nil else { return }
             let streak = sizeStreak[member, default: 0]
             let cooldown = redriveCooldownEpochs << min(streak, 4)
             let last = lastSizeRedrive[member]
@@ -2759,6 +3016,27 @@ public struct DaemonCore: Sendable {
     /// Record a worker completion, as the ack drain does.
     public mutating func acknowledge(winID: WindowID, seq: UInt64, epoch: UInt64) {
         ax.acknowledge(winID, seq: seq, epoch: epoch)
+    }
+
+    /// Record an answered refusal (denial or timeout, never traveling):
+    /// converge the sequence so stall accounting reflects reality, feed
+    /// the survivor count so the systemic verdict and breaker see it,
+    /// and abandon any glide leg — denied steps never converge it, so
+    /// walking them just burns AX round trips (e.g. a 900px homing walk
+    /// against a hidden window). Parks at the breaker threshold when
+    /// live glass is known; retries continue on backoff until then.
+    public mutating func noteWriteFailed(
+        _ id: WindowID, seq: UInt64, epoch: UInt64,
+        frames: (WindowID) -> IntRect?
+    ) {
+        ax.acknowledge(id, seq: seq, epoch: epoch)
+        auditSurvivors[id] = min((auditSurvivors[id] ?? 0) + 1, 100)
+        ax.invalidateSent(id)
+        glides.removeValue(forKey: id)
+        if (auditSurvivors[id] ?? 0) >= auditParkAfter,
+           let live = frames(id) {
+            auditParkedLive[id] = live
+        }
     }
 
     /// Poll the stuck-writer watchdog once per tick. Returns the
@@ -3050,13 +3328,83 @@ public struct DaemonCore: Sendable {
     /// half-plane, then row wrap (circle-first on outer edges so
     /// endpoint steps stay reachable, and on exposed interior steps so
     /// mixed-height rows wrap instead of sticking), then opposite
-    /// half-plane, then clamped landings in the same order (uniform
-    /// always-land).
+    /// half-plane, then proportional mapping (fractional-height landings
+    /// for stairs pairs the strict offset-preserving math cannot map),
+    /// then clamped landings in the same order (uniform always-land).
+    /// Samples inside the 20px approach zone moving outward evaluate as
+    /// their edge (`approach:` kinds): mouse ballistics plus macOS
+    /// edge-slide mean the 3px band itself is rarely sampled on a push.
+    /// Landings stay at the 6px inset so arrivals rest quiet.
+    ///
+    /// Loop breaker (`warpLoopAllow`/`warpLoopNote`, host-driven): N
+    /// identical landings in a row cool down ALL warp evaluation for a
+    /// few seconds so a held push carries through natively instead of
+    /// teleport-spamming the same spot. Re-arms early past a radius.
+    public var warpLoopRepeatLimit = 5
+    public var warpLoopCooldownMs: UInt64 = 5000
+    public var warpLoopRadiusPx: Int32 = 30
+    public var warpLoopWindowMs: UInt64 = 10000
+    public private(set) var warpLoopLanding: IntPoint?
+    private var warpLoopRepeats = 0
+    private var warpLoopCooldownEndMs: UInt64 = 0
+    private var warpLoopLastNoteMs: UInt64 = 0
+
+    /// Whether warp evaluation may run for this sample: false during a
+    /// loop cooldown, re-arming early once the pointer escaped the loop
+    /// spot. Expiry alone never re-arms a dwelling cursor (it would
+    /// re-trip instantly) — motion past 2px does. Pure.
+    public mutating func warpLoopAllow(cursor: IntPoint, nowMs: UInt64) -> Bool {
+        guard nowMs < warpLoopCooldownEndMs else {
+            if let loop = warpLoopLanding,
+               abs(cursor.x - loop.x) <= 2 && abs(cursor.y - loop.y) <= 2 {
+                return false
+            }
+            warpLoopCooldownEndMs = 0
+            warpLoopLanding = nil
+            warpLoopRepeats = 0
+            return true
+        }
+        if let loop = warpLoopLanding,
+           abs(cursor.x - loop.x) > warpLoopRadiusPx
+            || abs(cursor.y - loop.y) > warpLoopRadiusPx {
+            warpLoopCooldownEndMs = 0
+            warpLoopLanding = nil
+            warpLoopRepeats = 0
+            return true
+        }
+        return false
+    }
+
+    /// Register an issued edge-warp landing. Returns true when this
+    /// landing starts the cooldown (the landing itself still issues;
+    /// subsequent evaluations rest until re-arm). Repeats spread past
+    /// the window count singly — only a burst trips it. Pure.
+    public mutating func warpLoopNote(landing: IntPoint, nowMs: UInt64) -> Bool {
+        if let last = warpLoopLanding,
+           abs(landing.x - last.x) <= 2 && abs(landing.y - last.y) <= 2,
+           nowMs &- warpLoopLastNoteMs <= warpLoopWindowMs {
+            warpLoopRepeats += 1
+        } else {
+            warpLoopLanding = landing
+            warpLoopRepeats = 1
+        }
+        warpLoopLastNoteMs = nowMs
+        guard warpLoopRepeats >= warpLoopRepeatLimit else { return false }
+        warpLoopRepeats = 0
+        warpLoopCooldownEndMs = nowMs &+ warpLoopCooldownMs
+        return true
+    }
     public private(set) var lastWarpKind = "none"
+    /// Trigger cursor + resolved current display of the last warp
+    /// evaluation (nil display on outside misses): the landing line
+    /// alone can't show where the push came from. Read by host logs.
+    public private(set) var lastWarpCursor: IntPoint?
+    public private(set) var lastWarpDisplay: IntRect?
 
     public mutating func edgeWarpLanding(
         cursor: IntPoint, displays: [IntRect],
-        warpDirection: Int16, yOffset: Int32, velocityX: Double? = nil
+        warpDirection: Int16, yOffset: Int32, velocityX: Double? = nil,
+        approachAllowed: Bool = true
     ) -> IntPoint? {
         guard displays.count >= 2,
               let gminX = displays.map({ $0.min.x }).min(),
@@ -3071,14 +3419,66 @@ public struct DaemonCore: Sendable {
             min(max(cursor.x, gminX), gmaxX - 1),
             min(max(cursor.y, gminY), gmaxY - 1)
         )
-        guard let current = displays.first(where: { $0.contains(clamped) }) else {
+        lastWarpCursor = cursor
+        lastWarpDisplay = nil
+        let current: IntRect
+        let voidAnchored: Bool
+        if let found = displays.first(where: { $0.contains(clamped) }) {
+            current = found
+            voidAnchored = false
+            lastWarpDisplay = found
+        } else if let near = Self.nearestDisplay(to: clamped, in: displays, within: 8) {
+            // Stairs-void dwell: no display under the cursor, but one
+            // hugs it — evaluate as its edge so the notch warps instead
+            // of sticking. No native crossing exists here to yank
+            // (nothing is under the cursor), so this is safe.
+            current = near
+            voidAnchored = true
+            lastWarpDisplay = near
+        } else {
             lastWarpKind = "none:outside"
             return nil
         }
-        let onLeftEdge = abs(clamped.x - current.min.x) < 3
-        let onRightEdge = abs(current.max.x - clamped.x) < 3
-        guard onLeftEdge || onRightEdge else {
-            lastWarpKind = "none:interior"
+        var approached = false
+        func kind(_ base: String) -> String {
+            (approached ? "approach:" : "") + (voidAnchored ? "void:\(base)" : base)
+        }
+        let onLeftEdge: Bool
+        let onRightEdge: Bool
+        if voidAnchored {
+            // Anchored from the void: the approach side is the edge.
+            // Above/below approaches have no horizontal edge to warp.
+            onLeftEdge = clamped.x < current.min.x
+            onRightEdge = clamped.x >= current.max.x
+        } else {
+            onLeftEdge = abs(clamped.x - current.min.x) < 3
+            onRightEdge = abs(current.max.x - clamped.x) < 3
+        }
+        // Approach zone: fast movers headed outward from near (not in)
+        // the 3px band — mouse ballistics plus macOS edge-slide mean the
+        // band itself is rarely sampled on a push. Snap the decision to
+        // the edge; landings stay at the 6px inset so arrivals rest
+        // quiet (no ping-pong without moving the inset). Stillness
+        // (nil velocity) never fires: no direction, no intent.
+        let evalLeft: Bool
+        let evalRight: Bool
+        if onLeftEdge || onRightEdge {
+            evalLeft = onLeftEdge
+            evalRight = onRightEdge
+        } else if approachAllowed,
+                  let v = velocityX, v != 0,
+                  clamped.x >= current.min.x, clamped.x < current.max.x
+        {
+            // Interior cursor within 20px of an edge, moving outward.
+            evalLeft = clamped.x - current.min.x <= 20 && v < 0
+            evalRight = current.max.x - clamped.x <= 20 && v > 0
+            approached = evalLeft || evalRight
+        } else {
+            evalLeft = false
+            evalRight = false
+        }
+        guard evalLeft || evalRight else {
+            lastWarpKind = voidAnchored ? "void:interior" : "none:interior"
             return nil
         }
         // Shared-edge suppression: half-open containment evaluates seam
@@ -3110,7 +3510,7 @@ public struct DaemonCore: Sendable {
             let above = display.min.y < current.min.y
             let below = display.min.y > current.min.y
             let wantBelow: Bool
-            if onLeftEdge {
+            if evalLeft {
                 wantBelow = (warpDirection > 0) != flipped
             } else {
                 wantBelow = (warpDirection <= 0) != flipped
@@ -3124,7 +3524,7 @@ public struct DaemonCore: Sendable {
             for candidate in ordered where polarity(candidate, flipped: flipped) {
                 if let landing = warpLanding(
                     cursor: clamped, current: current, target: candidate,
-                    onLeftEdge: onLeftEdge, yOffset: yOffset,
+                    onLeftEdge: evalLeft, yOffset: yOffset,
                     velocityX: velocityX, strict: strict
                 ) {
                     return landing
@@ -3132,52 +3532,96 @@ public struct DaemonCore: Sendable {
             }
             return nil
         }
+        func attemptProportional(flipped: Bool) -> IntPoint? {
+            for candidate in ordered where polarity(candidate, flipped: flipped) {
+                if let landing = warpLandingProportional(
+                    cursor: clamped, current: current, target: candidate,
+                    onLeftEdge: evalLeft, yOffset: yOffset,
+                    velocityX: velocityX
+                ) {
+                    return landing
+                }
+            }
+            return nil
+        }
         if let landing = attempt(flipped: false, strict: true) {
-            lastWarpKind = "primary"
+            lastWarpKind = kind("primary")
             return landing
         }
         if let wrapped = rowWrapTarget(
             current: current,
-            onLeftEdge: onLeftEdge, onRightEdge: onRightEdge,
+            onLeftEdge: evalLeft, onRightEdge: evalRight,
             displays: displays
         ),
            let landing = warpLanding(
-               cursor: clamped, current: current, target: wrapped,
-               onLeftEdge: onLeftEdge, yOffset: yOffset,
-               velocityX: velocityX, strict: true
-           )
+                cursor: clamped, current: current, target: wrapped,
+                onLeftEdge: evalLeft, yOffset: yOffset,
+                velocityX: velocityX, strict: true
+            )
         {
-            lastWarpKind = "row"
+            lastWarpKind = kind("row")
             return landing
         }
         if let landing = attempt(flipped: true, strict: true) {
-            lastWarpKind = "fallback"
+            lastWarpKind = kind("fallback")
+            return landing
+        }
+        if let landing = attemptProportional(flipped: false) {
+            lastWarpKind = kind("proportional:primary")
+            return landing
+        }
+        if let landing = attemptProportional(flipped: true) {
+            lastWarpKind = kind("proportional:fallback")
             return landing
         }
         if let landing = attempt(flipped: false, strict: false) {
-            lastWarpKind = "clamp:primary"
+            lastWarpKind = kind("clamp:primary")
             return landing
         }
         if let landing = attempt(flipped: true, strict: false) {
-            lastWarpKind = "clamp:fallback"
+            lastWarpKind = kind("clamp:fallback")
             return landing
         }
         if let wrapped = rowWrapTarget(
             current: current,
-            onLeftEdge: onLeftEdge, onRightEdge: onRightEdge,
+            onLeftEdge: evalLeft, onRightEdge: evalRight,
             displays: displays
         ),
            let landing = warpLanding(
-               cursor: clamped, current: current, target: wrapped,
-               onLeftEdge: onLeftEdge, yOffset: yOffset,
-               velocityX: velocityX, strict: false
-           )
+                cursor: clamped, current: current, target: wrapped,
+                onLeftEdge: evalLeft, yOffset: yOffset,
+                velocityX: velocityX, strict: false
+            )
         {
-            lastWarpKind = "clamp:row"
+            lastWarpKind = kind("clamp:row")
             return landing
         }
-        lastWarpKind = "none:nomap"
+        lastWarpKind = voidAnchored ? "void:nomap" : "none:nomap"
         return nil
+    }
+
+    /// Nearest display to a void point within `tolerance` px (edge
+    /// distance, 0 when inside): stairs-notch dwells adopt a current
+    /// display instead of missing outright. Nil when farther.
+    public static func nearestDisplay(
+        to point: IntPoint, in displays: [IntRect], within tolerance: Int32
+    ) -> IntRect? {
+        var best: (Int32, IntRect)?
+        for rect in displays {
+            let dx: Int32
+            if point.x < rect.min.x { dx = rect.min.x - point.x }
+            else if point.x >= rect.max.x { dx = point.x - rect.max.x + 1 }
+            else { dx = 0 }
+            let dy: Int32
+            if point.y < rect.min.y { dy = rect.min.y - point.y }
+            else if point.y >= rect.max.y { dy = point.y - rect.max.y + 1 }
+            else { dy = 0 }
+            let dist = dx + dy
+            if dist <= tolerance, best.map({ dist < $0.0 }) ?? true {
+                best = (dist, rect)
+            }
+        }
+        return best?.1
     }
 
     /// Last crossing point examined by `warpForMovement` (nil when the
@@ -3196,7 +3640,8 @@ public struct DaemonCore: Sendable {
     /// a quiet direct miss so the verdict stays diagnosable.
     public mutating func warpForMovement(
         prev: IntPoint, prevAge: Double, cur: IntPoint, displays: [IntRect],
-        warpDirection: Int16, yOffset: Int32, velocityX: Double? = nil
+        warpDirection: Int16, yOffset: Int32, velocityX: Double? = nil,
+        approachAllowed: Bool = true
     ) -> IntPoint? {
         lastCrossPoint = nil
         var crossKind: String?
@@ -3206,7 +3651,8 @@ public struct DaemonCore: Sendable {
             lastCrossPoint = cross.at
             if let landing = edgeWarpLanding(
                 cursor: cross.at, displays: displays,
-                warpDirection: warpDirection, yOffset: yOffset, velocityX: velocityX
+                warpDirection: warpDirection, yOffset: yOffset, velocityX: velocityX,
+                approachAllowed: approachAllowed
             ) {
                 return landing
             }
@@ -3214,7 +3660,8 @@ public struct DaemonCore: Sendable {
         }
         guard let landing = edgeWarpLanding(
             cursor: cur, displays: displays,
-            warpDirection: warpDirection, yOffset: yOffset, velocityX: velocityX
+            warpDirection: warpDirection, yOffset: yOffset, velocityX: velocityX,
+            approachAllowed: approachAllowed
         ) else {
             if let crossKind, lastWarpKind != "none:seam", lastWarpKind != "none:nomap",
                crossKind == "none:seam" || crossKind == "none:nomap"
@@ -3247,6 +3694,40 @@ public struct DaemonCore: Sendable {
         } else {
             targetY = min(max(rawY, target.min.y), target.max.y - 1)
         }
+        return landingPoint(
+            target: target, targetY: targetY,
+            onLeftEdge: onLeftEdge, velocityX: velocityX
+        )
+    }
+
+    /// Proportional landing for stairs pairs: map the cursor's fractional
+    /// height on the source display onto the target, so diagonally-offset
+    /// displays with no shared Y band warp instead of sticking at the
+    /// edge. Strict range guard like `warpLanding`: misses fall through
+    /// to the clamped chain, which always lands.
+    private func warpLandingProportional(
+        cursor: IntPoint, current: IntRect, target: IntRect,
+        onLeftEdge: Bool, yOffset: Int32, velocityX: Double?
+    ) -> IntPoint? {
+        guard current.height > 0, target.height > 0 else { return nil }
+        let ratio = Double(cursor.y - current.min.y) / Double(current.height)
+        let mapped = Int32((ratio * Double(target.height)).rounded())
+        let directionSign: Int32 =
+            target.min.y > current.min.y ? 1 : -1
+        let rawY = target.min.y + mapped + yOffset * directionSign
+        guard rawY >= target.min.y, rawY < target.max.y else { return nil }
+        return landingPoint(
+            target: target, targetY: rawY,
+            onLeftEdge: onLeftEdge, velocityX: velocityX
+        )
+    }
+
+    /// Shared opposite-edge X landing (inset + velocity carry) for a
+    /// resolved target Y. Absurdly narrow targets center horizontally.
+    private func landingPoint(
+        target: IntRect, targetY: Int32,
+        onLeftEdge: Bool, velocityX: Double?
+    ) -> IntPoint {
         let lo = target.min.x + 3 + 1
         let hi = target.max.x - (3 + 1)
         guard lo <= hi else {
@@ -3406,12 +3887,16 @@ public static func firstExitCrossing(
             )
             if let incoming = spaceStash[space] {
                 strips[workspace] = incoming.rows
+                // The rows live in the strip again: drop the stash copy.
+                // Keeping it marks restored windows as stashed (hidden),
+                // which heals focus away, skips their writes, and parks
+                // them while visible.
+                spaceStash.removeValue(forKey: space)
                 if let row = incoming.activeRow {
                     activeVirtual[workspace] = row
                 } else {
                     activeVirtual.removeValue(forKey: workspace)
-                }
-                // Restored scroll eases in (see `offsetTargets`); a fresh
+                }                // Restored scroll eases in (see `offsetTargets`); a fresh
                 // space resets both sides.
                 if let offset = incoming.offset {
                     offsetTargets[workspace] = offset
@@ -3441,6 +3926,31 @@ public static func firstExitCrossing(
     public mutating func pruneSpaces(keeping live: Set<SpaceID>?) {
         guard let live else { return }
         spaceStash = spaceStash.filter { live.contains($0.key) }
+    }
+
+    /// Drop visible ids from every stash row: a window on-screen is on
+    /// the current space by definition, so any stash entry naming it is
+    /// stale (flaked space vote, missed prune). Returns the ids left in
+    /// no strip — the caller re-manages the rostered, visible ones, or
+    /// strips stay empty forever (nothing re-appends a window whose
+    /// `.appeared` fired while it was stashed).
+    public mutating func unstashVisible(_ ids: Set<WindowID>) -> Set<WindowID> {
+        guard !ids.isEmpty else { return [] }
+        for space in Array(spaceStash.keys) {
+            guard var stash = spaceStash[space] else { continue }
+            var changed = false
+            for row in Array(stash.rows.keys) {
+                guard var strip = stash.rows[row] else { continue }
+                let before = strip.allWindows.count
+                strip.removeAll(ids)
+                if strip.allWindows.count != before {
+                    stash.rows[row] = strip
+                    changed = true
+                }
+            }
+            if changed { spaceStash[space] = stash }
+        }
+        return Set(ids.filter { workspaceOf($0) == nil })
     }
 
     /// Drop slot for a pointer release (readout, pure): the workspace

@@ -165,6 +165,26 @@ do {
     checkClose(ring.size.height, 720.0, "pipeline ring h")
 }
 
+// cocoaToAX: stairs rig (ultrawide main below, builtin above-left).
+// The flip anchors on the MAIN display's Cocoa top edge (AX shares
+// CGDisplayBounds space). Union-top anchoring shifts everything down
+// by the overhang and tiles windows a display too low.
+do {
+    let mainTop: CGFloat = 946.0
+    let builtin = cocoaToAX(
+        CGRect(x: -1512, y: 946, width: 1512, height: 982), mainTop: mainTop)
+    checkClose(builtin.origin.x, -1512.0, "stairs builtin ax x")
+    checkClose(builtin.origin.y, -982.0, "stairs builtin ax y")
+    let wide = cocoaToAX(
+        CGRect(x: 0, y: 0, width: 3360, height: 946), mainTop: mainTop)
+    checkClose(wide.origin.x, 0.0, "stairs wide ax x")
+    checkClose(wide.origin.y, 0.0, "stairs wide ax y")
+    // Single display: main top == union top, flip is the identity shift.
+    let solo = cocoaToAX(
+        CGRect(x: 0, y: 0, width: 1512, height: 982), mainTop: 982.0)
+    checkClose(solo.origin.y, 0.0, "solo ax y")
+}
+
 if failures == 0 {
     print("GeometryChecks: all checks passed")
 } else {

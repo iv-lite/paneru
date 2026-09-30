@@ -130,6 +130,13 @@ public final class LiveWindow: @unchecked Sendable {
     /// app rejecting writes" without spamming on redrive backoff.
     private let complaintLock = NSLock()
     private var _lastComplaint: String?
+    /// Raw AX status of the last denied write (nil after any success):
+    /// lets the host tell a dead element (invalid UI element) from a
+    /// rejected value. Lock-guarded with the complaint above.
+    private var _lastDeniedCode: Int32?
+    public func lastDeniedCode() -> Int32? {
+        complaintLock.withLock { _lastDeniedCode }
+    }
 
     public init(
         id: WindowID, element: AXUIElement, frame: IntRect,
@@ -178,7 +185,22 @@ public final class LiveWindow: @unchecked Sendable {
     }
 
     private func clearComplaint() {
-        complaintLock.withLock { _lastComplaint = nil }
+        complaintLock.withLock {
+            _lastComplaint = nil
+            _lastDeniedCode = nil
+        }
+    }
+
+    private func denyComplaint(_ signature: String, code: Int32) {
+        let fresh = complaintLock.withLock { () -> Bool in
+            guard _lastComplaint != signature else { return false }
+            _lastComplaint = signature
+            _lastDeniedCode = code
+            return true
+        }
+        if fresh {
+            print("ax: window=\(id) \(signature)")
+        }
     }
 
     /// Resolve an element's window id, nil on any failure.
@@ -341,7 +363,9 @@ public final class LiveWindow: @unchecked Sendable {
             clearComplaint()
             _ = updateFrame()
         } else {
-            complain("reposition denied (\(status.rawValue)) to (\(origin.x),\(origin.y))")
+            denyComplaint(
+                "reposition denied (\(status.rawValue)) to (\(origin.x),\(origin.y))",
+                code: status.rawValue)
         }
         return frame
     }
@@ -375,7 +399,9 @@ public final class LiveWindow: @unchecked Sendable {
             if status == .success {
                 complain("resize confirm unreadable at \(size.x)x\(size.y)")
             } else {
-                complain("resize denied (\(status.rawValue)) at \(size.x)x\(size.y)")
+                denyComplaint(
+                    "resize denied (\(status.rawValue)) at \(size.x)x\(size.y)",
+                    code: status.rawValue)
             }
             return frame
         }

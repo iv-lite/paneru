@@ -450,6 +450,10 @@ core.glideMinMs = resolved.animationMinDurationMs
 core.glideMaxMs = resolved.animationMaxDurationMs
 nonisolated(unsafe) var apps: [pid_t: LiveApp] = [:]
 nonisolated(unsafe) var roster: [CGWindowID: LiveProviders.LiveWindow] = [:]
+/// Roster entries whose AX element died (-25202 in the write drain):
+/// dropped and re-adopted on the next roster sync so a recycled id
+/// gets a live ref instead of retrying dead glass forever.
+nonisolated(unsafe) var deadElements = Set<CGWindowID>()
 nonisolated(unsafe) var observers: [pid_t: LiveObserver] = [:]
 nonisolated(unsafe) var pending: [DaemonEvent] = []
 /// Windows whose rules suppress focus arrival.
@@ -833,6 +837,29 @@ nonisolated(unsafe) var spaceVotes: [WorkspaceID: (space: SpaceID, seen: Int)] =
     }
 }
 
+/// Drop one roster entry with full close treatment (latches, focus
+/// memory, `.disappeared`): shared by the vanish path and the dead
+/// AX-element path (-25202 means the ref is stale, never coming back).
+@Sendable func dropRosterEntry(_ wid: CGWindowID) {
+    let id = windowID(wid)
+    roster.removeValue(forKey: wid)
+    windowPIDs.removeValue(forKey: id)
+    dontFocus.remove(id)
+    fullscreenFloated.remove(id)
+    minimizedWindows.remove(id)
+    radiusCache.removeValue(forKey: id)
+    focusHistory.forget(id)
+    stableFrames.removeValue(forKey: wid)
+    // Recycle-unsafe latches: WindowIDs recycle across distinct
+    // windows, so a new window with this id must actuate and reveal
+    // fresh instead of matching the closed window's memory.
+    if prevActuatedFocus == id { prevActuatedFocus = nil }
+    if prevMffFocus == id { prevMffFocus = nil }
+    if lastHoverID == id { lastHoverID = nil }
+    pending.append(.disappeared(id: id))
+    print("window: closed \(id)")
+}
+
 @Sendable func syncRoster() {
     guard let onScreen = onScreenWindowIDs() else { return }
     lastRosterSync = Date()
@@ -924,6 +951,29 @@ nonisolated(unsafe) var spaceVotes: [WorkspaceID: (space: SpaceID, seen: Int)] =
     stashedMembers = Set(
         core.spaceStash.values.flatMap { $0.rows.values.flatMap { $0.allWindows } }
     )
+    // On-screen windows are on the current space by definition: any
+    // stash entry naming them is stale (flaked space vote, missed
+    // prune). Left in place it marks visible windows hidden — healing
+    // focus away, skipping their writes, parking them while the user
+    // looks at them — and strips stay empty forever, since nothing
+    // re-appends a window whose `.appeared` fired while stashed.
+    let onScreenIDs = Set(current.map { windowID($0) })
+    let homeless = core.unstashVisible(onScreenIDs)
+    stashedMembers.subtract(homeless)
+    if restorePlanner == nil {
+        for id in homeless {
+            guard let window = roster[CGWindowID(id)],
+                  workspaceOfWindow(id) == nil,
+                  !core.unmanaged.contains(id),
+                  !minimizedWindows.contains(id),
+                  !fullscreenFloated.contains(id),
+                  !window.isFullscreen
+            else { continue }
+            let ws = workspaceForFrame(window.frame)
+            pending.append(.appeared(id: id, workspace: ws))
+            print("space: re-managed visible window \(id) on ws=\(ws)")
+        }
+    }
     for wid in known.subtracting(current) {
         let id = windowID(wid)
         if stashedMembers.contains(id) {
@@ -967,22 +1017,18 @@ nonisolated(unsafe) var spaceVotes: [WorkspaceID: (space: SpaceID, seen: Int)] =
                 continue
             }
         }
-        roster.removeValue(forKey: wid)
-        windowPIDs.removeValue(forKey: id)
-        dontFocus.remove(id)
-        fullscreenFloated.remove(id)
-        minimizedWindows.remove(id)
-        radiusCache.removeValue(forKey: id)
-        focusHistory.forget(id)
-        stableFrames.removeValue(forKey: wid)
-        // Recycle-unsafe latches: WindowIDs recycle across distinct
-        // windows, so a new window with this id must actuate and reveal
-        // fresh instead of matching the closed window's memory.
-        if prevActuatedFocus == id { prevActuatedFocus = nil }
-        if prevMffFocus == id { prevMffFocus = nil }
-        if lastHoverID == id { lastHoverID = nil }
-        pending.append(.disappeared(id: id))
-        print("window: closed \(id)")
+        dropRosterEntry(wid)
+    }
+    // Dead AX elements flagged in the write drain: the ref is stale
+    // (window recreated under a recycled id) — drop so the live window
+    // re-adopts with a fresh element instead of retrying dead glass
+    // forever. Already-vanished ids were handled above; skip those.
+    if !deadElements.isEmpty {
+        for wid in deadElements where roster[wid] != nil {
+            dropRosterEntry(wid)
+            print("ax: window=\(windowID(wid)) re-adopted after dead element")
+        }
+        deadElements.removeAll()
     }
     // Stale focus (arrival for a rejected or never-adopted window) clears
     // here; adoption in flight (probing) still wins its race.
@@ -1985,26 +2031,77 @@ nonisolated(unsafe) var lastWarpEval = Date.distantPast
         (dt > 0 && dt <= 0.08) ? Double(cursor.x - lastWarpSample.point.x) / dt : nil
     lastWarpSample = (cursor, now)
     guard let warp = resolved.horizontalMouseWarp else { return }
+    // Loop breaker: sustained identical landings mean the warp fights a
+    // held push — rest the evaluation (and its log lines) so the pointer
+    // behaves natively instead of teleport-spamming the same spot.
+    let nowMs = UInt64(now.timeIntervalSince1970 * 1000)
+    guard core.warpLoopAllow(cursor: cursor, nowMs: nowMs) else { return }
+    let clearOfLanding: Bool = {
+        guard let pt = lastWarpLandingPt,
+              tickCount - lastWarpLandingTick < warpLandingPtTTLTicks
+        else { return true }
+        return abs(cursor.x - pt.x) > warpApproachRadiusPx
+            || abs(cursor.y - pt.y) > warpApproachRadiusPx
+    }()
+    let approachOK = Date().timeIntervalSince(lastWarpAt) > warpApproachImmunitySecs
+        && clearOfLanding
     guard let landing = core.warpForMovement(
         prev: prev, prevAge: dt, cur: cursor, displays: fullDisplayFrames(),
         warpDirection: warp,
         yOffset: resolved.horizontalMouseWarpOffset,
-        velocityX: velocityX
+        velocityX: velocityX,
+        approachAllowed: approachOK
     ) else {
         // Name the killer branch on edge-adjacent misses (seam vs nomap):
         // interior/lone/outside samples are the common quiet case.
         // Crossing-triggered evals append the crossing point so
         // band-jump samples diagnose with coordinates.
         let kind = core.lastWarpKind
-        if kind == "none:seam" || kind == "none:nomap" {
+        // void:interior stays silent (common hover above a display);
+        // void:nomap is a true dead end worth naming.
+        if kind == "none:seam" || kind == "none:nomap" || kind == "void:nomap" {
             let cross = core.lastCrossPoint.map { " cross \($0.x),\($0.y)" } ?? ""
             print("mouse: edge warp missed via \(kind) at \(cursor.x),\(cursor.y)\(cross)")
+        } else if kind == "none:outside" {
+            // Rounding-gap footprint: a cursor in no display that hugs
+            // an edge means the rounded frames disagree with the
+            // WindowServer by a pixel — warp cannot evaluate there.
+            // Bucketed + transition-printed so dwellings stay silent.
+            let frames = fullDisplayFrames()
+            let near = frames.contains { r in
+                abs(cursor.x - r.min.x) <= 5 || abs(r.max.x - cursor.x) <= 5
+            }
+            if near {
+                let line = "mouse: edge warp missed via none:outside"
+                    + " near edge at ~\(cursor.x / 100 * 100),\(cursor.y / 100 * 100)"
+                if line != lastWarpMissLine {
+                    lastWarpMissLine = line
+                    print(line)
+                }
+            }
         }
         return
     }
     warpMouse(to: CGPoint(x: Double(landing.x), y: Double(landing.y)))
     lastWarpSample = (landing, now)
-    print("mouse: edge warp \(landing.x),\(landing.y) via \(core.lastWarpKind)")
+    lastWarpAt = now
+    lastWarpLandingPt = landing
+    lastWarpLandingTick = tickCount
+    lastWarpMissLine = ""
+    if core.warpLoopNote(landing: landing, nowMs: nowMs) {
+        print("mouse: warp loop suspected —"
+            + " \(core.warpLoopRepeatLimit) identical landings,"
+            + " cooling down \(core.warpLoopCooldownMs / 1000)s"
+            + " (held push carries through natively)")
+    }
+    // Trigger cursor + resolved display ride along: the landing alone
+    // can't show where the push came from (void notch vs edge band).
+    let trigger = core.lastWarpCursor.map { " cur=\($0.x),\($0.y)" } ?? ""
+    let display = core.lastWarpDisplay.map {
+        " disp=\($0.min.x),\($0.min.y),\($0.width)x\($0.height)"
+    } ?? ""
+    print("mouse: edge warp \(landing.x),\(landing.y)"
+        + " via \(core.lastWarpKind)\(trigger)\(display)")
 }
 
 /// Pointer poll (~4Hz, movement-gated): edge warp first, then hover
@@ -2087,11 +2184,13 @@ nonisolated(unsafe) var tickTimer: Timer?
 /// geometry). `NSScreen.screens` walks every screen on the main thread,
 /// so ticks only pay a structural comparison.
 ///
-/// Frames convert to top-left (AX/WindowServer) space: AX positions
-/// arrive y-down while `NSScreen.frame` is y-up Cocoa, and comparing
-/// across systems routes every spawn to ws1. The flip anchors on the
-/// union's top edge, so slots, routing, and presentation (which already
-/// assumes y-down) all agree.
+/// Frames convert to AX/WindowServer space: AX positions arrive y-down
+/// while `NSScreen.frame` is y-up Cocoa, and comparing across systems
+/// routes every spawn to ws1. The flip anchors on the MAIN display's
+/// Cocoa top edge (`CGDisplayBounds` space, which AX shares) — never
+/// the union top, which shifts every rect down by the overhang on
+/// stairs rigs with a display above main — so slots, routing, and
+/// presentation (which already assumes y-down) all agree.
 @Sendable func refreshDisplays() {
     let screens = NSScreen.screens
     var cocoa: [(id: UInt32, frame: NSRect)] = []
@@ -2101,14 +2200,15 @@ nonisolated(unsafe) var tickTimer: Timer?
         cocoa.append((id, screen.frame))
         usableCocoa.append((id, screen.visibleFrame))
     }
-    let top = cocoa.map { $0.frame.maxY }.max() ?? 0
+    // Main display's Cocoa top edge: its frame origin is the global
+    // Cocoa origin by definition, but match by id (screen order is not
+    // contractual). Falls back to the union top, which agrees whenever
+    // no display extends above main.
+    let mainID = CGMainDisplayID()
+    let mainTop = cocoa.first(where: { $0.id == mainID })?.frame.maxY
+        ?? cocoa.map { $0.frame.maxY }.max() ?? 0
     func flip(_ rect: NSRect) -> NSRect {
-        NSRect(
-            x: rect.origin.x,
-            y: top - (rect.origin.y + rect.size.height),
-            width: rect.size.width,
-            height: rect.size.height
-        )
+        cocoaToAX(rect, mainTop: mainTop)
     }
     var entries: [(id: UInt32, frame: NSRect)] = []
     for entry in cocoa {
@@ -2118,10 +2218,21 @@ nonisolated(unsafe) var tickTimer: Timer?
     for entry in usableCocoa {
         usableEntries.append((id: entry.id, frame: flip(entry.frame)))
     }
-    if entries.count == displayScreens.count,
-       zip(entries, displayScreens).allSatisfy({ $0.id == $1.id && $0.frame == $1.frame }),
-       usableEntries.allSatisfy({ entry in displayUsable[entry.id] == entry.frame })
-    {
+    // Change detection is per-display and Int-quantized: `NSScreen.screens`
+    // order is not contractual (zip position is meaningless across ticks)
+    // and `visibleFrame` can carry sub-pixel dust — exact `NSRect ==`
+    // kept a full re-enumeration (and warp-sample invalidation) firing
+    // every tick. Quantized per-id maps only differ on real change.
+    func key(_ rect: NSRect) -> [Int] {
+        [Int(rect.origin.x.rounded()), Int(rect.origin.y.rounded()),
+         Int(rect.width.rounded()), Int(rect.height.rounded())]
+    }
+    let full = Dictionary(uniqueKeysWithValues: entries.map { ($0.id, key($0.frame)) })
+    let live = Dictionary(uniqueKeysWithValues: displayScreens.map { ($0.id, key($0.frame)) })
+    let usable = Dictionary(uniqueKeysWithValues: usableEntries.map { ($0.id, key($0.frame)) })
+    let knownUsable = Dictionary(
+        uniqueKeysWithValues: displayUsable.map { ($0.key, key($0.value)) })
+    if full == live, usable == knownUsable {
         return
     }
     // Main display (global origin) first for ws-1 continuity, then the
@@ -2166,6 +2277,25 @@ nonisolated(unsafe) var tickTimer: Timer?
     displayUsable = Dictionary(
         uniqueKeysWithValues: usableEntries.map { ($0.id, $0.frame) }
     )
+    // Rounded AX-space frames (the warp edge math consumes these, so a
+    // 1px rounding gap shows up here, not in a forensic session).
+    for entry in entries {
+        print("display: id=\(entry.id)"
+            + " frame=\(Int(entry.frame.origin.x)),\(Int(entry.frame.origin.y))"
+            + " \(Int(entry.frame.width))x\(Int(entry.frame.height))")
+    }
+    // One viewport line per workspace (slot-vs-viewport mismatches read
+    // straight from the log after display changes). Runs only when the
+    // set changed — the early return above keeps steady state silent.
+    for ws in workspaceDisplay.keys.sorted() {
+        if let id = workspaceDisplay[ws],
+           let usable = displayUsable[id] {
+            let view = viewportForScreen(usable)
+            print("viewport: ws=\(ws) display=\(id)"
+                + " min=\(Int(view.min.x)),\(Int(view.min.y))"
+                + " size=\(Int(view.width))x\(Int(view.height))")
+        }
+    }
 }
 
 /// Workspace ring in spatial display order (1-based, main first).
@@ -2182,11 +2312,18 @@ nonisolated(unsafe) var tickTimer: Timer?
     refreshDisplays()
     var out: [WorkspaceID: IntRect] = [:]
     let mainFrame = displayScreens.first?.frame
-    for (ws, id) in workspaceDisplay {
-        let frame = displayUsable[id]
-            ?? displayScreens.first { $0.id == id }?.frame ?? mainFrame
+    // Mapped workspaces plus orphan strip owners (unplugged displays):
+    // orphans tile against the main viewport so their windows stay
+    // reachable instead of silently inheriting the active workspace's
+    // rect (slots landing a full display off).
+    for ws in Set(workspaceDisplay.keys).union(core.strips.keys) {
+        let id = workspaceDisplay[ws]
+        let frame = id.flatMap({ displayUsable[$0] })
+            ?? id.flatMap({ display in displayScreens.first { $0.id == display }?.frame })
+            ?? mainFrame
         if let frame {
-            out[ws] = viewportForScreen(frame, menubarReserve: displayUsable[id] == nil)
+            out[ws] = viewportForScreen(
+                frame, menubarReserve: id.flatMap({ displayUsable[$0] }) == nil)
         }
     }
     if out.isEmpty {
@@ -2327,6 +2464,35 @@ nonisolated(unsafe) var dragFoldDX = 0.0
 nonisolated(unsafe) var dragLastX = 0.0
 /// Last shown drop ghost (retained to skip steady-state rewrites).
 nonisolated(unsafe) var lastGhostRect: CGRect?
+/// Audit-report spam throttle: fingerprint of the last printed
+/// divergence block + tick, so a stuck roster prints once per change
+/// (or hourly) instead of every 5s audit.
+nonisolated(unsafe) var lastAuditFingerprint = ""
+nonisolated(unsafe) var lastAuditPrintTick = 0
+/// Last observed Accessibility grant state (transition-printed: loss
+/// explains systemic write denial far better than per-window spam).
+nonisolated(unsafe) var axGrantTrusted = true
+/// Last printed near-edge warp-miss footprint (transition-printed:
+/// a dwelling cursor repeats one line instead of spamming per poll).
+nonisolated(unsafe) var lastWarpMissLine = ""
+/// Last warp landing time: approach-zone evaluations rest for 350ms
+/// after a landing so post-arrival jitter can't bounce straight back.
+/// Direct-band dwells are unaffected (a deliberate hold still warps).
+nonisolated(unsafe) var lastWarpAt = Date.distantPast
+/// Approach-zone immunity window after a landing.
+let warpApproachImmunitySecs = 0.35
+/// Last warp landing point + tick: approach evaluations inside 30px
+/// stay suppressed even past the time window (arrival jitter lives
+/// there); genuine pushes leave the radius. Stale points evaporate
+/// after a minute so old landings never strand future pushes.
+nonisolated(unsafe) var lastWarpLandingPt: IntPoint?
+nonisolated(unsafe) var lastWarpLandingTick = 0
+let warpApproachRadiusPx: Int32 = 30
+let warpLandingPtTTLTicks = 3600
+/// Last focus-heal line + tick (transition-printed): a stuck hidden
+/// focus repeats one line per change instead of per tick.
+nonisolated(unsafe) var lastHealLine = ""
+nonisolated(unsafe) var lastHealTick = 0
 /// Click-vs-drag travel, per axis (Rust `CLICK_RELEASE_MAX_TRAVEL_PX`).
 let dragClickThreshold = 4.0
 /// Per-tick drive clamp (Rust folds the same ±512px).
@@ -2413,6 +2579,28 @@ let stateFilePath =
             "rows": rows,
         ] as [String: Any]
     }
+    // Workspace→viewport map + committed slots: a slot outside its
+    // owner's viewport (or a workspace stuck on a fallback rect) reads
+    // directly here instead of needing a forensic session.
+    var viewports: [String: Any] = [:]
+    for (ws, view) in workspaceViewports() {
+        viewports[String(ws)] = [
+            "min": [Int(view.min.x), Int(view.min.y)],
+            "size": [Int(view.width), Int(view.height)],
+            "display": workspaceDisplay[ws].map { Int($0) } ?? NSNull(),
+        ] as [String: Any]
+    }
+    var slots: [String: Any] = [:]
+    for (id, slot) in core.committedSlotMap() {
+        slots[String(id)] = [Int(slot.x), Int(slot.y)]
+    }
+    // Stashed Spaces (strip-per-Space rotation): windows here are
+    // legitimately strip-less in `strips`, so a slot-holder with no
+    // strip reads as stashed, not leaked.
+    var stashed: [String: Any] = [:]
+    for (space, stash) in core.spaceStash {
+        stashed[String(space)] = stash.rows.values.flatMap { $0.allWindows }.map { Int($0) }
+    }
     let document: [String: Any] = [
         "tick": tick,
         "activeWorkspace": Int(core.activeWorkspace),
@@ -2423,6 +2611,11 @@ let stateFilePath =
         "roster": roster.count,
         "unmanaged": core.unmanaged.sorted().map { Int($0) },
         "strips": strips,
+        "viewports": viewports,
+        "slots": slots,
+        "viewportFallbacks": core.viewportFallbacks.sorted().map { Int($0) },
+        "parkedWrites": core.auditParkedLive.keys.sorted().map { Int($0) },
+        "spaceStash": stashed,
     ]
     guard let data = try? JSONSerialization.data(withJSONObject: document) else { return }
     try? data.write(to: URL(fileURLWithPath: stateFilePath), options: .atomic)
@@ -2583,7 +2776,18 @@ let perfSlowTickMs = 8.0
     let acks = ackBox.drain()
     if !acks.isEmpty { lastAckAt = Date() }
     for ack in acks {
-        core.acknowledge(winID: ack.winID, seq: ack.seq, epoch: ack.epoch)
+        if ack.ok {
+            core.acknowledge(winID: ack.winID, seq: ack.seq, epoch: ack.epoch)
+        } else {
+            // Answered refusal (not traveling): converge the sequence
+            // but record the failure — the glass will never follow from
+            // these intents, so the breaker must see it. Without this,
+            // denied writes read as "in flight" forever and the audit
+            // skips the window while the model claims convergence.
+            core.noteWriteFailed(
+                ack.winID, seq: ack.seq, epoch: ack.epoch,
+                frames: { roster[CGWindowID(bitPattern: $0)]?.frame })
+        }
     }
     // Snappy warp path: evaluate edges on pointer motion instead of
     // waiting for the 4Hz poll (~1 frame response instead of ≤500ms).
@@ -2787,6 +2991,15 @@ let perfSlowTickMs = 8.0
             core.acknowledge(winID: job.winID, seq: job.seq, epoch: job.epoch)
             continue
         }
+        // Stashed windows live on an inactive Space: the OS refuses
+        // off-Space writes, so skip like minimized (converge the seq,
+        // count no failure; Space return re-tiles via fresh intents).
+        // The audit still lists the divergence truthfully — it just
+        // never reaches AX from here.
+        guard !stashedMembers.contains(job.winID) else {
+            core.acknowledge(winID: job.winID, seq: job.seq, epoch: job.epoch)
+            continue
+        }
         batchBuilder.append((window, job))
     }
     let batch = batchBuilder
@@ -2802,14 +3015,30 @@ let perfSlowTickMs = 8.0
     } else if !batch.isEmpty {
         axWorker.async {
             for (window, job) in batch {
+                // Per-call denial capture: a later success clears the
+                // shared slot, so read the code before the next call.
+                var denied: Int32?
                 if let origin = job.origin {
                     _ = window.reposition(to: origin)
+                    denied = window.lastDeniedCode()
                 }
                 if let size = job.size {
                     _ = window.resize(to: size, origin: job.origin)
+                    if denied == nil {
+                        denied = window.lastDeniedCode()
+                    }
+                }
+                // Dead element: flag for drop + re-adopt on the next
+                // roster sync (a parked window reads glass through the
+                // same dead ref, so it can never re-arm on its own).
+                if let code = denied,
+                   code == AXError.invalidUIElement.rawValue,
+                   deadElements.insert(CGWindowID(job.winID)).inserted {
+                    print("ax: window=\(job.winID) element dead (-25202); re-adopting")
                 }
                 ackBox.append(AXWriteAck(
-                    winID: job.winID, seq: job.seq, epoch: job.epoch, ok: true
+                    winID: job.winID, seq: job.seq, epoch: job.epoch,
+                    ok: denied == nil
                 ))
             }
         }
@@ -2839,6 +3068,13 @@ let perfSlowTickMs = 8.0
         )
         print("ax: worker lane retired (#\(workerRetirements)): re-issuing on a fresh queue")
     }
+    // Retirement budget is renewable, not lifetime: completions flowing
+    // with no traveling gap proves the lane healthy again. Without this
+    // reset, three wedged apps per boot permanently end all healing.
+    if workerRetirements > 0, core.writerGap() == nil {
+        workerRetirements = 0
+        print("ax: worker lane healthy again — retirement budget restored")
+    }
     // Raise intents go straight to AX — unless shadowing, where the
     // observer never touches another daemon's windows.
     if !shadowMode {
@@ -2855,6 +3091,14 @@ let perfSlowTickMs = 8.0
     // stranded. Heal once to the nearest visible neighbor; no visible
     // neighbor clears. Picks already hidden are refused (no flap);
     // a healed tick clears the guard by construction.
+    // (Helper is local: the fingerprint state above is tick-owned.)
+    func printHealedOnce(_ line: String) {
+        if line != lastHealLine || tickCount - lastHealTick >= 216000 {
+            lastHealLine = line
+            lastHealTick = tickCount
+            print(line)
+        }
+    }
     if let lost = result.focus,
        minimizedWindows.contains(lost) || stashedMembers.contains(lost),
        let ws = workspaceOfWindow(lost),
@@ -2867,10 +3111,14 @@ let perfSlowTickMs = 8.0
             frames: { roster[CGWindowID(bitPattern: $0)]?.frame }, lost: lost
         ), !minimizedWindows.contains(target), !stashedMembers.contains(target) {
             pending.append(.focus(id: target))
-            print("focus: healed to \(target) from hidden \(lost)")
+            printHealedOnce("focus: healed to \(target) from hidden \(lost)")
         } else {
+            // Rest the cleared window briefly: refocus arrivals (hover
+            // over unconverged glass, observer echoes) would otherwise
+            // re-land focus here next tick and loop clear→denied-write.
+            core.noteHiddenCleared(lost, epoch: core.currentEpoch)
             pending.append(.focus(id: nil))
-            print("focus: cleared from hidden \(lost) (no visible neighbor)")
+            printHealedOnce("focus: cleared from hidden \(lost) (no visible neighbor)")
         }
     }
     // Focus actuation (Rust `focus_with/without_raise`): the core owns
@@ -3138,23 +3386,56 @@ let perfSlowTickMs = 8.0
     }
     // Model/glass divergence watch (audit cadence): silent when
     // converged, one capped block when not — the next "it didn't move"
-    // diagnoses itself instead of needing a forensic session.
+    // diagnoses itself instead of needing a forensic session. Repeats
+    // stay silent (fingerprint throttle): a stuck roster prints once
+    // per change instead of every audit.
     if tickCount % 300 == 0 {
+        // Grant transitions explain systemic denial outright: per-window
+        // "denied" spam means nothing next to a lost grant.
+        let trusted = hasAccessibilityGrant()
+        if trusted != axGrantTrusted {
+            axGrantTrusted = trusted
+            if trusted {
+                core.unparkAllWrites()
+                print("ax: accessibility grant restored — resuming writes")
+            } else {
+                print("ax: ACCESSIBILITY GRANT LOST — every write is denied;"
+                    + " re-grant paneru-swift in System Settings → Privacy & Security"
+                    + " → Accessibility, then relaunch")
+            }
+        }
+        var block: [String] = []
         for line in core.divergenceReport(frames: { roster[CGWindowID(bitPattern: $0)]?.frame }) {
-            print("drift: \(line)")
+            block.append("drift: \(line)")
         }
         // Rest-state overlap watch (same cadence): silent when tiled,
         // one capped block when glass shares interior pixels — slots
         // ride along so the verdict (slot math vs write path) is in
         // the log, not a forensic session.
         for line in core.overlapReport(frames: { roster[CGWindowID(bitPattern: $0)]?.frame }) {
-            print("\(line)")
+            block.append(line)
         }
         // Chronic-divergence watch (same cadence): windows the audit
         // repaired three running times prove a repair path fires but
         // glass never follows — the retile watchdog's watch list.
         for line in core.survivorReport(frames: { roster[CGWindowID(bitPattern: $0)]?.frame }) {
-            print("\(line)")
+            block.append(line)
+        }
+        // Systemic verdict: chronic survivors across 3+ windows means
+        // the grant is gone (or the OS wedged), not one bad app.
+        let chronic = core.auditSurvivors.values.filter { $0 >= 10 }.count
+        if chronic >= 3 {
+            block.append(
+                "ax: SYSTEMIC denial — \(chronic) windows unwritable for 10+ audits;"
+                    + " check the Accessibility grant for paneru-swift")
+        }
+        let fingerprint = block.joined(separator: "\n")
+        if fingerprint != lastAuditFingerprint || tickCount - lastAuditPrintTick >= 216000 {
+            for line in block {
+                print(line)
+            }
+            lastAuditFingerprint = fingerprint
+            lastAuditPrintTick = tickCount
         }
     }
     // Shadow observer poll (tick-cadenced): fetch async off-thread,
@@ -3247,9 +3528,13 @@ let perfSlowTickMs = 8.0
             borderStyles[id] = style
         }
         if !shadowMode {
+            // Sync glass rects, not padded slots: `resolveOverlayItems`
+            // draws `plan.added/moved` rects verbatim, so syncing the raw
+            // plan would float the ring hPad/vPad off the glass.
+            let glassPlan = glassCorrectedPlan(borderPlan, correct: glassForBorder)
             MainActor.assumeIsolated {
                 Presenter.syncBorders(resolveOverlayItems(
-                    plan: borderPlan,
+                    plan: glassPlan,
                     currentRects: borderRects, currentStyles: borderStyles
                 ))
             }

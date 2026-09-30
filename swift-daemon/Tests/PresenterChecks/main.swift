@@ -65,6 +65,35 @@ do {
 }
 
 do {
+    // Glass correction shrinks added/moved plan rects by the window's
+    // insets (the ring hugs glass, never the padded slot); removals
+    // and reskins pass through untouched.
+    let inset: (WindowID, CGRect) -> CGRect = { _, rect in
+        rect.insetBy(dx: 8, dy: 8)
+    }
+    let plan = BorderSyncPlan(
+        removed: [9],
+        added: [(0, CGRect(x: 0, y: 0, width: 400, height: 700), style)],
+        moved: [(1, CGRect(x: 400, y: 0, width: 400, height: 700))],
+        reskinned: [(2, other)]
+    )
+    let corrected = glassCorrectedPlan(plan, correct: inset)
+    checkEqual(
+        corrected.added[0].1, CGRect(x: 8, y: 8, width: 384, height: 684),
+        "added rects shrink to glass"
+    )
+    checkEqual(corrected.added[0].2, style, "added styles survive correction")
+    checkEqual(
+        corrected.moved[0].1, CGRect(x: 408, y: 8, width: 384, height: 684),
+        "moved rects shrink to glass"
+    )
+    checkEqual(corrected.removed, [9], "removals survive correction")
+    checkEqual(corrected.reskinned.count, 1, "reskins survive correction")
+    let identity = glassCorrectedPlan(plan, correct: { _, rect in rect })
+    checkEqual(identity.added[0].1, plan.added[0].1, "identity correction is a no-op")
+}
+
+do {
     let empty = BorderSyncPlan(removed: [], added: [], moved: [], reskinned: [])
     check(
         resolveOverlayItems(plan: empty, currentRects: [:], currentStyles: [:]).isEmpty,

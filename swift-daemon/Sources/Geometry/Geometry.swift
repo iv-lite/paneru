@@ -248,6 +248,23 @@ public func cgAbsToCocoa(_ frame: CGRect, primaryScreenHeight: CGFloat) -> CGRec
     return CGRect(origin: CGPoint(x: frame.origin.x, y: cocoaY), size: frame.size)
 }
 
+/// Convert a Cocoa screen frame (y-up) to AX/WindowServer space (y-down).
+/// The flip anchors on the MAIN display's Cocoa top edge: AX positions
+/// share `CGDisplayBounds` space, whose origin is the main display's
+/// top-left. Anchoring on the union top instead shifts every rect down
+/// by the overhang whenever a display extends above main (stairs rigs),
+/// landing viewports — and every tiled slot — a full display too low.
+/// Single-display and top-aligned rigs are unaffected (union top == main
+/// top there), which is why the wrong anchor survives basic testing.
+public func cocoaToAX(_ frame: CGRect, mainTop: CGFloat) -> CGRect {
+    CGRect(
+        x: frame.origin.x,
+        y: mainTop - (frame.origin.y + frame.size.height),
+        width: frame.size.width,
+        height: frame.size.height
+    )
+}
+
 /// Strict-overlap test for Cocoa rects (a window straddling a seam touches
 /// both displays). Mirrors `overlay::rects_intersect`.
 public func rectsIntersect(_ a: CGRect, _ b: CGRect) -> Bool {

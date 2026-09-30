@@ -17,6 +17,20 @@ public typealias OverlayBorderItem = (
     id: WindowID, rect: CGRect, style: Presentation.BorderStyle
 )
 
+/// Correct a border plan to glass rects before sync: AX glass sits
+/// hPad/vPad inside the abutting padded slots, so syncing raw plan
+/// rects floats the ring off the glass. `correct` shrinks one plan
+/// rect to its window's glass (host `glassForBorder`).
+public func glassCorrectedPlan(
+    _ plan: BorderSyncPlan,
+    correct: (WindowID, CGRect) -> CGRect
+) -> BorderSyncPlan {
+    var out = plan
+    out.added = out.added.map { ($0.0, correct($0.0, $0.1), $0.2) }
+    out.moved = out.moved.map { ($0.0, correct($0.0, $0.1)) }
+    return out
+}
+
 /// Merge a `BorderSyncPlan` into the full desired set the pool syncs:
 /// added items whole, moved items with their current style, reskinned
 /// items with their current rect. Removals are handled by omission (the
