@@ -33,7 +33,7 @@ let package = Package(
             name: "CLua",
             path: "Sources/CLua",
             publicHeadersPath: "include",
-            cSettings: [.headerSearchPath("include")]
+            cSettings: [.headerSearchPath("include"), .define("LUA_USE_POSIX")]
         ),
         .target(
             name: "Geometry",
@@ -61,6 +61,7 @@ let package = Package(
         // (`src/overlay.rs`, `overlay-swift/Flash.swift`).
         .target(
             name: "Presentation",
+            dependencies: ["Geometry"],
             path: "Sources/Presentation"
         ),
         // Script-state store model (`crates/shared_types/script_state.rs`,
