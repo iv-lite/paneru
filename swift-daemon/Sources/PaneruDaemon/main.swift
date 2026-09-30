@@ -2000,6 +2000,37 @@ nonisolated(unsafe) var lastWarpEval = Date.distantPast
         .map { $0.uint32Value }
 }
 
+/// Fastest display refresh (Hz) for the tick timer: variable-rate
+/// ProMotion panels report 0 and count as 120. Recomputed with the
+/// display set; the timer follows via `rescheduleTickTimer`.
+nonisolated(unsafe) var displayMaxHz = 60.0
+/// The 60–120Hz tick timer, recreated when the fastest display
+/// changes (invalidating the old one first).
+nonisolated(unsafe) var tickTimer: Timer?
+
+/// Display refresh for one display id, Hz. The modern rate property
+/// needs macOS 15+; older systems keep today's 60Hz behavior (no
+/// regression). A 0/variable read means ProMotion and counts as 120.
+@Sendable func displayRefreshHz(for id: CGDirectDisplayID) -> Double {
+    guard let mode = CGDisplayCopyDisplayMode(id) else { return 60.0 }
+    if #available(macOS 15.0, *) {
+        let rate = mode.refreshRate
+        return rate > 0 ? rate : 120.0
+    } else {
+        return 60.0
+    }
+}
+
+/// Tick timer follows the fastest display (60Hz floor, 120Hz cap).
+/// Tweens run on wall time so any rate is safe; the idle backoff
+/// keeps faster ticks free at rest. Main thread only (runloop-owned).
+@Sendable func rescheduleTickTimer() {
+    tickTimer?.invalidate()
+    let hz = min(max(displayMaxHz, 60.0), 120.0)
+    tickTimer = Timer.scheduledTimer(withTimeInterval: 1.0 / hz, repeats: true) { _ in
+        tick()
+    }
+}
 /// Re-enumerate displays when the set changes (count, identity,
 /// geometry). `NSScreen.screens` walks every screen on the main thread,
 /// so ticks only pay a structural comparison.
@@ -2053,6 +2084,13 @@ nonisolated(unsafe) var lastWarpEval = Date.distantPast
     // Fresh geometry invalidates the warp segment: crossings measured
     // against retired edges would warp off stale travel.
     lastWarpSample.at = Date.distantPast
+    // The tick timer follows the fastest display; log on change.
+    let hz = displayScreens.map { displayRefreshHz(for: $0.id) }.max() ?? 60.0
+    if hz != displayMaxHz {
+        displayMaxHz = hz
+        rescheduleTickTimer()
+        print("display: max refresh \(Int(min(max(hz, 60.0), 120.0)))Hz")
+    }
     workspaceDisplay = [:]
     for (index, entry) in displayScreens.enumerated() {
         workspaceDisplay[WorkspaceID(index + 1)] = entry.id
@@ -3264,9 +3302,7 @@ let perfSlowTickMs = 8.0
     }
 }
 
-Timer.scheduledTimer(withTimeInterval: 1.0 / 60.0, repeats: true) { _ in
-    tick()
-}
+rescheduleTickTimer()
 
 // Script file: discovered, or created from the default (so the watcher
 // always has a concrete path, mirroring `ensure_lua_file`).
