@@ -738,6 +738,11 @@ public struct DaemonCore: Sendable {
                         strips[slot.workspace, default: [:]][slot.row] = target
                         if slot.workspace != activeWorkspace {
                             activeWorkspace = slot.workspace
+                            print(
+                                "move: drop window=\(id) members=\(moving.windows)"
+                                    + " \(source.map { "\($0.ws):\($0.row)" } ?? "?")"
+                                    + " -> \(slot.workspace):\(slot.row)"
+                            )
                             setFocus(moving.top, raise: true)
                             // Refocus + reveal regardless of change: an
                             // already-focused drop must still actuate and
@@ -1418,6 +1423,10 @@ public struct DaemonCore: Sendable {
         // the neighbor now at the hole (stay keeps looking at source).
         // The removal index may now dangle past the end; the apply
         // step clamps to the surviving neighbor.
+        print(
+            "move: window=\(id) members=\(column.windows)"
+                + " \(sourceWS):\(sourceRow) -> \(target):\(row)"
+        )
         if let from = strips[sourceWS]?[sourceRow], !from.columns.isEmpty {
             pendingCenterNeighbor[sourceWS] = (row: sourceRow, index: index)
         }
