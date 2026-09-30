@@ -933,6 +933,22 @@ nonisolated(unsafe) var spaceVotes: [WorkspaceID: (space: SpaceID, seen: Int)] =
             print("window: minimized \(id)")
             continue
         }
+        // Native-fullscreen windows leave the on-screen list for their
+        // own Space but keep roster and strip membership (Rust
+        // `NativeFullscreenMarker` parity): one main-thread AX read
+        // tells them apart from real closes, same as minimized. The
+        // worker flip owns `fullscreenFloated` and the float itself;
+        // this only refuses the drop. App quit while fullscreen drops
+        // like a real close instead of haunting the strips.
+        if fullscreenFloated.contains(id)
+            || (roster[wid]?.isFullscreen ?? false)
+        {
+            if NSRunningApplication(processIdentifier: windowPIDs[id] ?? -1) == nil {
+                fullscreenFloated.remove(id)
+            } else {
+                continue
+            }
+        }
         roster.removeValue(forKey: wid)
         windowPIDs.removeValue(forKey: id)
         dontFocus.remove(id)
