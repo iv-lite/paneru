@@ -100,6 +100,38 @@ do {
     checkEqual(displayIndexForPoint(IntPoint(0, 0), in: []), nil, "no displays is nil")
 }
 
+// Stable workspace assignment: UUIDs survive reorder, vanish, return,
+// and newcomers take the smallest free number.
+do {
+    let uuids: [UInt32: String] = [10: "A", 20: "B", 30: "C"]
+    let fresh = assignWorkspaces(orderedDisplayIDs: [10, 20, 30], uuids: uuids, known: [:])
+    checkEqual(fresh.mapping, [1: 10, 2: 20, 3: 30], "fresh rig matches legacy order")
+    checkEqual(fresh.uuids, [1: "A", 2: "B", 3: "C"], "fresh rig records UUIDs")
+    // Sleep/wake reorder with rotated numeric ids: mapping follows UUIDs.
+    let rotatedUUIDs: [UInt32: String] = [7: "B", 8: "A", 9: "C"]
+    let kept = assignWorkspaces(
+        orderedDisplayIDs: [7, 8, 9], uuids: rotatedUUIDs, known: fresh.uuids
+    )
+    checkEqual(kept.mapping, [1: 8, 2: 7, 3: 9], "reorder keeps physical displays")
+    // Vanish: workspace unmaps but keeps its UUID record.
+    let gone = assignWorkspaces(
+        orderedDisplayIDs: [10, 30], uuids: uuids, known: fresh.uuids
+    )
+    checkEqual(gone.mapping, [1: 10, 3: 30], "vanished display unmaps")
+    checkEqual(gone.uuids[2], "B", "vanished UUID record kept")
+    // Return: the sleeper maps back in place.
+    let back = assignWorkspaces(
+        orderedDisplayIDs: [10, 20, 30], uuids: uuids, known: gone.uuids
+    )
+    checkEqual(back.mapping, [1: 10, 2: 20, 3: 30], "returnee restores in place")
+    // Newcomer with unknown UUID takes the next free number.
+    let plus = assignWorkspaces(
+        orderedDisplayIDs: [10, 20, 30, 40],
+        uuids: [10: "A", 20: "B", 30: "C"], known: fresh.uuids
+    )
+    checkEqual(plus.mapping[4], 40, "newcomer takes the next number")
+}
+
 if failures == 0 {
     print("DisplaysChecks: all checks passed")
 } else {

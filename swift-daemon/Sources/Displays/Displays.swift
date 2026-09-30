@@ -16,6 +16,41 @@ public enum DockPosition: Equatable, Sendable {
     case hidden
 }
 
+// MARK: - Workspace assignment
+
+/// Stable workspace-to-display assignment: workspaces keep known
+/// displays by UUID (numeric ids rotate across reboots; sleep/wake
+/// reorders), so windows never leak across physical displays on
+/// re-enumeration. Newcomers (unknown UUIDs) take the smallest free
+/// workspace numbers in display order (main first), matching legacy
+/// index assignment on a fresh rig. Vanished displays simply unmap
+/// (their UUID records live with the caller for returnees). Pure —
+/// the no-leak guarantee pins here.
+public func assignWorkspaces(
+    orderedDisplayIDs: [UInt32],
+    uuids: [UInt32: String],
+    known: [WorkspaceID: String]
+) -> (mapping: [WorkspaceID: UInt32], uuids: [WorkspaceID: String]) {
+    var mapping: [WorkspaceID: UInt32] = [:]
+    var outUUIDs = known
+    var used: Set<UInt32> = []
+    for ws in known.keys.sorted() {
+        guard let uuid = known[ws],
+              let id = orderedDisplayIDs.first(where: { uuids[$0] == uuid })
+        else { continue }
+        mapping[ws] = id
+        used.insert(id)
+    }
+    var next: WorkspaceID = 1
+    for id in orderedDisplayIDs where !used.contains(id) {
+        while mapping[next] != nil { next += 1 }
+        mapping[next] = id
+        if let uuid = uuids[id] { outUUIDs[next] = uuid }
+        next += 1
+    }
+    return (mapping, outUUIDs)
+}
+
 // MARK: - Point location
 
 /// Index of the display containing a point, else the nearest display's

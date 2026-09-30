@@ -197,6 +197,10 @@ if let path = tuningPath {
 /// use): reads-before-declaration crashed this process at startup.
 nonisolated(unsafe) var displayScreens: [(id: UInt32, frame: NSRect)] = []
 nonisolated(unsafe) var workspaceDisplay: [WorkspaceID: UInt32] = [:]
+/// Workspace to stable display UUID: assignments survive numeric-id
+/// rotation and sleep/wake reorder (see `refreshDisplays`). Vanished
+/// displays keep their record so returnees map back in place.
+nonisolated(unsafe) var workspaceDisplayUUID: [WorkspaceID: String] = [:]
 /// Stable display UUIDs by display id (EDID identity, surviving reboots
 /// and numeric-id rotation). Populated beside `displayScreens`; session
 /// save/restore keys off these first, numeric ids second — mirroring
@@ -2119,23 +2123,29 @@ nonisolated(unsafe) var tickTimer: Timer?
         rescheduleTickTimer()
         print("display: max refresh \(Int(min(max(hz, 60.0), 120.0)))Hz")
     }
-    workspaceDisplay = [:]
-    for (index, entry) in displayScreens.enumerated() {
-        workspaceDisplay[WorkspaceID(index + 1)] = entry.id
-    }
-    displayUsable = Dictionary(
-        uniqueKeysWithValues: usableEntries.map { ($0.id, $0.frame) }
-    )
     // Stable UUIDs refresh with the set (cheap: one CoreGraphics call per
-    // display, only when the set changed).
+    // display, only when the set changed) ahead of mapping, so newcomers
+    // record UUIDs on their first pass. Vanished ids keep their record
+    // so returning sleepers map back (see below).
     for entry in displayScreens where displayUUIDs[entry.id] == nil {
         displayUUIDs[entry.id] = displayUUID(for: entry.id)
     }
-    for id in Array(displayUUIDs.keys)
-        where !displayScreens.contains(where: { $0.id == id })
-    {
-        displayUUIDs.removeValue(forKey: id)
-    }
+    // Stability first: workspaces keep their known displays by UUID.
+    // Numeric ids rotate across reboots and sleep/wake reorders, so
+    // index assignment shuffles windows across physical displays;
+    // UUIDs survive both. Vanished displays keep their UUID record
+    // (cheap strings) so a sleeper that returns restores in place.
+    // (Pure core in `Displays.assignWorkspaces`; this threads live state.)
+    let assigned = assignWorkspaces(
+        orderedDisplayIDs: displayScreens.map { $0.id },
+        uuids: displayUUIDs,
+        known: workspaceDisplayUUID
+    )
+    workspaceDisplay = assigned.mapping
+    workspaceDisplayUUID = assigned.uuids
+    displayUsable = Dictionary(
+        uniqueKeysWithValues: usableEntries.map { ($0.id, $0.frame) }
+    )
 }
 
 /// Workspace ring in spatial display order (1-based, main first).
