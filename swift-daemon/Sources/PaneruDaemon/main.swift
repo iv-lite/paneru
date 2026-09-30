@@ -3120,25 +3120,47 @@ let perfSlowTickMs = 8.0
             vPad: CGFloat(window.verticalPadding)
         )
     }
-    if !result.borderPlan.isEmpty {
-        for id in result.borderPlan.removed {
+    // No rings on native-fullscreen windows: viewport-sized glass on
+    // another Space reads as an orphan ring here (border-only scope;
+    // focus behavior unchanged). Focusless ticks with tracked rects
+    // prune outright: only focused windows earn borders, so leftovers
+    // are orphans by definition (the plan's hiddenReset, host-side).
+    var borderPlan = result.borderPlan
+    if let focus = result.focus, fullscreenFloated.contains(focus) {
+        borderPlan.added.removeAll(where: { $0.0 == focus })
+        borderPlan.moved.removeAll(where: { $0.0 == focus })
+        borderPlan.reskinned.removeAll(where: { $0.0 == focus })
+        borderRects.removeValue(forKey: focus)
+        borderStyles.removeValue(forKey: focus)
+    }
+    if result.focus == nil, !borderRects.isEmpty {
+        borderRects.removeAll()
+        borderStyles.removeAll()
+        if !shadowMode {
+            MainActor.assumeIsolated {
+                Presenter.syncBorders([])
+            }
+        }
+    }
+    if !borderPlan.isEmpty {
+        for id in borderPlan.removed {
             borderRects.removeValue(forKey: id)
             borderStyles.removeValue(forKey: id)
         }
-        for (id, rect, style) in result.borderPlan.added {
+        for (id, rect, style) in borderPlan.added {
             borderRects[id] = glassForBorder(id, rect)
             borderStyles[id] = style
         }
-        for (id, rect) in result.borderPlan.moved {
+        for (id, rect) in borderPlan.moved {
             borderRects[id] = glassForBorder(id, rect)
         }
-        for (id, style) in result.borderPlan.reskinned {
+        for (id, style) in borderPlan.reskinned {
             borderStyles[id] = style
         }
         if !shadowMode {
             MainActor.assumeIsolated {
                 Presenter.syncBorders(resolveOverlayItems(
-                    plan: result.borderPlan,
+                    plan: borderPlan,
                     currentRects: borderRects, currentStyles: borderStyles
                 ))
             }
