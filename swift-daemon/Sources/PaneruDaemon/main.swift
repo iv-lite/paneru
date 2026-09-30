@@ -2857,7 +2857,7 @@ let perfSlowTickMs = 8.0
         }
     }
     // Mouse-follows-focus: a focus arrival the pointer didn't cause
-    // warps to the window's visible center (simplified
+    // warps to the window's center (simplified
     // `Added<FocusedMarker>` arrival system). Hover echoes never warp —
     // the pointer already sits on the window, and warping onto
     // pre-reveal geometry round-trips into a new hover once reveal

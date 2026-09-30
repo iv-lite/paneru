@@ -2883,12 +2883,18 @@ public struct DaemonCore: Sendable {
         cause: FollowCause, enabled: Bool
     ) -> IntPoint? {
         guard enabled, let frame = focusFrame else { return nil }
+        // Sliver gate on the visible slice: never warp for windows
+        // with ~nothing on-screen, whatever the cause.
         let visible = frame.intersected(with: viewport)
         guard visible.area >= 50 * 50 else { return nil }
-        if cause != .keyboard, visible.contains(cursor) { return nil }
+        if cause != .keyboard, frame.contains(cursor) { return nil }
+        // Full-frame center (deliberate Rust divergence — Rust warps to
+        // the visible center): the cursor belongs on the window itself,
+        // wherever the viewport crops it. Hover uses frame containment
+        // too, so the landing never re-fires a new hover by itself.
         return IntPoint(
-            visible.min.x + visible.width / 2,
-            visible.min.y + visible.height / 2
+            frame.min.x + frame.width / 2,
+            frame.min.y + frame.height / 2
         )
     }
 

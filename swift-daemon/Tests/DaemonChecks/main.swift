@@ -764,7 +764,7 @@ do {
 }
 
 // Mouse-follow decision is pure: keyboard arrivals always recenter on
-// the visible center, ambient ones hold when the cursor is already
+// the full-frame center, ambient ones hold when the cursor is already
 // inside, and slivers/off-screen frames never warp.
 do {
     let daemon = DaemonCore()
@@ -804,7 +804,7 @@ do {
         daemon.followWarpTarget(
             focusFrame: IntRect(900, 100, 1200, 500), viewport: view,
             cursor: IntPoint(0, 0), cause: .ambient, enabled: true
-        ), IntPoint(962, 300), "half-hung windows warp to the visible center"
+        ), IntPoint(1050, 300), "half-hung windows warp to the frame center"
     )
     checkEqual(
         daemon.followWarpTarget(
