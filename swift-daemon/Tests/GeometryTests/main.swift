@@ -150,6 +150,21 @@ do {
     checkClose(glass.size.height, 0.0, "glass clamps h")
 }
 
+// Ring-on-glass pipeline: padded slot truth shrinks to raw glass,
+// then the ring straddles the glass edge — the between-window gap
+// stays outside the ring, never between glass and ring.
+do {
+    let padded = CGRect(origin: CGPoint(x: 0.0, y: 34.0), size: CGSize(width: 416.0, height: 734.0))
+    let glass = glassRect(padded, hPad: 8.0, vPad: 8.0)
+    let ring = borderWindowRect(glass, width: 2.0)
+    checkClose(glass.origin.x, 8.0, "pipeline glass x")
+    checkClose(glass.size.width, 400.0, "pipeline glass w")
+    checkClose(ring.origin.x, 7.0, "pipeline ring x")
+    checkClose(ring.size.width, 402.0, "pipeline ring w")
+    checkClose(ring.origin.y, 41.0, "pipeline ring y")
+    checkClose(ring.size.height, 720.0, "pipeline ring h")
+}
+
 if failures == 0 {
     print("GeometryChecks: all checks passed")
 } else {
