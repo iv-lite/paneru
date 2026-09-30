@@ -39,6 +39,8 @@ public struct DaemonOptions: Sendable {
     public var horizontalMouseWarpOffset: Int32?
     public var animations: Bool?
     public var animationDurationMs: UInt64?
+    public var animationMinDurationMs: UInt64?
+    public var animationMaxDurationMs: UInt64?
     public var autoCenter: Bool?
     public var centerSingleColumn: Bool?
     public var defaultRatio: Double?
@@ -106,6 +108,8 @@ public struct DaemonOptions: Sendable {
 public let defaultPresetColumnWidths: [Double] = [0.25, 0.33333, 0.50, 0.66667, 0.75, 1.0, 1.5, 2.0]
 public let defaultPresetStackHeights: [Double] = [0.25, 0.33333, 0.50, 0.66667, 0.75]
 public let defaultAnimationDurationMs: UInt64 = 250
+public let defaultAnimationMinDurationMs: UInt64 = 80
+public let defaultAnimationMaxDurationMs: UInt64 = 320
 public let defaultRestoreGraceMs: UInt64 = 2000
 public let defaultGapPx: UInt16 = 8
 public let maxGapPx: Int32 = 50
@@ -121,6 +125,9 @@ public struct ResolvedConfig: Equatable, Sendable {
     public var animationsEnabled = true
     /// Zero when animations are off (snaps instantly).
     public var animationDurationMs: UInt64 = defaultAnimationDurationMs
+    /// Glide pacing bounds (proportional scaling floor/ceiling).
+    public var animationMinDurationMs: UInt64 = defaultAnimationMinDurationMs
+    public var animationMaxDurationMs: UInt64 = defaultAnimationMaxDurationMs
     public var autoCenter = false
     public var centerSingleColumn = false
     public var defaultRatio: Double?
@@ -202,6 +209,8 @@ public struct ResolvedConfig: Equatable, Sendable {
             && lhs.horizontalMouseWarp == rhs.horizontalMouseWarp
             && lhs.animationsEnabled == rhs.animationsEnabled
             && lhs.animationDurationMs == rhs.animationDurationMs
+            && lhs.animationMinDurationMs == rhs.animationMinDurationMs
+            && lhs.animationMaxDurationMs == rhs.animationMaxDurationMs
             && lhs.autoCenter == rhs.autoCenter
             && lhs.defaultRatio == rhs.defaultRatio
             && lhs.sliverHeight == rhs.sliverHeight
@@ -265,6 +274,11 @@ extension DaemonOptions {
         } else {
             out.animationsEnabled = true
             out.animationDurationMs = min(animationDurationMs ?? defaultAnimationDurationMs, 2000)
+            out.animationMinDurationMs = min(animationMinDurationMs ?? defaultAnimationMinDurationMs, 1000)
+            out.animationMaxDurationMs = max(
+                out.animationMinDurationMs,
+                min(animationMaxDurationMs ?? defaultAnimationMaxDurationMs, 2000)
+            )
         }
         if autoCenter == true { out.autoCenter = true }
         if centerSingleColumn == true { out.centerSingleColumn = true }
@@ -355,6 +369,12 @@ extension DaemonOptions {
             config.animationsEnabled = true
             if let d = animationDurationMs {
                 config.animationDurationMs = min(d, 2000)
+            }
+            if let m = animationMinDurationMs {
+                config.animationMinDurationMs = min(m, 1000)
+            }
+            if let m = animationMaxDurationMs {
+                config.animationMaxDurationMs = max(config.animationMinDurationMs, min(m, 2000))
             }
         } else if let d = animationDurationMs {
             config.animationDurationMs = min(d, 2000)

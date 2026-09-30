@@ -70,6 +70,8 @@ public func decodeSetupOptions(_ root: [String: ScriptValue]) -> DaemonOptions {
     }
     out.animations = flag("animations")
     if let v = setupInt(map["animation_duration_ms"]) { out.animationDurationMs = UInt64(max(v, 0)) }
+    if let v = setupInt(map["animation_min_duration_ms"]) { out.animationMinDurationMs = UInt64(max(v, 0)) }
+    if let v = setupInt(map["animation_max_duration_ms"]) { out.animationMaxDurationMs = UInt64(max(v, 0)) }
     out.autoCenter = flag("auto_center")
     out.centerSingleColumn = flag("center_single_column")
     out.defaultRatio = setupDouble(map["default_ratio"])

@@ -112,12 +112,28 @@ private func ms(_ secs: Float) -> UInt64 {
 
 /// Distance-proportional glide: near-reference moves use `base`, shorter
 /// ones shrink toward the minimum, longer ones grow toward the maximum.
+/// Square-root scaling keeps ultrawide traverses readable. The full
+/// form takes pacing overrides (config-pushed bounds, viewport-scaled
+/// reference); the short form pins Rust-parity constants.
+public func proportionalDuration(
+    distancePx: Float, baseMs: UInt64,
+    minMs: UInt64, maxMs: UInt64, referencePx: Float
+) -> UInt64 {
+    guard baseMs > 0, distancePx > Float.ulpOfOne else { return baseMs }
+    let scale = min(max(sqrt(distancePx / max(referencePx, 1)), 0.5), 1.5)
+    let scaled = Float(baseMs) / 1000.0 * scale
+    return ms(min(max(scaled, Float(minMs) / 1000.0), Float(maxMs) / 1000.0))
+}
+
+/// Distance-proportional glide: near-reference moves use `base`, shorter
+/// ones shrink toward the minimum, longer ones grow toward the maximum.
 /// Square-root scaling keeps ultrawide traverses readable.
 public func proportionalDuration(distancePx: Float, baseMs: UInt64) -> UInt64 {
-    guard baseMs > 0, distancePx > Float.ulpOfOne else { return baseMs }
-    let scale = min(max(sqrt(distancePx / referenceTravelPx), 0.5), 1.5)
-    let scaled = Float(baseMs) / 1000.0 * scale
-    return ms(min(max(scaled, Float(minAnimationDurationMs) / 1000.0), Float(maxAnimationDurationMs) / 1000.0))
+    proportionalDuration(
+        distancePx: distancePx, baseMs: baseMs,
+        minMs: minAnimationDurationMs, maxMs: maxAnimationDurationMs,
+        referencePx: referenceTravelPx
+    )
 }
 
 /// Shortens the glide when retargeting mid-flight: covers only the

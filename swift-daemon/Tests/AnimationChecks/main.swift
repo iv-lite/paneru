@@ -86,6 +86,28 @@ do {
     checkEqual(proportionalDuration(distancePx: 100, baseMs: 0), 0, "zero base stays zero")
 }
 
+// full-form pacing overrides: bounds and reference apply, short form
+// delegates to Rust-parity constants.
+do {
+    let custom = proportionalDuration(
+        distancePx: 100, baseMs: 150, minMs: 20, maxMs: 1000, referencePx: 800
+    )
+    check(custom < 150, "custom form shrinks short moves")
+    check(custom >= 20, "custom minimum binds")
+    let clamped = proportionalDuration(
+        distancePx: 3440, baseMs: 150, minMs: 20, maxMs: 200, referencePx: 800
+    )
+    checkEqual(clamped, 200, "custom maximum binds")
+    let near = proportionalDuration(
+        distancePx: 1706, baseMs: 150, minMs: 20, maxMs: 1000, referencePx: 1706
+    )
+    checkEqual(near, 150, "reference-scaled travel keeps base")
+    let far = proportionalDuration(
+        distancePx: 1706, baseMs: 150, minMs: 20, maxMs: 1000, referencePx: 800
+    )
+    check(far > near, "wider reference shortens less")
+}
+
 private func checkPhase(_ got: (stampMs: UInt64, opened: Bool), _ want: (UInt64, Bool), _ message: String) {
     check(got.stampMs == want.0 && got.opened == want.1, "\(message) (got \(got), want \(want))")
 }

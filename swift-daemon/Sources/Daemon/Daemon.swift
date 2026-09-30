@@ -336,6 +336,15 @@ public struct DaemonCore: Sendable {
     /// Base glide duration in ms (Rust `animation_duration_ms`, 250):
     /// proportional pacing shrinks/grows per distance (80…320ms).
     public var glideBaseMs: UInt64 = 250
+    /// Glide pacing bounds, host-pushed from config (defaults pin Rust
+    /// parity: 80ms floor, 320ms ceiling).
+    public var glideMinMs: UInt64 = 80
+    public var glideMaxMs: UInt64 = 320
+    /// Proportional-pacing reference, refreshed per commit from the
+    /// active viewport (800px below ~2400px widths, wider above):
+    /// ultrawide traverses keep per-pixel pace instead of camping the
+    /// ceiling while standard rigs behave exactly as before.
+    public var glideReferencePx: Float = 800
     /// Wall-clock source for tween progress (ms). Nil keeps the
     /// epoch-derived clock (`epoch * 16`), so frame-counted tests stay
     /// deterministic; production injects wall time so main-thread
@@ -2073,6 +2082,10 @@ public struct DaemonCore: Sendable {
         // Rows that are not showing park at their own display's sliver
         // instead of their slots (mirrors workspace-switch parking; the
         // OS must hold them there so macOS never relocates them).
+        // Pacing reference follows the active viewport (ultrawide rigs
+        // scale up from 800px; standard widths pin the legacy value).
+        let refHome = viewport(for: activeWorkspace, in: viewports)
+        glideReferencePx = max(800, Float(refHome.width) / 3.0)
         // Programmatic offset targets ease first, so this tick's slots
         // already account for strip travel (members ride composed).
         easeOffsets(epoch: epoch)
@@ -2474,7 +2487,10 @@ public struct DaemonCore: Sendable {
         if leg == nil {
             let (stamp, opened) = birthPhase(nowMs: nowMs, burstOpenedMs: glideBurstOpenedMs)
             if opened { glideBurstOpenedMs = stamp }
-            let own = proportionalDuration(distancePx: dist, baseMs: glideBaseMs)
+            let own = proportionalDuration(
+                distancePx: dist, baseMs: glideBaseMs,
+                minMs: glideMinMs, maxMs: glideMaxMs, referencePx: glideReferencePx
+            )
             let duration = joinDuration(
                 ownMs: own, nowMs: nowMs, deadlineMs: glideBurstDeadlineMs
             )
@@ -2550,7 +2566,10 @@ public struct DaemonCore: Sendable {
         if leg == nil {
             let (stamp, opened) = birthPhase(nowMs: nowMs, burstOpenedMs: glideBurstOpenedMs)
             if opened { glideBurstOpenedMs = stamp }
-            let own = proportionalDuration(distancePx: dist, baseMs: glideBaseMs)
+            let own = proportionalDuration(
+                distancePx: dist, baseMs: glideBaseMs,
+                minMs: glideMinMs, maxMs: glideMaxMs, referencePx: glideReferencePx
+            )
             let duration = joinDuration(
                 ownMs: own, nowMs: nowMs, deadlineMs: glideBurstDeadlineMs
             )

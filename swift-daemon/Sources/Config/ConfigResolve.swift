@@ -79,6 +79,12 @@ public func decodeOptions(_ sections: [String: [String: String]]) -> DaemonOptio
     if let v = int(options, "animation_duration_ms") {
         out.animationDurationMs = UInt64(max(v, 0))
     }
+    if let v = int(options, "animation_min_duration_ms") {
+        out.animationMinDurationMs = UInt64(max(v, 0))
+    }
+    if let v = int(options, "animation_max_duration_ms") {
+        out.animationMaxDurationMs = UInt64(max(v, 0))
+    }
     out.autoCenter = bool(options, "auto_center")
     out.centerSingleColumn = bool(options, "center_single_column")
     out.defaultRatio = double(options, "default_ratio")
