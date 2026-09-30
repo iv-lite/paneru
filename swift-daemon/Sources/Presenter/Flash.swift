@@ -56,7 +56,7 @@ final class FlashView: NSView {
 final class FlashManager {
     nonisolated(unsafe) static let shared = FlashManager()
     private var window: NSWindow?
-    private var shown: (msg: String, bucket: UInt8, frame: NSRect)?
+    private var shown: (msg: String, frame: NSRect)?
 
     @MainActor
     func show(message: String, opacity: Float, topRight: NSPoint) {
@@ -80,31 +80,38 @@ final class FlashManager {
             width: size.width,
             height: size.height
         )
-        let bucket = UInt8((CGFloat(opacity).clamped01 * 10).rounded())
-        if let shown, shown.msg == message, shown.bucket == bucket,
+        // Layer-backed raster is cached in a GPU texture: re-shows only
+        // adjust layer opacity (no CPU redraw), and same-message frames
+        // never rebuild the view.
+        if let shown, shown.msg == message,
             shown.frame.equalToEpsilon(frame),
             let window
         {
+            window.contentView?.layer?.opacity = Float(opacity)
             window.orderFront(nil)
             return
         }
-        shown = (message, bucket, frame)
+        shown = (message, frame)
         if let window {
             let v = FlashView(frame: NSRect(origin: .zero, size: size))
+            v.wantsLayer = true
             v.opacity = CGFloat(opacity)
             v.message = message
             v.isBadge = isBadge
             window.contentView = v
-            window.setFrame(frame, display: true)
+            v.layer?.opacity = Float(opacity)
+            window.setFrame(frame, display: false)
             window.orderFront(nil)
         } else {
             let window = Screens.makeOverlayWindow(frame: frame)
             window.level = .floating + 1
             let v = FlashView(frame: NSRect(origin: .zero, size: size))
+            v.wantsLayer = true
             v.opacity = CGFloat(opacity)
             v.message = message
             v.isBadge = isBadge
             window.contentView = v
+            v.layer?.opacity = Float(opacity)
             window.orderFront(nil)
             self.window = window
         }

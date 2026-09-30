@@ -107,9 +107,9 @@ public struct DaemonOptions: Sendable {
 
 public let defaultPresetColumnWidths: [Double] = [0.25, 0.33333, 0.50, 0.66667, 0.75, 1.0, 1.5, 2.0]
 public let defaultPresetStackHeights: [Double] = [0.25, 0.33333, 0.50, 0.66667, 0.75]
-public let defaultAnimationDurationMs: UInt64 = 250
+public let defaultAnimationDurationMs: UInt64 = 180
 public let defaultAnimationMinDurationMs: UInt64 = 80
-public let defaultAnimationMaxDurationMs: UInt64 = 320
+public let defaultAnimationMaxDurationMs: UInt64 = 260
 public let defaultRestoreGraceMs: UInt64 = 2000
 public let defaultGapPx: UInt16 = 8
 public let maxGapPx: Int32 = 50

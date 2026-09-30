@@ -59,7 +59,7 @@ do {
     checkEqual(c.restoreMissingWindows, .ignore, "missing windows ignored")
     checkEqual(c.presetColumnWidths, [0.25, 0.33333, 0.50, 0.66667, 0.75, 1.0, 1.5, 2.0], "column presets")
     checkEqual(c.presetStackHeights, [0.25, 0.33333, 0.50, 0.66667, 0.75], "stack presets")
-    checkEqual(c.animationDurationMs, 250, "animation default")
+    checkEqual(c.animationDurationMs, 180, "animation default")
 }
 
 // Clamps mirror the getters.

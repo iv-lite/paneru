@@ -3008,6 +3008,41 @@ do {
     checkEqual(daemon.positions[1], IntPoint(400, 34), "advanced clock lands the leg")
 }
 
+// Mid-flight retarget past the carry band lands at the new target
+// without stalling or ping-ponging.
+do {
+    var daemon = DaemonCore()
+    let clock = ManualClock()
+    daemon.wallClockMs = { clock.now }
+    let live = frames(slots: [0: IntPoint(0, 34), 1: IntPoint(400, 34), 2: IntPoint(800, 34)])
+    _ = daemon.tick(
+        events: [
+            .appeared(id: 0, workspace: 1), .appeared(id: 1, workspace: 1),
+            .appeared(id: 2, workspace: 1), .focus(id: 0),
+        ],
+        frames: live, viewport: viewport, focusedStyle: style
+    )
+    // Drop window 2 into the middle: leg 800 -> 400.
+    _ = daemon.tick(
+        events: [.drop(id: 2, point: IntPoint(100, 400))],
+        frames: live, viewport: viewport, focusedStyle: style
+    )
+    clock.now = 60
+    _ = daemon.tick(events: [], frames: live, viewport: viewport, focusedStyle: style)
+    let mid = daemon.positions[2] ?? IntPoint(-1, -1)
+    check(mid != IntPoint(400, 34) && mid != IntPoint(800, 34), "leg in flight mid-window")
+    // Drop it back to the end: retarget past the carry band.
+    _ = daemon.tick(
+        events: [.drop(id: 2, point: IntPoint(900, 400))],
+        frames: live, viewport: viewport, focusedStyle: style
+    )
+    clock.now = 1000
+    _ = daemon.tick(events: [], frames: live, viewport: viewport, focusedStyle: style)
+    checkEqual(daemon.positions[2], IntPoint(800, 34), "retarget lands at the new slot")
+    _ = daemon.tick(events: [], frames: live, viewport: viewport, focusedStyle: style)
+    checkEqual(daemon.positions[2], IntPoint(800, 34), "landing sticks")
+}
+
 if failures == 0 {
     print("DaemonChecks: all checks passed")
 } else {

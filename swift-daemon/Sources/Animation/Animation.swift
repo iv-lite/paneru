@@ -23,8 +23,9 @@ public let maxAnimationDurationMs: UInt64 = 320
 public let referenceTravelPx: Float = 800.0
 /// Legs born within this of a burst opening adopt its phase stamp.
 public let burstJoinWindowMs: UInt64 = 50
-/// Retarget drift below which a leg carries its phase.
-public let retargetCarryPx: Float = 32.0
+/// Retarget drift below which a leg carries its phase (finishing on the
+/// original deadline instead of restarting).
+public let retargetCarryPx: Float = 64.0
 /// First-tick visibility window and minimum step per axis.
 public let firstTickWindowMs: UInt64 = 25
 public let firstTickKickPx: Int32 = 2
@@ -138,11 +139,14 @@ public func proportionalDuration(distancePx: Float, baseMs: UInt64) -> UInt64 {
 
 /// Shortens the glide when retargeting mid-flight: covers only the
 /// remaining distance proportionally, floored at the minimum.
-public func retargetDuration(remainingPx: Float, totalPx: Float, baseMs: UInt64) -> UInt64 {
+public func retargetDuration(
+    remainingPx: Float, totalPx: Float, baseMs: UInt64,
+    minMs: UInt64 = minAnimationDurationMs
+) -> UInt64 {
     guard baseMs > 0, totalPx > Float.ulpOfOne else { return baseMs }
     let ratio = min(max(remainingPx / totalPx, 0), 1)
     guard ratio < 1.0 else { return baseMs }
-    return ms(max(Float(baseMs) / 1000.0 * ratio, Float(minAnimationDurationMs) / 1000.0))
+    return ms(max(Float(baseMs) / 1000.0 * ratio, Float(minMs) / 1000.0))
 }
 
 /// Burst-synchronized duration for a joining leg: stretch to the burst's

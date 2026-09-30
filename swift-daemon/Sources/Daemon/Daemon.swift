@@ -333,13 +333,13 @@ public struct DaemonCore: Sendable {
     /// Eased glides on/off (Rust `animations` switch). Off (or a zero
     /// base duration) snaps exactly like before.
     public var animationsEnabled = true
-    /// Base glide duration in ms (Rust `animation_duration_ms`, 250):
-    /// proportional pacing shrinks/grows per distance (80…320ms).
-    public var glideBaseMs: UInt64 = 250
-    /// Glide pacing bounds, host-pushed from config (defaults pin Rust
-    /// parity: 80ms floor, 320ms ceiling).
+    /// Base glide duration in ms (stock 180; `animation_duration_ms`
+    /// overrides): proportional pacing shrinks/grows per distance.
+    public var glideBaseMs: UInt64 = 180
+    /// Glide pacing bounds, host-pushed from config (stock 80ms floor,
+    /// 260ms ceiling).
     public var glideMinMs: UInt64 = 80
-    public var glideMaxMs: UInt64 = 320
+    public var glideMaxMs: UInt64 = 260
     /// Proportional-pacing reference, refreshed per commit from the
     /// active viewport (800px below ~2400px widths, wider above):
     /// ultrawide traverses keep per-pixel pace instead of camping the
@@ -2498,6 +2498,10 @@ public struct DaemonCore: Sendable {
             return (dx * dx + dy * dy).squareRoot()
         }()
         var leg = glides[member]
+        // Restarted legs shorten: a retarget past the carry band births
+        // a leg priced for the remainder, not a full fresh glide (the
+        // sluggish tail). Total measures from the old leg's start.
+        var restartedTotal: Float?
         if var live = leg, live.target != to {
             let drift: Float = {
                 let dx = Float(to.x - live.target.x), dy = Float(to.y - live.target.y)
@@ -2508,16 +2512,24 @@ public struct DaemonCore: Sendable {
                 live.target = to
                 leg = live
             } else {
+                let dx = Float(to.x - live.start.x), dy = Float(to.y - live.start.y)
+                restartedTotal = (dx * dx + dy * dy).squareRoot()
                 leg = nil
             }
         }
         if leg == nil {
             let (stamp, opened) = birthPhase(nowMs: nowMs, burstOpenedMs: glideBurstOpenedMs)
             if opened { glideBurstOpenedMs = stamp }
-            let own = proportionalDuration(
+            var own = proportionalDuration(
                 distancePx: dist, baseMs: glideBaseMs,
                 minMs: glideMinMs, maxMs: glideMaxMs, referencePx: glideReferencePx
             )
+            if let total = restartedTotal, total > Float.ulpOfOne {
+                own = min(own, retargetDuration(
+                    remainingPx: dist, totalPx: total,
+                    baseMs: glideBaseMs, minMs: glideMinMs
+                ))
+            }
             let duration = joinDuration(
                 ownMs: own, nowMs: nowMs, deadlineMs: glideBurstDeadlineMs
             )
@@ -2580,6 +2592,8 @@ public struct DaemonCore: Sendable {
         }
         let dist = Float(abs(to - from))
         var leg = offsetLegs[ws]
+        // Restarted legs shorten, like window legs above.
+        var restartedTotal: Float?
         if var live = leg, live.target != IntPoint(to, 0) {
             let drift = Float(abs(to - live.target.x))
             let elapsed = nowMs >= live.bornMs ? nowMs - live.bornMs : 0
@@ -2587,16 +2601,23 @@ public struct DaemonCore: Sendable {
                 live.target = IntPoint(to, 0)
                 leg = live
             } else {
+                restartedTotal = Float(abs(to - live.start.x))
                 leg = nil
             }
         }
         if leg == nil {
             let (stamp, opened) = birthPhase(nowMs: nowMs, burstOpenedMs: glideBurstOpenedMs)
             if opened { glideBurstOpenedMs = stamp }
-            let own = proportionalDuration(
+            var own = proportionalDuration(
                 distancePx: dist, baseMs: glideBaseMs,
                 minMs: glideMinMs, maxMs: glideMaxMs, referencePx: glideReferencePx
             )
+            if let total = restartedTotal, total > Float.ulpOfOne {
+                own = min(own, retargetDuration(
+                    remainingPx: dist, totalPx: total,
+                    baseMs: glideBaseMs, minMs: glideMinMs
+                ))
+            }
             let duration = joinDuration(
                 ownMs: own, nowMs: nowMs, deadlineMs: glideBurstDeadlineMs
             )
