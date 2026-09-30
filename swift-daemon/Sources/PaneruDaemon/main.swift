@@ -1007,6 +1007,16 @@ nonisolated(unsafe) var spaceVotes: [WorkspaceID: (space: SpaceID, seen: Int)] =
         }
         let frame = window.frame
         defer { stableFrames[wid] = frame }
+        // Scrolled strips explain display mismatch: slots ride offsets,
+        // so a rested-but-scrolled column can sit across the seam while
+        // belonging home. Rehome only from still water (manual drags
+        // land at rest with zero offsets and still heal).
+        if let home = workspaceOfWindow(id),
+           (core.offsets[home] ?? 0) != 0
+               || (core.offsetTarget(for: home) ?? 0) != (core.offsets[home] ?? 0)
+        {
+            continue
+        }
         guard shouldRehome(
             stableFrame: stableFrames[wid], liveFrame: frame,
             slot: core.committedSlot(of: id),
