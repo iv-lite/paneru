@@ -2958,6 +2958,33 @@ do {
     check(!daemon.isFullWidth(0), "recycled id starts unmarked")
 }
 
+// Binpack failure stacks at minimum height instead of piling members
+// onto coincident preserved slots (short viewport, fused stack).
+do {
+    var daemon = DaemonCore()
+    daemon.animationsEnabled = false
+    daemon.glideBaseMs = 0
+    let short = IntRect(0, 0, 1024, 300)
+    let live = frames(slots: [0: IntPoint(0, 0), 1: IntPoint(0, 0)])
+    _ = daemon.tick(
+        events: [.appeared(id: 0, workspace: 1), .appeared(id: 1, workspace: 1), .focus(id: 1)],
+        frames: live, viewport: short, focusedStyle: style
+    )
+    _ = daemon.tick(
+        events: [.command(.window(.stack(true)))],
+        frames: live, viewport: short, focusedStyle: style
+    )
+    checkEqual(
+        daemon.strips[1]?[0]?.allWindows.sorted(), [0, 1], "stack fuses the column"
+    )
+    _ = daemon.tick(events: [], frames: live, viewport: short, focusedStyle: style)
+    let s0 = daemon.committedSlot(of: 0)
+    let s1 = daemon.committedSlot(of: 1)
+    check(s0 != s1, "fallback slots never coincide")
+    checkEqual(s0?.y, 0, "first item tops the viewport")
+    checkEqual(s1?.y, 200, "second item stacks at minimum height")
+}
+
 // Wall-clock tweens: a frozen clock stalls leg progress no matter how
 // many epochs pass (no epoch dilation), and advancing it lands the leg.
 do {

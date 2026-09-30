@@ -2225,10 +2225,14 @@ public struct DaemonCore: Sendable {
 
     /// Split the viewport height over stacked items (tab-group members
     /// share one item frame), issuing move + resize intents per member.
-    /// Falls back to preserved-y slots when even minimums don't fit.
+    /// When even minimums don't fit, stack at minimum height with the
+    /// last item taking the remainder (overflowing the viewport rather
+    /// than piling members onto coincident preserved-y slots no watch
+    /// can tell apart from convergence).
     private mutating func layoutStackItems(
-        _ items: [StackItem], x: Int32, home: IntRect, epoch: UInt64,
-        frames: (WindowID) -> IntRect?, heldMembers: Set<WindowID>
+        _ items: [StackItem], x: Int32, home: IntRect,
+        epoch: UInt64, frames: (WindowID) -> IntRect?,
+        heldMembers: Set<WindowID>
     ) {
         let desired = items.map { item in
             item.windows.compactMap { frames($0)?.height }.max()
@@ -2236,17 +2240,31 @@ public struct DaemonCore: Sendable {
         }
         // Stacked slots abut like columns: gaps are host-side AX
         // insets, never pitch, so heights fill the viewport exactly.
-        guard let assigned = binpackHeights(
+        // An empty assignment (total failure) falls through too:
+        // zipping it would silently skip every member, freezing
+        // windows outside the layout no watch can see (deliberate
+        // Rust divergence — upstream returns the empty vec as-is).
+        let assignment = binpackHeights(
             desired, minHeight: stackMinHeight, totalHeight: home.height
-        ) else {
-            for member in items.flatMap({ $0.windows }) {
-                let slot = preservedSlot(member, x: x, home: home, frames: frames)
-                committedSlots[member] = slot
-                applyMove(
-                    member, to: slot, epoch: epoch,
-                    frames: frames, heldMembers: heldMembers
-                )
-                clampMemberSize(member, home: home, epoch: epoch, frames: frames)
+        )
+        guard let assigned = assignment, assigned.count == items.count else {
+            var y = home.min.y
+            for (index, item) in items.enumerated() {
+                let h = index + 1 == items.count
+                    ? max(home.max.y - y, stackMinHeight)
+                    : stackMinHeight
+                for member in item.windows {
+                    let liveW = frames(member)?.width ?? 0
+                    let target = IntSize(max(liveW, 0), max(h, 0))
+                    let slot = IntPoint(x, y)
+                    committedSlots[member] = slot
+                    applyMove(
+                        member, to: slot, epoch: epoch,
+                        frames: frames, heldMembers: heldMembers
+                    )
+                    applySize(member, to: target, epoch: epoch, frames: frames)
+                }
+                y += h
             }
             return
         }
