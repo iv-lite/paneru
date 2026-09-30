@@ -36,6 +36,12 @@ private func frames(slots: [Int32: IntPoint]) -> (Int32) -> IntRect? {
 private let viewport = IntRect(0, 0, 1024, 768)
 private let style = BorderStyle(r: 1, g: 1, b: 1, opacity: 1, width: 2, radius: 8)
 
+/// Manual wall clock for tween tests: the straight-line runner owns
+/// time, so legs advance only when the test says so.
+final class ManualClock: @unchecked Sendable {
+    var now: UInt64 = 0
+}
+
 // Spawn lays out left to right (short singles center vertically);
 // second tick with centered frames is quiescent.
 do {
@@ -2950,6 +2956,29 @@ do {
         frames: live, viewport: viewport, focusedStyle: style
     )
     check(!daemon.isFullWidth(0), "recycled id starts unmarked")
+}
+
+// Wall-clock tweens: a frozen clock stalls leg progress no matter how
+// many epochs pass (no epoch dilation), and advancing it lands the leg.
+do {
+    var daemon = DaemonCore()
+    let clock = ManualClock()
+    daemon.wallClockMs = { clock.now }
+    let live = frames(slots: [0: IntPoint(0, 0), 1: IntPoint(0, 0)])
+    _ = daemon.tick(
+        events: [.appeared(id: 0, workspace: 1), .appeared(id: 1, workspace: 1), .focus(id: 0)],
+        frames: live, viewport: viewport, focusedStyle: style
+    )
+    _ = daemon.tick(events: [], frames: live, viewport: viewport, focusedStyle: style)
+    let early = daemon.positions[1]
+    check(early != IntPoint(400, 34), "glide starts in flight")
+    for _ in 0..<40 {
+        _ = daemon.tick(events: [], frames: live, viewport: viewport, focusedStyle: style)
+    }
+    checkEqual(daemon.positions[1], early, "frozen clock stalls the leg across epochs")
+    clock.now = 10_000
+    _ = daemon.tick(events: [], frames: live, viewport: viewport, focusedStyle: style)
+    checkEqual(daemon.positions[1], IntPoint(400, 34), "advanced clock lands the leg")
 }
 
 if failures == 0 {

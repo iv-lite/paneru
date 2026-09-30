@@ -317,7 +317,8 @@ public struct DaemonCore: Sendable {
     /// Glide legs for eased motion (Rust `PositionDrive`): per-window
     /// tween from drive-start to slot. `positions` walks the eased curve
     /// instead of snapping, so siblings land together and AX converges
-    /// without pop-and-redrive flapping. Epoch-clocked (≈16ms each).
+    /// without pop-and-redrive flapping. Wall-clocked when the host
+    /// injects `wallClockMs`, else epoch-clocked (≈16ms each).
     private struct GlideLeg: Equatable {
         var start: IntPoint
         var target: IntPoint
@@ -335,6 +336,12 @@ public struct DaemonCore: Sendable {
     /// Base glide duration in ms (Rust `animation_duration_ms`, 250):
     /// proportional pacing shrinks/grows per distance (80…320ms).
     public var glideBaseMs: UInt64 = 250
+    /// Wall-clock source for tween progress (ms). Nil keeps the
+    /// epoch-derived clock (`epoch * 16`), so frame-counted tests stay
+    /// deterministic; production injects wall time so main-thread
+    /// timer slip stretches no glide (epoch dilation). Retry/audit
+    /// cadences stay epoch-counted on purpose (frames, not seconds).
+    public var wallClockMs: (@Sendable () -> UInt64)?
     /// Stuck-writer degrade (Rust `ax_writer` ladder): while the oldest
     /// traveling epoch lags past the degrade threshold, the commit
     /// redrive repairs only the focused window instead of hammering
@@ -2441,7 +2448,7 @@ public struct DaemonCore: Sendable {
     private mutating func glideStep(
         _ member: WindowID, from: IntPoint, to: IntPoint, epoch: UInt64
     ) -> IntPoint {
-        let nowMs = epoch &* 16
+        let nowMs = wallClockMs?() ?? epoch &* 16
         if let deadline = glideBurstDeadlineMs, nowMs > deadline {
             glideBurstDeadlineMs = nil
             glideBurstOpenedMs = nil
@@ -2523,7 +2530,7 @@ public struct DaemonCore: Sendable {
     private mutating func offsetGlideStep(
         ws: WorkspaceID, from: Int32, to: Int32, epoch: UInt64
     ) -> Int32 {
-        let nowMs = epoch &* 16
+        let nowMs = wallClockMs?() ?? epoch &* 16
         if let deadline = glideBurstDeadlineMs, nowMs > deadline {
             glideBurstDeadlineMs = nil
             glideBurstOpenedMs = nil

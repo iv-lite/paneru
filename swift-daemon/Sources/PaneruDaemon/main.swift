@@ -435,6 +435,9 @@ core.windowHiddenRatio = resolved.windowHiddenRatio
 core.createWorkspaceAutomatically = resolved.createWorkspaceAutomatically
 core.autoCenter = resolved.autoCenter
 core.swipeDirectionSign = resolved.swipeDirection == .reversed ? 1.0 : -1.0
+// Tweens run on wall time (epoch dilation under load stretches no
+// glide); the harness leaves this nil and stays frame-counted.
+core.wallClockMs = { DispatchTime.now().uptimeNanoseconds / 1_000_000 }
 // Slots abut; gaps live in per-window AX padding (see applyWindowPadding).
 core.centerSingleColumn = resolved.centerSingleColumn
 core.animationsEnabled = resolved.animationsEnabled
@@ -1574,6 +1577,9 @@ func watchTuning(_ path: String) {
     core.createWorkspaceAutomatically = resolved.createWorkspaceAutomatically
     core.autoCenter = resolved.autoCenter
 core.swipeDirectionSign = resolved.swipeDirection == .reversed ? 1.0 : -1.0
+// Tweens run on wall time (epoch dilation under load stretches no
+// glide); the harness leaves this nil and stays frame-counted.
+core.wallClockMs = { DispatchTime.now().uptimeNanoseconds / 1_000_000 }
     // Slots abut; gaps live in per-window AX padding (see applyWindowPadding).
     core.centerSingleColumn = resolved.centerSingleColumn
     core.animationsEnabled = resolved.animationsEnabled
