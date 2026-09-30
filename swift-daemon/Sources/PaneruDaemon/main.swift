@@ -1096,7 +1096,13 @@ tap.sink = {
     }
 }
 // Scroll modifiers from config; nil (unset) disables interception so
-// plain scrolling always delivers natively.
+// plain scrolling always delivers natively. NOTE — finger-count
+// alignment: the tap only consumes exactly the configured count, so a
+// different count (or a macOS Trackpad preference using another count
+// for Mission Control / spaces swipes) flows to the OS natively. Keep
+// `swipe_fingers` matching the fingers you swipe with, and set the
+// system swipe gestures to a different count (or off), or the native
+// swipe wins outright whenever the tap is deaf or the counts differ.
 tap.tuning = TapTuning(
     swipeFingers: resolved.swipeFingers,
     swipeVertical: resolved.swipeVertical,
@@ -3122,10 +3128,12 @@ let perfSlowTickMs = 8.0
                 + " roster=\(roster.count) focus=\(result.focus.map(String.init) ?? "-")"
         )
     }
-    // Tap health ladder, on the same ~2Hz cadence as the frame refresh:
-    // a tap the OS disabled (timeout/user-input) re-arms here instead of
-    // silently going deaf. Matches `tapHealthCheckInterval` order.
-    if tickCount % 1800 == 0 {
+    // Tap health ladder (~5s cadence): a tap the OS disabled
+    // (timeout/user-input) re-arms here instead of silently going deaf
+    // for half a minute (during which native gestures win outright).
+    // The healthy path is two cheap C calls. Matches
+    // `tapHealthCheckInterval` order.
+    if tickCount % 300 == 0 {
         switch tap.ensureAlive() {
         case .healthy:
             break
