@@ -512,10 +512,24 @@ nonisolated(unsafe) var flipCheckCounter = 0
 /// Serial AX worker: every Accessibility round trip runs here, never on
 /// the main runloop (which also owns the event tap — blocking it stalls
 /// all input delivery). Results hop back to main for roster/model
-/// application. One lane keeps per-app ordering sane.
-let axWorker = DispatchQueue(
+/// application. One lane keeps per-window ordering sane. `var` (not
+/// `let`) so lane retirement can replace a hung queue (see the
+/// watchdog); in-flight blocks on the old lane complete against stale
+/// sequences the core ignores.
+nonisolated(unsafe) var axWorker = DispatchQueue(
     label: "com.github.iv-lite.paneru-swift.ax", qos: .userInitiated
 )
+/// Last worker completion (wall time): the lane-health clock. Any ack
+/// proves the lane alive; thirty ackless seconds with frames traveling
+/// retires it (capped per boot).
+nonisolated(unsafe) var lastAckAt = Date()
+/// Lane retirements so far this boot (cap: the diagnosis degrades
+/// gracefully instead of churning queues when AX itself is down).
+nonisolated(unsafe) var workerRetirements = 0
+/// Ackless seconds with traveling frames before a lane retires.
+let workerRetireTimeoutSecs = 30.0
+/// Lane retirements per boot, max.
+let workerMaxRetirements = 3
 
 /// Newcomer probe results: plain data across the queue boundary (the live
 /// `AXUIElement` never leaves the worker except inside the adopted
@@ -2564,7 +2578,10 @@ let perfSlowTickMs = 8.0
     // Worker completions land here (main thread): the async AX writes
     // dispatched below acknowledge through the box, so unacked state
     // tracks real flight and the stall watchdog means something.
+    // Any completion refreshes the lane-health clock (see the
+    // retirement check by the watchdog below).
     let acks = ackBox.drain()
+    if !acks.isEmpty { lastAckAt = Date() }
     for ack in acks {
         core.acknowledge(winID: ack.winID, seq: ack.seq, epoch: ack.epoch)
     }
@@ -2581,13 +2598,15 @@ let perfSlowTickMs = 8.0
     let t1: Date? = perfTimingEnabled ? Date() : nil
     // Idle backoff: a fully quiet tick skips the scan/present work and
     // just advances the clock; every 30th tick still runs full (display
-    // and state cadences). The pointer poll keeps its own 4Hz floor on
+    // and state cadences). Chronic audit survivors break the quiet
+    // (a quiescent model with wrong glass must keep full ticks coming
+    // so backoff-gated redrives fire on schedule). The pointer poll keeps its own 4Hz floor on
     // skip ticks (edge warp and hover must sample while the layout
     // rests). Mirrors the Rust idle/low-power sleep ladder; the 60Hz
     // timer stays, so wakeups are a frame away.
     if lastQuiescent, pending.isEmpty, !rosterDirty, !needTuningReload,
        restorePlanner == nil, restorePending.isEmpty, dragGrabbed == nil,
-       !terminationRequested, tickCount % 30 != 0
+       !terminationRequested, core.auditSurvivors.isEmpty, tickCount % 30 != 0
     {
         tickCount += 1
         if tickCount % 15 == 0 {
@@ -2799,6 +2818,26 @@ let perfSlowTickMs = 8.0
     // only the focused window (see `pollWriterStall`).
     if let gap = core.pollWriterStall() {
         print("ax: writer stall (gap \(gap) epochs, focused-only repair)")
+    }
+    // Worker-lane retirement: timeouts bound wedged apps, but a hung
+    // AX call blocks the serial lane forever — no completions, an
+    // ever-open gap, audits excusing on unacked grace, glass frozen
+    // while the model churns. Thirty ackless seconds with frames
+    // traveling retires the lane: intents are idempotent
+    // latest-per-window writes, so the fresh queue converges instead
+    // of duplicating (stale completions from the old lane carry old
+    // sequences and are ignored). Capped per boot; beyond that the
+    // degraded writer plus the watch list carry the diagnosis.
+    if core.writerGap() != nil,
+       Date().timeIntervalSince(lastAckAt) > workerRetireTimeoutSecs,
+       workerRetirements < workerMaxRetirements
+    {
+        workerRetirements += 1
+        lastAckAt = Date()
+        axWorker = DispatchQueue(
+            label: "com.github.iv-lite.paneru-swift.ax", qos: .userInitiated
+        )
+        print("ax: worker lane retired (#\(workerRetirements)): re-issuing on a fresh queue")
     }
     // Raise intents go straight to AX — unless shadowing, where the
     // observer never touches another daemon's windows.
@@ -3109,6 +3148,12 @@ let perfSlowTickMs = 8.0
         // ride along so the verdict (slot math vs write path) is in
         // the log, not a forensic session.
         for line in core.overlapReport(frames: { roster[CGWindowID(bitPattern: $0)]?.frame }) {
+            print("\(line)")
+        }
+        // Chronic-divergence watch (same cadence): windows the audit
+        // repaired three running times prove a repair path fires but
+        // glass never follows — the retile watchdog's watch list.
+        for line in core.survivorReport(frames: { roster[CGWindowID(bitPattern: $0)]?.frame }) {
             print("\(line)")
         }
     }

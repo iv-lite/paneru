@@ -2958,6 +2958,41 @@ do {
     check(!daemon.isFullWidth(0), "recycled id starts unmarked")
 }
 
+// Audit survivors: a window the audit repairs on consecutive runs
+// lands the watch list; converging clears it.
+do {
+    var daemon = DaemonCore()
+    daemon.animationsEnabled = false
+    daemon.glideBaseMs = 0
+    daemon.auditCadenceEpochs = 5
+    let live = frames(slots: [0: IntPoint(0, 34)])
+    _ = daemon.tick(
+        events: [.appeared(id: 0, workspace: 1), .focus(id: 0)],
+        frames: live, viewport: viewport, focusedStyle: style
+    )
+    // Freeze the glass off-slot; acks flow so nothing is in flight.
+    let drifted: (Int32) -> IntRect? = { _ in
+        IntRect(min: IntPoint(200, 200), max: IntPoint(600, 900))
+    }
+    for _ in 0..<25 {
+        let r = daemon.tick(events: [], frames: drifted, viewport: viewport, focusedStyle: style)
+        for job in r.axJobs {
+            daemon.acknowledge(winID: job.winID, seq: job.seq, epoch: job.epoch)
+        }
+    }
+    let stuck = daemon.survivorReport(frames: drifted)
+    checkEqual(stuck.count, 1, "chronic drift lands the watch list")
+    // Converge the glass: the next audits clear the survivor.
+    for _ in 0..<15 {
+        let r = daemon.tick(events: [], frames: live, viewport: viewport, focusedStyle: style)
+        for job in r.axJobs {
+            daemon.acknowledge(winID: job.winID, seq: job.seq, epoch: job.epoch)
+        }
+    }
+    check(daemon.survivorReport(frames: live).isEmpty, "convergence clears survivors")
+    check(daemon.auditSurvivors.isEmpty, "survivor map drains")
+}
+
 // Binpack failure stacks at minimum height instead of piling members
 // onto coincident preserved slots (short viewport, fused stack).
 do {

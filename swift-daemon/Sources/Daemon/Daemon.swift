@@ -356,6 +356,14 @@ public struct DaemonCore: Sendable {
     /// redrive repairs only the focused window instead of hammering
     /// every stuck app each cooldown. Polled via `pollWriterStall`.
     public private(set) var writerDegraded = false
+    /// Consecutive audits that repaired each window (retile watchdog):
+    /// three in a row lands `survivorReport` — proof a repair path
+    /// fires but glass never follows. Read by the host quiescence gate
+    /// (chronic divergence keeps full ticks coming).
+    public private(set) var auditSurvivors: [WindowID: Int] = [:]
+    /// Audit cadence in epochs (5s at 60Hz). Injectable for tests;
+    /// production leaves the Rust-parity 300.
+    public var auditCadenceEpochs: UInt64 = 300
 
     public init() {}
 
@@ -504,7 +512,7 @@ public struct DaemonCore: Sendable {
         // 5s audit (300 epochs at 60Hz): membership dedup/prune plus
         // drift re-homing, mirroring Rust's `audit_window_positions`
         // cadence and scope.
-        if epoch % 300 == 0 {
+        if epoch % max(auditCadenceEpochs, 1) == 0 {
             auditPass()
             auditRehome(frames: frames, epoch: epoch)
         }
@@ -669,6 +677,7 @@ public struct DaemonCore: Sendable {
                 homing.remove(id)
                 redriveLastLive.removeValue(forKey: id)
                 fullWidth.removeValue(forKey: id)
+                auditSurvivors.removeValue(forKey: id)
                 if pendingReveals.remove(id) != nil { /* dropped with it */ }
                 lastRedrive.removeValue(forKey: id)
                 redriveStreak.removeValue(forKey: id)
@@ -1889,15 +1898,7 @@ public struct DaemonCore: Sendable {
                     }
                     let position = positions[member]
                     let size = sizes[member]
-                    var flags: [String] = []
-                    if glides[member] != nil { flags.append("leg") }
-                    if homing.contains(member) { flags.append("homing") }
-                    if held == member { flags.append("held") }
-                    if isUnacked(member) { flags.append("unacked") }
-                    if redriveStreak[member, default: 0] > 0 {
-                        flags.append("streak\(redriveStreak[member] ?? 0)")
-                    }
-                    if writerDegraded, member != focus { flags.append("degraded") }
+                    let flags = excuseFlags(member)
                     let posOff = position.map {
                         abs($0.x - slot.x) + abs($0.y - slot.y)
                     } ?? -1
@@ -1924,6 +1925,46 @@ public struct DaemonCore: Sendable {
         }
         if skipped > 0 {
             lines.append("(\(skipped) more unchecked/skipped)")
+        }
+        return lines
+    }
+
+    /// In-flight excuses for one window, shared by the divergence and
+    /// survivor reports: glide leg, homing, held hand, unacked job,
+    /// backoff streak, degraded writer.
+    private func excuseFlags(_ member: WindowID) -> [String] {
+        var flags: [String] = []
+        if glides[member] != nil { flags.append("leg") }
+        if homing.contains(member) { flags.append("homing") }
+        if held == member { flags.append("held") }
+        if isUnacked(member) { flags.append("unacked") }
+        if redriveStreak[member, default: 0] > 0 {
+            flags.append("streak\(redriveStreak[member] ?? 0)")
+        }
+        if writerDegraded, member != focus { flags.append("degraded") }
+        return flags
+    }
+
+    /// Chronic-divergence snapshot: windows the audit repaired on three
+    /// or more consecutive runs. A survivor proves a repair path fires
+    /// but glass never follows (wedged app, hung lane, OS clamp) — the
+    /// retile watchdog's watch list. Empty means every repair converges.
+    /// Callers print throttled, like `divergenceReport`.
+    public func survivorReport(frames: (WindowID) -> IntRect?) -> [String] {
+        var lines: [String] = []
+        for member in auditSurvivors.keys.sorted() {
+            guard let audits = auditSurvivors[member], audits >= 3,
+                  let slot = committedSlots[member],
+                  let live = frames(member)
+            else { continue }
+            let flags = excuseFlags(member)
+            lines.append(
+                "stuck: window=\(member) slot=\(slot.x),\(slot.y)"
+                    + " live=\(live.min.x),\(live.min.y)"
+                    + " audits=\(audits)"
+                    + (flags.isEmpty ? "" : " [\(flags.joined(separator: ","))]")
+            )
+            if lines.count >= 8 { break }
         }
         return lines
     }
@@ -1986,6 +2027,7 @@ public struct DaemonCore: Sendable {
     /// strips are moving targets). Sizes re-home alongside origins so
     /// the Firefox class (OS-clamped dimensions) cannot strand either.
     private mutating func auditRehome(frames: (WindowID) -> IntRect?, epoch: UInt64) {
+        var repairedNow: Set<WindowID> = []
         for (ws, rows) in strips {
             // Mid-scroll workspaces are moving targets: an unreached
             // offset target means slots are still traveling.
@@ -2042,10 +2084,18 @@ public struct DaemonCore: Sendable {
                             lastRedrive[member] = epoch
                             sizeStreak[member] = 0
                             lastSizeRedrive[member] = epoch
+                            repairedNow.insert(member)
                         }
                     }
                 }
             }
+        }
+        // Survivor roll: consecutive audits that repaired this window.
+        // Converged (or vanished) members drop out; three running
+        // lands the watch list (`survivorReport`).
+        for id in repairedNow { auditSurvivors[id, default: 0] += 1 }
+        for id in Array(auditSurvivors.keys) where !repairedNow.contains(id) {
+            auditSurvivors.removeValue(forKey: id)
         }
     }
 
@@ -2742,6 +2792,13 @@ public struct DaemonCore: Sendable {
     /// Whether a window still has traveling truth.
     public func isUnacked(_ winID: WindowID) -> Bool {
         ax.unacked(winID)
+    }
+
+    /// Oldest still-traveling commit-frame gap, if any (retile watchdog:
+    /// a gap that outlives every ack means the worker lane is hung, not
+    /// slow — slow lanes still complete batches and ack).
+    public func writerGap() -> UInt64? {
+        ax.openGap()
     }
 
     /// Current strip offset for a workspace (diagnostics/tuning).
