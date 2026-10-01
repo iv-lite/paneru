@@ -985,7 +985,10 @@ nonisolated(unsafe) var rotatedAt: [WorkspaceID: Date] = [:]
     }
     for wid in known.subtracting(current) {
         let id = windowID(wid)
-        if stashedMembers.contains(id) {
+        // Stashed-but-listed members (carried across a rotation) take
+        // the normal vanished path below: only pure-stash members skip
+        // it, else ghosts linger in shown strips while invisible.
+        if stashedMembers.contains(id), workspaceOfWindow(id) == nil {
             // App quit while stashed: drop like a real close.
             if NSRunningApplication(processIdentifier: windowPIDs[id] ?? -1) == nil {
                 stashedMembers.remove(id)

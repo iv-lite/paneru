@@ -825,6 +825,231 @@ do {
     checkEqual(daemon.activeWorkspace, 2, "edge-column arrival retargets")
 }
 
+// Unknown spaces adopt live members instead of wiping: a managed
+// space ID with rostered windows keeps order and slots (the old
+// `[:]` orphaned every member into fresh-append scramble).
+do {
+    var daemon = DaemonCore()
+    _ = daemon.tick(
+        events: [.appeared(id: 0, workspace: 1), .appeared(id: 1, workspace: 1)],
+        frames: frames(slots: [0: IntPoint(0, 0), 1: IntPoint(400, 0)]),
+        viewport: viewport, focusedStyle: style
+    )
+    checkEqual(
+        daemon.strips[1]?[0]?.allWindows, [0, 1], "setup strips left to right"
+    )
+    _ = daemon.resolveSpace(workspace: 1, space: 111)
+    _ = daemon.resolveSpace(workspace: 1, space: 999)
+    checkEqual(
+        daemon.strips[1]?[0]?.allWindows, [0, 1],
+        "unknown space carries members over"
+    )
+    checkEqual(daemon.spaceOfWorkspace[1], 999, "unknown space still records")
+}
+
+// Rotations through empty flux never shrink the good stash: leaving
+// with empty strips keeps the existing entry, and returning restores
+// order instead of the wiped layout.
+do {
+    var daemon = DaemonCore()
+    _ = daemon.tick(
+        events: [.appeared(id: 0, workspace: 1), .appeared(id: 1, workspace: 1)],
+        frames: frames(slots: [0: IntPoint(0, 0), 1: IntPoint(400, 0)]),
+        viewport: viewport, focusedStyle: style
+    )
+    _ = daemon.resolveSpace(workspace: 1, space: 111)
+    _ = daemon.resolveSpace(workspace: 1, space: 222)
+    checkEqual(
+        daemon.strips[1]?[0]?.allWindows, [0, 1],
+        "rotation onto a fresh space carries members over"
+    )
+    _ = daemon.resolveSpace(workspace: 1, space: 333)
+    let stashed = Set(
+        (daemon.spaceStash[111]?.rows.values.flatMap { $0.allWindows }) ?? []
+    )
+    checkEqual(stashed, Set<Int32>([0, 1]), "flux never shrinks the good stash")
+    _ = daemon.resolveSpace(workspace: 1, space: 111)
+    checkEqual(
+        daemon.strips[1]?[0]?.allWindows, [0, 1],
+        "return restores order after flux"
+    )
+}
+
+// Long absence keeps order: the vanish park expires after its TTL,
+// the sweep hands the row to the space stash, and the returnee
+// restores whole from long-term memory instead of appending last.
+do {
+    var daemon = DaemonCore()
+    let live: [Int32: IntPoint] = [
+        0: IntPoint(0, 0), 1: IntPoint(400, 0), 2: IntPoint(800, 0),
+    ]
+    _ = daemon.tick(
+        events: [
+            .appeared(id: 0, workspace: 1), .appeared(id: 1, workspace: 1),
+            .appeared(id: 2, workspace: 1),
+        ],
+        frames: frames(slots: live),
+        viewport: viewport, focusedStyle: style
+    )
+    _ = daemon.resolveSpace(workspace: 1, space: 111)
+    _ = daemon.tick(
+        events: [.disappeared(id: 0), .disappeared(id: 1), .disappeared(id: 2)],
+        frames: frames(slots: live),
+        viewport: viewport, focusedStyle: style
+    )
+    check(
+        daemon.strips[1]?[0]?.allWindows.isEmpty ?? true,
+        "vanish empties the strip (parked)"
+    )
+    for _ in 0..<3700 {
+        _ = daemon.tick(
+            events: [], frames: frames(slots: live),
+            viewport: viewport, focusedStyle: style
+        )
+    }
+    check(
+        daemon.spaceStash[111]?.rows.values.contains(where: { $0.contains(0) }) ?? false,
+        "expired park hands the row to the space stash"
+    )
+    _ = daemon.tick(
+        events: [.appeared(id: 0, workspace: 1)],
+        frames: frames(slots: live),
+        viewport: viewport, focusedStyle: style
+    )
+    checkEqual(
+        daemon.strips[1]?[0]?.allWindows, [0, 1, 2],
+        "expired park restores order from the space stash"
+    )
+}
+
+// Adopt-on-focus-arrival: a live but strip-less window the user
+// touches is adopted into its frame's workspace instead of focusing
+// into limbo (reveal skips, writes skipped, stranded focus).
+// Exclusions hold: frameless ids, parked members (their appeared
+// restores whole), and floating windows stay out.
+do {
+    var daemon = DaemonCore()
+    daemon.workspaceRing = [1, 2]
+    let left = IntRect(0, 0, 1024, 768)
+    let right = IntRect(1024, 0, 2048, 768)
+    _ = daemon.tick(
+        events: [.appeared(id: 0, workspace: 1), .focus(id: 0)],
+        frames: frames(slots: [0: IntPoint(0, 0), 1: IntPoint(1024, 0)]),
+        viewports: [1: left, 2: right], focusedStyle: style
+    )
+    // Window 1 never appeared: touching it adopts it onto ws2.
+    _ = daemon.tick(
+        events: [.focus(id: 1)],
+        frames: frames(slots: [0: IntPoint(0, 0), 1: IntPoint(1024, 0)]),
+        viewports: [1: left, 2: right], focusedStyle: style
+    )
+    checkEqual(daemon.focus, 1, "arrival still focuses")
+    check(
+        daemon.strips[2]?[0]?.contains(1) ?? false,
+        "arrival adopts the strip-less window"
+    )
+    checkEqual(daemon.activeWorkspace, 2, "adopted arrival retargets")
+    // Frameless ids never adopt (mock returns nil below).
+    _ = daemon.tick(
+        events: [.focus(id: 9)],
+        frames: { id in
+            guard id != 9 else { return nil }
+            let origin = [0: IntPoint(0, 0), 1: IntPoint(1024, 0)][id] ?? IntPoint(0, 0)
+            return IntRect(min: origin, max: IntPoint(origin.x + 400, origin.y + 700))
+        },
+        viewports: [1: left, 2: right], focusedStyle: style
+    )
+    checkEqual(daemon.focus, 9, "frameless arrival still focuses")
+    check(
+        !(daemon.strips[1]?[0]?.contains(9) ?? true)
+            && !(daemon.strips[2]?[0]?.contains(9) ?? true),
+        "frameless arrival adopts nothing"
+    )
+    // Parked members wait for their appeared (whole-row restore),
+    // never a partial adopt.
+    _ = daemon.tick(
+        events: [.disappeared(id: 1)],
+        frames: frames(slots: [0: IntPoint(0, 0), 1: IntPoint(1024, 0)]),
+        viewports: [1: left, 2: right], focusedStyle: style
+    )
+    _ = daemon.tick(
+        events: [.focus(id: 1)],
+        frames: frames(slots: [0: IntPoint(0, 0), 1: IntPoint(1024, 0)]),
+        viewports: [1: left, 2: right], focusedStyle: style
+    )
+    check(
+        !(daemon.strips[2]?[0]?.contains(1) ?? false),
+        "parked arrival waits for its appeared"
+    )
+    _ = daemon.tick(
+        events: [.appeared(id: 1, workspace: 2)],
+        frames: frames(slots: [0: IntPoint(0, 0), 1: IntPoint(1024, 0)]),
+        viewports: [1: left, 2: right], focusedStyle: style
+    )
+    check(
+        daemon.strips[2]?[0]?.contains(1) ?? false,
+        "appeared restores the parked member"
+    )
+    // Floating windows stay out (fullscreen floats unmanaged).
+    _ = daemon.tick(
+        events: [.command(.layout([.setFloating(window: 2, floating: true)]))],
+        frames: frames(slots: [0: IntPoint(0, 0)]),
+        viewports: [1: left, 2: right], focusedStyle: style
+    )
+    _ = daemon.tick(
+        events: [.focus(id: 2)],
+        frames: frames(slots: [0: IntPoint(0, 0), 2: IntPoint(1024, 0)]),
+        viewports: [1: left, 2: right], focusedStyle: style
+    )
+    check(
+        !(daemon.strips[2]?[0]?.contains(2) ?? true),
+        "floating arrival is never adopted"
+    )
+}
+
+// Frame-aware y discipline: correct layouts are untouched (centered
+// singles already satisfy the clamp — the no-op property), and
+// oversize pins to the top (edge-pin). Held drags keep hand truth
+// (guarded at the clamp site).
+do {
+    var daemon = DaemonCore()
+    // Single short window: centered slot satisfies the clamp exactly.
+    _ = daemon.tick(
+        events: [.appeared(id: 0, workspace: 1)],
+        frames: frames(slots: [0: IntPoint(0, 0)]),
+        viewport: viewport, focusedStyle: style
+    )
+    for _ in 0..<10 {
+        _ = daemon.tick(
+            events: [], frames: frames(slots: [0: IntPoint(0, 0)]),
+            viewport: viewport, focusedStyle: style
+        )
+    }
+    checkEqual(
+        daemon.committedSlot(of: 0),
+        IntPoint(0, (768 - 700) / 2),
+        "correct centered layout is untouched"
+    )
+    // Tall glass (900 > 768 viewport) pins to the top (edge-pin).
+    var tall = DaemonCore()
+    _ = tall.tick(
+        events: [.appeared(id: 0, workspace: 1)],
+        frames: { _ in IntRect(min: IntPoint(0, 0), max: IntPoint(400, 900)) },
+        viewport: viewport, focusedStyle: style
+    )
+    for _ in 0..<10 {
+        _ = tall.tick(
+            events: [],
+            frames: { _ in IntRect(min: IntPoint(0, 0), max: IntPoint(400, 900)) },
+            viewport: viewport, focusedStyle: style
+        )
+    }
+    checkEqual(
+        tall.committedSlot(of: 0)?.y, 0,
+        "oversize pins to the viewport top"
+    )
+}
+
 // Mouse display hops retarget the active workspace, focus its first
 // window, and queue one cursor warp (exactly-once host delivery).
 do {
@@ -1461,8 +1686,8 @@ do {
     checkEqual(daemon.spaceOfWorkspace[1], 11, "records the live space")
     check(daemon.resolveSpace(workspace: 1, space: 22), "switch rotates")
     checkEqual(
-        daemon.strips[1]?[0]?.allWindows ?? [], [],
-        "outgoing layout stashed away"
+        daemon.strips[1]?[0]?.allWindows ?? [], [0],
+        "live members carry over the switch (vanish cleans genuine moves)"
     )
     checkEqual(daemon.spaceStash[11]?.rows[0]?.allWindows, [0], "stash holds the old strip")
     _ = daemon.tick(
@@ -1471,19 +1696,22 @@ do {
         viewport: viewport, focusedStyle: style
     )
     check(daemon.resolveSpace(workspace: 1, space: 11), "switching back rotates")
-    checkEqual(daemon.strips[1]?[0]?.allWindows, [0], "incoming layout restores")
+    checkEqual(
+        daemon.strips[1]?[0]?.allWindows, [0, 1],
+        "restore merges the returning layout ahead of vanish"
+    )
     checkEqual(
         daemon.spaceStash[11], nil,
         "restored spaces leave no stash duplicate (no false hidden)"
     )
     daemon.pruneSpaces(keeping: [11, 22])
     checkEqual(
-        daemon.spaceStash[22]?.rows[0]?.allWindows, [1],
+        daemon.spaceStash[22]?.rows[0]?.allWindows, [0, 1],
         "live stashes survive pruning"
     )
     daemon.pruneSpaces(keeping: [11])
     checkEqual(daemon.spaceStash[22], nil, "destroyed spaces prune")
-    checkEqual(daemon.strips[1]?[0]?.allWindows, [0], "live strips survive pruning")
+    checkEqual(daemon.strips[1]?[0]?.allWindows, [0, 1], "live strips survive pruning")
     daemon.pruneSpaces(keeping: nil)
     check(daemon.spaceStash.isEmpty, "nil enumeration skips pruning")
 }
@@ -1491,7 +1719,8 @@ do {
 // Visible windows are never stashed: on-screen ids drop out of every
 // stash row, and strip-less survivors report for re-management (strips
 // otherwise stay empty forever — nothing re-appends a window whose
-// `.appeared` fired while it was stashed).
+// `.appeared` fired while it was stashed). Rotations carry live
+// members, so strip-lessness here comes from a genuine vanish.
 do {
     var daemon = DaemonCore()
     _ = daemon.tick(
@@ -1505,13 +1734,22 @@ do {
         daemon.spaceStash[11]?.rows[0]?.allWindows.sorted(), [0, 1],
         "both windows stashed"
     )
+    _ = daemon.tick(
+        events: [.disappeared(id: 0)],
+        frames: frames(slots: [0: IntPoint(0, 0), 1: IntPoint(0, 0)]),
+        viewport: viewport, focusedStyle: style
+    )
+    checkEqual(
+        daemon.strips[1]?[0]?.allWindows, [1],
+        "vanish parks the member out"
+    )
     checkEqual(
         daemon.unstashVisible([0]), Set<WindowID>([0]),
-        "visible strip-less window reports homeless"
+        "vanished strip-less window reports homeless"
     )
     checkEqual(
         daemon.spaceStash[11]?.rows[0]?.allWindows, [1],
-        "visible id leaves the stash row"
+        "reported id leaves the stash row"
     )
     _ = daemon.tick(
         events: [.appeared(id: 0, workspace: 1)],
@@ -1519,12 +1757,12 @@ do {
         viewport: viewport, focusedStyle: style
     )
     checkEqual(
-        daemon.unstashVisible([0, 1]), Set<WindowID>([1]),
-        "re-managed window no longer homeless"
+        daemon.strips[1]?[0]?.allWindows, [0, 1],
+        "parked row restores whole ahead of the stash duplicate"
     )
     checkEqual(
-        daemon.spaceStash[11]?.rows[0]?.allWindows, [],
-        "second visible id leaves the stash row"
+        daemon.unstashVisible([0, 1]), Set<WindowID>([]),
+        "managed windows report nothing homeless"
     )
 }
 
@@ -3929,7 +4167,10 @@ do {
     )
     _ = daemon.resolveSpace(workspace: 1, space: 11)
     check(daemon.resolveSpace(workspace: 1, space: 22), "switch stashes")
-    checkEqual(daemon.strips[1]?[0]?.allWindows ?? [], [], "strip emptied by switch")
+    checkEqual(
+        daemon.strips[1]?[0]?.allWindows ?? [], [0],
+        "switch carries live members (genuine moves vanish next)"
+    )
     let r = daemon.tick(
         events: [.command(.layout([.focus(0)]))],
         frames: frames(slots: [0: IntPoint(0, 0)]),

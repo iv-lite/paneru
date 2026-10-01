@@ -298,6 +298,9 @@ public struct DaemonCore: Sendable {
     private struct ParkedRow {
         var strip: LayoutStrip
         var atEpoch: UInt64
+        /// SLS space at park time: expiry hands the row to the space
+        /// stash (long-term memory) instead of dropping order.
+        var space: SpaceID?
     }
     private var parkedRows: [WorkspaceID: [UInt32: ParkedRow]] = [:]
     /// Parked strip offsets per workspace: a Space trip must not inherit
@@ -771,27 +774,36 @@ public struct DaemonCore: Sendable {
                 // Space return: a parked row holding this window restores
                 // whole (order, stacks, positions) instead of appending
                 // scrambled. Newcomers from other rows merge at the end.
-                if let row = parkedRow(containing: id, in: workspace, epoch: epoch) {
-                    guard var restored = parkedRows[workspace]?[row]?.strip else { continue }
+                if let row = parkedRow(containing: id, in: workspace, epoch: epoch),
+                   let parked = parkedRows[workspace]?[row]
+                {
                     parkedRows[workspace]?.removeValue(forKey: row)
                     if parkedRows[workspace]?.isEmpty == true {
                         parkedRows.removeValue(forKey: workspace)
                     }
-                    if let current = strips[workspace]?[row] {
-                        for member in current.allWindows where !restored.contains(member) {
-                            restored.append(member)
-                        }
-                    }
-                    strips[workspace, default: [:]][row] = restored
-                    if let parked = parkedOffsets[workspace],
-                       epoch &- parked.atEpoch <= parkedRowTTLEpochs,
-                       parked.offset != (offsets[workspace] ?? 0)
-                    {
-                        // Restored scroll eases in like any programmatic
-                        // move (see `offsetTargets`).
-                        offsetTargets[workspace] = parked.offset
-                    }
-                    parkedOffsets.removeValue(forKey: workspace)
+                    let offset: Int32? = {
+                        guard let saved = parkedOffsets[workspace],
+                              epoch &- saved.atEpoch <= parkedRowTTLEpochs
+                        else { return nil }
+                        return saved.offset
+                    }()
+                    restoreRow(
+                        parked.strip, workspace: workspace, row: row,
+                        offset: offset
+                    )
+                } else if let space = spaceOfWorkspace[workspace],
+                          let (row, strip) = stashedRow(containing: id, in: space)
+                {
+                    // Long-term memory: the vanish park expired (or the
+                    // space rotated away), but the space stash still names
+                    // this window — restore the row instead of appending
+                    // scrambled. Scroll stays put (long-term stash offsets
+                    // go stale; only the short-term park restores scroll).
+                    removeStashedRow(row, in: space)
+                    restoreRow(
+                        strip, workspace: workspace, row: row,
+                        offset: nil
+                    )
                 }
                 var strip = strips[workspace]?[activeVirtual[workspace] ?? 0]
                     ?? LayoutStrip(id: workspace, virtualIndex: activeVirtual[workspace] ?? 0)
@@ -818,7 +830,8 @@ public struct DaemonCore: Sendable {
                            let strip = strips[ws]?[row]
                         {
                             parkedRows[ws, default: [:]][row] = ParkedRow(
-                                strip: strip, atEpoch: epoch
+                                strip: strip, atEpoch: epoch,
+                                space: spaceOfWorkspace[ws]
                             )
                             if parkedOffsets[ws] == nil {
                                 parkedOffsets[ws] = (offsets[ws] ?? 0, epoch)
@@ -884,6 +897,22 @@ public struct DaemonCore: Sendable {
                 // inside `setFocus` (no reveal churn). Heal-cleared hidden
                 // windows rest briefly instead of refocus→clear looping.
                 if let hid = id, hiddenBlocked(hid, epoch: epoch) { continue }
+                // Adopt-on-arrival: a live but strip-less window the user
+                // just touched is a missed adoption (appeared-while-stashed
+                // during restore, pruned stash, vanished-row expiry race)
+                // — adopt it into its frame's workspace instead of
+                // focusing into limbo (reveal skips, writes skipped, focus
+                // stranded on a ghost). Fullscreen floats, minimized,
+                // parked/stashed members, and frameless ids stay out:
+                // their own paths own them.
+                if let hid = id,
+                   workspaceOf(hid) == nil,
+                   !unmanaged.contains(hid),
+                   !inParkedOrStashed(hid),
+                   let live = frames(hid)
+                {
+                    adoptArrival(hid, frame: live, viewports: viewports)
+                }
                 setFocus(id, raise: false)
             case .dragMoved(let id, let dx):
                 held = id
@@ -2092,6 +2121,51 @@ public struct DaemonCore: Sendable {
         return nil
     }
 
+    /// Restore one parked row whole (order, stacks, positions) into its
+    /// workspace, merging members the row doesn't know. Shared by the
+    /// short-term vanish park (`parkedRows`) and the long-term space
+    /// stash (`spaceStash`).
+    private mutating func restoreRow(
+        _ strip: LayoutStrip, workspace: WorkspaceID, row: UInt32,
+        offset: Int32?
+    ) {
+        var restored = strip
+        if let current = strips[workspace]?[row] {
+            for member in current.allWindows where !restored.contains(member) {
+                restored.append(member)
+            }
+        }
+        strips[workspace, default: [:]][row] = restored
+        if let offset, offset != (offsets[workspace] ?? 0) {
+            // Restored scroll eases in like any programmatic move
+            // (see `offsetTargets`).
+            offsetTargets[workspace] = offset
+        }
+        parkedOffsets.removeValue(forKey: workspace)
+    }
+
+    /// A space-stash row naming `id` on `space`, if the long-term memory
+    /// still holds this window after the vanish park expired.
+    private func stashedRow(containing id: WindowID, in space: SpaceID) -> (UInt32, LayoutStrip)? {
+        guard let stash = spaceStash[space] else { return nil }
+        for (row, strip) in stash.rows where strip.contains(id) {
+            return (row, strip)
+        }
+        return nil
+    }
+
+    /// Drop one row from the space stash (consumed by restore); drops the
+    /// space entry once its last row restores.
+    private mutating func removeStashedRow(_ row: UInt32, in space: SpaceID) {
+        guard var stash = spaceStash[space] else { return }
+        stash.rows.removeValue(forKey: row)
+        if stash.rows.isEmpty {
+            spaceStash.removeValue(forKey: space)
+        } else {
+            spaceStash[space] = stash
+        }
+    }
+
     /// Drop expired parked rows, clearing positions of members that never
     /// came back (truly closed windows must not pin truth forever — and
     /// CG window ids get reused, so stale positions would misplace fresh
@@ -2110,8 +2184,19 @@ public struct DaemonCore: Sendable {
                             sizes.removeValue(forKey: member)
                             glides.removeValue(forKey: member)
                             sizeStreak.removeValue(forKey: member)
-                            lastSizeRedrive.removeValue(forKey: member)
+                            lastRedrive.removeValue(forKey: member)
                             committedSlots.removeValue(forKey: member)
+                        }
+                        // Long-term memory: hand the expired row to the
+                        // space stash (which `pruneSpaces` bounds) instead
+                        // of dropping order. Collisions (two workspaces
+                        // sharing one space and row) keep today's drop.
+                        if let space = parked.space,
+                           spaceStash[space]?.rows[row] == nil
+                        {
+                            var stash = spaceStash[space] ?? SpaceStash()
+                            stash.rows[row] = parked.strip
+                            spaceStash[space] = stash
                         }
                     }
                     parkedRows[ws]?.removeValue(forKey: row)
@@ -2163,6 +2248,51 @@ public struct DaemonCore: Sendable {
         strips.values.contains { rows in
             rows.values.contains { $0.contains(id) }
         }
+    }
+
+    /// Named in any parked row or space-stash row: a vanished window
+    /// whose return path already owns it (appeared restores whole) —
+    /// adopt-on-arrival must not steal it first.
+    private func inParkedOrStashed(_ id: WindowID) -> Bool {
+        for rows in parkedRows.values {
+            for parked in rows.values where parked.strip.contains(id) {
+                return true
+            }
+        }
+        for stash in spaceStash.values {
+            for strip in stash.rows.values where strip.contains(id) {
+                return true
+            }
+        }
+        return false
+    }
+
+    /// Adopt a touched-but-strip-less window into its frame's workspace
+    /// (viewport containing the live center, else active), seeding model
+    /// truth from the live frame like `.appeared`. Idempotent (`append`
+    /// dedups) with the host's homeless re-manage.
+    private mutating func adoptArrival(
+        _ id: WindowID, frame: IntRect, viewports: [WorkspaceID: IntRect]
+    ) {
+        let center = IntPoint(
+            (frame.min.x + frame.max.x) / 2, (frame.min.y + frame.max.y) / 2
+        )
+        var owner = activeWorkspace
+        for ws in viewports.keys.sorted() {
+            if let view = viewports[ws], view.contains(center) {
+                owner = ws
+                break
+            }
+        }
+        let row = activeVirtual[owner] ?? 0
+        var strip = strips[owner]?[row]
+            ?? LayoutStrip(id: owner, virtualIndex: row)
+        strip.append(id)
+        strips[owner, default: [:]][row] = strip
+        if positions[id] == nil {
+            positions[id] = IntPoint(frame.min.x, frame.min.y)
+        }
+        dirty.formUnion([.layout, .paint])
     }
 
     /// Rest-state divergence snapshot for diagnostics: per managed
@@ -2762,9 +2892,23 @@ public struct DaemonCore: Sendable {
                 } else {
                     slot = centeredSlot(member, x: x, home: home, frames: frames)
                 }
-                committedSlots[member] = slot
+                // Frame-aware y discipline: singles/tabs/fullWidth fit
+                // by construction (center/top-align under clamped sizes),
+                // so this is a no-op there and only bites stale-height
+                // spill past the edge. Held drags keep their hand truth;
+                // oversize top-aligns (edge-pin).
+                var placed = slot
+                if !heldMembers.contains(member),
+                   let liveH = frames(member)?.height
+                {
+                    placed.y = min(
+                        max(slot.y, home.min.y),
+                        max(home.min.y, home.max.y - liveH)
+                    )
+                }
+                committedSlots[member] = placed
                 applyMove(
-                    member, to: slot, epoch: epoch,
+                    member, to: placed, epoch: epoch,
                     frames: frames, heldMembers: heldMembers, union: union
                 )
                 clampMemberSize(member, home: home, epoch: epoch, frames: frames)
@@ -4188,13 +4332,38 @@ public static func firstExitCrossing(
     public mutating func resolveSpace(workspace: WorkspaceID, space: SpaceID) -> Bool {
         guard space != 0 else { return false }
         if let current = spaceOfWorkspace[workspace], current != space {
-            spaceStash[current] = SpaceStash(
-                rows: strips[workspace] ?? [:],
-                activeRow: activeVirtual[workspace],
-                offset: offsets[workspace]
-            )
+            let outgoing = strips[workspace] ?? [:]
+            let outgoingEmpty = outgoing.values.allSatisfy { $0.allWindows.isEmpty }
+            // Flux guard: a rotation firing while strips are mid-re-adopt
+            // (empty) must never overwrite the last good stashed layout —
+            // that destroys the only copy of the row order.
+            if spaceStash[current] == nil || !outgoingEmpty {
+                spaceStash[current] = SpaceStash(
+                    rows: outgoing,
+                    activeRow: activeVirtual[workspace],
+                    offset: offsets[workspace]
+                )
+            }
             if let incoming = spaceStash[space] {
-                strips[workspace] = incoming.rows
+                // Merge, don't replace: current members may be carried
+                // live rows (flake rotations) or ahead of their vanish
+                // events (genuine switches) — replacing with a gutted or
+                // older stash row orphans them into fresh-append
+                // scramble. Stash rows lead, current members append.
+                var merged = incoming.rows
+                for (row, strip) in strips[workspace] ?? [:] {
+                    for member in strip.allWindows
+                        where !(merged[row]?.contains(member) ?? false)
+                    {
+                        merged[
+                            row,
+                            default: LayoutStrip(
+                                id: workspace, virtualIndex: row
+                            )
+                        ].append(member)
+                    }
+                }
+                strips[workspace] = merged
                 // The rows live in the strip again: drop the stash copy.
                 // Keeping it marks restored windows as stashed (hidden),
                 // which heals focus away, skips their writes, and parks
@@ -4213,7 +4382,11 @@ public static func firstExitCrossing(
                     offsetTargets.removeValue(forKey: workspace)
                     offsetLegs.removeValue(forKey: workspace)
                 }
-            } else {
+            } else if outgoingEmpty {
+                // Unknown space with no live members starts empty.
+                // Non-empty rows carry over instead (an adoption, not
+                // emptiness): wiping would orphan every member into
+                // fresh-append scramble with positions lost.
                 strips[workspace] = [:]
                 activeVirtual.removeValue(forKey: workspace)
                 offsets.removeValue(forKey: workspace)
