@@ -1070,10 +1070,11 @@ do {
     checkEqual(daemon.lastWarpKind, "none:outside", "far void reports outside")
 }
 
-// Approach zone: 18px inside the ultrawide's left edge moving outward
+// Approach zone: 8px inside the ultrawide's left edge moving outward
 // evaluates as the edge (strict maps 1200-982 onto the builtin;
-// carry -15 lands at -6-15). Stillness, inward motion, and the
-// immunity flag all stay silent; the direct band ignores the flag.
+// carry -15 lands at -6-15). Past 10px stays silent; stillness,
+// inward motion, and the immunity flag all stay silent; the direct
+// band ignores the flag.
 do {
     var daemon = DaemonCore()
     let builtin = IntRect(-1512, 0, 0, 982)
@@ -1081,7 +1082,7 @@ do {
     let steps = [builtin, wide]
     checkEqual(
         daemon.edgeWarpLanding(
-            cursor: IntPoint(18, 1200), displays: steps,
+            cursor: IntPoint(8, 1200), displays: steps,
             warpDirection: -1, yOffset: 0, velocityX: -500
         ), IntPoint(-21, 218), "approach zone warps outward motion"
     )
@@ -1089,23 +1090,44 @@ do {
         daemon.lastWarpKind, "approach:primary", "approach landing reports its stage")
     checkEqual(
         daemon.edgeWarpLanding(
-            cursor: IntPoint(18, 1200), displays: steps,
+            cursor: IntPoint(12, 1200), displays: steps,
+            warpDirection: -1, yOffset: 0, velocityX: -500
+        ), nil, "past 10px stays silent"
+    )
+    checkEqual(daemon.lastWarpKind, "none:interior", "outsider reports interior")
+    checkEqual(
+        daemon.edgeWarpLanding(
+            cursor: IntPoint(8, 1200), displays: steps,
             warpDirection: -1, yOffset: 0, velocityX: nil
         ), nil, "stillness in the zone stays silent"
     )
     checkEqual(daemon.lastWarpKind, "none:interior", "stillness reports interior")
     checkEqual(
         daemon.edgeWarpLanding(
-            cursor: IntPoint(18, 1200), displays: steps,
+            cursor: IntPoint(8, 1200), displays: steps,
             warpDirection: -1, yOffset: 0, velocityX: 500
         ), nil, "inward motion stays silent"
     )
     checkEqual(
         daemon.edgeWarpLanding(
-            cursor: IntPoint(18, 1200), displays: steps,
+            cursor: IntPoint(8, 1200), displays: steps,
             warpDirection: -1, yOffset: 0, velocityX: -500,
             approachAllowed: false
         ), nil, "immunity suppresses the approach zone"
+    )
+    // Direct band boundary: 1px fires with no velocity at all, while
+    // 2px out needs the approach (outward motion) to evaluate.
+    checkEqual(
+        daemon.edgeWarpLanding(
+            cursor: IntPoint(1, 1200), displays: steps,
+            warpDirection: -1, yOffset: 0, velocityX: nil
+        ), IntPoint(-6, 218), "1px band fires velocity-free (no carry)"
+    )
+    checkEqual(
+        daemon.edgeWarpLanding(
+            cursor: IntPoint(2, 1200), displays: steps,
+            warpDirection: -1, yOffset: 0, velocityX: nil
+        ), nil, "2px out needs outward motion"
     )
     checkEqual(
         daemon.edgeWarpLanding(
@@ -1558,6 +1580,64 @@ do {
     )
     checkEqual(daemon.committedSlot(of: 1), IntPoint(400, 34), "arrived frames slot in")
     checkEqual(daemon.committedSlot(of: 2), IntPoint(800, 34), "strip reflows without piling")
+}
+
+// Flapping reads ride model width: laid-out windows freeze on their
+// last slot (no intents on stale geometry) while pitch holds, so
+// downstream columns never teleport or pile mid-scroll.
+do {
+    var daemon = DaemonCore()
+    daemon.animationsEnabled = false
+    daemon.glideBaseMs = 0
+    _ = daemon.tick(
+        events: [
+            .appeared(id: 0, workspace: 1), .appeared(id: 1, workspace: 1),
+            .appeared(id: 2, workspace: 1),
+        ],
+        frames: frames(slots: [0: IntPoint(0, 34), 1: IntPoint(400, 34), 2: IntPoint(800, 34)]),
+        viewport: viewport, focusedStyle: style
+    )
+    let flap: (Int32) -> IntRect? = { id in
+        if id == 1 { return nil }
+        let origin = id == 0 ? IntPoint(0, 34) : IntPoint(800, 34)
+        return IntRect(min: origin, max: IntPoint(origin.x + 400, origin.y + 700))
+    }
+    let r = daemon.tick(
+        events: [], frames: flap, viewport: viewport, focusedStyle: style
+    )
+    checkEqual(daemon.committedSlot(of: 1), IntPoint(400, 34), "flapping member freezes")
+    checkEqual(daemon.committedSlot(of: 2), IntPoint(800, 34), "downstream holds pitch")
+    check(
+        !r.axJobs.contains(where: { $0.winID == 1 }),
+        "flapping member issues no intents"
+    )
+}
+
+// Warp target prefers the committed slot (model truth) so arrivals
+// don't chase unconverged glass; slotless falls back to live.
+do {
+    var daemon = DaemonCore()
+    daemon.animationsEnabled = false
+    daemon.glideBaseMs = 0
+    _ = daemon.tick(
+        events: [.appeared(id: 0, workspace: 1)],
+        frames: frames(slots: [0: IntPoint(0, 34)]),
+        viewport: viewport, focusedStyle: style
+    )
+    let lagging: (Int32) -> IntRect? = { _ in
+        IntRect(min: IntPoint(500, 500), max: IntPoint(900, 1200))
+    }
+    checkEqual(
+        daemon.predictedFrame(0, frames: lagging),
+        IntRect(min: IntPoint(0, 34), max: IntPoint(400, 734)),
+        "warp target rides the slot with live size"
+    )
+    checkEqual(
+        daemon.predictedFrame(1, frames: lagging),
+        IntRect(min: IntPoint(500, 500), max: IntPoint(900, 1200)),
+        "slotless falls back to live glass"
+    )
+    checkEqual(daemon.predictedFrame(2, frames: { _ in nil }), nil, "unknown is nil")
 }
 
 // Bounded parking: frozen glass plus frozen slot cannot satisfy the
@@ -3700,6 +3780,192 @@ do {
     checkEqual(daemon.positions[2], IntPoint(800, 34), "retarget lands at the new slot")
     _ = daemon.tick(events: [], frames: live, viewport: viewport, focusedStyle: style)
     checkEqual(daemon.positions[2], IntPoint(800, 34), "landing sticks")
+}
+
+// Cause latch: keyed commands raise, ambient arrivals don't — the
+// host classifies keyboard vs ambient off this, not wall-clock.
+do {
+    var daemon = DaemonCore()
+    daemon.animationsEnabled = false
+    daemon.glideBaseMs = 0
+    _ = daemon.tick(
+        events: [.appeared(id: 0, workspace: 1), .appeared(id: 1, workspace: 1)],
+        frames: frames(slots: [0: IntPoint(0, 0), 1: IntPoint(400, 0)]),
+        viewport: viewport, focusedStyle: style
+    )
+    let keyed = daemon.tick(
+        events: [.command(.layout([.focus(1)]))],
+        frames: frames(slots: [0: IntPoint(0, 34), 1: IntPoint(400, 34)]),
+        viewport: viewport, focusedStyle: style
+    )
+    checkEqual(keyed.focus, 1, "keyed focus lands")
+    check(keyed.focusRaise, "keyed arrival raises")
+    let ambient = daemon.tick(
+        events: [.focus(id: 0)],
+        frames: frames(slots: [0: IntPoint(0, 34), 1: IntPoint(400, 34)]),
+        viewport: viewport, focusedStyle: style
+    )
+    checkEqual(ambient.focus, 0, "ambient focus lands")
+    check(!ambient.focusRaise, "ambient arrival never raises")
+}
+
+// Keyed focus wins over stale stash: the window returns to the strip
+// and takes focus instead of heal-clearing to nothing.
+do {
+    var daemon = DaemonCore()
+    daemon.animationsEnabled = false
+    daemon.glideBaseMs = 0
+    _ = daemon.tick(
+        events: [.appeared(id: 0, workspace: 1)],
+        frames: frames(slots: [0: IntPoint(0, 0)]),
+        viewport: viewport, focusedStyle: style
+    )
+    _ = daemon.resolveSpace(workspace: 1, space: 11)
+    check(daemon.resolveSpace(workspace: 1, space: 22), "switch stashes")
+    checkEqual(daemon.strips[1]?[0]?.allWindows ?? [], [], "strip emptied by switch")
+    let r = daemon.tick(
+        events: [.command(.layout([.focus(0)]))],
+        frames: frames(slots: [0: IntPoint(0, 0)]),
+        viewport: viewport, focusedStyle: style
+    )
+    checkEqual(r.focus, 0, "keyed focus lands on stashed window")
+    checkEqual(daemon.strips[1]?[0]?.allWindows, [0], "stashed window re-managed")
+    check(
+        !(daemon.spaceStash[11]?.rows[0]?.allWindows.contains(0) ?? false),
+        "stash entry cleared"
+    )
+}
+
+// Slotless focused window still scrolls: reveal falls back to column
+// pitch when every prior column has a known width.
+do {
+    var daemon = DaemonCore()
+    daemon.animationsEnabled = false
+    daemon.glideBaseMs = 0
+    let live34: (Int32) -> IntRect? = { id in
+        let origins: [Int32: IntPoint] = [
+            0: IntPoint(0, 34), 1: IntPoint(400, 34), 2: IntPoint(800, 34),
+        ]
+        guard let origin = origins[id] else { return nil }
+        return IntRect(min: origin, max: IntPoint(origin.x + 400, origin.y + 700))
+    }
+    _ = daemon.tick(
+        events: [
+            .appeared(id: 0, workspace: 1), .appeared(id: 1, workspace: 1),
+            .appeared(id: 2, workspace: 1),
+        ],
+        frames: live34, viewport: viewport, focusedStyle: style
+    )
+    _ = daemon.tick(
+        events: [.appeared(id: 3, workspace: 1)],
+        frames: { id in id == 3 ? nil : live34(id) },
+        viewport: viewport, focusedStyle: style
+    )
+    checkEqual(daemon.committedSlot(of: 3), nil, "frameless focused-to-be has no slot")
+    _ = daemon.tick(
+        events: [.command(.layout([.focus(3)]))],
+        frames: { id in id == 3 ? nil : live34(id) },
+        viewport: viewport, focusedStyle: style
+    )
+    checkEqual(daemon.focus, 3, "keyed focus lands slotless")
+    checkEqual(daemon.offsets[1], -176, "reveal scrolls by column pitch")
+}
+
+// Size-inflight reads busy while intents travel or just sent.
+do {
+    var daemon = DaemonCore()
+    daemon.animationsEnabled = false
+    daemon.glideBaseMs = 0
+    let born = daemon.tick(
+        events: [.appeared(id: 0, workspace: 1)],
+        frames: frames(slots: [0: IntPoint(0, 0)]),
+        viewport: viewport, focusedStyle: style
+    )
+    for job in born.axJobs {
+        daemon.acknowledge(winID: job.winID, seq: job.seq, epoch: job.epoch)
+    }
+    for _ in 0..<3 {
+        let r = daemon.tick(
+            events: [],
+            frames: frames(slots: [0: IntPoint(0, 34)]),
+            viewport: viewport, focusedStyle: style
+        )
+        for job in r.axJobs {
+            daemon.acknowledge(winID: job.winID, seq: job.seq, epoch: job.epoch)
+        }
+    }
+    check(!daemon.sizeSettling(0), "converged sizes settle nothing")
+    _ = daemon.tick(
+        events: [.focus(id: 0)],
+        frames: frames(slots: [0: IntPoint(0, 34)]),
+        viewport: viewport, focusedStyle: style
+    )
+    let sized = daemon.tick(
+        events: [.command(.window(.fullWidth))],
+        frames: frames(slots: [0: IntPoint(0, 34)]),
+        viewport: viewport, focusedStyle: style
+    )
+    check(
+        sized.axJobs.contains(where: { $0.winID == 0 && $0.size != nil }),
+        "maximize fires a size intent"
+    )
+    check(daemon.sizeSettling(0), "fresh intent reads settling")
+    for job in sized.axJobs {
+        daemon.acknowledge(winID: job.winID, seq: job.seq, epoch: job.epoch)
+    }
+    let full: (Int32) -> IntRect? = { _ in
+        IntRect(min: IntPoint(8, 8), max: IntPoint(1032, 776))
+    }
+    for _ in 0..<3 {
+        let r = daemon.tick(
+            events: [], frames: full, viewport: viewport, focusedStyle: style
+        )
+        for job in r.axJobs {
+            daemon.acknowledge(winID: job.winID, seq: job.seq, epoch: job.epoch)
+        }
+    }
+    check(!daemon.sizeSettling(0), "converged sizes settle out")
+}
+
+// Shrink converges promptly: a regressed live frame re-fires on the
+// very next tick instead of waiting out a full cooldown.
+do {
+    var daemon = DaemonCore()
+    daemon.animationsEnabled = false
+    daemon.glideBaseMs = 0
+    _ = daemon.tick(
+        events: [.appeared(id: 0, workspace: 1)],
+        frames: frames(slots: [0: IntPoint(0, 0)]),
+        viewport: viewport, focusedStyle: style
+    )
+    _ = daemon.tick(
+        events: [.focus(id: 0)],
+        frames: frames(slots: [0: IntPoint(0, 34)]),
+        viewport: viewport, focusedStyle: style
+    )
+    _ = daemon.tick(
+        events: [.command(.window(.fullWidth))],
+        frames: frames(slots: [0: IntPoint(0, 34)]),
+        viewport: viewport, focusedStyle: style
+    )
+    let full = IntRect(min: IntPoint(8, 8), max: IntPoint(1032, 776))
+    let converged = daemon.tick(
+        events: [],
+        frames: { _ in full }, viewport: viewport, focusedStyle: style
+    )
+    check(
+        !converged.axJobs.contains(where: { $0.winID == 0 && $0.size != nil }),
+        "converged fullscreen rests"
+    )
+    let regressed = IntRect(min: IntPoint(0, 0), max: IntPoint(1100, 800))
+    let retry = daemon.tick(
+        events: [],
+        frames: { _ in regressed }, viewport: viewport, focusedStyle: style
+    )
+    check(
+        retry.axJobs.contains(where: { $0.winID == 0 && $0.size != nil }),
+        "regressed live re-fires immediately"
+    )
 }
 
 if failures == 0 {

@@ -1023,12 +1023,13 @@ nonisolated(unsafe) var spaceVotes: [WorkspaceID: (space: SpaceID, seen: Int)] =
     // (window recreated under a recycled id) — drop so the live window
     // re-adopts with a fresh element instead of retrying dead glass
     // forever. Already-vanished ids were handled above; skip those.
-    if !deadElements.isEmpty {
-        for wid in deadElements where roster[wid] != nil {
-            dropRosterEntry(wid)
-            print("ax: window=\(windowID(wid)) re-adopted after dead element")
-        }
-        deadElements.removeAll()
+    // Swap-then-process: the worker flags concurrently, so check-then-
+    // clear would drop flags landing between the loop and the clear.
+    let dead = deadElements
+    deadElements.removeAll()
+    for wid in dead where roster[wid] != nil {
+        dropRosterEntry(wid)
+        print("ax: window=\(windowID(wid)) re-adopted after dead element")
     }
     // Stale focus (arrival for a rejected or never-adopted window) clears
     // here; adoption in flight (probing) still wins its race.
@@ -1081,8 +1082,25 @@ nonisolated(unsafe) var spaceVotes: [WorkspaceID: (space: SpaceID, seen: Int)] =
         // land at rest with zero offsets and still heal).
         if let home = workspaceOfWindow(id),
            (core.offsets[home] ?? 0) != 0
-               || (core.offsetTarget(for: home) ?? 0) != (core.offsets[home] ?? 0)
+                || (core.offsetTarget(for: home) ?? 0) != (core.offsets[home] ?? 0)
         {
+            continue
+        }
+        // Resize-glide guard: rehome on model, not transient glass. A
+        // resize can push the live center over the seam while the
+        // committed slot still sits home — the glass glides back, no
+        // ownership change. Likewise while a size intent is traveling.
+        if let home = workspaceOfWindow(id),
+           let slot = core.committedSlot(of: id)
+        {
+            let slotRect = IntRect(
+                min: slot,
+                max: IntPoint(slot.x + frame.width, slot.y + frame.height)
+            )
+            if workspaceForFrame(slotRect) == home || core.sizeSettling(id) {
+                continue
+            }
+        } else if core.sizeSettling(id) {
             continue
         }
         guard shouldRehome(
@@ -2503,6 +2521,15 @@ nonisolated(unsafe) var lastWarpLandingPt: IntPoint?
 nonisolated(unsafe) var lastWarpLandingTick = 0
 let warpApproachRadiusPx: Int32 = 30
 let warpLandingPtTTLTicks = 3600
+/// Follow-warp timestamps (ms, pruned to the window): more than
+/// `followWarpTripCount` follow warps inside `followWarpTripWindowMs`
+/// suppress further follow warps until quiet. The identical-landing
+/// breaker cannot see A→B→A ping-pong (landings alternate), so this
+/// rate trip bounds hover/warp flaps however they alternate.
+nonisolated(unsafe) var followWarpLog: [UInt64] = []
+nonisolated(unsafe) var followWarpTripped = false
+let followWarpTripCount = 8
+let followWarpTripWindowMs: UInt64 = 10_000
 /// Last focus-heal line + tick (transition-printed): a stuck hidden
 /// focus repeats one line per change instead of per tick.
 nonisolated(unsafe) var lastHealLine = ""
@@ -2608,6 +2635,17 @@ let stateFilePath =
     for (id, slot) in core.committedSlotMap() {
         slots[String(id)] = [Int(slot.x), Int(slot.y)]
     }
+    // Live glass next to model slots: slot-vs-glass divergence (and
+    // its direction) reads directly here — the overlap/stuck class
+    // diagnoses without a forensic session.
+    var glass: [String: Any] = [:]
+    for (wid, window) in roster {
+        let frame = window.frame
+        glass[String(windowID(wid))] = [
+            Int(frame.min.x), Int(frame.min.y),
+            Int(frame.width), Int(frame.height),
+        ]
+    }
     // Stashed Spaces (strip-per-Space rotation): windows here are
     // legitimately strip-less in `strips`, so a slot-holder with no
     // strip reads as stashed, not leaked.
@@ -2627,6 +2665,7 @@ let stateFilePath =
         "strips": strips,
         "viewports": viewports,
         "slots": slots,
+        "glass": glass,
         "viewportFallbacks": core.viewportFallbacks.sorted().map { Int($0) },
         "parkedWrites": core.auditParkedLive.keys.sorted().map { Int($0) },
         "spaceStash": stashed,
@@ -3158,6 +3197,13 @@ let perfSlowTickMs = 8.0
     } else if let id = result.focus, id != prevActuatedFocus,
               let window = roster[CGWindowID(id)]
     {
+        // Keyed focus wins over minimized too: restore to the desktop
+        // first, or every downstream pass (reveal, warp, border) reads
+        // docked glass and the arrival looks dead. One-shot on arrival
+        // like actuation below; the flip scan re-marks if it failed.
+        if minimizedWindows.contains(id), window.deminimize() {
+            minimizedWindows.remove(id)
+        }
         if result.focusRaise {
             if let pid = windowPIDs[id] {
                 NSRunningApplication(processIdentifier: pid)?
@@ -3208,16 +3254,28 @@ let perfSlowTickMs = 8.0
     // arrivals warp. Display hops above land first; the window center
     // then wins, like Rust's arrival pass running after the move
     // commands.
+    // Cause comes from the core raise latch, not wall-clock: only the
+    // tap stamps key times, so script/menubar/XPC focus would forever
+    // misclassify as ambient. Keyed arrivals raise; hover, polls, and
+    // observer echoes never do.
+    let arriveCause: DaemonCore.FollowCause =
+        result.focusRaise
+        || Date().timeIntervalSince(lastKeyCommandAt) < mouseFollowKeyWindow
+        ? .keyboard : .ambient
     if resolved.mouseFollowsFocus,
        let id = result.focus, id != prevMffFocus,
        !tap.leftButtonHeld,
-       !(id == lastHoverID
+       arriveCause == .keyboard || !(id == lastHoverID
            && Date().timeIntervalSince(lastHoverAt) < mouseFollowHoverEcho),
        Date().timeIntervalSince(tap.lastSwipe) >= mouseFollowSwipeQuiet,
        let window = roster[CGWindowID(bitPattern: id)],
        let ws = workspaceOfWindow(id),
        let view = viewports[ws]
     {
+        // Evaluated: arm the dedup. Unevaluated ticks (unrostered
+        // window, missing viewport) must NOT latch, or the retry when
+        // the window resolves is skipped forever.
+        prevMffFocus = id
         let frame = window.frame
         let pressInside =
             tap.lastMouseDown.map { press in
@@ -3228,30 +3286,64 @@ let perfSlowTickMs = 8.0
                     ))
             } ?? false
         if !pressInside {
-            let cause: DaemonCore.FollowCause =
-                Date().timeIntervalSince(lastKeyCommandAt) < mouseFollowKeyWindow
-                ? .keyboard : .ambient
+            // Host copy of the core cause (computed above): keyboard
+            // wins over the echo veto — an explicit keyed focus wants
+            // the cursor centered even right after a hover vote.
+            let cause = arriveCause
             // An unknown cursor still recenters for keyboard arrivals
             // (the pure decision ignores it there); ambient ones hold.
             let cursor = tickCursor()
+            // Warp onto the committed slot (model truth), not live
+            // glass: chasing unconverged frames recomputes every
+            // arrival and ping-pongs the cursor between neighbors.
+            let warpFrame = core.predictedFrame(
+                id, frames: { roster[CGWindowID(bitPattern: $0)]?.frame }
+            ) ?? frame
             if cause == .keyboard || cursor != nil,
                let target = core.followWarpTarget(
-                   focusFrame: frame, viewport: view,
+                   focusFrame: warpFrame, viewport: view,
                    cursor: cursor ?? IntPoint(0, 0),
                    cause: cause, enabled: true
                )
             {
-                if shadowMode {
-                    print("shadow: follow warp \(target.x),\(target.y) window=\(id) cause=\(cause) (dropped)")
-                } else {
-                    warpMouse(to: CGPoint(x: Double(target.x), y: Double(target.y)))
-                    lastWarpSample = (target, Date())
-                    print("mouse: follow warp \(target.x),\(target.y) window=\(id) cause=\(cause)")
+                let nowMs = UInt64(Date().timeIntervalSince1970 * 1000)
+                // Shared loop breaker: identical follow landings cool
+                // down with edge warps; the rate trip below catches
+                // alternating ping-pong the identical-run counter
+                // cannot see.
+                if core.warpLoopAllow(cursor: cursor ?? target, nowMs: nowMs) {
+                    followWarpLog = followWarpLog.filter {
+                        nowMs &- $0 <= followWarpTripWindowMs
+                    }
+                    if followWarpLog.count >= followWarpTripCount {
+                        if !followWarpTripped {
+                            followWarpTripped = true
+                            print("mouse: follow warp tripped — cooling down (hover/warp flap)")
+                        }
+                    } else {
+                        if followWarpTripped {
+                            followWarpTripped = false
+                            print("mouse: follow warp resumed")
+                        }
+                        followWarpLog.append(nowMs)
+                        if core.warpLoopNote(landing: target, nowMs: nowMs) {
+                            print("mouse: warp loop suspected — cooling down (follow warp)")
+                        }
+                        if shadowMode {
+                            print("shadow: follow warp \(target.x),\(target.y) window=\(id) cause=\(cause) (dropped)")
+                        } else {
+                            warpMouse(to: CGPoint(x: Double(target.x), y: Double(target.y)))
+                            lastWarpSample = (target, Date())
+                            print("mouse: follow warp \(target.x),\(target.y) window=\(id) cause=\(cause)")
+                        }
+                    }
                 }
             }
         }
     }
-    prevMffFocus = result.focus
+    if result.focus == nil {
+        prevMffFocus = nil
+    }
     // Drop ghost: a full-height bar tracking the grabbed column's
     // landing slot (shared `dropSlot` math, so ghost == landing).
     // Armed grabs only — content drags show nothing. Steady ticks skip

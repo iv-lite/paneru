@@ -463,6 +463,38 @@ public struct DaemonCore: Sendable {
         strips[activeWorkspace, default: [:]][row] = strip
     }
 
+    /// Pull a window out of every stash row, re-managing it on the
+    /// active workspace when strip-less. Keyed focus calls this first:
+    /// a stale stash entry would otherwise heal-clear the arrival
+    /// instantly (focus yanked before any scroll/warp/actuation
+    /// paints), reading as "nothing happens". No-op for windows that
+    /// live in strips already.
+    @discardableResult
+    public mutating func unstashWindow(_ id: WindowID) -> Bool {
+        var found = false
+        for space in Array(spaceStash.keys) {
+            guard var stash = spaceStash[space] else { continue }
+            var changed = false
+            for row in Array(stash.rows.keys) {
+                guard var strip = stash.rows[row], strip.contains(id) else { continue }
+                strip.remove(id)
+                stash.rows[row] = strip
+                changed = true
+                found = true
+            }
+            if changed { spaceStash[space] = stash }
+        }
+        if found, workspaceOf(id) == nil {
+            let row = activeVirtual[activeWorkspace] ?? 0
+            var strip = strips[activeWorkspace]?[row]
+                ?? LayoutStrip(id: activeWorkspace, virtualIndex: row)
+            strip.append(id)
+            strips[activeWorkspace, default: [:]][strip.virtualIndex] = strip
+            dirty.formUnion([.layout, .paint])
+        }
+        return found
+    }
+
     /// Assign model focus with its actuation cause (Rust `focus_entity`):
     /// command-driven arrivals (`raise: true`) want OS raise, ambient
     /// ones (hover/refill/echo) only claim. Same-value arrivals
@@ -472,6 +504,11 @@ public struct DaemonCore: Sendable {
         // (a later change recomputes it), so echoes never churn reveal
         // or re-arm actuation.
         guard id != focus else { return }
+        // Keyed arrivals win over stale stash entries (ambient hover
+        // must never resurrect hidden windows, so it skips this).
+        if raise, let id {
+            _ = unstashWindow(id)
+        }
         focus = id
         lastFocusRaise = raise && id != nil
         if raise, id != nil {
@@ -1598,6 +1635,9 @@ public struct DaemonCore: Sendable {
             case .focus(let id):
                 if activeStrip().contains(id) || unmanaged.contains(id) {
                     setFocus(id, raise: true)
+                } else if unstashWindow(id) {
+                    // Stale-stashed target: re-managed above, now focus.
+                    setFocus(id, raise: true)
                 }
             case .setFrame(let id, let frame):
                 enqueueMove(
@@ -1692,6 +1732,19 @@ public struct DaemonCore: Sendable {
     /// Clamp gesture-driven travel to the strip extents (mirrors
     /// `clamp_viewport_offset`, which constrains scroll physics only —
     /// never programmatic moves). The layout is rebuilt offset-free from
+    /// One column's pitch width: live glass first, model size while
+    /// frames flap unreadable mid-scroll, nil only when nothing is
+    /// known (fresh spawn pre-read). Pitch and both offset clamps
+    /// share this so bounds can never disagree with slots mid-gesture
+    /// (counting frameless as zero here while pitch skips halts the
+    /// strip with the pile intact).
+    private func columnWidth(
+        _ column: LayoutColumn, frames: (WindowID) -> IntRect?
+    ) -> Int32? {
+        column.windows.compactMap { frames($0)?.width }.max()
+            ?? column.windows.compactMap { sizes[$0]?.x }.max()
+    }
+
     /// live widths (committed slots bake the offset in flight, so they
     /// cannot rebase themselves).
     private mutating func clampSwipeTravel(
@@ -1706,11 +1759,12 @@ public struct DaemonCore: Sendable {
         var lastWidth: Int32 = 0
         var x: Int32 = 0
         for column in strip.columns {
+            guard let w = columnWidth(column, frames: frames) else { continue }
             if first == nil {
                 first = x
             }
             last = x
-            lastWidth = column.windows.compactMap { frames($0)?.width }.max() ?? 0
+            lastWidth = w
             x += lastWidth
         }
         guard let first, let last else { return }
@@ -1756,7 +1810,9 @@ public struct DaemonCore: Sendable {
         guard let strip = strips[ws]?[row], !strip.columns.isEmpty else { return }
         var total: Int32 = 0
         for column in strip.columns {
-            total += column.windows.compactMap { frames($0)?.width }.max() ?? 0
+            if let w = columnWidth(column, frames: frames) {
+                total += w
+            }
         }
         let width = max(viewport.width, 1)
         let span = max(total, width)
@@ -1863,6 +1919,26 @@ public struct DaemonCore: Sendable {
         }
     }
 
+    /// Absolute pitch x for a member's column (viewport origin plus
+    /// prior column widths plus offset), nil when any prior column
+    /// width is unknown. Lets reveal scroll to slotless focused
+    /// windows whose frames never laid out.
+    private func pitchXFor(
+        _ id: WindowID, owner: WorkspaceID, viewport: IntRect,
+        frames: (WindowID) -> IntRect?
+    ) -> IntPoint? {
+        let row = activeVirtual[owner] ?? 0
+        guard let strip = strips[owner]?[row],
+              let index = strip.index(of: id)
+        else { return nil }
+        var x = viewport.min.x + (offsets[owner] ?? 0)
+        for column in strip.columns.prefix(index) {
+            guard let w = columnWidth(column, frames: frames) else { return nil }
+            x += w
+        }
+        return IntPoint(x, viewport.min.y)
+    }
+
     /// Scroll the minimal shortfall to reveal the focused window.
     /// Under `autoCenter` the focused window is centered in its viewport
     /// instead (Rust `autocenter_window_on_focus`): the strip moves, never
@@ -1895,7 +1971,18 @@ public struct DaemonCore: Sendable {
             print("focus: reveal skipped window=\(id) (not on shown row)")
             return
         }
-        guard let slot = committedSlots[id] else {
+        // Slotless focused window (frameless, never laid out): scroll
+        // by column pitch when every prior column has a known width.
+        // Skipping here strands keyboard focus with zero visible
+        // effect — no scroll, no warp, no border.
+        let slot: IntPoint
+        if let known = committedSlots[id] {
+            slot = known
+        } else if let pitched = pitchXFor(
+            id, owner: owner, viewport: viewport, frames: frames
+        ) {
+            slot = pitched
+        } else {
             print("focus: reveal skipped window=\(id) (slotless)")
             return
         }
@@ -2460,13 +2547,15 @@ public struct DaemonCore: Sendable {
                 // Slots anchor at the workspace viewport's origin: each
                 // display tiles its own strip (offsets stay viewport-
                 // relative, 0 == left edge, on every screen).
-                // Frameless columns (no readable frame yet) contribute
-                // no width AND take no slot: pitching them at zero
-                // would pile every downstream column onto the same x.
-                // They freeze on their last committed slot until frames
-                // arrive instead.
+                // Widths prefer live glass, then model size (a column
+                // whose frames flap unreadable mid-scroll rides its
+                // last size instead of teleporting downstream slots).
+                // Nothing known at all (fresh spawn pre-read): the
+                // column takes no slot and advances no pitch — freezing
+                // instead of piling neighbors onto its x. It slots in
+                // once frames arrive.
                 let colWidths: [Int32?] = strip.columns.map { column in
-                    column.windows.compactMap { frames($0)?.width }.max()
+                    columnWidth(column, frames: frames)
                 }
                 // NOTE: no fill clamp here. Offsets legitimately rest
                 // outside the fill range (continuous-swipe snap bounds,
@@ -2631,6 +2720,9 @@ public struct DaemonCore: Sendable {
         case .fullscreen:
             // OS-managed: never relocate, keep preserved slots.
             for member in column.windows {
+                // Unreadable glass freezes (pitch still rode model
+                // width above): no intents on stale geometry.
+                guard frames(member) != nil else { continue }
                 let slot = preservedSlot(member, x: x, home: home, frames: frames)
                 committedSlots[member] = slot
                 applyMove(
@@ -2648,6 +2740,10 @@ public struct DaemonCore: Sendable {
             // live (short) height would park them low with the bottom
             // hanging past the viewport edge.
             for member in column.windows {
+                // Unreadable glass freezes on its last slot (pitch
+                // still rode model width above): no intents on stale
+                // geometry.
+                guard frames(member) != nil else { continue }
                 let slot: IntPoint
                 if fullWidth[member] != nil {
                     slot = IntPoint(x, home.min.y)
@@ -2695,6 +2791,7 @@ public struct DaemonCore: Sendable {
                     ? max(home.max.y - y, stackMinHeight)
                     : stackMinHeight
                 for member in item.windows {
+                    guard frames(member) != nil else { continue }
                     let liveW = frames(member)?.width ?? 0
                     let target = IntSize(max(liveW, 0), max(h, 0))
                     let slot = IntPoint(x, y)
@@ -2712,6 +2809,7 @@ public struct DaemonCore: Sendable {
         var y = home.min.y
         for (item, h) in zip(items, assigned) {
             for member in item.windows {
+                guard frames(member) != nil else { continue }
                 let liveW = frames(member)?.width ?? 0
                 let target = clampSizeToViewport(
                     IntSize(max(liveW, 0), max(h, 0)), viewport: home
@@ -2909,8 +3007,11 @@ public struct DaemonCore: Sendable {
             let streak = sizeStreak[member, default: 0]
             let cooldown = redriveCooldownEpochs << min(streak, 4)
             let last = lastSizeRedrive[member]
+            // First repeat fires immediately (moves do the same):
+            // partial landings need the retry now, not after a full
+            // cooldown of sitting wrong-sized.
             let due: Bool = {
-                guard let last else { return false }
+                guard let last else { return true }
                 let (end, overflow) = last.addingReportingOverflow(cooldown)
                 return overflow || epoch >= end
             }()
@@ -3221,6 +3322,17 @@ public struct DaemonCore: Sendable {
         return warn
     }
 
+    /// Whether a size intent is traveling or freshly sent: resize
+    /// glides skew live centers over display seams transiently, so
+    /// re-home waits instead of transferring ownership on passing
+    /// geometry.
+    public func sizeSettling(_ id: WindowID) -> Bool {
+        ax.unackedLive(id)
+            || (lastSizeRedrive[id].map {
+                currentEpoch &- $0 < redriveCooldownEpochs * 2
+            } ?? false)
+    }
+
     /// Drop focus sitting on a window the roster no longer holds (stale
     /// arrival for a rejected or never-adopted window). The adoption race
     /// (focus before appeared) is the caller's to protect.
@@ -3433,7 +3545,9 @@ public struct DaemonCore: Sendable {
     ) -> IntPoint? {
         guard enabled, let frame = focusFrame else { return nil }
         // Sliver gate on the visible slice: never warp for windows
-        // with ~nothing on-screen, whatever the cause.
+        // with ~nothing on-screen, whatever the cause. Keyed arrivals
+        // pass predicted (post-scroll slot) frames, so an offscreen
+        // window the strip just scrolled to still warps.
         let visible = frame.intersected(with: viewport)
         guard visible.area >= 50 * 50 else { return nil }
         if cause != .keyboard, frame.contains(cursor) { return nil }
@@ -3444,6 +3558,22 @@ public struct DaemonCore: Sendable {
         return IntPoint(
             frame.min.x + frame.width / 2,
             frame.min.y + frame.height / 2
+        )
+    }
+
+    /// Warp/hit frame for focus-follow: committed slot origin with
+    /// live size (model truth), falling back to the live frame when
+    /// slotless. Warping onto live glass chases unconverged windows —
+    /// every arrival recomputes on moved glass and the cursor
+    /// ping-pongs between neighbors.
+    public func predictedFrame(
+        _ id: WindowID, frames: (WindowID) -> IntRect?
+    ) -> IntRect? {
+        guard let live = frames(id) else { return nil }
+        guard let slot = committedSlots[id] else { return live }
+        return IntRect(
+            min: slot,
+            max: IntPoint(slot.x + live.width, slot.y + live.height)
         )
     }
 
@@ -3497,9 +3627,9 @@ public struct DaemonCore: Sendable {
     /// half-plane, then proportional mapping (fractional-height landings
     /// for stairs pairs the strict offset-preserving math cannot map),
     /// then clamped landings in the same order (uniform always-land).
-    /// Samples inside the 20px approach zone moving outward evaluate as
+    /// Samples inside the 10px approach zone moving outward evaluate as
     /// their edge (`approach:` kinds): mouse ballistics plus macOS
-    /// edge-slide mean the 3px band itself is rarely sampled on a push.
+    /// edge-slide mean the 2px band itself is rarely sampled on a push.
     /// Landings stay at the 6px inset so arrivals rest quiet.
     ///
     /// Loop breaker (`warpLoopAllow`/`warpLoopNote`, host-driven): N
@@ -3617,11 +3747,11 @@ public struct DaemonCore: Sendable {
             onLeftEdge = clamped.x < current.min.x
             onRightEdge = clamped.x >= current.max.x
         } else {
-            onLeftEdge = abs(clamped.x - current.min.x) < 3
-            onRightEdge = abs(current.max.x - clamped.x) < 3
+            onLeftEdge = abs(clamped.x - current.min.x) < 2
+            onRightEdge = abs(current.max.x - clamped.x) < 2
         }
         // Approach zone: fast movers headed outward from near (not in)
-        // the 3px band — mouse ballistics plus macOS edge-slide mean the
+        // the 2px band — mouse ballistics plus macOS edge-slide mean the
         // band itself is rarely sampled on a push. Snap the decision to
         // the edge; landings stay at the 6px inset so arrivals rest
         // quiet (no ping-pong without moving the inset). Stillness
@@ -3635,9 +3765,9 @@ public struct DaemonCore: Sendable {
                   let v = velocityX, v != 0,
                   clamped.x >= current.min.x, clamped.x < current.max.x
         {
-            // Interior cursor within 20px of an edge, moving outward.
-            evalLeft = clamped.x - current.min.x <= 20 && v < 0
-            evalRight = current.max.x - clamped.x <= 20 && v > 0
+            // Interior cursor within 10px of an edge, moving outward.
+            evalLeft = clamped.x - current.min.x <= 10 && v < 0
+            evalRight = current.max.x - clamped.x <= 10 && v > 0
             approached = evalLeft || evalRight
         } else {
             evalLeft = false
@@ -3798,7 +3928,7 @@ public struct DaemonCore: Sendable {
     /// Warp decision for one cursor sample given the previous evaluated
     /// sample: a display edge crossed between samples evaluates at the
     /// crossing (just inside the exited display), so fast and diagonal
-    /// flings that jump the 3px edge band still warp — no perfect
+    /// flings that jump the 2px edge band still warp — no perfect
     /// horizontal aim required. Entry crossings (outside → inside)
     /// never evaluate: arriving natively is not a warp. Falls back to
     /// the direct sample (slow dwells inside the band cross nothing).

@@ -170,6 +170,15 @@ public final class LiveWindow: @unchecked Sendable {
         )
     }
 
+    /// Whether the last write failed with a dead element (-25202):
+    /// the ref is stale, not the target — retrying the AX call only
+    /// spams the log (every glide step re-signs the complaint).
+    /// Cleared by any success (or element replacement, which builds a
+    /// fresh window).
+    public func elementDead() -> Bool {
+        complaintLock.withLock { _lastDeniedCode == AXError.invalidUIElement.rawValue }
+    }
+
     /// Report a write failure once per distinct signature; success
     /// clears. Prints outside the lock (a rare duplicate line is
     /// harmless, a deadlock is not).
@@ -350,6 +359,11 @@ public final class LiveWindow: @unchecked Sendable {
     @discardableResult
     public func reposition(to origin: IntPoint) -> IntRect {
         guard !dryRun else { return frame }
+        // Dead element: the AX call cannot succeed — skip it (and its
+        // per-target complaint) until drop + re-adopt replaces the ref.
+        // The failure pipeline already recorded this window; the audit
+        // owns the divergence meanwhile.
+        guard !elementDead() else { return frame }
         let driftX = Double(origin.x) - Double(frame.min.x)
         let driftY = Double(origin.y) - Double(frame.min.y)
         guard abs(driftX) > axDeadband || abs(driftY) > axDeadband else {
@@ -387,6 +401,7 @@ public final class LiveWindow: @unchecked Sendable {
     @discardableResult
     public func resize(to size: IntSize, origin: IntPoint? = nil) -> IntRect {
         guard !dryRun else { return frame }
+        guard !elementDead() else { return frame }
         guard abs(Double(size.x) - Double(frame.width)) > axDeadband
             || abs(Double(size.y) - Double(frame.height)) > axDeadband
         else {
@@ -437,6 +452,23 @@ public final class LiveWindow: @unchecked Sendable {
                 _ = updateFrame()
             }
             _ = reposition(to: origin)
+        } else if landedWidth < previousWidth, landedWidth > Double(size.x),
+                  let origin
+        {
+            // Partial shrink (macOS clamps/minimums silently land
+            // short with success status): set again from the target
+            // origin instead of waiting out the backoff.
+            _ = reposition(to: origin)
+            var retry = target
+            if let retryValue = AXValueCreate(.cgSize, &retry) {
+                _ = withEnhancedUIDisabled {
+                    AXUIElementSetAttributeValue(
+                        element, kAXSizeAttribute as CFString, retryValue
+                    )
+                }
+                _ = updateFrame()
+            }
+            _ = reposition(to: origin)
         }
         return frame
     }
@@ -445,6 +477,19 @@ public final class LiveWindow: @unchecked Sendable {
     public func raise() {
         guard !dryRun else { return }
         AXUIElementPerformAction(element, kAXRaiseAction as CFString)
+    }
+
+    /// Clear the minimized bit (keyed focus arrival on a minimized
+    /// window): the OS restores it to the desktop; layout then owns
+    /// it like any managed window.
+    @discardableResult
+    public func deminimize() -> Bool {
+        guard !dryRun else { return false }
+        return withEnhancedUIDisabled {
+            AXUIElementSetAttributeValue(
+                element, kAXMinimizedAttribute as CFString, kCFBooleanFalse
+            )
+        } == .success
     }
 
     /// Claim AX focus without activation (hover/ambient arrivals): sets
