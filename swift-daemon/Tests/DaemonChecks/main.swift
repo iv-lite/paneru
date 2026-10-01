@@ -718,6 +718,113 @@ do {
     checkEqual(daemon.focus, 0, "empty neighbors hold focus")
 }
 
+// Focus arrivals for hidden windows never drag the workspace: a
+// window owned by a display its committed slot isn't visible on
+// focuses in place, while visible cross-display arrivals retarget.
+do {
+    var daemon = DaemonCore()
+    daemon.workspaceRing = [1, 2]
+    let left = IntRect(0, 0, 1024, 768)
+    let right = IntRect(1024, 0, 2048, 768)
+    // Window 1 belongs to ws2, which reports no viewport yet: its
+    // committed slot lands on the fallback, off ws2's display. Its
+    // glass sits where the OS would really put a fresh window (right
+    // display); the (0,0) default would fake a left-display window
+    // and poison reveal.
+    _ = daemon.tick(
+        events: [.appeared(id: 0, workspace: 1), .appeared(id: 1, workspace: 2), .focus(id: 0)],
+        frames: frames(slots: [0: IntPoint(0, 0), 1: IntPoint(1100, 0)]),
+        viewports: [1: left], focusedStyle: style
+    )
+    checkEqual(daemon.activeWorkspace, 1, "setup stays home")
+    _ = daemon.tick(
+        events: [.focus(id: 1)],
+        frames: frames(slots: [0: IntPoint(0, 0), 1: IntPoint(1100, 0)]),
+        viewports: [1: left, 2: right], focusedStyle: style
+    )
+    checkEqual(daemon.focus, 1, "hidden arrival still focuses")
+    checkEqual(daemon.activeWorkspace, 1, "hidden arrival never drags the workspace")
+}
+
+// Scrolled-hidden arrivals never drag the workspace: a window whose
+// committed slot sits strictly off its owner's viewport focuses in
+// place, while the edge column resting in view still retargets.
+do {
+    var daemon = DaemonCore()
+    daemon.workspaceRing = [1, 2]
+    let left = IntRect(0, 0, 1024, 768)
+    let right = IntRect(1024, 0, 2048, 768)
+    let glass: [Int32: IntPoint] = [
+        0: IntPoint(0, 0), 1: IntPoint(1024, 0), 2: IntPoint(1424, 0),
+        3: IntPoint(1824, 0), 4: IntPoint(2224, 0),
+    ]
+    _ = daemon.tick(
+        events: [
+            .appeared(id: 0, workspace: 1),
+            .appeared(id: 1, workspace: 2), .appeared(id: 2, workspace: 2),
+            .appeared(id: 3, workspace: 2), .appeared(id: 4, workspace: 2),
+            .focus(id: 0),
+        ],
+        frames: frames(slots: glass),
+        viewports: [1: left, 2: right], focusedStyle: style
+    )
+    for _ in 0..<25 {
+        _ = daemon.tick(
+            events: [], frames: frames(slots: glass),
+            viewports: [1: left, 2: right], focusedStyle: style
+        )
+    }
+    // Step onto ws2 so the swipe scrolls its strip, then swipe the
+    // wide strip off its viewport and rest with glass riding the
+    // scrolled model (like the single-display hidden tests): rest
+    // settles at the snap bound, last column flush with the edge.
+    _ = daemon.tick(
+        events: [.focus(id: 2)],
+        frames: frames(slots: glass),
+        viewports: [1: left, 2: right], focusedStyle: style
+    )
+    checkEqual(daemon.activeWorkspace, 2, "setup steps onto the wide strip")
+    _ = daemon.tick(
+        events: [.swipe(delta: 2.0, fingers: 3)],
+        frames: frames(slots: glass),
+        viewports: [1: left, 2: right], focusedStyle: style
+    )
+    let scrolled: [Int32: IntPoint] = [
+        0: IntPoint(0, 0), 1: IntPoint(-176, 34), 2: IntPoint(224, 34),
+        3: IntPoint(624, 34), 4: IntPoint(1024, 34),
+    ]
+    for _ in 0..<40 {
+        _ = daemon.tick(
+            events: [], frames: frames(slots: scrolled),
+            viewports: [1: left, 2: right], focusedStyle: style
+        )
+    }
+    checkEqual(daemon.offsets[2], -1200, "setup parks the strip off its viewport")
+    // Step home: the scrolled-hidden arrival focuses in place without
+    // dragging the workspace, while the edge column resting in view
+    // still retargets.
+    _ = daemon.tick(
+        events: [.focus(id: 0)],
+        frames: frames(slots: scrolled),
+        viewports: [1: left, 2: right], focusedStyle: style
+    )
+    checkEqual(daemon.activeWorkspace, 1, "setup steps home")
+    _ = daemon.tick(
+        events: [.focus(id: 1)],
+        frames: frames(slots: scrolled),
+        viewports: [1: left, 2: right], focusedStyle: style
+    )
+    checkEqual(daemon.focus, 1, "scrolled-hidden arrival still focuses")
+    checkEqual(daemon.activeWorkspace, 1, "scrolled-hidden arrival never drags the workspace")
+    _ = daemon.tick(
+        events: [.focus(id: 4)],
+        frames: frames(slots: scrolled),
+        viewports: [1: left, 2: right], focusedStyle: style
+    )
+    checkEqual(daemon.focus, 4, "edge-column arrival focuses")
+    checkEqual(daemon.activeWorkspace, 2, "edge-column arrival retargets")
+}
+
 // Mouse display hops retarget the active workspace, focus its first
 // window, and queue one cursor warp (exactly-once host delivery).
 do {

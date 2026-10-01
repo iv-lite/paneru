@@ -778,8 +778,18 @@ nonisolated(unsafe) var stableFrames: [CGWindowID: IntRect] = [:]
 /// Pending space-rotation votes per workspace: one flaky SLS read
 /// must never rotate layouts (stash + empty strips + re-adopt storm =
 /// lost window positions). A fresh NSWorkspace switch signal
-/// corroborates immediately; silent changes need two agreeing syncs.
-nonisolated(unsafe) var spaceVotes: [WorkspaceID: (space: SpaceID, seen: Int)] = [:]
+/// corroborates immediately; silent changes need two agreeing syncs,
+///
+/// and every rotation cools down silent switches briefly so flapping
+/// reads settle instead of churning. Pure state lives in
+/// `Displays.SpaceVoter`; this only keys it per workspace.
+nonisolated(unsafe) var spaceVoters: [WorkspaceID: SpaceVoter] = [:]
+
+/// Workspaces whose layout just rotated to a new space, keyed by
+/// rotation time: the re-home pass skips them briefly so windows in
+/// flux (frames still traveling from the old space) are never judged
+/// by stale coordinates. One sync of still water, then normal rules.
+nonisolated(unsafe) var rotatedAt: [WorkspaceID: Date] = [:]
 
 /// Reconcile the roster with the on-screen list. Vanished windows drop
 /// inline (no AX involved); newcomers probe on the AX worker and adopt
@@ -792,9 +802,14 @@ nonisolated(unsafe) var spaceVotes: [WorkspaceID: (space: SpaceID, seen: Int)] =
 @Sendable func refreshSpaces() {
     guard skyCID != nil else { return }
     // A fresh switch signal corroborates the read (same 2s window as
-    // the fast re-home path); silent changes vote below instead.
+    // the fast re-home path); silent changes vote instead. Reads for
+    // spaces outside the managed set never count (stale/destroyed IDs).
     let corroborated =
         spaceChangedAt.map { Date().timeIntervalSince($0) < 2.0 } ?? false
+    let now = Date()
+    let managedSet: Set<SpaceID>? = skyManagedSpaces().map {
+        Set($0.flatMap { $0.spaces })
+    }
     var live = Set<SpaceID>()
     for ws in displayWorkspaceRing() {
         guard let display = workspaceDisplay[ws],
@@ -802,38 +817,32 @@ nonisolated(unsafe) var spaceVotes: [WorkspaceID: (space: SpaceID, seen: Int)] =
         else { continue }
         live.insert(space)
         let old = core.spaceOfWorkspace[ws] ?? 0
-        // First resolution only records (nothing stashed yet);
-        // agreeing reads clear stale votes.
-        guard old != 0, old != space else {
-            if old == 0 {
-                core.resolveSpace(workspace: ws, space: space)
-            } else {
-                spaceVotes.removeValue(forKey: ws)
+        var voter = spaceVoters[ws] ?? SpaceVoter()
+        let verdict = voter.evaluate(
+            old: old, read: space, corroborated: corroborated,
+            managed: managedSet, now: now
+        )
+        spaceVoters[ws] = voter
+        switch verdict {
+        case .record:
+            core.resolveSpace(workspace: ws, space: space)
+        case .clear:
+            break
+        case .rotate:
+            rotatedAt[ws] = now
+            if rotatedAt.count > 64 {
+                let cutoff = now.addingTimeInterval(-5.0)
+                rotatedAt = rotatedAt.filter { $0.value > cutoff }
             }
-            continue
-        }
-        if corroborated {
-            spaceVotes.removeValue(forKey: ws)
             if core.resolveSpace(workspace: ws, space: space) {
-                print("space: ws=\(ws) \(old) → \(space)")
+                print("space: ws=\(ws) \(old) → \(space)" + (corroborated ? "" : " (voted)"))
             }
-            continue
-        }
-        let seen = spaceVotes[ws]?.space == space
-            ? (spaceVotes[ws]?.seen ?? 0) + 1 : 1
-        if seen >= 2 {
-            spaceVotes.removeValue(forKey: ws)
-            if core.resolveSpace(workspace: ws, space: space) {
-                print("space: ws=\(ws) \(old) → \(space) (voted)")
-            }
-        } else {
-            spaceVotes[ws] = (space, seen)
+        case .hold, .ignore:
+            break
         }
     }
-    if let managed = skyManagedSpaces() {
-        core.pruneSpaces(
-            keeping: Set(managed.flatMap { $0.spaces }).union(live)
-        )
+    if let managed = managedSet {
+        core.pruneSpaces(keeping: managed.union(live))
     }
 }
 
@@ -1065,6 +1074,9 @@ nonisolated(unsafe) var spaceVotes: [WorkspaceID: (space: SpaceID, seen: Int)] =
     let spaceFresh =
         spaceChangedAt.map { Date().timeIntervalSince($0) < 2.0 } ?? false
     var confirms = 0
+    // Rotation-settle cutoff: windows owned by (or physically inside)
+    // a just-rotated workspace keep their home until frames land.
+    let rotateCutoff = Date().addingTimeInterval(-1.0)
     for (wid, window) in roster {
         let id = windowID(wid)
         if spaceFresh, confirms < 8,
@@ -1076,6 +1088,15 @@ nonisolated(unsafe) var spaceVotes: [WorkspaceID: (space: SpaceID, seen: Int)] =
         }
         let frame = window.frame
         defer { stableFrames[wid] = frame }
+        // Rotation settle: a workspace that just rotated owns windows
+        // whose frames are still traveling — never re-home by stale
+        // coordinates on either side of the move.
+        if let home = workspaceOfWindow(id),
+           (rotatedAt[home] ?? .distantPast) > rotateCutoff
+             || (rotatedAt[workspaceForFrame(frame)] ?? .distantPast) > rotateCutoff
+        {
+            continue
+        }
         // Scrolled strips explain display mismatch: slots ride offsets,
         // so a rested-but-scrolled column can sit across the seam while
         // belonging home. Rehome only from still water (manual drags

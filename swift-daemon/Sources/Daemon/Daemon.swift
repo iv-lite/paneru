@@ -520,14 +520,26 @@ public struct DaemonCore: Sendable {
         // act where the user is looking. Command arrivals (raise) and
         // settled ambient arrivals hop; ambient echoes inside the
         // transfer-protection window don't (stale old-app reports
-        // during activation would yank straight back).
+        // during activation would yank straight back). The hop also
+        // needs the target to be plausibly visible: a focus arrival
+        // for a window whose committed slot misses its owner's
+        // viewport is a hidden/off-viewport report (strip scrolled
+        // away, buried on another space), and hopping would drag the
+        // workspace — and its reveal pass — onto a window that isn't
+        // there. Slots (model intent) rather than traveling positions:
+        // a window gliding across displays already slots home.
+        // Unknown slots (fresh clicks) still hop.
         if let id {
             let protected =
                 !raise
                 && lastRaiseEpoch.map({ currentEpoch &- $0 <= raiseHopQuietEpochs }) ?? false
             if !protected, let owner = workspaceOf(id), owner != activeWorkspace {
-                activeWorkspace = owner
-                dirty.insert(.layout)
+                let present =
+                    committedSlots[id].map { viewport(for: owner, in: [:]).contains($0) } ?? true
+                if present {
+                    activeWorkspace = owner
+                    dirty.insert(.layout)
+                }
             }
         }
         dirty.insert(.focus)

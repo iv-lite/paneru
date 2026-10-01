@@ -1,3 +1,4 @@
+import Foundation
 import Geometry
 
 // Physical display model: identity, bounds, menubar/notch/dock insets,
@@ -163,5 +164,94 @@ public struct Display: Equatable, Sendable {
         case .hidden, nil: break
         }
         return viewport
+    }
+}
+
+// MARK: - Space rotation votes
+
+/// Verdict for one workspace's SLS space read: rotating layouts
+/// (stash + empty strips + re-adopt storm) must never fire on flaky
+/// reads, but real switches must apply promptly. Pure — the host
+/// feeds reads, acts on verdicts, and owns the managed set.
+public enum SpaceVoteAction: Equatable, Sendable {
+    /// First sighting: adopt without stash churn.
+    case record
+    /// Agrees with current: drop any stale vote.
+    case clear
+    /// Switch now (corroborated signal or agreeing silent reads).
+    case rotate
+    /// Count the vote, wait for more agreement.
+    case hold
+    /// Flake: outside the managed set, or cooling down. Never rotates.
+    case ignore
+}
+
+/// One workspace's rotation vote state. Silent changes need two
+/// agreeing syncs; reads for unmanaged spaces never count; every
+/// rotation (voted or corroborated) cools down silent rotations
+/// briefly so flapping A→B→A→B settles after the first instead of
+/// churning strips on every pair.
+public struct SpaceVoter: Equatable, Sendable {
+    public var voteSpace: SpaceID?
+    public var voteSeen: Int
+    public var cooldownUntil: Date?
+
+    public init() {
+        voteSpace = nil
+        voteSeen = 0
+        cooldownUntil = nil
+    }
+
+    /// Seconds of post-rotation silence for uncorroborated reads.
+    public static var cooldownSecs: Double { 10 }
+
+    public mutating func evaluate(
+        old: SpaceID, read: SpaceID, corroborated: Bool,
+        managed: Set<SpaceID>?, now: Date
+    ) -> SpaceVoteAction {
+        // First sighting only records; agreeing reads clear stale votes.
+        guard old != 0, old != read else {
+            voteSpace = nil
+            voteSeen = 0
+            return old == 0 ? .record : .clear
+        }
+        // Unknown spaces never rotate (failed enumeration passes nil
+        // and skips pruning the same way — never act on missing data).
+        if let managed, !managed.contains(read) {
+            if voteSpace == read {
+                voteSpace = nil
+                voteSeen = 0
+            }
+            return .ignore
+        }
+        // A fresh switch signal corroborates immediately and rearms
+        // the cooldown; silent reads inside cooldown only vote.
+        if corroborated {
+            voteSpace = nil
+            voteSeen = 0
+            cooldownUntil = now.addingTimeInterval(Self.cooldownSecs)
+            return .rotate
+        }
+        if let until = cooldownUntil, now < until {
+            if voteSpace == read {
+                voteSeen += 1
+            } else {
+                voteSpace = read
+                voteSeen = 1
+            }
+            return .ignore
+        }
+        cooldownUntil = nil
+        if voteSpace == read {
+            voteSeen += 1
+        } else {
+            voteSpace = read
+            voteSeen = 1
+        }
+        guard voteSeen >= 2 else { return .hold }
+        voteSpace = nil
+        voteSeen = 0
+        cooldownUntil = now.addingTimeInterval(Self.cooldownSecs)
+        return .rotate
     }
 }

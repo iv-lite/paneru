@@ -132,6 +132,85 @@ do {
     checkEqual(plus.mapping[4], 40, "newcomer takes the next number")
 }
 
+// SpaceVoter: one flaky SLS read must never rotate layouts; real
+// switches apply promptly; rotations cool down silent flapping.
+do {
+    let t0 = Date()
+    // First sighting records; agreeing reads clear stale votes.
+    var fresh = SpaceVoter()
+    checkEqual(
+        fresh.evaluate(old: 0, read: 35, corroborated: false, managed: [35], now: t0),
+        .record, "first sighting records"
+    )
+    var steady = SpaceVoter()
+    checkEqual(
+        steady.evaluate(old: 123, read: 123, corroborated: false, managed: [123], now: t0),
+        .clear, "agreeing read clears"
+    )
+    // Silent flapping votes twice, then rotates once with cooldown.
+    var flap = SpaceVoter()
+    checkEqual(
+        flap.evaluate(old: 123, read: 35, corroborated: false, managed: [123, 35], now: t0),
+        .hold, "first silent read holds"
+    )
+    checkEqual(
+        flap.evaluate(old: 123, read: 35, corroborated: false, managed: [123, 35], now: t0),
+        .rotate, "second agreeing read rotates"
+    )
+    checkEqual(
+        flap.evaluate(old: 35, read: 123, corroborated: false, managed: [123, 35], now: t0),
+        .ignore, "post-rotation flap cools down"
+    )
+    // Corroborated switches rotate immediately and re-arm cooldown.
+    var sig = SpaceVoter()
+    checkEqual(
+        sig.evaluate(old: 123, read: 35, corroborated: true, managed: [123, 35], now: t0),
+        .rotate, "fresh switch signal rotates at once"
+    )
+    checkEqual(
+        sig.evaluate(old: 35, read: 48, corroborated: false, managed: [35, 48], now: t0),
+        .ignore, "signal rotation cools silent reads"
+    )
+    // Unknown spaces never rotate (stale/destroyed SLS IDs).
+    var stale = SpaceVoter()
+    checkEqual(
+        stale.evaluate(old: 123, read: 999, corroborated: false, managed: [123], now: t0),
+        .ignore, "unmanaged space read ignored"
+    )
+    checkEqual(
+        stale.evaluate(old: 123, read: 999, corroborated: true, managed: [123], now: t0),
+        .ignore, "unmanaged space ignored even when signaled"
+    )
+    check(
+        stale.voteSpace == nil, "unmanaged read leaves no pending vote"
+    )
+    // Cooldown expires: real later switches still apply.
+    var later = SpaceVoter()
+    _ = later.evaluate(old: 123, read: 35, corroborated: true, managed: [123, 35], now: t0)
+    checkEqual(
+        later.evaluate(
+            old: 35, read: 48, corroborated: false, managed: [35, 48],
+            now: t0.addingTimeInterval(11.0)
+        ),
+        .hold, "post-cooldown change votes again"
+    )
+    checkEqual(
+        later.evaluate(
+            old: 35, read: 48, corroborated: false, managed: [35, 48],
+            now: t0.addingTimeInterval(11.0)
+        ),
+        .rotate, "post-cooldown agreement rotates"
+    )
+    // Competing reads restart the vote instead of rotating either.
+    var torn = SpaceVoter()
+    _ = torn.evaluate(old: 1, read: 2, corroborated: false, managed: [1, 2, 3], now: t0)
+    checkEqual(
+        torn.evaluate(old: 1, read: 3, corroborated: false, managed: [1, 2, 3], now: t0),
+        .hold, "competing read restarts the vote"
+    )
+    checkEqual(torn.voteSpace, 3, "competing read replaces pending vote")
+}
+
 if failures == 0 {
     print("DisplaysChecks: all checks passed")
 } else {
