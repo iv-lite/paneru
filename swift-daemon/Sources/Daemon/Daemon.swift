@@ -159,7 +159,11 @@ public struct DaemonCore: Sendable {
     public private(set) var hiddenCleared: [WindowID: UInt64] = [:]
 
     /// Note a heal-cleared hidden window (host focus guard).
+    /// Idempotent while blocked: re-noting every tick would extend the
+    /// freeze indefinitely (committed slots already written, but no
+    /// intents fire and positions never advance).
     public mutating func noteHiddenCleared(_ id: WindowID, epoch: UInt64) {
+        guard hiddenCleared[id] == nil else { return }
         hiddenCleared[id] = epoch
     }
 
@@ -396,12 +400,22 @@ public struct DaemonCore: Sendable {
     /// 5s, so 10 ≈ a minute of failed writes). Injectable for tests;
     /// production leaves 10.
     public var auditParkAfter: Int = 10
+    /// Consecutive parked audits before a forced re-arm (one fresh
+    /// repair attempt, then re-park if glass still won't follow).
+    /// Parking is "retry rarely", never "rest forever": without the
+    /// bound a window whose glass and slot both froze (edge-held live
+    /// frame, centered slot) never satisfies the movement re-arm.
+    /// Production 30 audits ≈ 2.5min; tests never run that long.
+    public var auditParkMaxAudits: Int = 30
+    /// Audits spent parked per window (movement re-arms reset it).
+    private var auditParkStreak: [WindowID: Int] = [:]
     /// Release every circuit-breaker park (grant restored): the next
     /// audit repairs parked windows normally instead of waiting for
     /// glass movement that denial may have frozen.
     public mutating func unparkAllWrites() {
         auditParkedLive.removeAll()
         auditParkedSlot.removeAll()
+        auditParkStreak.removeAll()
     }
     /// Audit cadence in epochs (5s at 60Hz). Injectable for tests;
     /// production leaves the Rust-parity 300.
@@ -476,10 +490,16 @@ public struct DaemonCore: Sendable {
         gestureFresh = false
         raised = []
         // Record strip-owning workspaces the host left viewport-less:
-        // their slots fall back (see `viewport(for:)`) and can land on
-        // the wrong display — visible in the state file instead of
-        // silent.
+        // their slots fall back (see `viewport(for:)`) — visible in the
+        // state file instead of silent.
         viewportFallbacks = Set(strips.keys.filter { viewports[$0] == nil })
+        // Remember every supplied viewport: the fallback below reuses a
+        // workspace's own last-good rect instead of the active
+        // workspace's, so a viewport-less strip tiles near its own
+        // display instead of a full display off.
+        for (ws, view) in viewports {
+            lastGoodViewport[ws] = view
+        }
         // One frame clock for ingest and commit alike: surgery intents
         // enqueued during ingest carry this tick's epoch.
         let epoch = ax.beginFrame()
@@ -561,7 +581,7 @@ public struct DaemonCore: Sendable {
         // cadence and scope.
         if epoch % max(auditCadenceEpochs, 1) == 0 {
             auditPass()
-            auditRehome(frames: frames, epoch: epoch)
+            auditRehome(frames: frames, epoch: epoch, viewports: viewports)
         }
         let jobs = commitPass(frames: frames, viewports: viewports, epoch: epoch)
         // Transfer reveals land on fresh slots (commit just wrote them);
@@ -614,20 +634,31 @@ public struct DaemonCore: Sendable {
 
     /// Strip-owning workspaces missing from the host-supplied viewports
     /// on the last tick: those strips tiled against a fallback rect
-    /// (active workspace's, or empty), so their slots can sit on the
-    /// wrong display. Empty means every strip used its own display.
+    /// (their own last-good viewport, else the active workspace's, or
+    /// empty). Empty means every strip used its own display.
     /// Read by host diagnostics (state file).
     public private(set) var viewportFallbacks: Set<WorkspaceID> = []
+    /// Last viewport supplied per workspace. The `viewport(for:)`
+    /// fallback prefers a workspace's own last-good rect over the
+    /// active workspace's, so transiently viewport-less strips stay
+    /// near their own display instead of bleeding a full display off.
+    private var lastGoodViewport: [WorkspaceID: IntRect] = [:]
     /// Committed slot origins for external diagnostics (state file):
     /// window id → slot origin. Read-only snapshot.
     public func committedSlotMap() -> [WindowID: IntPoint] { committedSlots }
 
-    /// Viewport for a workspace: its own when the host supplied one, else
-    /// the active workspace's, else an empty rect (callers guard widths).
+    /// Viewport for a workspace: its own when the host supplied one,
+    /// else its own last-good rect (transiently viewport-less strips
+    /// stay near their display instead of bleeding a full display off),
+    /// else the active workspace's, else an empty rect (callers guard
+    /// widths).
     private func viewport(
         for workspace: WorkspaceID?, in viewports: [WorkspaceID: IntRect]
     ) -> IntRect {
         if let workspace, let view = viewports[workspace] {
+            return view
+        }
+        if let workspace, let view = lastGoodViewport[workspace] {
             return view
         }
         if let view = viewports[activeWorkspace] {
@@ -737,6 +768,7 @@ public struct DaemonCore: Sendable {
                 auditSurvivors.removeValue(forKey: id)
                 auditParkedLive.removeValue(forKey: id)
                 auditParkedSlot.removeValue(forKey: id)
+                auditParkStreak.removeValue(forKey: id)
                 // committedSlots deliberately survive: space returns
                 // restore silently against the frozen slot (positions
                 // walk the eased curve toward it).
@@ -1830,6 +1862,26 @@ public struct DaemonCore: Sendable {
             print("focus: reveal skipped window=\(id) (slotless)")
             return
         }
+        // Glass-outside skip: when live glass sits outside the owner
+        // viewport horizontally but the slot is on-screen, scrolling the
+        // strip chases invisible glass and strands visible siblings
+        // off-display (hidden-focus flap). The commit pass still glides
+        // the window home, and reveal re-fires on later arrivals once
+        // glass is back. Never-placed windows (no model position yet)
+        // always reveal: the strip must travel to fresh spawns.
+        if positions[id] != nil, let live = frames(id) {
+            let glassLo = max(live.min.x, viewport.min.x)
+            let glassHi = min(live.max.x, viewport.max.x)
+            if glassHi - glassLo <= 0 {
+                let width = frames(id)?.width ?? 0
+                let slotLo = max(slot.x, viewport.min.x)
+                let slotHi = min(slot.x + max(width, 0), viewport.max.x)
+                if slotHi - slotLo > 0 {
+                    print("focus: reveal skipped window=\(id) (glass outside viewport)")
+                    return
+                }
+            }
+        }
         let width = frames(id)?.width ?? 0
         let offset = offsets[owner] ?? 0
         if autoCenter {
@@ -2123,8 +2175,16 @@ public struct DaemonCore: Sendable {
     /// whole workspaces with an unreached offset target (mid-scroll
     /// strips are moving targets). Sizes re-home alongside origins so
     /// the Firefox class (OS-clamped dimensions) cannot strand either.
-    private mutating func auditRehome(frames: (WindowID) -> IntRect?, epoch: UInt64) {
+    private mutating func auditRehome(
+        frames: (WindowID) -> IntRect?, epoch: UInt64,
+        viewports: [WorkspaceID: IntRect]
+    ) {
         var repairedNow: Set<WindowID> = []
+        // The drain strips off-union origins, so auditing them as
+        // failures parks healthy scrolled-off windows for model
+        // positions no write can reach. Skip them here (no repair, no
+        // count); they converge via the fast path once scrolled back.
+        let union = writeUnion(Array(viewports.values))
         for (ws, rows) in strips {
             // Mid-scroll workspaces are moving targets: an unreached
             // offset target means slots are still traveling.
@@ -2170,6 +2230,15 @@ public struct DaemonCore: Sendable {
                                let slot = committedSlots[member],
                                let live = frames(member)
                         else { continue }
+                        // Unreachable slots (scrolled off every display)
+                        // are the scroll domain, not write failures: the
+                        // drain strips those origins, so repairing here
+                        // only feeds the breaker. See `union` above.
+                        if let union,
+                           slot.x < union.min.x || slot.x >= union.max.x
+                            || slot.y < union.min.y || slot.y >= union.max.y {
+                            continue
+                        }
                         // Circuit breaker re-arm: parked glass moved (user
                         // drag, grant return) or the slot itself moved
                         // (scroll, offset clamp, retile) — resume repair
@@ -2180,6 +2249,21 @@ public struct DaemonCore: Sendable {
                             auditParkedLive.removeValue(forKey: member)
                             auditParkedSlot.removeValue(forKey: member)
                             auditSurvivors.removeValue(forKey: member)
+                            auditParkStreak.removeValue(forKey: member)
+                        } else if auditParkedLive[member] != nil {
+                            // Bounded parking: frozen glass + frozen slot
+                            // never satisfies the movement re-arm above,
+                            // so count parked audits and force one fresh
+                            // repair attempt at the bound (re-park follows
+                            // if glass still won't follow).
+                            let streak = (auditParkStreak[member] ?? 0) + 1
+                            auditParkStreak[member] = streak
+                            if streak >= auditParkMaxAudits {
+                                auditParkedLive.removeValue(forKey: member)
+                                auditParkedSlot.removeValue(forKey: member)
+                                auditSurvivors.removeValue(forKey: member)
+                                auditParkStreak.removeValue(forKey: member)
+                            }
                         }
                         // Chronic no-progress: stop writing until glass
                         // moves. The survivor count only grows on
@@ -2308,6 +2392,9 @@ public struct DaemonCore: Sendable {
         // Programmatic offset targets ease first, so this tick's slots
         // already account for strip travel (members ride composed).
         easeOffsets(epoch: epoch)
+        // Display union once: slot reachability gates the fast-path
+        // redrive below, and the drain vets origins against it.
+        let union = writeUnion(Array(viewports.values))
         for (ws, rows) in strips {
             let home = viewport(for: ws, in: viewports)
             // Sanity-clamp offsets every commit: swipe snap bounds and
@@ -2369,7 +2456,8 @@ public struct DaemonCore: Sendable {
                     }
                     layoutColumn(
                         column, x: colX, home: home,
-                        epoch: epoch, frames: frames, heldMembers: heldMembers
+                        epoch: epoch, frames: frames, heldMembers: heldMembers,
+                        union: union
                     )
                     // Slots abut: gaps are host-side AX insets, never pitch.
                     x += colWidths[index]
@@ -2380,12 +2468,14 @@ public struct DaemonCore: Sendable {
         var batch: [WindowID: AXWriteJob] = [:]
         for (_, job) in inbox { coalesceJobs(&batch, job) }
         inbox.removeAll()
-        // Off-union guard: origins outside every display (stale offsets,
-        // wrong-display homes) are rejected by the OS with denial spam —
-        // drop them and park the window instead of writing. Legit sliver
-        // parking sits 10px off-viewport and always passes (tolerance).
+        // Off-union guard: origins outside every display are bogus
+        // targets (stale offsets, wrong-display homes) — drop them
+        // instead of writing. Model errors (off-union slots) never
+        // park here; proven write failures park at audit cadence.
+        // Legit sliver parking sits 10px off-viewport and always
+        // passes (tolerance).
         dropOffUnionJobs(
-            &batch, union: writeUnion(Array(viewports.values)), frames: frames,
+            &batch, union: union, frames: frames,
             held: held)
         var ordered = drainOrder(batch)
         for i in ordered.indices {
@@ -2448,6 +2538,19 @@ public struct DaemonCore: Sendable {
             } else {
                 batch[id] = stripped
             }
+            // Model error, not a write failure: the committed slot is
+            // off-union too, so the strip offset that baked it is stale
+            // (stale restore offset, transfer ping-pong). Strip the
+            // bogus origin but do NOT park the window for it — parking
+            // waits for proven write failures at audit cadence, and the
+            // next commit re-derives the slot as offsets settle. (Slots
+            // with no record — direct surgery moves — keep the old
+            // strip-and-park path below.)
+            if let slot = committedSlots[id],
+               slot.x < union.min.x || slot.x >= union.max.x
+                || slot.y < union.min.y || slot.y >= union.max.y {
+                continue
+            }
             if let live = frames(id) {
                 auditParkedLive[id] = live
                 if let slot = committedSlots[id] {
@@ -2470,13 +2573,13 @@ public struct DaemonCore: Sendable {
     private mutating func layoutColumn(
         _ column: LayoutColumn, x: Int32, home: IntRect,
         epoch: UInt64, frames: (WindowID) -> IntRect?,
-        heldMembers: Set<WindowID>
+        heldMembers: Set<WindowID>, union: IntRect?
     ) {
         switch column {
         case .stack(let items) where items.count > 1:
             layoutStackItems(
                 items, x: x, home: home, epoch: epoch,
-                frames: frames, heldMembers: heldMembers
+                frames: frames, heldMembers: heldMembers, union: union
             )
         case .fullscreen:
             // OS-managed: never relocate, keep preserved slots.
@@ -2485,7 +2588,7 @@ public struct DaemonCore: Sendable {
                 committedSlots[member] = slot
                 applyMove(
                     member, to: slot, epoch: epoch,
-                    frames: frames, heldMembers: heldMembers
+                    frames: frames, heldMembers: heldMembers, union: union
                 )
                 clampMemberSize(member, home: home, epoch: epoch, frames: frames)
             }
@@ -2507,7 +2610,7 @@ public struct DaemonCore: Sendable {
                 committedSlots[member] = slot
                 applyMove(
                     member, to: slot, epoch: epoch,
-                    frames: frames, heldMembers: heldMembers
+                    frames: frames, heldMembers: heldMembers, union: union
                 )
                 clampMemberSize(member, home: home, epoch: epoch, frames: frames)
             }
@@ -2523,7 +2626,7 @@ public struct DaemonCore: Sendable {
     private mutating func layoutStackItems(
         _ items: [StackItem], x: Int32, home: IntRect,
         epoch: UInt64, frames: (WindowID) -> IntRect?,
-        heldMembers: Set<WindowID>
+        heldMembers: Set<WindowID>, union: IntRect?
     ) {
         let desired = items.map { item in
             item.windows.compactMap { frames($0)?.height }.max()
@@ -2551,7 +2654,7 @@ public struct DaemonCore: Sendable {
                     committedSlots[member] = slot
                     applyMove(
                         member, to: slot, epoch: epoch,
-                        frames: frames, heldMembers: heldMembers
+                        frames: frames, heldMembers: heldMembers, union: union
                     )
                     applySize(member, to: target, epoch: epoch, frames: frames)
                 }
@@ -2570,7 +2673,7 @@ public struct DaemonCore: Sendable {
                 committedSlots[member] = slot
                 applyMove(
                     member, to: slot, epoch: epoch,
-                    frames: frames, heldMembers: heldMembers
+                    frames: frames, heldMembers: heldMembers, union: union
                 )
                 applySize(member, to: target, epoch: epoch, frames: frames)
             }
@@ -2612,9 +2715,13 @@ public struct DaemonCore: Sendable {
 
     /// Move intent with homing/hand/convergence handling (extracted
     /// verbatim from the commit loop so stack and single paths share it).
+    /// Unreachable (off-union) slots rest in the verify arm: the drain
+    /// strips those origins, so re-driving only grows the backoff for a
+    /// position no write can reach — convergence resumes on scroll-back.
     private mutating func applyMove(
         _ member: WindowID, to slot: IntPoint, epoch: UInt64,
-        frames: (WindowID) -> IntRect?, heldMembers: Set<WindowID>
+        frames: (WindowID) -> IntRect?, heldMembers: Set<WindowID>,
+        union: IntRect?
     ) {
         // Heal-cleared hidden windows rest: the guard already decided
         // they drive nothing until the block lapses.
@@ -2668,6 +2775,15 @@ public struct DaemonCore: Sendable {
                             if let live = frames(member),
                                abs(live.min.x - slot.x) > axDeadbandPx
                                 || abs(live.min.y - slot.y) > axDeadbandPx,
+                               // Unreachable slots rest: the drain strips
+                               // off-union origins, so re-driving only
+                               // grows the backoff for a position no
+                               // write can reach. Reachable again on
+                               // scroll-back (else arm resets below).
+                               union.map({
+                                   slot.x >= $0.min.x && slot.x < $0.max.x
+                                    && slot.y >= $0.min.y && slot.y < $0.max.y
+                               }) ?? true,
                                // Degraded writer: repair only the focused
                                // window (Rust `STUCK_DEGRADE` rung).
                                !writerDegraded || member == focus,
@@ -2682,8 +2798,11 @@ public struct DaemonCore: Sendable {
                 // frame goes static across attempts — the
                 // window rests where the OS holds it
                 // instead of jumping forever. Any live
-                // movement (or new intent) re-arms.
-                if redriveLastLive[member] == live {
+                // movement (or new intent) re-arms. Never
+                // escalate on a traveling intent: a slow
+                // app that just needs a few hundred ms
+                // looks static until its write lands.
+                if redriveLastLive[member] == live, !ax.unackedLive(member) {
                     redriveStreak[member] = 5
                 }
                 // Exponential backoff per chronically

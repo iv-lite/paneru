@@ -185,6 +185,15 @@ do {
     checkClose(solo.origin.y, 0.0, "solo ax y")
 }
 
+// irectFrom center-size parity (Rust irect_from): sub-pixel edges
+// round center and size, never edges, so translated widths agree
+// exactly and abutting columns inherit no 1px seam.
+do {
+    let r = irectFrom(CGRect(x: 100.4, y: 50.4, width: 100.2, height: 200.6))
+    checkEqual(r.width, 100, "center-size width")
+    checkEqual(r.height, 201, "center-size height")
+}
+
 if failures == 0 {
     print("GeometryChecks: all checks passed")
 } else {

@@ -1416,6 +1416,193 @@ do {
     )
 }
 
+// Missing viewports fall back to last-good, never the active
+// workspace's rect: unfocused strips stay near their own display
+// instead of bleeding a full display off.
+do {
+    var daemon = DaemonCore()
+    daemon.animationsEnabled = false
+    daemon.glideBaseMs = 0
+    daemon.workspaceRing = [1, 2]
+    let left = IntRect(0, 0, 1024, 768)
+    let right = IntRect(1024, 0, 2048, 768)
+    _ = daemon.tick(
+        events: [.appeared(id: 0, workspace: 1), .appeared(id: 1, workspace: 2)],
+        frames: frames(slots: [0: IntPoint(0, 0), 1: IntPoint(0, 0)]),
+        viewports: [1: left, 2: right], focusedStyle: style
+    )
+    _ = daemon.tick(
+        events: [],
+        frames: frames(slots: [0: IntPoint(0, 34), 1: IntPoint(1024, 34)]),
+        viewports: [1: left], focusedStyle: style
+    )
+    checkEqual(
+        daemon.viewportFallbacks, Set<WorkspaceID>([2]),
+        "missing viewport recorded"
+    )
+    checkEqual(
+        daemon.committedSlot(of: 1), IntPoint(1024, 34),
+        "viewport-less strip tiles near its own display"
+    )
+}
+
+// Reveal never chases invisible glass: focus on a window whose live
+// frame left the owner viewport while its slot stays on-screen leaves
+// the strip alone (commit still glides the window home; reveal
+// re-fires once glass returns).
+do {
+    var daemon = DaemonCore()
+    daemon.animationsEnabled = false
+    daemon.glideBaseMs = 0
+    daemon.autoCenter = true
+    _ = daemon.tick(
+        events: [.appeared(id: 0, workspace: 1), .appeared(id: 1, workspace: 1)],
+        frames: frames(slots: [0: IntPoint(0, 0), 1: IntPoint(400, 0)]),
+        viewport: viewport, focusedStyle: style
+    )
+    _ = daemon.tick(
+        events: [.focus(id: 0)],
+        frames: frames(slots: [0: IntPoint(0, 34), 1: IntPoint(400, 34)]),
+        viewport: viewport, focusedStyle: style
+    )
+    checkEqual(daemon.offsets[1], 312, "centering rides the strip")
+    // Glass of 0 flees the viewport; refocus must not yank the strip.
+    let fled: (Int32) -> IntRect? = { id in
+        if id == 0 {
+            return IntRect(min: IntPoint(-2000, 34), max: IntPoint(-1600, 734))
+        }
+        return IntRect(min: IntPoint(712, 34), max: IntPoint(1112, 734))
+    }
+    _ = daemon.tick(
+        events: [.focus(id: 1)],
+        frames: fled, viewport: viewport, focusedStyle: style
+    )
+    checkEqual(daemon.offsets[1], -88, "visible arrival still centers")
+    _ = daemon.tick(
+        events: [.focus(id: 0)],
+        frames: fled, viewport: viewport, focusedStyle: style
+    )
+    checkEqual(daemon.offsets[1], -88, "reveal skips invisible glass")
+}
+
+// Bounded parking: frozen glass plus frozen slot cannot satisfy the
+// movement re-arm, so parked audits expire the park for one fresh
+// repair (re-park follows if glass still will not follow).
+do {
+    var daemon = DaemonCore()
+    daemon.animationsEnabled = false
+    daemon.glideBaseMs = 0
+    daemon.auditCadenceEpochs = 5
+    daemon.auditParkAfter = 3
+    daemon.auditParkMaxAudits = 2
+    let live = frames(slots: [0: IntPoint(0, 34)])
+    _ = daemon.tick(
+        events: [.appeared(id: 0, workspace: 1)],
+        frames: live, viewport: viewport, focusedStyle: style
+    )
+    let drifted: (Int32) -> IntRect? = { _ in
+        IntRect(min: IntPoint(200, 200), max: IntPoint(600, 900))
+    }
+    var parked = false
+    for _ in 0..<30 {
+        let r = daemon.tick(events: [], frames: drifted, viewport: viewport, focusedStyle: style)
+        for job in r.axJobs {
+            daemon.acknowledge(winID: job.winID, seq: job.seq, epoch: job.epoch)
+        }
+        if daemon.auditParkedLive[0] != nil {
+            parked = true
+            break
+        }
+    }
+    check(parked, "chronic window parks")
+    var jobsAfterPark = 0
+    for _ in 0..<10 {
+        let r = daemon.tick(events: [], frames: drifted, viewport: viewport, focusedStyle: style)
+        jobsAfterPark += r.axJobs.count
+        for job in r.axJobs {
+            daemon.acknowledge(winID: job.winID, seq: job.seq, epoch: job.epoch)
+        }
+    }
+    check(daemon.auditParkedLive[0] == nil, "park expires at the bound")
+    check(jobsAfterPark > 0, "expiry retries the repair")
+}
+
+// Stale-offset slots never park: an off-union slot blames the model
+// (stale restore offset), so the origin strips but the breaker stays
+// out — parking waits for proven write failures.
+do {
+    var daemon = DaemonCore()
+    daemon.animationsEnabled = false
+    daemon.glideBaseMs = 0
+    let document = """
+        {"v":1,"active_workspace":1,"focus":0,"workspaces":[{"workspace_id":1,"active_row":0,"rows":[{"virtual_index":0,"offset_x":-20000,"offset_y":0,"active":true,"columns":[{"Single":0}]}],"floating":[]}]}
+        """
+    guard let doc = HandoffDoc.decode(Data(document.utf8)) else {
+        check(false, "stale-offset handoff decodes")
+        exit(1)
+    }
+    let live: (Int32) -> IntRect? = { _ in
+        IntRect(min: IntPoint(0, 34), max: IntPoint(400, 734))
+    }
+    daemon.applyHandoff(doc, frames: live, viewports: [1: viewport])
+    let r = daemon.tick(
+        events: [], frames: live, viewport: viewport, focusedStyle: style
+    )
+    let job = r.axJobs.first(where: { $0.winID == 0 })
+    check(job?.origin == nil, "stale-offset slot strips the origin")
+    check(daemon.auditParkedLive[0] == nil, "stale-offset slot never parks")
+    checkEqual(daemon.auditSurvivors[0] ?? 0, 0, "stale-offset slot feeds no survivor")
+}
+
+// Unreachable slots rest everywhere: the fast path resets its backoff
+// instead of growing it, and the audit neither repairs nor counts
+// them. Scrolled back, the very next tick re-drives (no 8s hangover).
+do {
+    var daemon = DaemonCore()
+    daemon.animationsEnabled = false
+    daemon.glideBaseMs = 0
+    daemon.auditCadenceEpochs = 5
+    daemon.auditParkAfter = 3
+    let far = """
+        {"v":1,"active_workspace":1,"focus":0,"workspaces":[{"workspace_id":1,"active_row":0,"rows":[{"virtual_index":0,"offset_x":-20000,"offset_y":0,"active":true,"columns":[{"Single":0}]}],"floating":[]}]}
+        """
+    guard let farDoc = HandoffDoc.decode(Data(far.utf8)) else {
+        check(false, "far handoff decodes")
+        exit(1)
+    }
+    let live: (Int32) -> IntRect? = { _ in
+        IntRect(min: IntPoint(0, 34), max: IntPoint(400, 734))
+    }
+    daemon.applyHandoff(farDoc, frames: live, viewports: [1: viewport])
+    for _ in 0..<12 {
+        let r = daemon.tick(
+            events: [], frames: live, viewport: viewport, focusedStyle: style
+        )
+        for job in r.axJobs {
+            daemon.acknowledge(winID: job.winID, seq: job.seq, epoch: job.epoch)
+        }
+    }
+    check(daemon.auditParkedLive[0] == nil, "unreachable slot never parks")
+    checkEqual(daemon.auditSurvivors[0] ?? 0, 0, "unreachable slot feeds no survivor")
+    // Scroll back: same layout, sane offset — redrive fires at once.
+    guard let nearDoc = HandoffDoc.decode(
+        Data(far.replacingOccurrences(of: "-20000", with: "0").utf8)) else {
+        check(false, "near handoff decodes")
+        exit(1)
+    }
+    daemon.applyHandoff(nearDoc, frames: live, viewports: [1: viewport])
+    let drifted: (Int32) -> IntRect? = { _ in
+        IntRect(min: IntPoint(200, 200), max: IntPoint(600, 900))
+    }
+    let back = daemon.tick(
+        events: [], frames: drifted, viewport: viewport, focusedStyle: style
+    )
+    check(
+        back.axJobs.contains(where: { $0.winID == 0 && $0.origin != nil }),
+        "scroll-back redrives without backoff hangover"
+    )
+}
+
 // Query visibility is geometric: largest slice wins, slivers hide.
 do {
     let daemon = DaemonCore()

@@ -902,10 +902,10 @@ nonisolated(unsafe) var spaceVotes: [WorkspaceID: (space: SpaceID, seen: Int)] =
                 adopted.append((
                     AdoptedWindow(
                         wid: wid, ownerPID: pid,
-                        frame: IntRect(
-                            min: IntPoint(Int32(raw.minX.rounded()), Int32(raw.minY.rounded())),
-                            max: IntPoint(Int32(raw.maxX.rounded()), Int32(raw.maxY.rounded()))
-                        ),
+                        // Center-size rounding (Rust `irect_from` parity,
+                        // like `updateFrame`): per-edge rounding drifts
+                        // widths by a pixel against abutting columns.
+                        frame: irectFrom(raw),
                         title: probe.title ?? "", appName: "", bundleID: "",
                         role: probe.role ?? "", subrole: probe.subrole ?? "",
                         identifier: probe.identifier ?? "main",

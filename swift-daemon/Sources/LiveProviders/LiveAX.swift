@@ -292,16 +292,20 @@ public final class LiveWindow: @unchecked Sendable {
     }
 
     /// Padded frame: raw CG truth expanded back out by the padding.
+    /// Center-size rounding matches Rust `manager::irect_from` (round
+    /// center and size, not edges) so cached widths agree exactly and
+    /// abutting columns never inherit a 1px seam.
     public func updateFrame() -> IntRect? {
         guard let raw = readRawFrame() else { return nil }
+        let base = irectFrom(raw)
         let padded = IntRect(
             min: IntPoint(
-                Int32(raw.minX.rounded()) - horizontalPadding,
-                Int32(raw.minY.rounded()) - verticalPadding
+                base.min.x - horizontalPadding,
+                base.min.y - verticalPadding
             ),
             max: IntPoint(
-                Int32(raw.maxX.rounded()) + horizontalPadding,
-                Int32(raw.maxY.rounded()) + verticalPadding
+                base.max.x + horizontalPadding,
+                base.max.y + verticalPadding
             )
         )
         frame = padded
@@ -338,12 +342,16 @@ public final class LiveWindow: @unchecked Sendable {
     }
 
     /// Move with padding added and a 1px deadband; returns the frame the
-    /// OS now holds (cached truth on failure).
+    /// OS now holds (cached truth on failure). The deadband compares
+    /// padded slot origin to padded cache (Rust `reposition` parity) —
+    /// raw-vs-padded never converges (off by the pad) and rewrites
+    /// every tick, dithering neighbors across rounding seams. Padding
+    /// joins only the AX write itself.
     @discardableResult
     public func reposition(to origin: IntPoint) -> IntRect {
         guard !dryRun else { return frame }
-        let driftX = Double(origin.x + horizontalPadding) - Double(frame.min.x)
-        let driftY = Double(origin.y + verticalPadding) - Double(frame.min.y)
+        let driftX = Double(origin.x) - Double(frame.min.x)
+        let driftY = Double(origin.y) - Double(frame.min.y)
         guard abs(driftX) > axDeadband || abs(driftY) > axDeadband else {
             clearComplaint()
             return frame
@@ -373,19 +381,22 @@ public final class LiveWindow: @unchecked Sendable {
     /// Resize with padding subtracted and staged retry for partial
     /// growth: when the app lands between the old and target widths, the
     /// origin shifts left by the shortfall and the size is set again.
+    /// The deadband compares padded slot size to padded cache (Rust
+    /// `resize` parity) — raw-vs-padded never converges (off by twice
+    /// the pad); padding joins only the AX write itself.
     @discardableResult
     public func resize(to size: IntSize, origin: IntPoint? = nil) -> IntRect {
         guard !dryRun else { return frame }
-        let target = CGSize(
-            width: Double(size.x - 2 * horizontalPadding),
-            height: Double(size.y - 2 * verticalPadding)
-        )
-        guard abs(target.width - Double(frame.width)) > axDeadband
-            || abs(target.height - Double(frame.height)) > axDeadband
+        guard abs(Double(size.x) - Double(frame.width)) > axDeadband
+            || abs(Double(size.y) - Double(frame.height)) > axDeadband
         else {
             clearComplaint()
             return frame
         }
+        let target = CGSize(
+            width: Double(size.x - 2 * horizontalPadding),
+            height: Double(size.y - 2 * verticalPadding)
+        )
         var attempt = target
         guard let value = AXValueCreate(.cgSize, &attempt) else {
             complain("resize encode failed to \(size.x)x\(size.y)")
@@ -407,11 +418,14 @@ public final class LiveWindow: @unchecked Sendable {
         }
         clearComplaint()
         let landedWidth = Double(landed.width)
-        if landedWidth > previousWidth, landedWidth < target.width,
+        // Padded-vs-padded (Rust `resize_staging_origin` parity): the
+        // landed frame carries insets, so comparing against the raw
+        // target could never fire with any padding set.
+        if landedWidth > previousWidth, landedWidth < Double(size.x),
            let origin
         {
             // Partial growth: shift left by the shortfall and set again.
-            let shortfall = Int32((target.width - landedWidth).rounded())
+            let shortfall = Int32((Double(size.x) - landedWidth).rounded())
             _ = reposition(to: IntPoint(origin.x - shortfall, origin.y))
             var retry = target
             if let retryValue = AXValueCreate(.cgSize, &retry) {
