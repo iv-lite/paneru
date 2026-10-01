@@ -167,6 +167,14 @@ public struct DaemonCore: Sendable {
         hiddenCleared[id] = epoch
     }
 
+    /// Whether a workspace strip rests (offsets == target): hover
+    /// votes only for rested strips — the cursor over traveling glass
+    /// starts the hover/reveal flap. Converged strips hold equality,
+    /// so this passes at rest and stands down mid-glide.
+    public func stripRested(_ ws: WorkspaceID) -> Bool {
+        (offsets[ws] ?? 0) == (offsetTargets[ws] ?? offsets[ws] ?? 0)
+    }
+
     /// Whether a heal-cleared window still rests (lazily expiry-swept).
     private mutating func hiddenBlocked(_ id: WindowID, epoch: UInt64) -> Bool {
         guard let at = hiddenCleared[id] else { return false }
@@ -175,6 +183,13 @@ public struct DaemonCore: Sendable {
             return false
         }
         return true
+    }
+
+    /// Read-only twin of `hiddenBlocked` for the host frontmost repoll
+    /// (no sweep): refocusing a resting window resumes the loop.
+    public func isFocusBlocked(_ id: WindowID) -> Bool {
+        guard let at = hiddenCleared[id] else { return false }
+        return currentEpoch &- at < hiddenRefocusBlockEpochs
     }
     /// Epoch of the latest raise-arrival. Ambient arrivals skip the
     /// display-hop inside this window so a stale echo during a transfer
@@ -250,6 +265,12 @@ public struct DaemonCore: Sendable {
     /// rests. A set (not a slot): flapping arrivals accumulate instead
     /// of overwriting each other.
     private var pendingReveals = Set<WindowID>()
+    /// Arrival cause per pending reveal: keyed arrivals (keyboard,
+    /// commands) may center; ambient arrivals (hover echoes) only
+    /// expose — centering on hover scrolls the strip under a still
+    /// cursor, which re-polls hover on the neighbor and flaps.
+    /// Cleared with the set; absent reads as ambient.
+    private var pendingRevealRaise: [WindowID: Bool] = [:]
     /// Live width of the focused window at the last reveal evaluation.
     /// Resizes invalidate visibility verdicts computed for a stale width
     /// (expose for a narrow frame strands the grown window, and vice
@@ -511,6 +532,7 @@ public struct DaemonCore: Sendable {
         // late-adopted windows still actuate on appearance.
         if focus != prevFocus, let id = focus {
             pendingReveals.insert(id)
+            pendingRevealRaise[id] = lastFocusRaise
         }
         if focus != prevFocus {
             focusRaiseLatched = (focus != nil && lastFocusRaise)
@@ -527,6 +549,7 @@ public struct DaemonCore: Sendable {
         {
             if let last = lastRevealWidth, last.id == id, last.width != width {
                 pendingReveals.insert(id)
+                pendingRevealRaise[id] = lastFocusRaise
             }
             lastRevealWidth = (id, width)
         } else {
@@ -561,14 +584,22 @@ public struct DaemonCore: Sendable {
         }
         if !pendingReveals.isEmpty, autoCenter, arrivalReady() {
             for id in pendingReveals.sorted() {
-                revealOwner(id, frames: frames, viewports: viewports)
+                revealOwner(
+                    id, frames: frames, viewports: viewports,
+                    raise: pendingRevealRaise[id] ?? false
+                )
             }
             pendingReveals.removeAll()
+            pendingRevealRaise.removeAll()
         } else if !pendingReveals.isEmpty, rested() {
             for id in pendingReveals.sorted() {
-                revealOwner(id, frames: frames, viewports: viewports)
+                revealOwner(
+                    id, frames: frames, viewports: viewports,
+                    raise: pendingRevealRaise[id] ?? false
+                )
             }
             pendingReveals.removeAll()
+            pendingRevealRaise.removeAll()
         }
         layoutPass()
         // NOTE: no orphan fallback here: an emptied active workspace is
@@ -590,12 +621,12 @@ public struct DaemonCore: Sendable {
         // waits for rest.
         if !transferReveals.isEmpty, autoCenter, arrivalReady() {
             for id in transferReveals.sorted() {
-                revealOwner(id, frames: frames, viewports: viewports)
+                revealOwner(id, frames: frames, viewports: viewports, raise: true)
             }
             transferReveals.removeAll()
         } else if !transferReveals.isEmpty, rested() {
             for id in transferReveals.sorted() {
-                revealOwner(id, frames: frames, viewports: viewports)
+                revealOwner(id, frames: frames, viewports: viewports, raise: true)
             }
             transferReveals.removeAll()
         }
@@ -1815,13 +1846,14 @@ public struct DaemonCore: Sendable {
     }
 
     /// Reveal a window on its own display plus clamp: one call for both
-    /// immediate and deferred arrivals.
+    /// immediate and deferred arrivals. Keyed arrivals (keyboard,
+    /// commands) may center; ambient arrivals (hover) only expose.
     private mutating func revealOwner(
         _ id: WindowID, frames: (WindowID) -> IntRect?,
-        viewports: [WorkspaceID: IntRect]
+        viewports: [WorkspaceID: IntRect], raise: Bool
     ) {
         let owner = workspaceOf(id) ?? activeWorkspace
-        revealFocus(id, frames: frames, viewport: viewport(for: owner, in: viewports))
+        revealFocus(id, frames: frames, viewport: viewport(for: owner, in: viewports), raise: raise)
         // Under autoCenter the centering target owns out-of-range offsets
         // (Rust: the edge invariant is unenforced); clamping here would
         // uncenter edge windows and fight the glide. Manual gesture travel
@@ -1847,8 +1879,13 @@ public struct DaemonCore: Sendable {
     /// absolute (they bake the offset), so the layout arm passes the
     /// offset-free position — passing the absolute slot double-counts the
     /// offset on settled strips.
+    /// Keyed arrivals (keyboard, commands) center under `autoCenter`;
+    /// ambient arrivals (hover echoes) only expose: centering on hover
+    /// scrolls the strip under a still cursor, which re-polls hover on
+    /// the neighbor and flaps focus back and forth.
     private mutating func revealFocus(
-        _ id: WindowID, frames: (WindowID) -> IntRect?, viewport: IntRect
+        _ id: WindowID, frames: (WindowID) -> IntRect?, viewport: IntRect,
+        raise: Bool
     ) {
         guard let owner = workspaceOf(id) else {
             print("focus: reveal skipped window=\(id) (unknown workspace)")
@@ -1884,7 +1921,11 @@ public struct DaemonCore: Sendable {
         }
         let width = frames(id)?.width ?? 0
         let offset = offsets[owner] ?? 0
-        if autoCenter {
+        // Centering is keyed-only: an ambient hover arrival must never
+        // move the strip (it scrolls glass under a still cursor and
+        // re-polls hover on the neighbor). Ambient falls through to
+        // the minimal expose below, which rests for visible slots.
+        if autoCenter && raise {
             centerFocus(slot: slot, width: width, offset: offset, viewport: viewport, owner: owner)
             return
         }
@@ -2419,8 +2460,13 @@ public struct DaemonCore: Sendable {
                 // Slots anchor at the workspace viewport's origin: each
                 // display tiles its own strip (offsets stay viewport-
                 // relative, 0 == left edge, on every screen).
-                let colWidths: [Int32] = strip.columns.map { column in
-                    column.windows.compactMap { frames($0)?.width }.max() ?? 0
+                // Frameless columns (no readable frame yet) contribute
+                // no width AND take no slot: pitching them at zero
+                // would pile every downstream column onto the same x.
+                // They freeze on their last committed slot until frames
+                // arrive instead.
+                let colWidths: [Int32?] = strip.columns.map { column in
+                    column.windows.compactMap { frames($0)?.width }.max()
                 }
                 // NOTE: no fill clamp here. Offsets legitimately rest
                 // outside the fill range (continuous-swipe snap bounds,
@@ -2430,6 +2476,7 @@ public struct DaemonCore: Sendable {
                 // center/snap ops position intentionally.
                 var x = home.min.x + (offsets[ws] ?? 0)
                 for (index, column) in strip.columns.enumerated() {
+                    guard let colW = colWidths[index] else { continue }
                     // A lone narrow column centers when configured (Rust
                     // `center_single_column`) or maximized (`fullWidth`
                     // mark — a maximized window belongs mid-display).
@@ -2440,16 +2487,16 @@ public struct DaemonCore: Sendable {
                     // while marked. Truly full-width columns no-op
                     // (left == centered).
                     let loneNarrow = strip.columns.count == 1
-                        && colWidths[index] < home.width
+                        && colW < home.width
                     let marked = column.windows.contains(where: { fullWidth[$0] != nil })
                     let colX: Int32
                     if loneNarrow && marked {
-                        colX = home.min.x + (home.width - colWidths[index]) / 2
+                        colX = home.min.x + (home.width - colW) / 2
                         if offsetTargets[ws] != 0 {
                             offsetTargets[ws] = 0
                         }
                     } else if loneNarrow && centerSingleColumn {
-                        colX = home.min.x + (home.width - colWidths[index]) / 2
+                        colX = home.min.x + (home.width - colW) / 2
                             + (offsets[ws] ?? 0)
                     } else {
                         colX = x
@@ -2460,7 +2507,7 @@ public struct DaemonCore: Sendable {
                         union: union
                     )
                     // Slots abut: gaps are host-side AX insets, never pitch.
-                    x += colWidths[index]
+                    x += colW
                 }
             }
         }

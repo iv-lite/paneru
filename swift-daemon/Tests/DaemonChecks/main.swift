@@ -1399,20 +1399,21 @@ do {
     )
 }
 
-// Unknown live frames top-align instead of centering by zero height:
-// a fresh window with no readable frame must not start mid-viewport
-// (any later growth would hang past the bottom edge).
+// Unknown live frames take no slot instead of centering by zero
+// height: a fresh window with no readable frame freezes (no intents)
+// instead of starting mid-viewport or piling neighbors onto its x.
 do {
     var daemon = DaemonCore()
     daemon.animationsEnabled = false
-    _ = daemon.tick(
+    let r = daemon.tick(
         events: [.appeared(id: 0, workspace: 1)],
         frames: { (_: Int32) -> IntRect? in nil },
         viewport: viewport, focusedStyle: style
     )
-    checkEqual(
-        daemon.committedSlot(of: 0), IntPoint(0, 0),
-        "nil frame top-aligns"
+    checkEqual(daemon.committedSlot(of: 0), nil, "frameless window takes no slot")
+    check(
+        !r.axJobs.contains(where: { $0.winID == 0 }),
+        "frameless window issues no intents"
     )
 }
 
@@ -1446,10 +1447,10 @@ do {
     )
 }
 
-// Reveal never chases invisible glass: focus on a window whose live
-// frame left the owner viewport while its slot stays on-screen leaves
-// the strip alone (commit still glides the window home; reveal
-// re-fires once glass returns).
+// Reveal never chases invisible glass: ambient focus on a window whose
+// live frame left the owner viewport while its slot stays on-screen
+// leaves the strip alone (keyed arrivals still center; commit still
+// glides the window home; reveal re-fires once glass returns).
 do {
     var daemon = DaemonCore()
     daemon.animationsEnabled = false
@@ -1465,24 +1466,98 @@ do {
         frames: frames(slots: [0: IntPoint(0, 34), 1: IntPoint(400, 34)]),
         viewport: viewport, focusedStyle: style
     )
-    checkEqual(daemon.offsets[1], 312, "centering rides the strip")
-    // Glass of 0 flees the viewport; refocus must not yank the strip.
+    checkEqual(daemon.offsets[1] ?? 0, 0, "ambient focus leaves a settled strip")
+    _ = daemon.tick(
+        events: [.command(.window(.focus(.east)))],
+        frames: frames(slots: [0: IntPoint(0, 34), 1: IntPoint(400, 34)]),
+        viewport: viewport, focusedStyle: style
+    )
+    checkEqual(daemon.offsets[1], -88, "keyed focus centers (512-200-400)")
+    // Glass of 0 flees the viewport; ambient refocus must not yank back.
     let fled: (Int32) -> IntRect? = { id in
         if id == 0 {
             return IntRect(min: IntPoint(-2000, 34), max: IntPoint(-1600, 734))
         }
-        return IntRect(min: IntPoint(712, 34), max: IntPoint(1112, 734))
+        return IntRect(min: IntPoint(312, 34), max: IntPoint(712, 734))
     }
-    _ = daemon.tick(
-        events: [.focus(id: 1)],
-        frames: fled, viewport: viewport, focusedStyle: style
-    )
-    checkEqual(daemon.offsets[1], -88, "visible arrival still centers")
     _ = daemon.tick(
         events: [.focus(id: 0)],
         frames: fled, viewport: viewport, focusedStyle: style
     )
     checkEqual(daemon.offsets[1], -88, "reveal skips invisible glass")
+}
+
+// Strip rest gate: a traveling strip reports unrested (hover stands
+// down mid-glide), a settled one rested. Unknown workspaces rest.
+do {
+    var daemon = DaemonCore()
+    daemon.animationsEnabled = false
+    daemon.glideBaseMs = 0
+    daemon.autoCenter = true
+    _ = daemon.tick(
+        events: [.appeared(id: 0, workspace: 1), .appeared(id: 1, workspace: 1)],
+        frames: frames(slots: [0: IntPoint(0, 0), 1: IntPoint(400, 0)]),
+        viewport: viewport, focusedStyle: style
+    )
+    check(daemon.stripRested(1), "settled strip rested")
+    check(daemon.stripRested(999), "unknown workspace rests")
+    // Keyed focus eases the strip (animations on): unrested in flight.
+    daemon.animationsEnabled = true
+    daemon.glideBaseMs = 180
+    _ = daemon.tick(
+        events: [.focus(id: 0)],
+        frames: frames(slots: [0: IntPoint(0, 34), 1: IntPoint(400, 34)]),
+        viewport: viewport, focusedStyle: style
+    )
+    _ = daemon.tick(
+        events: [.command(.window(.focus(.east)))],
+        frames: frames(slots: [0: IntPoint(0, 34), 1: IntPoint(400, 34)]),
+        viewport: viewport, focusedStyle: style
+    )
+    check(!daemon.stripRested(1), "traveling strip unrested")
+    for _ in 0..<40 {
+        _ = daemon.tick(
+            events: [],
+            frames: frames(slots: [0: IntPoint(0, 34), 1: IntPoint(400, 34)]),
+            viewport: viewport, focusedStyle: style
+        )
+    }
+    check(daemon.stripRested(1), "eased strip rests again")
+}
+
+// Frameless columns freeze instead of piling: a column with no
+// readable frame takes no slot and advances no pitch, so the next
+// column abuts the last live width instead of stacking at its x.
+do {
+    var daemon = DaemonCore()
+    daemon.animationsEnabled = false
+    daemon.glideBaseMs = 0
+    let partial: (Int32) -> IntRect? = { id in
+        if id == 1 { return nil }
+        let origin = id == 0 ? IntPoint(0, 0) : IntPoint(400, 0)
+        return IntRect(min: origin, max: IntPoint(origin.x + 400, origin.y + 700))
+    }
+    let r = daemon.tick(
+        events: [
+            .appeared(id: 0, workspace: 1), .appeared(id: 1, workspace: 1),
+            .appeared(id: 2, workspace: 1),
+        ],
+        frames: partial, viewport: viewport, focusedStyle: style
+    )
+    checkEqual(daemon.committedSlot(of: 0), IntPoint(0, 34), "first column slots")
+    checkEqual(daemon.committedSlot(of: 1), nil, "frameless column takes no slot")
+    checkEqual(daemon.committedSlot(of: 2), IntPoint(400, 34), "next column abuts live widths")
+    check(
+        !r.axJobs.contains(where: { $0.winID == 1 }),
+        "frameless column issues no intents"
+    )
+    _ = daemon.tick(
+        events: [],
+        frames: frames(slots: [0: IntPoint(0, 34), 1: IntPoint(400, 34), 2: IntPoint(800, 34)]),
+        viewport: viewport, focusedStyle: style
+    )
+    checkEqual(daemon.committedSlot(of: 1), IntPoint(400, 34), "arrived frames slot in")
+    checkEqual(daemon.committedSlot(of: 2), IntPoint(800, 34), "strip reflows without piling")
 }
 
 // Bounded parking: frozen glass plus frozen slot cannot satisfy the
@@ -2893,9 +2968,9 @@ do {
     check(rested.axJobs.isEmpty, "abutted truth rests")
 }
 
-// autoCenter: a focus arrival centers the window in its viewport by moving
-// the strip (512-200-800 = -488); repeating focus on the centered window
-// retargets nothing.
+// autoCenter: a KEYED focus arrival centers the window in its viewport
+// by moving the strip (512-200-800 = -488); repeating focus on the
+// centered window retargets nothing (ambient repeats only expose).
 do {
     var daemon = DaemonCore()
     daemon.animationsEnabled = false
@@ -2919,12 +2994,17 @@ do {
         )
     }
     _ = daemon.tick(
-        events: [.focus(id: 2)],
+        events: [.focus(id: 1)],
+        frames: frames(slots: settled),
+        viewports: [1: viewport], focusedStyle: style
+    )
+    _ = daemon.tick(
+        events: [.command(.window(.focus(.east)))],
         frames: frames(slots: settled),
         viewports: [1: viewport], focusedStyle: style
     )
     checkEqual(
-        daemon.offsetTarget(for: 1), -488, "focus centers the window (512-200-800)"
+        daemon.offsetTarget(for: 1), -488, "keyed focus centers the window (512-200-800)"
     )
     checkEqual(daemon.offsets[1], -488, "centering snaps with animations off")
     let centered: [Int32: IntPoint] = [

@@ -1045,7 +1045,11 @@ nonisolated(unsafe) var spaceVotes: [WorkspaceID: (space: SpaceID, seen: Int)] =
         let probe = apps[front.processIdentifier] ?? LiveApp(pid: front.processIdentifier)
         if let fid = probe.focusedWindowID(),
            roster[CGWindowID(fid)] != nil,
-           !dontFocus.contains(windowID(fid))
+           !dontFocus.contains(windowID(fid)),
+           // Heal-cleared windows rest: refocusing here resumes the
+           // clear→rearrive loop the heal just broke (hover arrivals
+           // already rest via ingest).
+           !core.isFocusBlocked(windowID(fid))
         {
             pending.append(.focus(id: windowID(fid)))
         }
@@ -2123,20 +2127,30 @@ nonisolated(unsafe) var lastWarpEval = Date.distantPast
     else { return }
     if resolved.focusFollowsMouse,
        let hovered = core.hoverFocusTarget(
-           frontToBack: (onScreenWindowIDs() ?? []).map { windowID($0) },
-           focusable: Set(core.strips.values.flatMap {
-               $0.values.flatMap { $0.allWindows }
-           })
-           .subtracting(minimizedWindows)
-           .subtracting(stashedMembers),
-           frames: { roster[CGWindowID(bitPattern: $0)]?.frame },
-           cursor: cursor
-       ), hovered != core.focus
+            frontToBack: (onScreenWindowIDs() ?? []).map { windowID($0) },
+            focusable: Set(core.strips.values.flatMap {
+                $0.values.flatMap { $0.allWindows }
+            })
+            .subtracting(minimizedWindows)
+            .subtracting(stashedMembers),
+            frames: { roster[CGWindowID(bitPattern: $0)]?.frame },
+            cursor: cursor
+        ), hovered != core.focus,
+       hoverStripRested(hovered)
     {
         lastHoverID = hovered
         lastHoverAt = Date()
         pending.append(.focus(id: hovered))
     }
+}
+
+/// Hover votes only for rested strips: the cursor over traveling glass
+/// starts the hover/reveal flap (reveal scrolls, glass slides under
+/// the cursor, hover refires on the neighbor). Converged strips hold
+/// offsets == target, so this passes at rest and stands down mid-glide.
+@Sendable func hoverStripRested(_ id: WindowID) -> Bool {
+    guard let ws = workspaceOfWindow(id) else { return true }
+    return core.stripRested(ws)
 }
 
 // MARK: - Displays (one workspace per display)
