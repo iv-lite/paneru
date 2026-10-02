@@ -3415,9 +3415,9 @@ do {
     )
 }
 
-// Rejected size intents re-drive on cooldown with backoff (the
-// Firefox class: one stuck write must not pin an oversize window),
-// then go quiet again instead of hammering.
+// Rejected size intents re-drive on cooldown with backoff (a clamped
+// app: one stuck write must not pin an oversize window), then go quiet
+// again instead of hammering.
 do {
     var daemon = DaemonCore()
     let huge: (Int32) -> IntRect? = { id in
@@ -3959,7 +3959,7 @@ do {
 
 // Maximized size intent survives a dropped write: the fullWidth mark
 // owns model truth, so the viewport size redrives on cooldown instead
-// of the clamp adopting live truth (Firefox class).
+// of the clamp adopting live truth (a clamped app).
 do {
     var daemon = DaemonCore()
     daemon.animationsEnabled = false
@@ -3980,7 +3980,7 @@ do {
     for job in full.axJobs {
         daemon.acknowledge(winID: job.winID, seq: job.seq, epoch: job.epoch)
     }
-    // Firefox drops every write: live frozen small, dispatches acked.
+    // The app drops every write: live frozen small, dispatches acked.
     var redrove = false
     for _ in 0..<40 {
         let r = daemon.tick(events: [], frames: small, viewport: viewport, focusedStyle: style)
@@ -4851,8 +4851,8 @@ do {
 }
 
 // Clamped growth is deduped: a clamped app (live stays 400) must not
-// receive a resize every tick — that per-tick write is what made Firefox
-// walk up in visible steps.
+// receive a resize every tick — that per-tick write is what made a
+// clamped app walk up in visible steps.
 do {
     var daemon = DaemonCore()
     daemon.animationsEnabled = false

@@ -192,10 +192,10 @@ do {
 do {
     check(try compileMatchFilter(nil) == nil, "absent specs stay unfiltered")
     let matcher = try! compileMatchFilter(.map([
-        "bundle": .str("org.mozilla.firefox"), "managed": .bool(true),
+        "bundle": .str("com.example.app"), "managed": .bool(true),
     ]))!
     check(
-        try! matcher.matches(MatchWindow(bundleID: "org.mozilla.firefox", managed: true)),
+        try! matcher.matches(MatchWindow(bundleID: "com.example.app", managed: true)),
         "compiled specs match"
     )
     check(

@@ -2615,7 +2615,7 @@ public struct DaemonCore: Sendable {
     /// OS owns their geometry — repositioning would fight it), and
     /// whole workspaces with an unreached offset target (mid-scroll
     /// strips are moving targets). Sizes re-home alongside origins so
-    /// the Firefox class (OS-clamped dimensions) cannot strand either.
+    /// the OS-clamped app class cannot strand either.
     private mutating func auditRehome(
         frames: (WindowID) -> IntRect?, epoch: UInt64,
         viewports: [WorkspaceID: IntRect]
@@ -3188,7 +3188,7 @@ public struct DaemonCore: Sendable {
                     // Growth is owned by `clampMemberSize` -> `applySize`
                     // (deduped, with backoff): requesting it here too wrote
                     // a resize every tick while a clamped app lagged, so
-                    // Firefox walked up in visible steps. Centering the
+                    // the app walked up in visible steps. Centering the
                     // shortfall waits for the live width to settle, so
                     // stepped progress never drags the window side to side.
                     let settled = lastLiveWidth[member] == live.width
@@ -3549,7 +3549,7 @@ public struct DaemonCore: Sendable {
     /// One-shot size intent with model truth (`sizes`): a target change
     /// re-sends; an already-correct window records and rests. A recorded
     /// target the live frame never converges to (rejected writes,
-    /// snap-back apps — the Firefox class) re-drives on cooldown with
+    /// snap-back apps) re-drives on cooldown with
     /// its own backoff, so one stuck write can't pin an oversize window
     /// forever. Degraded writers repair focused windows only.
     private mutating func applySize(
@@ -3596,9 +3596,9 @@ public struct DaemonCore: Sendable {
     /// the viewport (Rust `clamp_managed_windows_to_viewport`); windows
     /// that already fit record and rest. Maximized members are
     /// model-sized to the viewport instead: the mark owns truth, so a
-    /// dropped or OS-clamped write redrives through `applySize`
-    /// (Firefox class) instead of the clamp adopting live truth as the
-    /// new size and silencing every retry path.
+    /// dropped or OS-clamped write redrives through `applySize` instead
+    /// of the clamp adopting live truth as the new size and silencing
+    /// every retry path.
     private mutating func clampMemberSize(
         _ member: WindowID, home: IntRect, epoch: UInt64,
         frames: (WindowID) -> IntRect?

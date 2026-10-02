@@ -438,8 +438,8 @@ do {
     }
     // Spawn pins decode on both surfaces, with threshold guards.
     do {
-        let rules = try! resolveWindowsTable(["ff": [
-            "title": ".*", "bundle_id": "org.mozilla.firefox",
+        let rules = try! resolveWindowsTable(["app": [
+            "title": ".*", "bundle_id": "com.example.app",
             "spawn_width": "0.5", "spawn_min_width": "800", "spawn_min_height": "600",
         ]])
         let rule = rules.first!
@@ -488,8 +488,8 @@ do {
             "window balance": .str("cmd + alt - b"),
         ]),
         "windows": .map([
-            "ff": .map([
-                "title": .str(".*"), "bundle_id": .str("org.mozilla.firefox"),
+            "app": .map([
+                "title": .str(".*"), "bundle_id": .str("com.example.app"),
                 "spawn_width": .float(0.5),
                 "spawn_min_width": .int(800), "spawn_min_height": .int(600),
             ]),
@@ -520,10 +520,10 @@ do {
     let east = doc.bindings?.first { $0.command == .window(.focus(.east)) }
     check(east != nil, "space-separated commands split")
     checkEqual(doc.rules?.count ?? -1, 1, "setup rules resolve")
-    let ff = doc.rules?.first
-    check(ff?.bundleID == "org.mozilla.firefox", "setup rule bundles match")
-    check(ff?.spawnWidth == 0.5, "setup spawn pins decode")
-    check(ff?.spawnMinWidth == 800, "setup spawn thresholds decode")
+    let app = doc.rules?.first
+    check(app?.bundleID == "com.example.app", "setup rule bundles match")
+    check(app?.spawnWidth == 0.5, "setup spawn pins decode")
+    check(app?.spawnMinWidth == 800, "setup spawn thresholds decode")
     // Absent tables inherit (nil, not empty); bad tables throw.
     let bare = try! decodeSetupDocument(.map(["options": .map([:])]))
     check(bare.bindings == nil, "absent bindings inherit")

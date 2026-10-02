@@ -427,8 +427,9 @@ impl WindowOS {
     /// Uses a per-PID ref-count so that concurrent operations on windows of the same app
     /// (via `par_iter_mut`) keep the attribute disabled until the last caller re-enables it.
     ///
-    /// This avoids animated move/resize that breaks window management for apps like Chrome,
-    /// Firefox, and Zen Browser when accessibility clients (e.g. Kindavim) enable enhanced UI.
+    /// This avoids animated move/resize that breaks window management for apps whose
+    /// accessibility layer enables enhanced UI (commonly Chromium- and Gecko-based
+    /// browsers).
     fn disable_enhanced_ui(&self) {
         // Nothing to disable, and nothing to lock or ask: this window's app has
         // already been found not to use the attribute.
