@@ -2691,7 +2691,12 @@ public struct DaemonCore: Sendable {
                               // Traveling intents may still land: only
                               // repair what the TTL already gave up on.
                                !ax.unackedLive(member),
-                               let slot = committedSlots[member],
+                               // Target the *presented* position (park for a
+                               // parked member), never the raw model slot:
+                               // a parked member's committed slot is its
+                               // off-viewport home on the sibling display, so
+                               // auditing it dragged hidden windows next door.
+                               let slot = positions[member] ?? committedSlots[member],
                                let live = frames(member)
                         else { continue }
                         // Unreachable slots (scrolled off every display)
@@ -3060,12 +3065,13 @@ public struct DaemonCore: Sendable {
                 min: origin,
                 max: IntPoint(origin.x + live.width, origin.y + live.height)
             )
-            let bleeds = viewports.contains { (other, rect) in
-                guard other != ws else { return false }
-                let hit = frame.intersected(with: rect)
-                return hit.width > 0 && hit.height > 0
+            // Only a *full* exit is corrected: a partly-visible window is
+            // left to the rigid strip (hiding it would leave a reserved-slot
+            // hole), and a fully-inside window is fine. Matches
+            // `parkOffscreen`.
+            guard frame.max.x <= home.min.x || frame.min.x >= home.max.x else {
+                continue
             }
-            guard bleeds else { continue }
             let corrected = parkTarget(
                 slot: origin, width: live.width, height: live.height, home: home
             )
@@ -3325,42 +3331,33 @@ public struct DaemonCore: Sendable {
 
     /// The transition decision: given the frame's relation to the owner
     /// viewport and whether it is already parked, should it park now?
-    /// Bleed rules decide the *entry*; an already-parked member stays
-    /// parked until its whole frame is back inside the owner viewport,
-    /// so the exit boundary cannot flip the target tick to tick. Pure
-    /// except for the caller's parking set.
+    /// Parking fires only on a **full** exit (the slot is entirely off the
+    /// owner), so the strip scrolls rigidly and visible columns always stay
+    /// adjacent with their gaps — a partly-visible window is never hidden
+    /// mid-run (that reserved-slot hole read as a gap the size of the
+    /// leaving window). Once parked, a member stays parked until its whole
+    /// frame is back inside.
     private func wantsPark(
         member: WindowID, slot: IntPoint, width: Int32, height: Int32,
         home: IntRect, union: IntRect?, siblings: [IntRect]
     ) -> Bool {
+        _ = siblings
         let fullyInside = slot.x >= home.min.x && slot.x + width <= home.max.x
         if parkedMembers.contains(member) {
             return !fullyInside
         }
         let exitedLeft = slot.x + width <= home.min.x
         let exitedRight = slot.x >= home.max.x
-        guard slot.x < home.min.x || slot.x + width > home.max.x else {
-            return false
-        }
-        if exitedLeft || exitedRight {
-            // Reachable? Far-bogus slots (stale offsets) stay the drain's
-            // to strip; near ones (scrolled strips, stairs voids) park.
-            guard let union else { return true }
-            let frame = IntRect(min: slot, max: IntPoint(slot.x + width, slot.y + height))
-            let reach = frame.intersected(with: IntRect(
-                min: IntPoint(union.min.x - parkedStripSliver, union.min.y - parkedStripSliver),
-                max: IntPoint(union.max.x + parkedStripSliver, union.max.y + parkedStripSliver)
-            ))
-            return reach.width > 0 && reach.height > 0
-        }
-        // Straddling the owner edge: park only on true bleed (a sibling
-        // display shows part of the frame). Void peeks keep their
-        // owner-visible part.
+        guard exitedLeft || exitedRight else { return false }
+        // Reachable? Far-bogus slots (stale offsets) stay the drain's to
+        // strip; near ones (scrolled strips, stairs voids) park.
+        guard let union else { return true }
         let frame = IntRect(min: slot, max: IntPoint(slot.x + width, slot.y + height))
-        return siblings.contains {
-            let hit = frame.intersected(with: $0)
-            return hit.width > 0 && hit.height > 0
-        }
+        let reach = frame.intersected(with: IntRect(
+            min: IntPoint(union.min.x - parkedStripSliver, union.min.y - parkedStripSliver),
+            max: IntPoint(union.max.x + parkedStripSliver, union.max.y + parkedStripSliver)
+        ))
+        return reach.width > 0 && reach.height > 0
     }
 
     /// Hide-park x/y for a slot the caller already decided to park: the

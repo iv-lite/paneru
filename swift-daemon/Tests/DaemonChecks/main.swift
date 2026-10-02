@@ -4540,9 +4540,10 @@ do {
     checkEqual(daemon.positions[0], IntPoint(1024, 34), "cross-display leg snaps instead of gliding")
 }
 
-// Edge straddle parks too: under unclamped rest offsets a sibling can
-// rest half on the neighbor indefinitely — per the never-on-the-wrong-
-// display rule it hide-parks like a full exit.
+// A partly-visible window is left in place: the strip scrolls rigidly, so
+// hiding a straddler would leave a reserved-slot hole the size of the
+// window. Only a full exit parks. (On the stairs rig a straddle overhang
+// falls into the void, not a neighbour's band.)
 do {
     var daemon = DaemonCore()
     daemon.animationsEnabled = false
@@ -4567,14 +4568,14 @@ do {
     let r = daemon.tick(
         events: [], frames: live, viewports: views, focusedStyle: style
     )
-    // Window 2 straddles the seam ([600,1000) over the 800 edge) onto the
-    // sibling: hide-parks at the owner edge, model slot intact.
+    // Window 2 straddles the seam ([600,1000) over the 800 edge): it stays
+    // put so the visible columns keep their gaps.
     check(
-        r.axJobs.contains(where: { $0.winID == 2 && $0.origin == IntPoint(791, 0) }),
-        "straddling member hide-parks"
+        !r.axJobs.contains(where: { $0.winID == 2 && $0.origin == IntPoint(791, 0) }),
+        "straddling member is not hidden mid-run"
     )
-    checkEqual(daemon.positions[2], IntPoint(791, 0), "straddle presents parked")
-    checkEqual(daemon.committedSlot(of: 2), IntPoint(600, 0), "straddle slot stays modeled")
+    checkEqual(daemon.positions[2], IntPoint(600, 0), "straddle stays in place")
+    checkEqual(daemon.committedSlot(of: 2), IntPoint(600, 0), "straddle slot modeled")
 }
 
 // Invariant: no emitted move target may come to rest on a sibling
@@ -4922,11 +4923,10 @@ do {
     checkEqual(daemon.offsets[1], 0, "lone resize resets the offset")
 }
 
-// A full-viewport window scrolled off its owner hide-parks at the owner
-// edge instead of straddling onto the neighbouring display. The park
-// gate used to skip viewport-spanning windows, so in a single-column
-// (default_ratio 1.0) setup every leaving window glided next door on a
-// focus change.
+// A full-viewport window scrolled fully off its owner hide-parks at the
+// owner edge instead of landing on the neighbouring display. (A partly
+// visible one is left in place — see the straddle test above — so the
+// visible columns keep their gaps.)
 do {
     var daemon = DaemonCore()
     daemon.animationsEnabled = false
@@ -4942,10 +4942,9 @@ do {
         events: [.appeared(id: 0, workspace: 1), .focus(id: 0)],
         frames: full, viewports: views, focusedStyle: style
     )
-    // Natural swipe right moves the strip right, so the full-width window
-    // straddles onto the sibling display.
+    // Natural swipe right scrolls the strip fully past the owner edge.
     let shifted = daemon.tick(
-        events: [.swipe(delta: -0.5, fingers: 3)],
+        events: [.swipe(delta: -1.0, fingers: 3)],
         frames: full, viewports: views, focusedStyle: style
     )
     check(
@@ -4953,9 +4952,57 @@ do {
         "full-width window parks at the owner edge, not the sibling"
     )
     check(
-        !shifted.axJobs.contains { $0.winID == 0 && $0.origin == IntPoint(512, 34) },
+        !shifted.axJobs.contains { $0.winID == 0 && $0.origin == IntPoint(1024, 34) },
         "full-width window never keeps its off-viewport slot"
     )
+}
+
+// A parked window macOS relocates onto the sibling display is pulled back
+// to its park (owner edge) — never re-driven to its off-viewport model
+// slot on the neighbour. Covers both the fast verify path and the 5s
+// audit (which used to compare against the raw committed slot).
+do {
+    var daemon = DaemonCore()
+    daemon.animationsEnabled = false
+    daemon.glideBaseMs = 0
+    daemon.auditCadenceEpochs = 5
+    daemon.workspaceRing = [1, 2]
+    let left = IntRect(0, 0, 1024, 768)
+    let right = IntRect(1024, 0, 2048, 768)
+    let views: [WorkspaceID: IntRect] = [1: left, 2: right]
+    func full(at x: Int32) -> (Int32) -> IntRect? {
+        { id in
+            guard id == 0 else { return nil }
+            return IntRect(min: IntPoint(x, 34), max: IntPoint(x + 1024, 734))
+        }
+    }
+    _ = daemon.tick(
+        events: [.appeared(id: 0, workspace: 1), .focus(id: 0)],
+        frames: full(at: 0), viewports: views, focusedStyle: style
+    )
+    let parked = daemon.tick(
+        events: [.swipe(delta: -1.0, fingers: 3)],
+        frames: full(at: 0), viewports: views, focusedStyle: style
+    )
+    check(
+        parked.axJobs.contains { $0.winID == 0 && $0.origin == IntPoint(1015, 34) },
+        "window parks before relocation"
+    )
+    // Simulate macOS relocating the parked window onto the sibling display.
+    var pulledBack = false
+    var sentToSibling = false
+    for _ in 0..<20 {
+        let r = daemon.tick(
+            events: [], frames: full(at: 1024), viewports: views, focusedStyle: style
+        )
+        for job in r.axJobs {
+            if job.winID == 0, job.origin == IntPoint(1015, 34) { pulledBack = true }
+            if job.winID == 0, job.origin == IntPoint(1024, 34) { sentToSibling = true }
+            daemon.acknowledge(winID: job.winID, seq: job.seq, epoch: job.epoch)
+        }
+    }
+    check(pulledBack, "relocated parked window is pulled back to its park")
+    check(!sentToSibling, "a parked window is never sent to its off-viewport slot")
 }
 
 if failures == 0 {
