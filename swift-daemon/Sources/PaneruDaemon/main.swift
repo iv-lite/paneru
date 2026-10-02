@@ -446,7 +446,12 @@ core.wallClockMs = { DispatchTime.now().uptimeNanoseconds / 1_000_000 }
 core.centerSingleColumn = resolved.centerSingleColumn
 // Parked glass keeps a single invisible pixel: the slot-space hide
 // width folds the gap insets the host adds on write.
-core.offscreenSliverWidth = 1 + resolved.gapHorizontal
+core.offscreenSliverWidth = 1 + resolved.gapHorizontal / 2
+core.defaultRatio = resolved.defaultRatio
+core.maximizeTiledWindows = resolved.maximizeTiledWindows
+core.reapEmptyWorkspaces = resolved.reapEmptyWorkspaces
+core.virtualWorkspaceAnimations = resolved.virtualWorkspaceAnimations
+core.insertWindowsMidStrip = resolved.insertWindowsMidStrip
 core.animationsEnabled = resolved.animationsEnabled
 core.glideBaseMs = resolved.animationDurationMs
 core.glideMinMs = resolved.animationMinDurationMs
@@ -579,8 +584,12 @@ struct AdoptedWindow: Sendable {
         let window = LiveWindow(id: windowID(wid), element: element, frame: probe.frame)
         // Slots abut; the between-window gap is this per-window AX inset
         // (Rust `set_padding`). The probe frame is raw CG truth, so the
-        // cached frame expands by exactly the insets here.
-        window.setPadding(hPad: resolved.gapHorizontal, vPad: resolved.gapVertical)
+        // cached frame expands by exactly the insets here. The inset is
+        // half the configured gap: two abutting slots then show exactly
+        // `gapHorizontal`/`gapVertical` between neighbours.
+        window.setPadding(
+            hPad: resolved.gapHorizontal / 2, vPad: resolved.gapVertical / 2
+        )
         // Shadow observers latch dry-run at adoption (defense in depth
         // behind the dispatch gates: adopted windows can never be
         // written, raised, or focused).
@@ -1721,7 +1730,11 @@ func watchTuning(_ path: String) {
 /// (Rust `set_padding`): pure cached-frame re-basing, no AX round trips.
 @Sendable func applyWindowPadding() {
     for window in roster.values {
-        window.setPadding(hPad: resolved.gapHorizontal, vPad: resolved.gapVertical)
+        // Half the configured gap per side: two abutting slots then show
+        // exactly `gapHorizontal`/`gapVertical` between neighbours.
+        window.setPadding(
+            hPad: resolved.gapHorizontal / 2, vPad: resolved.gapVertical / 2
+        )
     }
 }
 
@@ -1739,7 +1752,12 @@ core.swipeDirectionSign = resolved.swipeDirection == .reversed ? 1.0 : -1.0
 core.wallClockMs = { DispatchTime.now().uptimeNanoseconds / 1_000_000 }
     // Slots abut; gaps live in per-window AX padding (see applyWindowPadding).
     core.centerSingleColumn = resolved.centerSingleColumn
-    core.offscreenSliverWidth = 1 + resolved.gapHorizontal
+    core.offscreenSliverWidth = 1 + resolved.gapHorizontal / 2
+    core.defaultRatio = resolved.defaultRatio
+    core.maximizeTiledWindows = resolved.maximizeTiledWindows
+    core.reapEmptyWorkspaces = resolved.reapEmptyWorkspaces
+    core.virtualWorkspaceAnimations = resolved.virtualWorkspaceAnimations
+    core.insertWindowsMidStrip = resolved.insertWindowsMidStrip
     core.animationsEnabled = resolved.animationsEnabled
     core.glideBaseMs = resolved.animationDurationMs
     radiusRulesGen += 1

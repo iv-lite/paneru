@@ -931,6 +931,48 @@ do {
     )
 }
 
+// Space round trips preserve rest intent: rotating away mid-glide banks
+// the offset target (not the half-traveled offsets), so the return trip
+// restores the full scroll instead of stopping short and re-revealing.
+do {
+    var daemon = DaemonCore()
+    _ = daemon.tick(
+        events: [
+            .appeared(id: 0, workspace: 1), .appeared(id: 1, workspace: 1),
+            .appeared(id: 2, workspace: 1),
+        ],
+        frames: frames(slots: [0: IntPoint(0, 0), 1: IntPoint(400, 0), 2: IntPoint(800, 0)]),
+        viewport: viewport, focusedStyle: style
+    )
+    // Focus the far window (animated): reveal arms the scroll target
+    // while offsets are still traveling after one tick.
+    _ = daemon.tick(
+        events: [.focus(id: 2)],
+        frames: frames(slots: [0: IntPoint(0, 0), 1: IntPoint(400, 0), 2: IntPoint(800, 0)]),
+        viewport: viewport, focusedStyle: style
+    )
+    checkEqual(daemon.offsets[1] == -176, false, "scroll still traveling after one tick")
+    _ = daemon.resolveSpace(workspace: 1, space: 111)
+    _ = daemon.resolveSpace(workspace: 1, space: 222)
+    checkEqual(
+        daemon.spaceStash[111]?.offset, -176,
+        "rotation banks the rest target, not mid-glide offsets"
+    )
+    _ = daemon.resolveSpace(workspace: 1, space: 111)
+    checkEqual(
+        daemon.strips[1]?[0]?.allWindows, [0, 1, 2],
+        "return restores order"
+    )
+    for _ in 0..<30 {
+        _ = daemon.tick(
+            events: [],
+            frames: frames(slots: [0: IntPoint(0, 0), 1: IntPoint(400, 0), 2: IntPoint(800, 0)]),
+            viewport: viewport, focusedStyle: style
+        )
+    }
+    checkEqual(daemon.offsets[1], -176, "return restores the full scroll")
+}
+
 // Long absence keeps order: the vanish park expires after its TTL,
 // the sweep hands the row to the space stash, and the returnee
 // restores whole from long-term memory instead of appending last.
@@ -4508,6 +4550,293 @@ do {
     )
     checkEqual(daemon.positions[2], IntPoint(791, 0), "straddle presents parked")
     checkEqual(daemon.committedSlot(of: 2), IntPoint(600, 0), "straddle slot stays modeled")
+}
+
+// Invariant: no emitted move target may come to rest on a sibling
+// display. The stairs arrangement (vertically disjoint bands) is what
+// makes the hide-park safe — a parked window pokes into the void, never
+// a neighbor's band — so this asserts the rule the user relies on.
+do {
+    var daemon = DaemonCore()
+    daemon.animationsEnabled = false
+    daemon.glideBaseMs = 0
+    daemon.offscreenSliverWidth = 9
+    let d1 = IntRect(0, 0, 1920, 1080)
+    let d2 = IntRect(1920, 1080, 3840, 2160)
+    let d3 = IntRect(3840, 2160, 5352, 3142)
+    let views: [WorkspaceID: IntRect] = [1: d1, 2: d2, 3: d3]
+    let siblings = [d2, d3]
+    let live: (Int32) -> IntRect? = { _ in
+        IntRect(min: IntPoint(0, 0), max: IntPoint(400, 700))
+    }
+    func assertOffDisplays(_ result: FrameResult, _ label: String) {
+        for job in result.axJobs {
+            guard let o = job.origin else { continue }
+            let f = IntRect(min: o, max: IntPoint(o.x + 400, o.y + 700))
+            for s in siblings {
+                let hit = f.intersected(with: s)
+                check(
+                    !(hit.width > 0 && hit.height > 0),
+                    "\(label): origin \(o) must not rest on a sibling display"
+                )
+            }
+        }
+    }
+    let spawn = daemon.tick(
+        events: [
+            .appeared(id: 0, workspace: 1), .appeared(id: 1, workspace: 1),
+            .appeared(id: 2, workspace: 1),
+        ],
+        frames: live, viewports: views, focusedStyle: style
+    )
+    assertOffDisplays(spawn, "spawn")
+    for _ in 0..<10 {
+        let r = daemon.tick(
+            events: [.swipe(delta: -0.25, fingers: 3)],
+            frames: live, viewports: views, focusedStyle: style
+        )
+        assertOffDisplays(r, "swipe left")
+    }
+    for _ in 0..<20 {
+        let r = daemon.tick(
+            events: [.swipe(delta: 0.25, fingers: 3)],
+            frames: live, viewports: views, focusedStyle: style
+        )
+        assertOffDisplays(r, "swipe right")
+    }
+}
+
+// Multi-column pitch is model-owned but never smaller than live glass:
+// an app shrinking its own frame must not move downstream columns,
+// while an upward live change still widens the column so neighbours
+// cannot overlap.
+do {
+    var daemon = DaemonCore()
+    daemon.animationsEnabled = false
+    daemon.glideBaseMs = 0
+    let wide = IntRect(0, 0, 1200, 768)
+    _ = daemon.tick(
+        events: [
+            .appeared(id: 0, workspace: 1), .appeared(id: 1, workspace: 1),
+            .appeared(id: 2, workspace: 1),
+        ],
+        frames: frames(slots: [0: IntPoint(0, 0), 1: IntPoint(400, 0), 2: IntPoint(800, 0)]),
+        viewports: [1: wide], focusedStyle: style
+    )
+    checkEqual(daemon.committedSlot(of: 1), IntPoint(400, 34), "second column abuts")
+    // App shrinks its own glass to 300: pitch holds at the model width.
+    _ = daemon.tick(
+        events: [],
+        frames: { id in
+            let w: Int32 = id == 0 ? 300 : 400
+            let x: Int32 = id == 0 ? 0 : (id == 1 ? 400 : 800)
+            return IntRect(min: IntPoint(x, 0), max: IntPoint(x + w, 700))
+        },
+        viewports: [1: wide], focusedStyle: style
+    )
+    checkEqual(
+        daemon.committedSlot(of: 1), IntPoint(400, 34),
+        "downstream column stays put when glass shrinks"
+    )
+    // App grows to 500: pitch follows up so no overlap.
+    _ = daemon.tick(
+        events: [],
+        frames: { id in
+            let w: Int32 = id == 0 ? 500 : 400
+            let x: Int32 = id == 0 ? 0 : (id == 1 ? 400 : 800)
+            return IntRect(min: IntPoint(x, 0), max: IntPoint(x + w, 700))
+        },
+        viewports: [1: wide], focusedStyle: style
+    )
+    checkEqual(
+        daemon.committedSlot(of: 1), IntPoint(500, 34),
+        "upward live change widens the column"
+    )
+}
+
+// Hidden (inactive virtual) rows hide void-safe: their parked frames
+// must clear every sibling display band so a stairs neighbour never
+// shows them.
+do {
+    var daemon = DaemonCore()
+    daemon.animationsEnabled = false
+    daemon.glideBaseMs = 0
+    daemon.offscreenSliverWidth = 9
+    let d1 = IntRect(0, 0, 1920, 1080)
+    let d2 = IntRect(1920, 1080, 3840, 2160)
+    let views: [WorkspaceID: IntRect] = [1: d1, 2: d2]
+    let live = frames(slots: [0: IntPoint(0, 0), 1: IntPoint(400, 0)])
+    _ = daemon.tick(
+        events: [.appeared(id: 0, workspace: 1), .appeared(id: 1, workspace: 1)],
+        frames: live, viewports: views, focusedStyle: style
+    )
+    // Create and select row 1: row 0 hides.
+    let hidden = daemon.tick(
+        events: [.command(.window(.virtualAdd))],
+        frames: live, viewports: views, focusedStyle: style
+    )
+    var checkedHidden = 0
+    for job in hidden.axJobs {
+        guard let o = job.origin else { continue }
+        let f = IntRect(min: o, max: IntPoint(o.x + 400, o.y + 700))
+        let hit = f.intersected(with: d2)
+        check(
+            !(hit.width > 0 && hit.height > 0),
+            "hidden-row frame \(o) clears the sibling display"
+        )
+        checkedHidden += 1
+    }
+    check(checkedHidden > 0, "hiding a row parks its members")
+}
+
+// Width policy: `defaultRatio` sizes a fresh column and
+// `maximizeTiledWindows` grows it to the tile, centering the shortfall
+// until the app accepts. Both wire straight from the installer config.
+do {
+    var daemon = DaemonCore()
+    daemon.animationsEnabled = false
+    daemon.glideBaseMs = 0
+    daemon.defaultRatio = 1.0
+    daemon.maximizeTiledWindows = true
+    let spawned = daemon.tick(
+        events: [.appeared(id: 0, workspace: 1), .focus(id: 0)],
+        frames: frames(slots: [0: IntPoint(0, 34)]),
+        viewport: viewport, focusedStyle: style
+    )
+    check(
+        spawned.axJobs.contains { $0.winID == 0 && $0.size == IntSize(1024, 700) },
+        "fresh column grows to its ratio"
+    )
+    check(
+        spawned.axJobs.contains { $0.winID == 0 && $0.origin == IntPoint(312, 34) },
+        "clamped shortfall is centered in the column"
+    )
+    // App accepts: glass reaches full width, so the column rests at 0.
+    _ = daemon.tick(
+        events: [],
+        frames: { _ in IntRect(min: IntPoint(0, 34), max: IntPoint(1024, 734)) },
+        viewport: viewport, focusedStyle: style
+    )
+    checkEqual(daemon.committedSlot(of: 0), IntPoint(0, 34), "grown column rests full width")
+}
+
+// mid_strip_slot (Rust `insert_windows_mid_strip` math): the moved
+// column lands at the destination boundary nearest its on-screen x, and
+// the returned offset places that boundary there.
+do {
+    let (i1, o1) = DaemonCore.midStripSlot(
+        columns: [(0, 400), (400, 400)], viewportMinX: 0, offset: 0, movedLeft: 450
+    )
+    checkEqual(i1, 1, "nearest boundary picks the destination column")
+    checkEqual(o1, 50, "offset lands the boundary at the same x")
+    let (i2, o2) = DaemonCore.midStripSlot(
+        columns: [(0, 400), (400, 400)], viewportMinX: 0, offset: 0, movedLeft: 900
+    )
+    checkEqual(i2, 2, "past the last boundary appends")
+    checkEqual(o2, 100, "end-boundary offset")
+    let (i3, o3) = DaemonCore.midStripSlot(
+        columns: [], viewportMinX: 1000, offset: 0, movedLeft: 1200
+    )
+    checkEqual(i3, 0, "empty destination inserts at zero")
+    checkEqual(o3, 200, "empty destination offset lands the lone column")
+}
+
+// reap_empty_workspaces gates the empty non-active row reap.
+do {
+    func drive(_ reap: Bool) -> DaemonCore {
+        var daemon = DaemonCore()
+        daemon.animationsEnabled = false
+        daemon.glideBaseMs = 0
+        daemon.reapEmptyWorkspaces = reap
+        let live = frames(slots: [0: IntPoint(0, 0)])
+        _ = daemon.tick(
+            events: [.appeared(id: 0, workspace: 1), .focus(id: 0)],
+            frames: live, viewport: viewport, focusedStyle: style
+        )
+        _ = daemon.tick(
+            events: [.command(.window(.virtualMoveNumber(1, .stay)))],
+            frames: live, viewport: viewport, focusedStyle: style
+        )
+        _ = daemon.tick(events: [], frames: live, viewport: viewport, focusedStyle: style)
+        return daemon
+    }
+    check(drive(false).strips[1]?[0] != nil, "empty row kept when reaping is off")
+    check(drive(true).strips[1]?[0] == nil, "empty row reaped by default")
+}
+
+// virtual_workspace_animations: off snaps the row-switch moves, on glides.
+do {
+    func switchRow(_ animate: Bool) -> DaemonCore {
+        var daemon = DaemonCore()
+        daemon.virtualWorkspaceAnimations = animate
+        let live = frames(slots: [0: IntPoint(0, 34)])
+        _ = daemon.tick(
+            events: [.appeared(id: 0, workspace: 1)],
+            frames: live, viewport: viewport, focusedStyle: style
+        )
+        _ = daemon.tick(
+            events: [.command(.window(.virtualAdd))],
+            frames: live, viewport: viewport, focusedStyle: style
+        )
+        return daemon
+    }
+    let snapped = switchRow(false)
+    checkEqual(
+        snapped.positions[0], snapped.committedSlot(of: 0),
+        "row switch snaps when virtual animations are off"
+    )
+    let glided = switchRow(true)
+    check(
+        glided.positions[0] != glided.committedSlot(of: 0),
+        "row switch glides when virtual animations are on"
+    )
+}
+
+// insert_windows_mid_strip: moving a column into another row keeps it at
+// its on-screen x (nearest destination boundary) instead of appending.
+do {
+    func moveToRow(_ midStrip: Bool) -> DaemonCore {
+        var daemon = DaemonCore()
+        daemon.animationsEnabled = false
+        daemon.glideBaseMs = 0
+        daemon.insertWindowsMidStrip = midStrip
+        let live = frames(slots: [
+            0: IntPoint(0, 34), 1: IntPoint(400, 34), 2: IntPoint(800, 34),
+        ])
+        _ = daemon.tick(
+            events: [
+                .appeared(id: 0, workspace: 1), .appeared(id: 1, workspace: 1),
+                .appeared(id: 2, workspace: 1), .focus(id: 2),
+            ],
+            frames: live, viewport: viewport, focusedStyle: style
+        )
+        // Send window 2 to row 1, then return to row 0.
+        _ = daemon.tick(
+            events: [.command(.window(.virtualMoveNumber(1, .stay)))],
+            frames: live, viewport: viewport, focusedStyle: style
+        )
+        _ = daemon.tick(
+            events: [.command(.window(.virtualNumber(0)))],
+            frames: live, viewport: viewport, focusedStyle: style
+        )
+        // Move window 0 (at x=0) into row 1 with window 2.
+        _ = daemon.tick(
+            events: [
+                .focus(id: 0),
+                .command(.window(.virtualMoveNumber(1, .follow))),
+            ],
+            frames: live, viewport: viewport, focusedStyle: style
+        )
+        return daemon
+    }
+    checkEqual(
+        moveToRow(true).strips[1]?[1]?.allWindows, [0, 2],
+        "mid-strip move lands at the matching boundary"
+    )
+    checkEqual(
+        moveToRow(false).strips[1]?[1]?.allWindows, [2, 0],
+        "flag off appends at the end"
+    )
 }
 
 if failures == 0 {

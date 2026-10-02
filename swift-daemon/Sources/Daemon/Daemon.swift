@@ -365,6 +365,27 @@ public struct DaemonCore: Sendable {
     /// relocates it to another display. Default matches the product
     /// defaults (1 + 8).
     public var offscreenSliverWidth: Int32 = 9
+    /// New-column width ratio (Rust `default_ratio`): a member with no
+    /// model width yet adopts this fraction of its viewport width. Nil
+    /// keeps the window's OS-given width.
+    public var defaultRatio: Double?
+    /// Grow windows to fill their tile (Rust `maximize_tiled_windows`):
+    /// each column requests its model width, so windows that open
+    /// narrower than their tile are resized to fill it. Off keeps native
+    /// sizes.
+    public var maximizeTiledWindows = false
+    /// Reap empty non-active virtual rows (Rust `reap_empty_workspaces`).
+    /// Default true preserves the core's existing behavior; the shipped
+    /// config sets it explicitly.
+    public var reapEmptyWorkspaces = true
+    /// Animate virtual-row switches (Rust `virtual_workspace_animations`).
+    /// False snaps the leaving row's park and the arriving row's slots.
+    public var virtualWorkspaceAnimations = true
+    /// Keep a column moved into another strip at its current on-screen x
+    /// (Rust `insert_windows_mid_strip`): it lands in the destination
+    /// column nearest that x, shifting the rest, instead of appending at
+    /// the end.
+    public var insertWindowsMidStrip = false
     /// Minimum stacked-item height for `binpackHeights` (Rust 200px).
     public var stackMinHeight: Int32 = 200
     /// Model truth for sizes (origins live in `positions`): the last
@@ -570,6 +591,7 @@ public struct DaemonCore: Sendable {
         let prevFocus = focus
         gestureFresh = false
         raised = []
+        snapMovesThisTick = false
         // Record strip-owning workspaces the host left viewport-less:
         // their slots fall back (see `viewport(for:)`) — visible in the
         // state file instead of silent.
@@ -1158,6 +1180,69 @@ public struct DaemonCore: Sendable {
         }
     }
 
+    /// Model width of one column (padded): its tile pitch. Nil when no
+    /// member has a known width yet (fresh spawn).
+    private func modelColumnWidth(_ column: LayoutColumn) -> Int32? {
+        column.windows.compactMap { modelWidths[$0] }.max()
+            ?? column.windows.compactMap { sizes[$0]?.x }.max()
+    }
+
+    /// Destination column boundary nearest `movedLeft` (Rust
+    /// `mid_strip_slot`), returning the insert index and the offset that
+    /// lands that boundary at the same on-screen x. `columns` are
+    /// strip-local layout x + width; the trailing end counts as a
+    /// boundary. Pure — unit-tested via the callers.
+    public static func midStripSlot(
+        columns: [(x: Int32, width: Int32)],
+        viewportMinX: Int32, offset: Int32, movedLeft: Int32
+    ) -> (index: Int, offset: Int32) {
+        let lastX = columns.last.map { $0.x + $0.width } ?? 0
+        var index = columns.count
+        var chosen = lastX
+        var best = abs(viewportMinX + offset + lastX - movedLeft)
+        for (i, col) in columns.enumerated() {
+            let dist = abs(viewportMinX + offset + col.x - movedLeft)
+            if dist < best {
+                best = dist
+                index = i
+                chosen = col.x
+            }
+        }
+        return (index, movedLeft - viewportMinX - chosen)
+    }
+
+    /// Insert a moved column into `strip` (Rust `insert_windows_mid_strip`):
+    /// at the destination column nearest its current on-screen x, returning
+    /// the offset that lands it there; appends at the end when the flag is
+    /// off or the x/widths are unknown. A mid-strip placement always snaps
+    /// (Rust `test_mid_strip_move_does_not_animate`), so the reshuffle never
+    /// glides.
+    private mutating func insertMovedColumn(
+        _ column: LayoutColumn, moving id: WindowID, into strip: inout LayoutStrip,
+        home: IntRect, offset: Int32
+    ) -> Int32? {
+        guard insertWindowsMidStrip, let movedLeft = committedSlots[id]?.x else {
+            strip.insertColumn(at: Int.max, column)
+            return nil
+        }
+        var xs: [(x: Int32, width: Int32)] = []
+        var x: Int32 = 0
+        for col in strip.columns {
+            guard let w = modelColumnWidth(col) else {
+                strip.insertColumn(at: Int.max, column)
+                return nil
+            }
+            xs.append((x, w))
+            x += w
+        }
+        let (index, desired) = Self.midStripSlot(
+            columns: xs, viewportMinX: home.min.x, offset: offset, movedLeft: movedLeft
+        )
+        strip.insertColumn(at: min(max(index, 0), strip.len), column)
+        snapMovesThisTick = true
+        return desired
+    }
+
     /// Resolve a virtual-switch command against this workspace's rows.
     private mutating func ingestVirtualOperation(_ op: WindowOperation) {
         let ws = activeWorkspace
@@ -1186,11 +1271,13 @@ public struct DaemonCore: Sendable {
         case .select(let position):
             if position < rows.count {
                 activeVirtual[ws] = rows[position]
+                if !virtualWorkspaceAnimations { snapMovesThisTick = true }
                 dirty.formUnion([.layout, .paint])
             }
         case .create(let index):
             strips[ws, default: [:]][index] = LayoutStrip(id: ws, virtualIndex: index)
             activeVirtual[ws] = index
+            if !virtualWorkspaceAnimations { snapMovesThisTick = true }
             dirty.formUnion([.layout, .paint])
         case .focusNeighbor(let id):
             setFocus(id, raise: true)
@@ -1221,7 +1308,14 @@ public struct DaemonCore: Sendable {
         else { return }
         setActiveStrip(source)
         var target = strips[ws]?[targetRow] ?? LayoutStrip(id: ws, virtualIndex: targetRow)
-        target.insertColumn(at: Int.max, column)
+        // Mid-strip: keep the moved column at its on-screen x (Rust
+        // `insert_windows_mid_strip`). The row shares the workspace offset,
+        // so the offset hint is unused here; the insert index still lands
+        // it near its x.
+        _ = insertMovedColumn(
+            column, moving: id, into: &target,
+            home: viewport(for: ws, in: [:]), offset: offsets[ws] ?? 0
+        )
         strips[ws, default: [:]][targetRow] = target
         activeVirtual[ws] = targetRow
         // Refocus-equivalent: Rust re-focuses the moved window on follow,
@@ -1312,6 +1406,7 @@ public struct DaemonCore: Sendable {
         }
         fullWidth.removeValue(forKey: id)
         let newWidth = roundPx(next * Double(vw))
+        setModelWidth(id, newWidth)
         let size = IntSize(newWidth, frame.height)
         let center = IntPoint(
             (frame.min.x + frame.max.x) / 2, (frame.min.y + frame.max.y) / 2
@@ -1336,6 +1431,7 @@ public struct DaemonCore: Sendable {
         {
             for sibling in items[pos].windows where sibling != id {
                 if let siblingFrame = frames(sibling) {
+                    setModelWidth(sibling, newWidth)
                     enqueueResize(
                         sibling, to: IntSize(newWidth, siblingFrame.height), epoch: epoch
                     )
@@ -1415,6 +1511,7 @@ public struct DaemonCore: Sendable {
         if let ratio = fullWidth[id] {
             fullWidth.removeValue(forKey: id)
             let width = roundPx(ratio * Double(max(viewport.width, 1)))
+            setModelWidth(id, width)
             enqueueResize(id, to: IntSize(width, viewport.height), epoch: epoch)
         } else {
             var strip = activeStrip()
@@ -1475,6 +1572,7 @@ public struct DaemonCore: Sendable {
             for member in column.windows {
                 fullWidth.removeValue(forKey: member)
                 if let frame = frames(member) {
+                    setModelWidth(member, focusedWidth)
                     enqueueResize(
                         member, to: IntSize(focusedWidth, frame.height), epoch: epoch
                     )
@@ -1572,7 +1670,17 @@ public struct DaemonCore: Sendable {
         setActiveStrip(source)
         var target = strips[workspace]?[row]
             ?? LayoutStrip(id: workspace, virtualIndex: row)
-        target.insertColumn(at: Int.max, column)
+        // Same-display row move: keep the moved column at its on-screen x
+        // (Rust `insert_windows_mid_strip`). Cross-display targets append
+        // (the x would land it back on the source display).
+        if workspace == sourceWS {
+            _ = insertMovedColumn(
+                column, moving: id, into: &target,
+                home: viewport(for: workspace, in: [:]), offset: offsets[workspace] ?? 0
+            )
+        } else {
+            target.insertColumn(at: Int.max, column)
+        }
         strips[workspace, default: [:]][row] = target
         if follow == .follow {
             activeWorkspace = workspace
@@ -1627,12 +1735,17 @@ public struct DaemonCore: Sendable {
         setActiveStrip(source)
         let row = activeVirtual[target] ?? 0
         var destination = strips[target]?[row] ?? LayoutStrip(id: target, virtualIndex: row)
+        // Cross-display keyboard moves append: keeping the source
+        // on-screen x would land the window back on the source display.
+        // Mid-strip placement is for same-display reorders and pointer
+        // drops (see `insertMovedColumn` / `dropSlot`).
         destination.insertColumn(at: Int.max, column)
         strips[target, default: [:]][row] = destination
         // Width ratio survives the trip, clamped into the new display.
         if let frame = frames(id), sourceViewport.width > 0 {
             let ratio = Double(frame.width) / Double(max(sourceViewport.width, 1))
             let width = min(max(Int32((ratio * Double(max(targetViewport.width, 1))).rounded()), 1), max(targetViewport.width, 1))
+            setModelWidth(id, width)
             enqueueResize(id, to: IntSize(width, frame.height), epoch: epoch)
         }
         if follow == .follow {
@@ -1689,6 +1802,7 @@ public struct DaemonCore: Sendable {
                     setFocus(id, raise: true)
                 }
             case .setFrame(let id, let frame):
+                setModelWidth(id, frame.width)
                 enqueueMove(
                     id,
                     to: IntPoint(frame.x, frame.y), epoch: epoch
@@ -1702,6 +1816,7 @@ public struct DaemonCore: Sendable {
                 if let current = frames(id) {
                     let owner = viewport(for: workspaceOf(id), in: viewports)
                     let width = roundPx(ratio * Double(max(owner.width, 1)))
+                    setModelWidth(id, width)
                     enqueueResize(
                         id, to: IntSize(width, current.height), epoch: epoch
                     )
@@ -1790,8 +1905,20 @@ public struct DaemonCore: Sendable {
     private func columnWidth(
         _ column: LayoutColumn, frames: (WindowID) -> IntRect?
     ) -> Int32? {
-        column.windows.compactMap { frames($0)?.width }.max()
-            ?? column.windows.compactMap { sizes[$0]?.x }.max()
+        // Pitch is model-owned but never smaller than live glass: the
+        // model (seeded once, then set by deliberate intents) holds the
+        // tile width steady while an app's own resizes dither downward,
+        // while an upward live change still widens the column so
+        // neighbours can never overlap it. `sizes` is the last
+        // convergence target for a column whose frame is unreadable.
+        let live = column.windows.compactMap { frames($0)?.width }.max()
+        let model = column.windows.compactMap { modelWidths[$0] }.max()
+        switch (live, model) {
+        case let (l?, m?): return max(l, m)
+        case let (l?, nil): return l
+        case let (nil, m?): return m
+        case (nil, nil): return column.windows.compactMap { sizes[$0]?.x }.max()
+        }
     }
 
     /// live widths (committed slots bake the offset in flight, so they
@@ -1927,6 +2054,23 @@ public struct DaemonCore: Sendable {
     /// this their park intents read as bogus wrong-display targets and
     /// the windows never park).
     private var sliverParked = Set<WindowID>()
+    /// Stable hide-park membership: a member that has parked stays parked
+    /// until its whole frame is back inside the owner viewport, so the
+    /// exit boundary cannot flip the target tick to tick (each flip is a
+    /// real AX move — the visible flash/bounce).
+    private var parkedMembers = Set<WindowID>()
+    /// Padded model width per member: the column's intended tile width.
+    /// Seeded once at first sight, then updated only by deliberate
+    /// intents (resize presets, full-width, transfer, balance) — never
+    /// by raw live drift. A multi-column strip's pitch therefore stays
+    /// fixed while apps resize or glass dithers, so downstream columns
+    /// never breathe.
+    private var modelWidths: [WindowID: Int32] = [:]
+    /// One-tick snap override: virtual-row switches with
+    /// `virtualWorkspaceAnimations` off, and mid-strip moves (which must
+    /// never animate), set this so `applyMove` lands targets immediately
+    /// instead of easing to them. Reset at the top of every tick.
+    private var snapMovesThisTick = false
 
     /// Apply pending transfer-centerings against fresh slots: the
     /// window now at each hole scrolls to viewport center over the next
@@ -2637,8 +2781,9 @@ public struct DaemonCore: Sendable {
             for workspace in Array(strips.keys) {
                 let keep: UInt32? = (workspace == ws) ? spare : nil
                 for row in Array((strips[workspace] ?? [:]).keys) {
-                    if Optional(row) != keep
-                        && strips[workspace]?[row]?.allWindows.isEmpty == true
+                    if reapEmptyWorkspaces,
+                       Optional(row) != keep,
+                       strips[workspace]?[row]?.allWindows.isEmpty == true
                     {
                         strips[workspace]?.removeValue(forKey: row)
                     }
@@ -2696,11 +2841,41 @@ public struct DaemonCore: Sendable {
             for (rowIndex, strip) in rows {
                 guard rowIndex == shownRow else {
                     for member in strip.allWindows {
-                        committedSlots[member] = parked
-                        if positions[member] != parked {
-                            enqueueMove(member, to: parked, epoch: epoch)
+                        // Void-safe hide target: right edge minus the
+                        // sliver, y clamped into the owner band, so the
+                        // whole parked frame sits in the stairs void and
+                        // never in a neighbour's band. Falls back to the
+                        // Rust-parity corner when the frame is unreadable.
+                        let target: IntPoint
+                        if let live = frames(member), live.width > 0,
+                           live.height > 0, live.width < home.width {
+                            target = parkTarget(
+                                slot: IntPoint(home.max.x, home.max.y),
+                                width: live.width, height: live.height, home: home
+                            )
+                        } else {
+                            target = parked
                         }
-                        positions[member] = parked
+                        committedSlots[member] = target
+                        if positions[member] != target {
+                            if virtualWorkspaceAnimations, animationsEnabled,
+                               glideBaseMs > 0, !snapMovesThisTick
+                            {
+                                let from = positions[member] ?? target
+                                let step = glideStep(
+                                    member, from: from, to: target,
+                                    epoch: epoch, displays: [home] + siblings
+                                )
+                                enqueueMove(member, to: step, epoch: epoch)
+                                positions[member] = step
+                                if step == target { glides.removeValue(forKey: member) }
+                            } else {
+                                enqueueMove(member, to: target, epoch: epoch)
+                                positions[member] = target
+                                glides.removeValue(forKey: member)
+                            }
+                        }
+                        sliverParked.insert(member)
                     }
                     continue
                 }
@@ -2714,6 +2889,18 @@ public struct DaemonCore: Sendable {
                 // column takes no slot and advances no pitch — freezing
                 // instead of piling neighbors onto its x. It slots in
                 // once frames arrive.
+                // Seed the model width on first sight: a member with no
+                // model width yet takes its live padded width, after which
+                // pitch is model-owned (see `columnWidth`).
+                for column in strip.columns {
+                    for member in column.windows where modelWidths[member] == nil {
+                        if let r = defaultRatio, r > 0 {
+                            modelWidths[member] = roundPx(r * Double(home.width))
+                        } else if let w = frames(member)?.width, w > 0 {
+                            modelWidths[member] = w
+                        }
+                    }
+                }
                 let colWidths: [Int32?] = strip.columns.map { column in
                     columnWidth(column, frames: frames)
                 }
@@ -2751,7 +2938,7 @@ public struct DaemonCore: Sendable {
                         colX = x
                     }
                     layoutColumn(
-                        column, x: colX, home: home,
+                        column, x: colX, home: home, colW: colW,
                         epoch: epoch, frames: frames, heldMembers: heldMembers,
                         union: union, siblings: siblings
                     )
@@ -2764,6 +2951,14 @@ public struct DaemonCore: Sendable {
         var batch: [WindowID: AXWriteJob] = [:]
         for (_, job) in inbox { coalesceJobs(&batch, job) }
         inbox.removeAll()
+        // Containment guarantee: no managed strip member may rest on a
+        // sibling display, whatever path produced its target. Genuine
+        // bleeds (the layout path already parks, so this is the safety
+        // net for surgery/transfer/drag-release/audit) are projected to
+        // the owner-edge hide-park. Held hand truth and glide legs are
+        // exempt — they are transient by design and converge in-bounds.
+        enforceOwnerDisplays(
+            &batch, viewports: viewports, held: held, frames: frames)
         // Off-union guard: origins outside every display are bogus
         // targets (stale offsets, wrong-display homes) — drop them
         // instead of writing. Model errors (off-union slots) never
@@ -2804,6 +2999,45 @@ public struct DaemonCore: Sendable {
                 union.min.x - parkedStripSliver, union.min.y - parkedStripSliver),
             max: IntPoint(
                 union.max.x + parkedStripSliver, union.max.y + parkedStripSliver))
+    }
+
+    /// Containment safety net: rewrite any queued move whose target frame
+    /// would rest on a sibling display to the owner-edge hide-park, so no
+    /// code path can leave a strip member bleeding next door. Managed
+    /// strip members only; held hand truth and glide legs are transient
+    /// by design and exempt. Also keeps the model presented truth
+    /// (`positions`) in step with the corrected target.
+    private mutating func enforceOwnerDisplays(
+        _ batch: inout [WindowID: AXWriteJob],
+        viewports: [WorkspaceID: IntRect], held: WindowID?,
+        frames: (WindowID) -> IntRect?
+    ) {
+        for (id, job) in batch {
+            guard id != held, glides[id] == nil, let origin = job.origin,
+                  let ws = workspaceOf(id), let live = frames(id),
+                  live.width > 0, live.height > 0
+            else { continue }
+            let home = viewport(for: ws, in: viewports)
+            guard home.width > 0, home.height > 0 else { continue }
+            let frame = IntRect(
+                min: origin,
+                max: IntPoint(origin.x + live.width, origin.y + live.height)
+            )
+            let bleeds = viewports.contains { (other, rect) in
+                guard other != ws else { return false }
+                let hit = frame.intersected(with: rect)
+                return hit.width > 0 && hit.height > 0
+            }
+            guard bleeds else { continue }
+            let corrected = parkTarget(
+                slot: origin, width: live.width, height: live.height, home: home
+            )
+            guard corrected != origin else { continue }
+            var fixed = job
+            fixed.origin = corrected
+            batch[id] = fixed
+            positions[id] = corrected
+        }
     }
 
     /// Strip origins outside the display union (bogus targets the OS
@@ -2869,7 +3103,7 @@ public struct DaemonCore: Sendable {
     /// slots. Every member also gets its size clamped to the viewport
     /// (Rust `clamp_managed_windows_to_viewport`).
     private mutating func layoutColumn(
-        _ column: LayoutColumn, x: Int32, home: IntRect,
+        _ column: LayoutColumn, x: Int32, home: IntRect, colW: Int32,
         epoch: UInt64, frames: (WindowID) -> IntRect?,
         heldMembers: Set<WindowID>, union: IntRect?, siblings: [IntRect]
     ) {
@@ -2927,8 +3161,25 @@ public struct DaemonCore: Sendable {
                     )
                 }
                 committedSlots[member] = placed
+                // Maximize + center the shortfall: request the column's
+                // model width so the window fills its tile, and present
+                // it centered in the column when the app clamps narrower
+                // (the model slot stays the reveal/layout truth).
+                var target = placed
+                if let live = frames(member), !heldMembers.contains(member) {
+                    if maximizeTiledWindows, colW > live.width {
+                        // Grow to the tile and present the shortfall
+                        // centered while the app catches up (the model
+                        // slot stays the reveal/layout truth).
+                        enqueueResize(
+                            member, to: IntSize(colW, live.height), epoch: epoch
+                        )
+                        sizes[member] = IntSize(colW, live.height)
+                        target.x = placed.x + (colW - live.width) / 2
+                    }
+                }
                 applyMove(
-                    member, to: placed, epoch: epoch,
+                    member, to: target, epoch: epoch,
                     frames: frames, heldMembers: heldMembers, union: union, home: home, siblings: siblings
                 )
                 clampMemberSize(member, home: home, epoch: epoch, frames: frames)
@@ -3034,6 +3285,66 @@ public struct DaemonCore: Sendable {
         return IntPoint(x, home.min.y + (home.height - liveH) / 2)
     }
 
+    /// The transition decision: given the frame's relation to the owner
+    /// viewport and whether it is already parked, should it park now?
+    /// Bleed rules decide the *entry*; an already-parked member stays
+    /// parked until its whole frame is back inside the owner viewport,
+    /// so the exit boundary cannot flip the target tick to tick. Pure
+    /// except for the caller's parking set.
+    private func wantsPark(
+        member: WindowID, slot: IntPoint, width: Int32, height: Int32,
+        home: IntRect, union: IntRect?, siblings: [IntRect]
+    ) -> Bool {
+        let fullyInside = slot.x >= home.min.x && slot.x + width <= home.max.x
+        if parkedMembers.contains(member) {
+            return !fullyInside
+        }
+        let exitedLeft = slot.x + width <= home.min.x
+        let exitedRight = slot.x >= home.max.x
+        guard slot.x < home.min.x || slot.x + width > home.max.x else {
+            return false
+        }
+        if exitedLeft || exitedRight {
+            // Reachable? Far-bogus slots (stale offsets) stay the drain's
+            // to strip; near ones (scrolled strips, stairs voids) park.
+            guard let union else { return true }
+            let frame = IntRect(min: slot, max: IntPoint(slot.x + width, slot.y + height))
+            let reach = frame.intersected(with: IntRect(
+                min: IntPoint(union.min.x - parkedStripSliver, union.min.y - parkedStripSliver),
+                max: IntPoint(union.max.x + parkedStripSliver, union.max.y + parkedStripSliver)
+            ))
+            return reach.width > 0 && reach.height > 0
+        }
+        // Straddling the owner edge: park only on true bleed (a sibling
+        // display shows part of the frame). Void peeks keep their
+        // owner-visible part.
+        let frame = IntRect(min: slot, max: IntPoint(slot.x + width, slot.y + height))
+        return siblings.contains {
+            let hit = frame.intersected(with: $0)
+            return hit.width > 0 && hit.height > 0
+        }
+    }
+
+    /// Hide-park x/y for a slot the caller already decided to park: the
+    /// nearest exited side, clamped into the owner band vertically.
+    private func parkTarget(
+        slot: IntPoint, width: Int32, height: Int32, home: IntRect
+    ) -> IntPoint {
+        let x: Int32
+        if slot.x < home.min.x {
+            x = home.min.x - width + offscreenSliverWidth
+        } else {
+            x = home.max.x - offscreenSliverWidth
+        }
+        let y: Int32
+        if height >= home.height {
+            y = home.min.y
+        } else {
+            y = min(max(slot.y, home.min.y), home.max.y - height)
+        }
+        return IntPoint(x, y)
+    }
+
     /// Presented hide-park target for a member whose slot would paint on
     /// a sibling display (Rust `desired_window_frame` offscreen arms,
     /// extended to straddles): park just off the owner edge on the
@@ -3052,52 +3363,28 @@ public struct DaemonCore: Sendable {
     /// take the park-row y clamp into the owner band (oversize frames
     /// top-align): without it the parked frame can overlap a stair-step
     /// neighbor's band worse than the slot did. The slot's y is otherwise
-    /// untouched.
-    private func parkOffscreen(
+    /// untouched. Membership has hysteresis (`parkedMembers`): a member
+    /// that has parked stays parked until it is comfortably back inside,
+    /// so the exit boundary cannot flip the target tick to tick.
+    private mutating func parkOffscreen(
         _ member: WindowID, slot: IntPoint, home: IntRect,
         union: IntRect?, siblings: [IntRect], frames: (WindowID) -> IntRect?
     ) -> IntPoint? {
         guard let live = frames(member) else { return nil }
         let width = live.width, height = live.height
-        guard width > 0, height > 0, width < home.width else { return nil }
-        let frame = IntRect(min: slot, max: IntPoint(slot.x + width, slot.y + height))
-        let exitedLeft = slot.x + width <= home.min.x
-        let exitedRight = slot.x >= home.max.x
-        if exitedLeft || exitedRight {
-            // Reachable? Far-bogus slots (stale offsets) stay the drain's
-            // to strip; near ones (scrolled strips, stairs voids) park.
-            if let union {
-                let reach = frame.intersected(with: IntRect(
-                    min: IntPoint(union.min.x - parkedStripSliver, union.min.y - parkedStripSliver),
-                    max: IntPoint(union.max.x + parkedStripSliver, union.max.y + parkedStripSliver)
-                ))
-                guard reach.width > 0 && reach.height > 0 else { return nil }
-            }
-        } else {
-            // Straddling the owner edge: park only on true bleed (a
-            // sibling display shows part of the frame). Void peeks keep
-            // their owner-visible part.
-            let bleeds = siblings.contains {
-                let hit = frame.intersected(with: $0)
-                return hit.width > 0 && hit.height > 0
-            }
-            guard bleeds else { return nil }
-        }
-        let x: Int32
-        if slot.x < home.min.x {
-            x = home.min.x - width + offscreenSliverWidth
-        } else if slot.x + width > home.max.x {
-            x = home.max.x - offscreenSliverWidth
-        } else {
+        guard width > 0, height > 0, width < home.width else {
+            parkedMembers.remove(member)
             return nil
         }
-        let y: Int32
-        if height >= home.height {
-            y = home.min.y
-        } else {
-            y = min(max(slot.y, home.min.y), home.max.y - height)
+        guard wantsPark(
+            member: member, slot: slot, width: width, height: height,
+            home: home, union: union, siblings: siblings
+        ) else {
+            parkedMembers.remove(member)
+            return nil
         }
-        return IntPoint(x, y)
+        parkedMembers.insert(member)
+        return parkTarget(slot: slot, width: width, height: height, home: home)
     }
 
     /// Move intent with homing/hand/convergence handling (extracted
@@ -3156,7 +3443,7 @@ public struct DaemonCore: Sendable {
             {
                 positions[member] = target
                 glides.removeValue(forKey: member)
-            } else if !animationsEnabled || glideBaseMs == 0 {
+            } else if snapMovesThisTick || !animationsEnabled || glideBaseMs == 0 {
                 enqueueMove(member, to: target, epoch: epoch)
                 positions[member] = target
                 glides.removeValue(forKey: member)
@@ -3305,6 +3592,15 @@ public struct DaemonCore: Sendable {
             )
             return
         }
+        if maximizeTiledWindows, let modelW = modelWidths[member], modelW > 0 {
+            // Grow to the tile's model width (Rust
+            // `maximize_tiled_windows`), height clamped to the viewport.
+            applySize(
+                member, to: IntSize(modelW, min(live.height, home.height)),
+                epoch: epoch, frames: frames
+            )
+            return
+        }
         applySize(
             member,
             to: clampSizeToViewport(
@@ -3415,7 +3711,7 @@ public struct DaemonCore: Sendable {
                 offsetLegs.removeValue(forKey: ws)
                 continue
             }
-            if !animationsEnabled || glideBaseMs == 0 {
+            if snapMovesThisTick || !animationsEnabled || glideBaseMs == 0 {
                 offsets[ws] = target
                 offsetLegs.removeValue(forKey: ws)
                 continue
@@ -3501,6 +3797,14 @@ public struct DaemonCore: Sendable {
         job.epoch = epoch
         job.priority = (id == focus)
         inbox[id] = job
+    }
+
+    /// Seed/refresh a column's model width (padded). Called only by
+    /// deliberate width intents, never by convergence resizes, so the
+    /// pitch is not dragged around by raw live drift.
+    private mutating func setModelWidth(_ member: WindowID, _ width: Int32) {
+        guard width > 0 else { return }
+        modelWidths[member] = width
     }
 
     private mutating func enqueueMove(_ id: WindowID, to slot: IntPoint, epoch: UInt64) {
@@ -4451,11 +4755,16 @@ public static func firstExitCrossing(
             // Flux guard: a rotation firing while strips are mid-re-adopt
             // (empty) must never overwrite the last good stashed layout —
             // that destroys the only copy of the row order.
+            // Stash the rest intent, not the mid-ease offsets: a rotation
+            // firing mid-glide would otherwise bank a half-traveled
+            // position, and the return trip would restore short of target
+            // (reveal refires, strips bounce). The ease resumes from the
+            // banked target on return.
             if spaceStash[current] == nil || !outgoingEmpty {
                 spaceStash[current] = SpaceStash(
                     rows: outgoing,
                     activeRow: activeVirtual[workspace],
-                    offset: offsets[workspace]
+                    offset: offsetTargets[workspace] ?? offsets[workspace]
                 )
             }
             if let incoming = spaceStash[space] {
