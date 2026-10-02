@@ -1417,9 +1417,18 @@ public struct DaemonCore: Sendable {
         )
         let strip = activeStrip()
         if strip.contains(id) {
-            let shift = origin.x - frame.min.x
-            if shift != 0 {
-                offsetTargets[activeWorkspace, default: offsets[activeWorkspace] ?? 0] += shift
+            if strip.columns.count == 1 {
+                // A lone column never scrolls: it is positioned by the
+                // centering (center_single_column / full-width), so an
+                // edge-preserving offset shift would fight the centering
+                // and bounce the window. Reset the offset instead.
+                offsets[activeWorkspace] = 0
+                offsetTargets[activeWorkspace] = 0
+            } else {
+                let shift = origin.x - frame.min.x
+                if shift != 0 {
+                    offsetTargets[activeWorkspace, default: offsets[activeWorkspace] ?? 0] += shift
+                }
             }
         } else {
             enqueueMove(id, to: origin, epoch: epoch)
@@ -2066,6 +2075,10 @@ public struct DaemonCore: Sendable {
     /// fixed while apps resize or glass dithers, so downstream columns
     /// never breathe.
     private var modelWidths: [WindowID: Int32] = [:]
+    /// Last observed live width per member: lets the shortfall centering
+    /// wait for the app's resize to settle, so stepped progress (clamped
+    /// apps) never drags the window side to side.
+    private var lastLiveWidth: [WindowID: Int32] = [:]
     /// One-tick snap override: virtual-row switches with
     /// `virtualWorkspaceAnimations` off, and mid-strip moves (which must
     /// never animate), set this so `applyMove` lands targets immediately
@@ -2913,6 +2926,11 @@ public struct DaemonCore: Sendable {
                 var x = home.min.x + (offsets[ws] ?? 0)
                 for (index, column) in strip.columns.enumerated() {
                     guard let colW = colWidths[index] else { continue }
+                    // Decisions use the *model* width (stable across a
+                    // resize), while `colW` stays the pitch floor. Using
+                    // the live-following pitch here flipped `loneNarrow`
+                    // mid-resize and bounced the column left↔right.
+                    let layoutW = modelColumnWidth(column) ?? colW
                     // A lone narrow column centers when configured (Rust
                     // `center_single_column`) or maximized (`fullWidth`
                     // mark — a maximized window belongs mid-display).
@@ -2923,16 +2941,16 @@ public struct DaemonCore: Sendable {
                     // while marked. Truly full-width columns no-op
                     // (left == centered).
                     let loneNarrow = strip.columns.count == 1
-                        && colW < home.width
+                        && layoutW < home.width
                     let marked = column.windows.contains(where: { fullWidth[$0] != nil })
                     let colX: Int32
                     if loneNarrow && marked {
-                        colX = home.min.x + (home.width - colW) / 2
+                        colX = home.min.x + (home.width - layoutW) / 2
                         if offsetTargets[ws] != 0 {
                             offsetTargets[ws] = 0
                         }
                     } else if loneNarrow && centerSingleColumn {
-                        colX = home.min.x + (home.width - colW) / 2
+                        colX = home.min.x + (home.width - layoutW) / 2
                             + (offsets[ws] ?? 0)
                     } else {
                         colX = x
@@ -3167,14 +3185,15 @@ public struct DaemonCore: Sendable {
                 // (the model slot stays the reveal/layout truth).
                 var target = placed
                 if let live = frames(member), !heldMembers.contains(member) {
-                    if maximizeTiledWindows, colW > live.width {
-                        // Grow to the tile and present the shortfall
-                        // centered while the app catches up (the model
-                        // slot stays the reveal/layout truth).
-                        enqueueResize(
-                            member, to: IntSize(colW, live.height), epoch: epoch
-                        )
-                        sizes[member] = IntSize(colW, live.height)
+                    // Growth is owned by `clampMemberSize` -> `applySize`
+                    // (deduped, with backoff): requesting it here too wrote
+                    // a resize every tick while a clamped app lagged, so
+                    // Firefox walked up in visible steps. Centering the
+                    // shortfall waits for the live width to settle, so
+                    // stepped progress never drags the window side to side.
+                    let settled = lastLiveWidth[member] == live.width
+                    lastLiveWidth[member] = live.width
+                    if maximizeTiledWindows, colW > live.width, settled {
                         target.x = placed.x + (colW - live.width) / 2
                     }
                 }

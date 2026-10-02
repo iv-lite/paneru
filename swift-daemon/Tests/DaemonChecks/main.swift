@@ -4708,10 +4708,21 @@ do {
         "fresh column grows to its ratio"
     )
     check(
-        spawned.axJobs.contains { $0.winID == 0 && $0.origin == IntPoint(312, 34) },
-        "clamped shortfall is centered in the column"
+        !spawned.axJobs.contains { $0.winID == 0 && $0.origin == IntPoint(312, 34) },
+        "no centering while the grow is still in flight"
     )
-    // App accepts: glass reaches full width, so the column rests at 0.
+    // Clamped app (live stays 400): once the width has settled the
+    // shortfall centers in the column.
+    let settledClamped = daemon.tick(
+        events: [],
+        frames: frames(slots: [0: IntPoint(0, 34)]),
+        viewport: viewport, focusedStyle: style
+    )
+    check(
+        settledClamped.axJobs.contains { $0.winID == 0 && $0.origin == IntPoint(312, 34) },
+        "clamped shortfall centers once the width settles"
+    )
+    // App accepts: glass reaches full width and the column rests at 0.
     _ = daemon.tick(
         events: [],
         frames: { _ in IntRect(min: IntPoint(0, 34), max: IntPoint(1024, 734)) },
@@ -4837,6 +4848,53 @@ do {
         moveToRow(false).strips[1]?[1]?.allWindows, [2, 0],
         "flag off appends at the end"
     )
+}
+
+// Clamped growth is deduped: a clamped app (live stays 400) must not
+// receive a resize every tick — that per-tick write is what made Firefox
+// walk up in visible steps.
+do {
+    var daemon = DaemonCore()
+    daemon.animationsEnabled = false
+    daemon.glideBaseMs = 0
+    daemon.defaultRatio = 1.0
+    daemon.maximizeTiledWindows = true
+    let live = frames(slots: [0: IntPoint(0, 34)])
+    _ = daemon.tick(
+        events: [.appeared(id: 0, workspace: 1), .focus(id: 0)],
+        frames: live, viewport: viewport, focusedStyle: style
+    )
+    let second = daemon.tick(
+        events: [], frames: live, viewport: viewport, focusedStyle: style
+    )
+    check(
+        !second.axJobs.contains { $0.winID == 0 && $0.size == IntSize(1024, 700) },
+        "clamped grow is not re-sent every tick"
+    )
+}
+
+// A lone column never scrolls: shrinking it resets the offset instead of
+// shifting it (which fought the centering and bounced the window).
+do {
+    var daemon = DaemonCore()
+    daemon.animationsEnabled = false
+    daemon.glideBaseMs = 0
+    daemon.centerSingleColumn = true
+    let live = frames(slots: [0: IntPoint(0, 34)])
+    _ = daemon.tick(
+        events: [.appeared(id: 0, workspace: 1), .focus(id: 0)],
+        frames: live, viewport: viewport, focusedStyle: style
+    )
+    _ = daemon.tick(
+        events: [.swipe(delta: -0.2, fingers: 3)],
+        frames: live, viewport: viewport, focusedStyle: style
+    )
+    check(daemon.offsets[1] != 0, "offset carried before resize")
+    _ = daemon.tick(
+        events: [.command(.window(.resize(.shrink)))],
+        frames: live, viewport: viewport, focusedStyle: style
+    )
+    checkEqual(daemon.offsets[1], 0, "lone resize resets the offset")
 }
 
 if failures == 0 {
