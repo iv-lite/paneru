@@ -3190,11 +3190,13 @@ do {
     checkEqual(daemon.lastWarpKind, "none:seam", "seam verdict survives")
 }
 
-// Maximize anchors a lone column at the viewport origin (full-width
-// model, top-aligned); unmarked narrow lones stay left-anchored
+// Maximize anchors a lone column at the viewport origin once the glass
+// fills (top-aligned); unmarked narrow lones stay left-anchored
 // (center_single_column stays opt-in).
 do {
     var daemon = DaemonCore()
+    daemon.animationsEnabled = false
+    daemon.glideBaseMs = 0
     let live = frames(slots: [0: IntPoint(0, 34)])
     _ = daemon.tick(
         events: [.appeared(id: 0, workspace: 1), .focus(id: 0)],
@@ -3212,9 +3214,16 @@ do {
         maximized.axJobs.contains { $0.winID == 0 && $0.size == IntSize(1024, 768) },
         "maximize requests the full viewport (ratio 1.0)"
     )
+    // App accepts: glass reaches the viewport and the column fills at the
+    // origin.
+    _ = daemon.tick(
+        events: [],
+        frames: { _ in IntRect(min: IntPoint(0, 0), max: IntPoint(1024, 768)) },
+        viewport: viewport, focusedStyle: style
+    )
     checkEqual(
         daemon.committedSlot(of: 0), IntPoint(0, 0),
-        "maximize anchors a lone column at the origin, top-aligns full height"
+        "maximized column fills the viewport at the origin"
     )
 }
 
@@ -3355,15 +3364,14 @@ do {
         frames: live, viewport: viewport, focusedStyle: style
     )
     checkEqual(
-        daemon.committedSlot(of: 0), IntPoint(0, 0),
-        "maximize anchors at the origin despite carried scroll"
-    )
-    checkEqual(
         daemon.offsetTarget(for: 1), 0, "maximized reels the offset target home"
     )
+    // App accepts: glass reaches the viewport and the column fills at the
+    // origin (offset fully reeled home).
     for _ in 0..<25 {
         _ = daemon.tick(
-            events: [], frames: live,
+            events: [],
+            frames: { _ in IntRect(min: IntPoint(0, 0), max: IntPoint(1024, 768)) },
             viewport: viewport, focusedStyle: style
         )
     }
@@ -4541,8 +4549,15 @@ do {
         moved.axJobs.contains { $0.winID == 0 && $0.size == IntSize(1024, 768) },
         "cross-display move maximizes for the destination"
     )
+    // App accepts: glass reaches the destination viewport and the window
+    // fills it at the target origin.
+    _ = daemon.tick(
+        events: [],
+        frames: { _ in IntRect(min: IntPoint(1024, 0), max: IntPoint(2048, 768)) },
+        viewports: views, focusedStyle: style
+    )
     checkEqual(daemon.committedSlot(of: 0), IntPoint(1024, 0), "transfer slots maximized on the new display")
-    checkEqual(daemon.positions[0], IntPoint(1024, 0), "cross-display leg snaps instead of gliding")
+    checkEqual(daemon.positions[0], IntPoint(1024, 0), "cross-display move settles on the destination origin")
     checkEqual(daemon.focus, 0, "follow keeps focus on the moved window")
     checkEqual(daemon.activeWorkspace, 2, "follow retargets the active display")
 }
@@ -4639,10 +4654,8 @@ do {
     }
 }
 
-// Multi-column pitch is model-owned but never smaller than live glass:
-// an app shrinking its own frame must not move downstream columns,
-// while an upward live change still widens the column so neighbours
-// cannot overlap.
+// Multi-column pitch hugs the live glass: a shrunken column narrows with
+// it (downstream columns follow) instead of leaving a stale wide column.
 do {
     var daemon = DaemonCore()
     daemon.animationsEnabled = false
@@ -4657,7 +4670,7 @@ do {
         viewports: [1: wide], focusedStyle: style
     )
     checkEqual(daemon.committedSlot(of: 1), IntPoint(400, 34), "second column abuts")
-    // App shrinks its own glass to 300: pitch holds at the model width.
+    // App shrinks its own glass to 300: pitch hugs it.
     _ = daemon.tick(
         events: [],
         frames: { id in
@@ -4668,10 +4681,10 @@ do {
         viewports: [1: wide], focusedStyle: style
     )
     checkEqual(
-        daemon.committedSlot(of: 1), IntPoint(400, 34),
-        "downstream column stays put when glass shrinks"
+        daemon.committedSlot(of: 1), IntPoint(300, 34),
+        "downstream column hugs the shrunken glass"
     )
-    // App grows to 500: pitch follows up so no overlap.
+    // App grows to 500: pitch follows up too.
     _ = daemon.tick(
         events: [],
         frames: { id in
@@ -4723,8 +4736,8 @@ do {
 }
 
 // Width policy: `defaultRatio` sizes a fresh column and
-// `maximizeTiledWindows` grows it to the tile, centering the shortfall
-// until the app accepts. Both wire straight from the installer config.
+// `maximizeTiledWindows` grows it to the tile. Both wire straight from
+// the installer config.
 do {
     var daemon = DaemonCore()
     daemon.animationsEnabled = false
@@ -4740,20 +4753,21 @@ do {
         spawned.axJobs.contains { $0.winID == 0 && $0.size == IntSize(1024, 700) },
         "fresh column grows to its ratio"
     )
-    check(
-        !spawned.axJobs.contains { $0.winID == 0 && $0.origin == IntPoint(312, 34) },
-        "no centering while the grow is still in flight"
-    )
-    // Clamped app (live stays 400): once the width has settled the
-    // shortfall centers in the column.
-    let settledClamped = daemon.tick(
+    // Clamped app (live stays 400): the column hugs the actual width, so
+    // no oversized column is left around the window.
+    let clamped = daemon.tick(
         events: [],
         frames: frames(slots: [0: IntPoint(0, 34)]),
         viewport: viewport, focusedStyle: style
     )
+    checkEqual(
+        daemon.committedSlot(of: 0), IntPoint(0, 34),
+        "clamped column hugs the window (no oversized column)"
+    )
     check(
-        settledClamped.axJobs.contains { $0.winID == 0 && $0.origin == IntPoint(312, 34) },
-        "clamped shortfall centers once the width settles"
+        clamped.axJobs.contains { $0.winID == 0 && $0.size == IntSize(1024, 700) }
+            || clamped.axJobs.isEmpty,
+        "clamped grow is deduped, never a per-tick storm"
     )
     // App accepts: glass reaches full width and the column rests at 0.
     _ = daemon.tick(
@@ -5032,15 +5046,15 @@ do {
     )
     let target = daemon.offsetTarget(for: 1)
     check(target != 0, "focus reveal arms a scroll")
-    let slotsBefore = [0, 1, 2].map { daemon.committedSlot(of: $0)?.x ?? 0 }
+    let before = [0, 1, 2].map { daemon.positions[$0]?.x ?? 0 }
     _ = daemon.tick(events: [], frames: live, viewport: vp, focusedStyle: style)
     let mid = daemon.offsets[1] ?? 0
-    let slotsAfter = [0, 1, 2].map { daemon.committedSlot(of: $0)?.x ?? 0 }
-    let deltas = (0..<3).map { slotsAfter[$0] - slotsBefore[$0] }
+    let after = [0, 1, 2].map { daemon.positions[$0]?.x ?? 0 }
+    let deltas = (0..<3).map { after[$0] - before[$0] }
     check(mid != target, "offset eases rather than snapping")
     check(
         deltas[0] == deltas[1] && deltas[1] == deltas[2] && deltas[0] != 0,
-        "every column advances together during the glide"
+        "every column advances together during the glide (rigid ride)"
     )
     for _ in 0..<40 {
         _ = daemon.tick(events: [], frames: live, viewport: vp, focusedStyle: style)

@@ -1429,6 +1429,15 @@ public struct DaemonCore: Sendable {
                 if shift != 0 {
                     offsetTargets[activeWorkspace, default: offsets[activeWorkspace] ?? 0] += shift
                 }
+                // A strip that now fits the viewport reels home so no
+                // whitespace is left after a shrink.
+                let total = strip.columns.reduce(Int32(0)) { acc, col in
+                    acc + (columnWidth(col, frames: frames) ?? 0)
+                }
+                if total <= viewport.width {
+                    offsets[activeWorkspace] = 0
+                    offsetTargets[activeWorkspace] = 0
+                }
             }
         } else {
             enqueueMove(id, to: origin, epoch: epoch)
@@ -1934,20 +1943,13 @@ public struct DaemonCore: Sendable {
     private func columnWidth(
         _ column: LayoutColumn, frames: (WindowID) -> IntRect?
     ) -> Int32? {
-        // Pitch is model-owned but never smaller than live glass: the
-        // model (seeded once, then set by deliberate intents) holds the
-        // tile width steady while an app's own resizes dither downward,
-        // while an upward live change still widens the column so
-        // neighbours can never overlap it. `sizes` is the last
-        // convergence target for a column whose frame is unreadable.
-        let live = column.windows.compactMap { frames($0)?.width }.max()
-        let model = column.windows.compactMap { modelWidths[$0] }.max()
-        switch (live, model) {
-        case let (l?, m?): return max(l, m)
-        case let (l?, nil): return l
-        case let (nil, m?): return m
-        case (nil, nil): return column.windows.compactMap { sizes[$0]?.x }.max()
-        }
+        // Hug the window's actual width so a shrunken column narrows with
+        // it (a stale/wide model left the window floating in an oversized
+        // column — whitespace on both sides). The model is a fallback only
+        // when the frame is unreadable; `sizes` covers a never-read column.
+        column.windows.compactMap { frames($0)?.width }.max()
+            ?? column.windows.compactMap { modelWidths[$0] }.max()
+            ?? column.windows.compactMap { sizes[$0]?.x }.max()
     }
 
     /// live widths (committed slots bake the offset in flight, so they
@@ -2095,15 +2097,17 @@ public struct DaemonCore: Sendable {
     /// fixed while apps resize or glass dithers, so downstream columns
     /// never breathe.
     private var modelWidths: [WindowID: Int32] = [:]
-    /// Last observed live width per member: lets the shortfall centering
-    /// wait for the app's resize to settle, so stepped progress (clamped
-    /// apps) never drags the window side to side.
-    private var lastLiveWidth: [WindowID: Int32] = [:]
     /// One-tick snap override: virtual-row switches with
     /// `virtualWorkspaceAnimations` off, and mid-strip moves (which must
     /// never animate), set this so `applyMove` lands targets immediately
     /// instead of easing to them. Reset at the top of every tick.
     private var snapMovesThisTick = false
+    /// True while the workspace being laid out has its strip offset
+    /// mid-glide: members then **ride** the offset (snap to the recomputed
+    /// slot) instead of starting per-window glide legs, so all columns
+    /// advance rigidly with the single offset tween rather than chasing it
+    /// independently. Set per workspace in `commitPass`.
+    private var rideStripOffset = false
 
     /// Apply pending transfer-centerings against fresh slots: the
     /// window now at each hole scrolls to viewport center over the next
@@ -2858,8 +2862,7 @@ public struct DaemonCore: Sendable {
         glideReferencePx = max(800, Float(refHome.width) / 3.0)
         // Programmatic offset targets ease first, so this tick's slots
         // already account for strip travel (members ride composed).
-        easeOffsets(epoch: epoch)
-        // Display union once: slot reachability gates the fast-path
+        easeOffsets(epoch: epoch)        // Display union once: slot reachability gates the fast-path
         // redrive below, and the drain vets origins against it.
         let union = writeUnion(Array(viewports.values))
         for (ws, rows) in strips {
@@ -2868,6 +2871,10 @@ public struct DaemonCore: Sendable {
             // whose slot overlaps one of these paints next door and must
             // hide-park; slots in a void (stairs gaps) stay put.
             let siblings = viewports.filter { $0.key != ws }.map { $0.value }
+            // Strip mid-glide: members ride the offset rigidly (see
+            // `rideStripOffset`) so columns advance together.
+            rideStripOffset =
+                (offsetTargets[ws] ?? offsets[ws] ?? 0) != (offsets[ws] ?? 0)
             // Sanity-clamp offsets every commit: swipe snap bounds and
             // reveal composition legitimately rest outside the fill range
             // (see the NOTE below), but thousands of px past the content
@@ -2951,27 +2958,22 @@ public struct DaemonCore: Sendable {
                 var x = home.min.x + (offsets[ws] ?? 0)
                 for (index, column) in strip.columns.enumerated() {
                     guard let colW = colWidths[index] else { continue }
-                    // Decisions use the *model* width (stable across a
-                    // resize), while `colW` stays the pitch floor. Using
-                    // the live-following pitch here flipped `loneNarrow`
-                    // mid-resize and bounced the column left↔right.
-                    let layoutW = modelColumnWidth(column) ?? colW
-                    // A lone marked column centers absolutely (and reels
-                    // its offset home) whether or not it is narrower than
-                    // the viewport — a full-width marked column must sit at
-                    // home.min.x with offset 0, not drift with carried
-                    // scroll. Unmarked lone narrow centers only under
-                    // `center_single_column`.
+                    // A lone narrow column centers when configured (Rust
+                    // `center_single_column`) or maximized (`fullWidth`
+                    // mark). Centering uses the column's actual width
+                    // (`colW`); a stale model width here floated a shrunken
+                    // window in an oversized column — whitespace on both
+                    // sides.
                     let lone = strip.columns.count == 1
                     let marked = column.windows.contains(where: { fullWidth[$0] != nil })
                     let colX: Int32
                     if lone && marked {
-                        colX = home.min.x + (home.width - layoutW) / 2
+                        colX = home.min.x + (home.width - colW) / 2
                         if offsetTargets[ws] != 0 {
                             offsetTargets[ws] = 0
                         }
-                    } else if lone && centerSingleColumn && layoutW < home.width {
-                        colX = home.min.x + (home.width - layoutW) / 2
+                    } else if lone && centerSingleColumn && colW < home.width {
+                        colX = home.min.x + (home.width - colW) / 2
                             + (offsets[ws] ?? 0)
                     } else {
                         colX = x
@@ -3201,26 +3203,8 @@ public struct DaemonCore: Sendable {
                     )
                 }
                 committedSlots[member] = placed
-                // Maximize + center the shortfall: request the column's
-                // model width so the window fills its tile, and present
-                // it centered in the column when the app clamps narrower
-                // (the model slot stays the reveal/layout truth).
-                var target = placed
-                if let live = frames(member), !heldMembers.contains(member) {
-                    // Growth is owned by `clampMemberSize` -> `applySize`
-                    // (deduped, with backoff): requesting it here too wrote
-                    // a resize every tick while a clamped app lagged, so
-                    // the app walked up in visible steps. Centering the
-                    // shortfall waits for the live width to settle, so
-                    // stepped progress never drags the window side to side.
-                    let settled = lastLiveWidth[member] == live.width
-                    lastLiveWidth[member] = live.width
-                    if maximizeTiledWindows, colW > live.width, settled {
-                        target.x = placed.x + (colW - live.width) / 2
-                    }
-                }
                 applyMove(
-                    member, to: target, epoch: epoch,
+                    member, to: placed, epoch: epoch,
                     frames: frames, heldMembers: heldMembers, union: union, home: home, siblings: siblings
                 )
                 clampMemberSize(member, home: home, epoch: epoch, frames: frames)
@@ -3479,7 +3463,9 @@ public struct DaemonCore: Sendable {
             {
                 positions[member] = target
                 glides.removeValue(forKey: member)
-            } else if snapMovesThisTick || !animationsEnabled || glideBaseMs == 0 {
+            } else if snapMovesThisTick || rideStripOffset || !animationsEnabled
+                        || glideBaseMs == 0
+            {
                 enqueueMove(member, to: target, epoch: epoch)
                 positions[member] = target
                 glides.removeValue(forKey: member)
