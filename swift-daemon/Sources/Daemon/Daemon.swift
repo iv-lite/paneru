@@ -1531,11 +1531,23 @@ public struct DaemonCore: Sendable {
             let ratio = frames(id)
                 .map { Double($0.width) / Double(max(viewport.width, 1)) } ?? 0.5
             fullWidth[id] = ratio
+            // The mark owns full-viewport sizing: model truth must follow
+            // now, or a lone column centers by a stale narrow width while
+            // the window grows to the viewport, overhanging one side.
+            setModelWidth(id, viewport.width)
             if let frame = frames(id) {
                 if strip.contains(id) {
-                    let shift = viewport.min.x - frame.min.x
-                    if shift != 0 {
-                        offsetTargets[activeWorkspace, default: offsets[activeWorkspace] ?? 0] += shift
+                    // A lone column never scrolls: reel the offset home
+                    // rather than shifting it (the centering owns x). A
+                    // multi-column strip keeps the window's edge in place.
+                    if strip.columns.count <= 1 {
+                        offsets[activeWorkspace] = 0
+                        offsetTargets[activeWorkspace] = 0
+                    } else {
+                        let shift = viewport.min.x - frame.min.x
+                        if shift != 0 {
+                            offsetTargets[activeWorkspace, default: offsets[activeWorkspace] ?? 0] += shift
+                        }
                     }
                 } else {
                     enqueueMove(id, to: viewport.min, epoch: epoch)
@@ -2931,25 +2943,21 @@ public struct DaemonCore: Sendable {
                     // the live-following pitch here flipped `loneNarrow`
                     // mid-resize and bounced the column left↔right.
                     let layoutW = modelColumnWidth(column) ?? colW
-                    // A lone narrow column centers when configured (Rust
-                    // `center_single_column`) or maximized (`fullWidth`
-                    // mark — a maximized window belongs mid-display).
-                    // Maximized columns center ABSOLUTELY: carried scroll
-                    // offsets would otherwise park them off-center (swipes
-                    // leave offsets behind), and a fitting strip has
-                    // nothing to scroll — so the offset target reels to 0
-                    // while marked. Truly full-width columns no-op
-                    // (left == centered).
-                    let loneNarrow = strip.columns.count == 1
-                        && layoutW < home.width
+                    // A lone marked column centers absolutely (and reels
+                    // its offset home) whether or not it is narrower than
+                    // the viewport — a full-width marked column must sit at
+                    // home.min.x with offset 0, not drift with carried
+                    // scroll. Unmarked lone narrow centers only under
+                    // `center_single_column`.
+                    let lone = strip.columns.count == 1
                     let marked = column.windows.contains(where: { fullWidth[$0] != nil })
                     let colX: Int32
-                    if loneNarrow && marked {
+                    if lone && marked {
                         colX = home.min.x + (home.width - layoutW) / 2
                         if offsetTargets[ws] != 0 {
                             offsetTargets[ws] = 0
                         }
-                    } else if loneNarrow && centerSingleColumn {
+                    } else if lone && centerSingleColumn && layoutW < home.width {
                         colX = home.min.x + (home.width - layoutW) / 2
                             + (offsets[ws] ?? 0)
                     } else {
@@ -3391,7 +3399,11 @@ public struct DaemonCore: Sendable {
     ) -> IntPoint? {
         guard let live = frames(member) else { return nil }
         let width = live.width, height = live.height
-        guard width > 0, height > 0, width < home.width else {
+        // No upper width bound: a full-viewport (or wider) window that is
+        // scrolled off the owner must still park, or it glides onto the
+        // neighbouring display. The exit/straddle + reach/bleed checks
+        // below decide; a window fully inside the owner never parks.
+        guard width > 0, height > 0 else {
             parkedMembers.remove(member)
             return nil
         }

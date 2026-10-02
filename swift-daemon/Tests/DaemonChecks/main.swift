@@ -3190,8 +3190,9 @@ do {
     checkEqual(daemon.lastWarpKind, "none:seam", "seam verdict survives")
 }
 
-// Maximized lone columns center horizontally; unmarked narrow
-// lones stay left-anchored (center_single_column stays opt-in).
+// Maximize anchors a lone column at the viewport origin (full-width
+// model, top-aligned); unmarked narrow lones stay left-anchored
+// (center_single_column stays opt-in).
 do {
     var daemon = DaemonCore()
     let live = frames(slots: [0: IntPoint(0, 34)])
@@ -3208,8 +3209,8 @@ do {
         frames: live, viewport: viewport, focusedStyle: style
     )
     checkEqual(
-        daemon.committedSlot(of: 0), IntPoint(312, 0),
-        "maximized narrow lone centers horizontally, top-aligns full height"
+        daemon.committedSlot(of: 0), IntPoint(0, 0),
+        "maximize anchors a lone column at the origin, top-aligns full height"
     )
 }
 
@@ -3330,8 +3331,8 @@ do {
         frames: live, viewport: viewport, focusedStyle: style
     )
     checkEqual(
-        daemon.committedSlot(of: 0), IntPoint(312, 0),
-        "maximized centers absolutely despite carried scroll"
+        daemon.committedSlot(of: 0), IntPoint(0, 0),
+        "maximize anchors at the origin despite carried scroll"
     )
     checkEqual(
         daemon.offsetTarget(for: 1), 0, "maximized reels the offset target home"
@@ -3344,8 +3345,8 @@ do {
     }
     checkEqual(daemon.offsets[1], 0, "carried scroll settles out")
     checkEqual(
-        daemon.committedSlot(of: 0), IntPoint(312, 0),
-        "center holds after the reel"
+        daemon.committedSlot(of: 0), IntPoint(0, 0),
+        "anchor holds after the reel"
     )
 }
 
@@ -4895,6 +4896,42 @@ do {
         frames: live, viewport: viewport, focusedStyle: style
     )
     checkEqual(daemon.offsets[1], 0, "lone resize resets the offset")
+}
+
+// A full-viewport window scrolled off its owner hide-parks at the owner
+// edge instead of straddling onto the neighbouring display. The park
+// gate used to skip viewport-spanning windows, so in a single-column
+// (default_ratio 1.0) setup every leaving window glided next door on a
+// focus change.
+do {
+    var daemon = DaemonCore()
+    daemon.animationsEnabled = false
+    daemon.glideBaseMs = 0
+    daemon.workspaceRing = [1, 2]
+    let left = IntRect(0, 0, 1024, 768)
+    let right = IntRect(1024, 0, 2048, 768)
+    let views: [WorkspaceID: IntRect] = [1: left, 2: right]
+    let full: (Int32) -> IntRect? = { _ in
+        IntRect(min: IntPoint(0, 34), max: IntPoint(1024, 734))
+    }
+    _ = daemon.tick(
+        events: [.appeared(id: 0, workspace: 1), .focus(id: 0)],
+        frames: full, viewports: views, focusedStyle: style
+    )
+    // Natural swipe right moves the strip right, so the full-width window
+    // straddles onto the sibling display.
+    let shifted = daemon.tick(
+        events: [.swipe(delta: -0.5, fingers: 3)],
+        frames: full, viewports: views, focusedStyle: style
+    )
+    check(
+        shifted.axJobs.contains { $0.winID == 0 && $0.origin == IntPoint(1015, 34) },
+        "full-width window parks at the owner edge, not the sibling"
+    )
+    check(
+        !shifted.axJobs.contains { $0.winID == 0 && $0.origin == IntPoint(512, 34) },
+        "full-width window never keeps its off-viewport slot"
+    )
 }
 
 if failures == 0 {
