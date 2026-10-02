@@ -93,6 +93,13 @@ do {
     checkEqual(daemon.positions[1], IntPoint(400, 34), "mates stay unless grabbed")
     check(dragged.axJobs.contains { $0.winID == 0 }, "hand truth flows to AX")
     check(!dragged.quiescent, "drag tick works")
+    // Driving rung: the ring rides the committed slot (100,34) even
+    // though live glass still reports (0,34) — no lagging outline.
+    checkEqual(dragged.borderPlan.moved.map { $0.0 }, [0], "border tracks the driving slot")
+    check(
+        dragged.borderPlan.moved.first?.1 == CGRect(x: 100, y: 34, width: 400, height: 700),
+        "border sits on the slot, not stale glass (got \(dragged.borderPlan.moved.first?.1.debugDescription ?? "none"))"
+    )
 
     let released = daemon.tick(
         events: [.released],
@@ -101,13 +108,20 @@ do {
     )
     checkEqual(daemon.positions[0], IntPoint(0, 34), "release restores the slot")
     check(released.axJobs.contains { $0.winID == 0 }, "homing flows once")
+    // The ring jumps home with the slot on the release tick itself
+    // instead of trailing the glass for another frame.
+    checkEqual(released.borderPlan.moved.map { $0.0 }, [0], "border jumps home on release")
+    check(
+        released.borderPlan.moved.first?.1 == CGRect(x: 0, y: 34, width: 400, height: 700),
+        "released border sits on the home slot (got \(released.borderPlan.moved.first?.1.debugDescription ?? "none"))"
+    )
 
     let homing = daemon.tick(
         events: [],
         frames: frames(slots: [0: IntPoint(0, 34), 1: IntPoint(400, 34)]),
         viewport: viewport, focusedStyle: style
     )
-    checkEqual(homing.borderPlan.moved.map { $0.0 }, [0], "border rides the window home")
+    check(homing.borderPlan.isEmpty, "converged glass holds the ring steady")
     check(homing.axJobs.isEmpty, "no AX traffic while homing")
 
     let settled = daemon.tick(
@@ -116,6 +130,48 @@ do {
         viewport: viewport, focusedStyle: style
     )
     check(settled.quiescent, "post-release tick rests")
+}
+
+// Clamped rung: a denied write converges the sequence, so the ring falls
+// back to live glass instead of stranding on a slot the window rejects.
+do {
+    var daemon = DaemonCore()
+    _ = daemon.tick(
+        events: [.appeared(id: 0, workspace: 1), .appeared(id: 1, workspace: 1)],
+        frames: frames(slots: [0: IntPoint(0, 34), 1: IntPoint(400, 34)]),
+        viewport: viewport, focusedStyle: style
+    )
+    _ = daemon.tick(
+        events: [.focus(id: 0)],
+        frames: frames(slots: [0: IntPoint(0, 34), 1: IntPoint(400, 34)]),
+        viewport: viewport, focusedStyle: style
+    )
+    daemon.dragArmed = true
+    let dragged = daemon.tick(
+        events: [.dragMoved(id: 0, dx: 100)],
+        frames: frames(slots: [0: IntPoint(0, 34), 1: IntPoint(400, 34)]),
+        viewport: viewport, focusedStyle: style
+    )
+    checkEqual(dragged.borderPlan.moved.map { $0.0 }, [0], "driving ring tracks the slot")
+    guard let job = dragged.axJobs.first(where: { $0.winID == 0 }) else {
+        check(false, "drag issues an AX job to deny")
+        exit(1)
+    }
+    daemon.noteWriteFailed(0, seq: job.seq, epoch: job.epoch, frames: frames(slots: [0: IntPoint(0, 34), 1: IntPoint(400, 34)]))
+    // Hand off: an unarmed grab never chases, so no fresh intent re-arms
+    // the sequence and the denied state holds for the paint below.
+    daemon.dragArmed = false
+    let denied = daemon.tick(
+        events: [],
+        frames: frames(slots: [0: IntPoint(0, 34), 1: IntPoint(400, 34)]),
+        viewport: viewport, focusedStyle: style
+    )
+    // Glass never left (0,34): the ring returns there even though the
+    // model slot still reads (100,34).
+    check(
+        denied.borderPlan.moved.first?.1 == CGRect(x: 0, y: 34, width: 400, height: 700),
+        "denied ring hugs live glass (got \(denied.borderPlan.moved.first?.1.debugDescription ?? "none"))"
+    )
 }
 
 // Disappear removes everywhere and heals focus to a surviving neighbor.
@@ -1402,11 +1458,10 @@ do {
     checkEqual(daemon.lastWarpKind, "none:outside", "far void reports outside")
 }
 
-// Approach zone: 8px inside the ultrawide's left edge moving outward
-// evaluates as the edge (strict maps 1200-982 onto the builtin;
-// carry -15 lands at -6-15). Past 10px stays silent; stillness,
-// inward motion, and the immunity flag all stay silent; the direct
-// band ignores the flag.
+// Edge band only: the warp fires at the visual edge (1px band,
+// velocity-free). Former approach cases — interior pixels with outward
+// velocity — stay silent; band-jumping flings evaluate at the crossed
+// edge via `warpForMovement` instead.
 do {
     var daemon = DaemonCore()
     let builtin = IntRect(-1512, 0, 0, 982)
@@ -1414,41 +1469,33 @@ do {
     let steps = [builtin, wide]
     checkEqual(
         daemon.edgeWarpLanding(
-            cursor: IntPoint(8, 1200), displays: steps,
+            cursor: IntPoint(3, 1200), displays: steps,
             warpDirection: -1, yOffset: 0, velocityX: -500
-        ), IntPoint(-21, 218), "approach zone warps outward motion"
-    )
-    checkEqual(
-        daemon.lastWarpKind, "approach:primary", "approach landing reports its stage")
-    checkEqual(
-        daemon.edgeWarpLanding(
-            cursor: IntPoint(12, 1200), displays: steps,
-            warpDirection: -1, yOffset: 0, velocityX: -500
-        ), nil, "past 10px stays silent"
+        ), nil, "3px in stays silent even moving outward"
     )
     checkEqual(daemon.lastWarpKind, "none:interior", "outsider reports interior")
     checkEqual(
         daemon.edgeWarpLanding(
-            cursor: IntPoint(8, 1200), displays: steps,
+            cursor: IntPoint(2, 1200), displays: steps,
+            warpDirection: -1, yOffset: 0, velocityX: -500
+        ), nil, "2px in stays silent even moving outward"
+    )
+    checkEqual(daemon.lastWarpKind, "none:interior", "near-edge reports interior")
+    checkEqual(
+        daemon.edgeWarpLanding(
+            cursor: IntPoint(3, 1200), displays: steps,
             warpDirection: -1, yOffset: 0, velocityX: nil
-        ), nil, "stillness in the zone stays silent"
+        ), nil, "stillness in the old zone stays silent"
     )
     checkEqual(daemon.lastWarpKind, "none:interior", "stillness reports interior")
     checkEqual(
         daemon.edgeWarpLanding(
-            cursor: IntPoint(8, 1200), displays: steps,
+            cursor: IntPoint(3, 1200), displays: steps,
             warpDirection: -1, yOffset: 0, velocityX: 500
         ), nil, "inward motion stays silent"
     )
-    checkEqual(
-        daemon.edgeWarpLanding(
-            cursor: IntPoint(8, 1200), displays: steps,
-            warpDirection: -1, yOffset: 0, velocityX: -500,
-            approachAllowed: false
-        ), nil, "immunity suppresses the approach zone"
-    )
     // Direct band boundary: 1px fires with no velocity at all, while
-    // 2px out needs the approach (outward motion) to evaluate.
+    // 2px out stays silent even moving outward.
     checkEqual(
         daemon.edgeWarpLanding(
             cursor: IntPoint(1, 1200), displays: steps,
@@ -1459,14 +1506,13 @@ do {
         daemon.edgeWarpLanding(
             cursor: IntPoint(2, 1200), displays: steps,
             warpDirection: -1, yOffset: 0, velocityX: nil
-        ), nil, "2px out needs outward motion"
+        ), nil, "2px out stays silent"
     )
     checkEqual(
         daemon.edgeWarpLanding(
             cursor: IntPoint(1, 1200), displays: steps,
-            warpDirection: -1, yOffset: 0, velocityX: -500,
-            approachAllowed: false
-        ), IntPoint(-21, 218), "direct band ignores immunity"
+            warpDirection: -1, yOffset: 0, velocityX: -500
+        ), IntPoint(-21, 218), "band carries velocity into the landing"
     )
     checkEqual(daemon.lastWarpKind, "primary", "direct landing keeps its kind")
 }

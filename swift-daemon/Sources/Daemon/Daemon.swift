@@ -3401,7 +3401,25 @@ public struct DaemonCore: Sendable {
         focusedStyle: BorderStyle
     ) -> BorderSyncPlan {
         var desired: [(WindowID, CGRect, BorderStyle)] = []
-        if let focus, let frame = frames(focus) {
+        if let focus, let live = frames(focus) {
+            // Driving rung (Rust `border_frame_for` + `DriveTrust::Full`):
+            // while this window's writes still travel, paint the model's
+            // presented origin (`positions`: hand truth mid-drag, eased
+            // steps mid-glide) with live size. The glass converges there
+            // within a tick or two, while the stale live rect would leave
+            // the ring lagging behind for the whole glide (plus the host's
+            // roster lag after it). Acked or timed-out windows fall through
+            // to live glass (the clamped rung): a slot the glass will never
+            // reach must not wear the ring.
+            let frame: IntRect
+            if ax.unackedLive(focus), let pos = positions[focus] {
+                frame = IntRect(
+                    min: pos,
+                    max: IntPoint(pos.x + live.width, pos.y + live.height)
+                )
+            } else {
+                frame = live
+            }
             let cg = CGRect(
                 x: Double(frame.min.x), y: Double(frame.min.y),
                 width: Double(frame.width), height: Double(frame.height)
@@ -3416,8 +3434,8 @@ public struct DaemonCore: Sendable {
                 desired.append((focus, cg, focusedStyle))
             }
         }
-        // Present current borders in Cocoa coords 1:1 for the plan (the
-        // CG↔Cocoa flip happens at the presenter with the screen height).
+        // Tracked rects stay in live/AX space (y-down, padded truth);
+        // the CG↔Cocoa flip happens in the presenter at sync time.
         var current: [WindowID: BorderEntry] = [:]
         for (id, entry) in borders { current[id] = entry }
         let (plan, _) = planBorderSync(current: current, desired: desired)
@@ -3783,9 +3801,9 @@ public struct DaemonCore: Sendable {
     /// half-plane, then proportional mapping (fractional-height landings
     /// for stairs pairs the strict offset-preserving math cannot map),
     /// then clamped landings in the same order (uniform always-land).
-    /// Samples inside the 10px approach zone moving outward evaluate as
-    /// their edge (`approach:` kinds): mouse ballistics plus macOS
-    /// edge-slide mean the 2px band itself is rarely sampled on a push.
+    /// Only the 1px band itself evaluates: band-jumping flings are
+    /// caught at the crossed edge by `warpForMovement`, so no
+    /// anticipation zone is needed.
     /// Landings stay at the 6px inset so arrivals rest quiet.
     ///
     /// Loop breaker (`warpLoopAllow`/`warpLoopNote`, host-driven): N
@@ -3855,8 +3873,7 @@ public struct DaemonCore: Sendable {
 
     public mutating func edgeWarpLanding(
         cursor: IntPoint, displays: [IntRect],
-        warpDirection: Int16, yOffset: Int32, velocityX: Double? = nil,
-        approachAllowed: Bool = true
+        warpDirection: Int16, yOffset: Int32, velocityX: Double? = nil
     ) -> IntPoint? {
         guard displays.count >= 2,
               let gminX = displays.map({ $0.min.x }).min(),
@@ -3891,9 +3908,8 @@ public struct DaemonCore: Sendable {
             lastWarpKind = "none:outside"
             return nil
         }
-        var approached = false
         func kind(_ base: String) -> String {
-            (approached ? "approach:" : "") + (voidAnchored ? "void:\(base)" : base)
+            voidAnchored ? "void:\(base)" : base
         }
         let onLeftEdge: Bool
         let onRightEdge: Bool
@@ -3906,29 +3922,13 @@ public struct DaemonCore: Sendable {
             onLeftEdge = abs(clamped.x - current.min.x) < 2
             onRightEdge = abs(current.max.x - clamped.x) < 2
         }
-        // Approach zone: fast movers headed outward from near (not in)
-        // the 2px band — mouse ballistics plus macOS edge-slide mean the
-        // band itself is rarely sampled on a push. Snap the decision to
-        // the edge; landings stay at the 6px inset so arrivals rest
-        // quiet (no ping-pong without moving the inset). Stillness
-        // (nil velocity) never fires: no direction, no intent.
-        let evalLeft: Bool
-        let evalRight: Bool
-        if onLeftEdge || onRightEdge {
-            evalLeft = onLeftEdge
-            evalRight = onRightEdge
-        } else if approachAllowed,
-                  let v = velocityX, v != 0,
-                  clamped.x >= current.min.x, clamped.x < current.max.x
-        {
-            // Interior cursor within 10px of an edge, moving outward.
-            evalLeft = clamped.x - current.min.x <= 10 && v < 0
-            evalRight = current.max.x - clamped.x <= 10 && v > 0
-            approached = evalLeft || evalRight
-        } else {
-            evalLeft = false
-            evalRight = false
-        }
+        // Edge band only (1px): the warp fires at the visual edge,
+        // never from inside the display. Band-jumping flings evaluate at
+        // the crossed edge via `warpForMovement`; landings stay at the 6px
+        // inset so arrivals rest quiet (no ping-pong without moving the
+        // inset). Velocity only feeds landing carry, never the trigger.
+        let evalLeft = onLeftEdge
+        let evalRight = onRightEdge
         guard evalLeft || evalRight else {
             lastWarpKind = voidAnchored ? "void:interior" : "none:interior"
             return nil
@@ -4092,8 +4092,7 @@ public struct DaemonCore: Sendable {
     /// a quiet direct miss so the verdict stays diagnosable.
     public mutating func warpForMovement(
         prev: IntPoint, prevAge: Double, cur: IntPoint, displays: [IntRect],
-        warpDirection: Int16, yOffset: Int32, velocityX: Double? = nil,
-        approachAllowed: Bool = true
+        warpDirection: Int16, yOffset: Int32, velocityX: Double? = nil
     ) -> IntPoint? {
         lastCrossPoint = nil
         var crossKind: String?
@@ -4103,8 +4102,7 @@ public struct DaemonCore: Sendable {
             lastCrossPoint = cross.at
             if let landing = edgeWarpLanding(
                 cursor: cross.at, displays: displays,
-                warpDirection: warpDirection, yOffset: yOffset, velocityX: velocityX,
-                approachAllowed: approachAllowed
+                warpDirection: warpDirection, yOffset: yOffset, velocityX: velocityX
             ) {
                 return landing
             }
@@ -4112,8 +4110,7 @@ public struct DaemonCore: Sendable {
         }
         guard let landing = edgeWarpLanding(
             cursor: cur, displays: displays,
-            warpDirection: warpDirection, yOffset: yOffset, velocityX: velocityX,
-            approachAllowed: approachAllowed
+            warpDirection: warpDirection, yOffset: yOffset, velocityX: velocityX
         ) else {
             if let crossKind, lastWarpKind != "none:seam", lastWarpKind != "none:nomap",
                crossKind == "none:seam" || crossKind == "none:nomap"

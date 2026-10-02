@@ -2082,21 +2082,11 @@ nonisolated(unsafe) var lastWarpEval = Date.distantPast
     // behaves natively instead of teleport-spamming the same spot.
     let nowMs = UInt64(now.timeIntervalSince1970 * 1000)
     guard core.warpLoopAllow(cursor: cursor, nowMs: nowMs) else { return }
-    let clearOfLanding: Bool = {
-        guard let pt = lastWarpLandingPt,
-              tickCount - lastWarpLandingTick < warpLandingPtTTLTicks
-        else { return true }
-        return abs(cursor.x - pt.x) > warpApproachRadiusPx
-            || abs(cursor.y - pt.y) > warpApproachRadiusPx
-    }()
-    let approachOK = Date().timeIntervalSince(lastWarpAt) > warpApproachImmunitySecs
-        && clearOfLanding
     guard let landing = core.warpForMovement(
         prev: prev, prevAge: dt, cur: cursor, displays: fullDisplayFrames(),
         warpDirection: warp,
         yOffset: resolved.horizontalMouseWarpOffset,
-        velocityX: velocityX,
-        approachAllowed: approachOK
+        velocityX: velocityX
     ) else {
         // Name the killer branch on edge-adjacent misses (seam vs nomap):
         // interior/lone/outside samples are the common quiet case.
@@ -2130,9 +2120,6 @@ nonisolated(unsafe) var lastWarpEval = Date.distantPast
     }
     warpMouse(to: CGPoint(x: Double(landing.x), y: Double(landing.y)))
     lastWarpSample = (landing, now)
-    lastWarpAt = now
-    lastWarpLandingPt = landing
-    lastWarpLandingTick = tickCount
     lastWarpMissLine = ""
     if core.warpLoopNote(landing: landing, nowMs: nowMs) {
         print("mouse: warp loop suspected —"
@@ -2531,20 +2518,6 @@ nonisolated(unsafe) var axGrantTrusted = true
 /// Last printed near-edge warp-miss footprint (transition-printed:
 /// a dwelling cursor repeats one line instead of spamming per poll).
 nonisolated(unsafe) var lastWarpMissLine = ""
-/// Last warp landing time: approach-zone evaluations rest for 350ms
-/// after a landing so post-arrival jitter can't bounce straight back.
-/// Direct-band dwells are unaffected (a deliberate hold still warps).
-nonisolated(unsafe) var lastWarpAt = Date.distantPast
-/// Approach-zone immunity window after a landing.
-let warpApproachImmunitySecs = 0.35
-/// Last warp landing point + tick: approach evaluations inside 30px
-/// stay suppressed even past the time window (arrival jitter lives
-/// there); genuine pushes leave the radius. Stale points evaporate
-/// after a minute so old landings never strand future pushes.
-nonisolated(unsafe) var lastWarpLandingPt: IntPoint?
-nonisolated(unsafe) var lastWarpLandingTick = 0
-let warpApproachRadiusPx: Int32 = 30
-let warpLandingPtTTLTicks = 3600
 /// Follow-warp timestamps (ms, pruned to the window): more than
 /// `followWarpTripCount` follow warps inside `followWarpTripWindowMs`
 /// suppress further follow warps until quiet. The identical-landing
