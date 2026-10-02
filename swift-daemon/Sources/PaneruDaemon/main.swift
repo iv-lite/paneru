@@ -2203,22 +2203,42 @@ nonisolated(unsafe) var lastWarpEval = Date.distantPast
           Date().timeIntervalSince(tap.lastSwipe) >= mouseFollowSwipeQuiet,
           restorePlanner == nil
     else { return }
-    if resolved.focusFollowsMouse,
-       let hovered = core.hoverFocusTarget(
-            frontToBack: (onScreenWindowIDs() ?? []).map { windowID($0) },
-            focusable: Set(core.strips.values.flatMap {
-                $0.values.flatMap { $0.allWindows }
-            })
-            .subtracting(minimizedWindows)
-            .subtracting(stashedMembers),
-            frames: { roster[CGWindowID(bitPattern: $0)]?.frame },
-            cursor: cursor
-        ), hovered != core.focus,
-       hoverStripRested(hovered)
-    {
-        lastHoverID = hovered
+    guard resolved.focusFollowsMouse else { return }
+    let hovered = core.hoverFocusTarget(
+        frontToBack: (onScreenWindowIDs() ?? []).map { windowID($0) },
+        focusable: Set(core.strips.values.flatMap {
+            $0.values.flatMap { $0.allWindows }
+        })
+        .subtracting(minimizedWindows)
+        .subtracting(stashedMembers),
+        frames: { roster[CGWindowID(bitPattern: $0)]?.frame },
+        cursor: cursor
+    )
+    // Motion-gated decision: a still cursor must never re-focus the window
+    // under it, or it undoes keyboard focus and mouse-follows-focus warps on
+    // the next tick. A hover the rest gate defers is remembered and retried
+    // on later polls, so a hover that arrives mid-glide still lands.
+    if moved {
+        if let hovered, hovered != core.focus {
+            if hoverStripRested(hovered) {
+                hoverPendingID = nil
+                lastHoverID = hovered
+                lastHoverAt = Date()
+                pending.append(.focus(id: hovered))
+            } else {
+                hoverPendingID = hovered
+            }
+        } else {
+            hoverPendingID = nil
+        }
+        return
+    }
+    // Still cursor: only a deferred hover retries (never a fresh decision).
+    if let id = hoverPendingID, id != core.focus, hoverStripRested(id) {
+        hoverPendingID = nil
+        lastHoverID = id
         lastHoverAt = Date()
-        pending.append(.focus(id: hovered))
+        pending.append(.focus(id: id))
     }
 }
 
@@ -2517,6 +2537,9 @@ nonisolated(unsafe) var prevMffFocus: WindowID?
 /// fresh hover never warp — Rust's skip-reshuffle generation, host-side.
 nonisolated(unsafe) var lastHoverID: WindowID?
 nonisolated(unsafe) var lastHoverAt = Date.distantPast
+/// Hover the rest gate deferred (cursor moved onto a traveling strip):
+/// retried on later polls once the strip rests, without needing new motion.
+nonisolated(unsafe) var hoverPendingID: WindowID?
 /// Session persistence dirtied since the last save (Rust 30s
 /// dirty-gated cadence, simplified: any busy tick or focus/row/
 /// roster drift marks it; the interval below does the write).

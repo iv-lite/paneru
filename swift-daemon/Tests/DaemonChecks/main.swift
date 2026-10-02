@@ -4518,7 +4518,8 @@ do {
 }
 
 // Seam jump-cut: a glide leg spanning two displays lands instead of
-// sliding glass across the neighbor mid-flight.
+// sliding glass across the neighbor mid-flight. A cross-display move also
+// maximizes the window for the destination.
 do {
     var daemon = DaemonCore()
     daemon.workspaceRing = [1, 2]
@@ -4531,13 +4532,19 @@ do {
         viewports: views, focusedStyle: style
     )
     checkEqual(daemon.positions[0], IntPoint(0, 34), "transfer source starts settled")
-    _ = daemon.tick(
+    let moved = daemon.tick(
         events: [.command(.window(.toNextDisplay(.follow)))],
         frames: frames(slots: [0: IntPoint(0, 34)]),
         viewports: views, focusedStyle: style
     )
-    checkEqual(daemon.committedSlot(of: 0), IntPoint(1024, 34), "transfer slots on the new display")
-    checkEqual(daemon.positions[0], IntPoint(1024, 34), "cross-display leg snaps instead of gliding")
+    check(
+        moved.axJobs.contains { $0.winID == 0 && $0.size == IntSize(1024, 768) },
+        "cross-display move maximizes for the destination"
+    )
+    checkEqual(daemon.committedSlot(of: 0), IntPoint(1024, 0), "transfer slots maximized on the new display")
+    checkEqual(daemon.positions[0], IntPoint(1024, 0), "cross-display leg snaps instead of gliding")
+    checkEqual(daemon.focus, 0, "follow keeps focus on the moved window")
+    checkEqual(daemon.activeWorkspace, 2, "follow retargets the active display")
 }
 
 // A partly-visible window is left in place: the strip scrolls rigidly, so
@@ -5003,6 +5010,43 @@ do {
     }
     check(pulledBack, "relocated parked window is pulled back to its park")
     check(!sentToSibling, "a parked window is never sent to its off-viewport slot")
+}
+
+// Focus reveal glides the strip and every column advances together (the
+// offset eases, never snaps, and all slots shift by the same delta).
+do {
+    var daemon = DaemonCore()
+    let vp = IntRect(0, 0, 900, 768)
+    let live = frames(slots: [
+        0: IntPoint(0, 34), 1: IntPoint(400, 34), 2: IntPoint(800, 34),
+    ])
+    _ = daemon.tick(
+        events: [
+            .appeared(id: 0, workspace: 1), .appeared(id: 1, workspace: 1),
+            .appeared(id: 2, workspace: 1), .focus(id: 0),
+        ],
+        frames: live, viewport: vp, focusedStyle: style
+    )
+    _ = daemon.tick(
+        events: [.focus(id: 2)], frames: live, viewport: vp, focusedStyle: style
+    )
+    let target = daemon.offsetTarget(for: 1)
+    check(target != 0, "focus reveal arms a scroll")
+    let slotsBefore = [0, 1, 2].map { daemon.committedSlot(of: $0)?.x ?? 0 }
+    _ = daemon.tick(events: [], frames: live, viewport: vp, focusedStyle: style)
+    let mid = daemon.offsets[1] ?? 0
+    let slotsAfter = [0, 1, 2].map { daemon.committedSlot(of: $0)?.x ?? 0 }
+    let deltas = (0..<3).map { slotsAfter[$0] - slotsBefore[$0] }
+    check(mid != target, "offset eases rather than snapping")
+    check(
+        deltas[0] == deltas[1] && deltas[1] == deltas[2] && deltas[0] != 0,
+        "every column advances together during the glide"
+    )
+    for _ in 0..<40 {
+        _ = daemon.tick(events: [], frames: live, viewport: vp, focusedStyle: style)
+    }
+    checkEqual(daemon.offsets[1], target, "offset settles on the target")
+    checkEqual(daemon.offsetTarget(for: 1), target, "target holds after settling")
 }
 
 if failures == 0 {

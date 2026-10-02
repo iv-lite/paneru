@@ -1735,11 +1735,9 @@ public struct DaemonCore: Sendable {
     }
 
     /// Move the focused window's whole column to the neighboring display
-    /// workspace (spatial ring, wrapping), preserving its width ratio and
-    /// clamping into the target viewport — mirrors the Rust ring move
-    /// (`adjacent` + width-ratio + `clamp_size_to_viewport`). `follow`
-    /// retargets the active workspace; `stay` leaves focus behind on the
-    /// source display.
+    /// workspace (spatial ring, wrapping). The moved window is maximized
+    /// to the destination viewport (ratio 1.0); `follow` also focuses it
+    /// there, while `stay` leaves focus behind on the source display.
     private mutating func moveFocusedToDisplay(
         next: Bool, follow: MoveFocus,
         frames: (WindowID) -> IntRect?,
@@ -1758,7 +1756,6 @@ public struct DaemonCore: Sendable {
         guard target != activeWorkspace else { return }
         let sourceWS = activeWorkspace
         let sourceRow = activeVirtual[sourceWS] ?? 0
-        let sourceViewport = viewport(for: activeWorkspace, in: viewports)
         let targetViewport = viewport(for: target, in: viewports)
         var source = activeStrip()
         guard let index = source.index(of: id),
@@ -1773,13 +1770,13 @@ public struct DaemonCore: Sendable {
         // drops (see `insertMovedColumn` / `dropSlot`).
         destination.insertColumn(at: Int.max, column)
         strips[target, default: [:]][row] = destination
-        // Width ratio survives the trip, clamped into the new display.
-        if let frame = frames(id), sourceViewport.width > 0 {
-            let ratio = Double(frame.width) / Double(max(sourceViewport.width, 1))
-            let width = min(max(Int32((ratio * Double(max(targetViewport.width, 1))).rounded()), 1), max(targetViewport.width, 1))
-            setModelWidth(id, width)
-            enqueueResize(id, to: IntSize(width, frame.height), epoch: epoch)
-        }
+        // Maximize for the destination display: fill its viewport at
+        // ratio 1.0 (the source ratio does not carry across displays).
+        fullWidth[id] = 1.0
+        setModelWidth(id, targetViewport.width)
+        enqueueResize(
+            id, to: IntSize(targetViewport.width, targetViewport.height), epoch: epoch
+        )
         if follow == .follow {
             activeWorkspace = target
             // Refocus + reveal the moved window even though model focus
