@@ -767,6 +767,7 @@ nonisolated(unsafe) var stableFrames: [CGWindowID: IntRect] = [:]
         if isFullscreen, !fullscreenFloated.contains(id), !core.unmanaged.contains(id) {
             fullscreenFloated.insert(id)
             pending.append(.command(.layout([.setFloating(window: id, floating: true)])))
+            print("fullscreen: window=\(id) enter")
         } else if !isFullscreen, fullscreenFloated.contains(id) {
             fullscreenFloated.remove(id)
             let meta = core.windowMetadata[id]
@@ -775,6 +776,15 @@ nonisolated(unsafe) var stableFrames: [CGWindowID: IntRect] = [:]
             )
             if !rules.contains(where: { $0.floating }) {
                 pending.append(.command(.layout([.setFloating(window: id, floating: false)])))
+                // Returning to the strip: the model focus id is unchanged,
+                // but the keyboard focus is still on the departed
+                // fullscreen app — re-assert it on the re-tiled window
+                // (setFocus alone is a no-op on the same id).
+                if core.focus != id {
+                    pending.append(.focus(id: id))
+                }
+                core.refocusTouch(id)
+                print("fullscreen: window=\(id) leave focus=\(core.focus.map(String.init) ?? "-")")
                 // Re-tiled inside the restore window: like a fresh
                 // adoption, it may still have a saved slot waiting
                 // (first probes often misreport fullscreen, e.g. on
@@ -2174,13 +2184,20 @@ nonisolated(unsafe) var lastWarpEval = Date.distantPast
 /// drags, fresh swipes, and the restore window all hold (a teleported
 /// cursor skips hover until the next motion).
 @Sendable func pollPointer(viewports: [WorkspaceID: IntRect]) {
-    guard tap.lastMouseMovedAt > lastPointerPoll else { return }
-    lastPointerPoll = Date()
     guard let cursor = tickCursor() else { return }
-    // Shadow never warps (the evaluation only feeds warps); hover focus
-    // below still runs so arrivals replicate.
-    if !shadowMode {
-        checkWarp(cursor: cursor)
+    // Edge warp stays movement-gated (a still cursor at the edge must not
+    // warp repeatedly). Hover focus is evaluated on every poll regardless:
+    // gating it on motion dropped a hover that arrived while the strip was
+    // mid-glide and never retried it once the cursor held still — the
+    // "sometimes focus-follows-mouse doesn't fire" symptom.
+    let moved = tap.lastMouseMovedAt > lastPointerPoll
+    if moved {
+        lastPointerPoll = Date()
+        // Shadow never warps (the evaluation only feeds warps); hover focus
+        // below still runs so arrivals replicate.
+        if !shadowMode {
+            checkWarp(cursor: cursor)
+        }
     }
     guard !tap.leftButtonHeld,
           Date().timeIntervalSince(tap.lastSwipe) >= mouseFollowSwipeQuiet,
@@ -3419,7 +3436,13 @@ let perfSlowTickMs = 8.0
         )
     }
     if let prev = prevActiveWS, prev != core.activeWorkspace {
-        if result.focus == nil,
+        // A strip focus belongs to the active workspace; a nil focus or one
+        // sitting on a floating/fullscreen window (e.g. returning from a
+        // native-fullscreen app) does not, so re-assert the last-managed
+        // strip window there.
+        let focusOnStrip =
+            result.focus.flatMap { workspaceOfWindow($0) } == core.activeWorkspace
+        if !focusOnStrip,
            let last = focusHistory.lastManaged(workspace: core.activeWorkspace)
                ?? focusHistory.lastFloating(workspace: core.activeWorkspace),
            workspaceOfWindow(last) == core.activeWorkspace

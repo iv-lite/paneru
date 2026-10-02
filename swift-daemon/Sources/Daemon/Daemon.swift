@@ -1510,6 +1510,17 @@ public struct DaemonCore: Sendable {
         fullWidth[id] != nil
     }
 
+    /// Force an actuate + reveal for `id` even when the focus id is
+    /// unchanged (one-shot `refocus`). Used when returning from a
+    /// native-fullscreen app: the model focus is still the window, but
+    /// the keyboard focus sits on the departed fullscreen app, so the
+    /// strip window must be re-asserted without a focus change event.
+    public mutating func refocusTouch(_ id: WindowID) {
+        focusTouch = id
+        transferReveals.insert(id)
+        dirty.formUnion([.focus, .paint])
+    }
+
     /// Toggle full-viewport sizing, remembering the width ratio for the way
     /// back. Turning on first unstacks, then parks the strip so the window
     /// lands on the viewport's left edge.

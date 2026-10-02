@@ -64,7 +64,7 @@ final class BorderPool {
                 }
                 entries[item.id] = entry
             } else {
-                let window = Screens.makeOverlayWindow(frame: cocoa)
+                let window = Screens.makeOverlayWindow(frame: cocoa, level: Screens.borderLevel)
                 let view = NSView(frame: NSRect(origin: .zero, size: cocoa.size))
                 view.wantsLayer = true
                 window.contentView = view

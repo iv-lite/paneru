@@ -60,8 +60,15 @@ enum Screens {
         a.maxX > b.minX && b.maxX > a.minX && a.maxY > b.minY && b.maxY > a.minY
     }
 
+    /// Overlay windows default to `.floating` (dim, flash, drop preview —
+    /// they must draw above app windows). Borders pass a level *below*
+    /// normal so app windows, including managed floating windows, render
+    /// above the focused window's ring instead of the ring bleeding over
+    /// them; the ring still shows in the gap outside the glass.
     @MainActor
-    static func makeOverlayWindow(frame: NSRect) -> NSWindow {
+    static func makeOverlayWindow(
+        frame: NSRect, level: NSWindow.Level = .floating
+    ) -> NSWindow {
         let window = NSWindow(
             contentRect: frame,
             styleMask: .borderless,
@@ -72,10 +79,17 @@ enum Screens {
         window.backgroundColor = .clear
         window.ignoresMouseEvents = true
         window.hasShadow = false
-        window.level = .floating
+        window.level = level
         window.collectionBehavior = [
             .transient, .ignoresCycle, .canJoinAllSpaces, .stationary, .fullScreenNone,
         ]
         return window
     }
+
+    /// Level for per-window border windows: just under normal app windows,
+    /// so a floating window over the focused one is never overdrawn by the
+    /// ring.
+    static let borderLevel = NSWindow.Level(
+        rawValue: NSWindow.Level.normal.rawValue - 1
+    )
 }

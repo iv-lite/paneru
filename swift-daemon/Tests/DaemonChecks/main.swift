@@ -3204,14 +3204,38 @@ do {
         daemon.committedSlot(of: 0), IntPoint(0, 34),
         "unmarked narrow lone stays left"
     )
-    _ = daemon.tick(
+    let maximized = daemon.tick(
         events: [.command(.window(.fullWidth))],
         frames: live, viewport: viewport, focusedStyle: style
+    )
+    check(
+        maximized.axJobs.contains { $0.winID == 0 && $0.size == IntSize(1024, 768) },
+        "maximize requests the full viewport (ratio 1.0)"
     )
     checkEqual(
         daemon.committedSlot(of: 0), IntPoint(0, 0),
         "maximize anchors a lone column at the origin, top-aligns full height"
     )
+}
+
+// Returning from a native-fullscreen app: the model focus id is unchanged
+// but the keyboard focus must be re-asserted on the strip window. The
+// core exposes a force-actuation that surfaces as `refocus` for the host.
+do {
+    var daemon = DaemonCore()
+    daemon.animationsEnabled = false
+    daemon.glideBaseMs = 0
+    _ = daemon.tick(
+        events: [.appeared(id: 0, workspace: 1), .focus(id: 0)],
+        frames: frames(slots: [0: IntPoint(0, 34)]),
+        viewport: viewport, focusedStyle: style
+    )
+    daemon.refocusTouch(0)
+    let back = daemon.tick(
+        events: [], frames: frames(slots: [0: IntPoint(0, 34)]),
+        viewport: viewport, focusedStyle: style
+    )
+    checkEqual(back.refocus, 0, "refocusTouch forces actuation on return")
 }
 
 // Stairs of 3 reachability: outer endpoints wrap around the row
