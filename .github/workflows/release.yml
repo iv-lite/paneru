@@ -30,9 +30,6 @@ jobs:
     timeout-minutes: 60
     steps:
       - uses: actions/checkout@v4
-      - uses: swift-actions/setup-swift@v2
-        with:
-          swift-version: "latest"
       - name: Show Swift version
         run: swift --version
       - name: Build the Swift package
@@ -69,9 +66,6 @@ jobs:
     if: startsWith(github.ref, 'refs/tags/v') || github.event_name == 'workflow_dispatch'
     steps:
       - uses: actions/checkout@v4
-      - uses: swift-actions/setup-swift@v2
-        with:
-          swift-version: "latest"
       - name: Show Swift version
         run: swift --version
 

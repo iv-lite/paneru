@@ -1943,12 +1943,14 @@ public struct DaemonCore: Sendable {
     private func columnWidth(
         _ column: LayoutColumn, frames: (WindowID) -> IntRect?
     ) -> Int32? {
-        // Hug the window's actual width so a shrunken column narrows with
-        // it (a stale/wide model left the window floating in an oversized
-        // column — whitespace on both sides). The model is a fallback only
-        // when the frame is unreadable; `sizes` covers a never-read column.
-        column.windows.compactMap { frames($0)?.width }.max()
-            ?? column.windows.compactMap { modelWidths[$0] }.max()
+        // Model-driven pitch: the column's intended tile width, kept
+        // stable across a resize so neighbours never overlap it. The
+        // model **adopts the live width** once a resize converges or is
+        // given up on (see `applySize`), so a settled/clamped window is
+        // hugged exactly (no oversized column) while a mid-resize column
+        // stays at its intent (no transient overlap).
+        column.windows.compactMap { modelWidths[$0] }.max()
+            ?? column.windows.compactMap { frames($0)?.width }.max()
             ?? column.windows.compactMap { sizes[$0]?.x }.max()
     }
 
@@ -2973,8 +2975,17 @@ public struct DaemonCore: Sendable {
                             offsetTargets[ws] = 0
                         }
                     } else if lone && centerSingleColumn && colW < home.width {
+                        // A fitting lone column never scrolls: center it
+                        // exactly and reel any carried offset home (an
+                        // offset here shifted the column off-center,
+                        // leaving an uneven gap on one side).
                         colX = home.min.x + (home.width - colW) / 2
-                            + (offsets[ws] ?? 0)
+                        if offsets[ws] != 0 {
+                            offsets[ws] = 0
+                        }
+                        if offsetTargets[ws] != 0 {
+                            offsetTargets[ws] = 0
+                        }
                     } else {
                         colX = x
                     }
@@ -3565,6 +3576,9 @@ public struct DaemonCore: Sendable {
             sizes[member] = target
             sizeStreak[member] = 0
             lastSizeRedrive.removeValue(forKey: member)
+            // Converged: adopt the app's width as the tile so the column
+            // hugs the window exactly (no oversized column, no overlap).
+            modelWidths[member] = live.width
             return
         }
         if sizes[member] == target {
@@ -3574,6 +3588,16 @@ public struct DaemonCore: Sendable {
             // writes fire. Fresh targets below still send once.
             guard auditParkedLive[member] == nil else { return }
             let streak = sizeStreak[member, default: 0]
+            if streak >= 5 {
+                // Chronic clamp (app can't reach the tile): give up and
+                // adopt the actual width as the model so the column hugs
+                // it instead of leaving a permanent oversized gap.
+                modelWidths[member] = live.width
+                sizes[member] = IntSize(live.width, live.height)
+                sizeStreak[member] = 0
+                lastSizeRedrive.removeValue(forKey: member)
+                return
+            }
             let cooldown = redriveCooldownEpochs << min(streak, 4)
             let last = lastSizeRedrive[member]
             // First repeat fires immediately (moves do the same):

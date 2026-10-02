@@ -4660,6 +4660,8 @@ do {
     var daemon = DaemonCore()
     daemon.animationsEnabled = false
     daemon.glideBaseMs = 0
+    // Non-maximize: an app-driven resize is adopted (pitch follows it).
+    daemon.maximizeTiledWindows = false
     let wide = IntRect(0, 0, 1200, 768)
     _ = daemon.tick(
         events: [
@@ -4670,30 +4672,27 @@ do {
         viewports: [1: wide], focusedStyle: style
     )
     checkEqual(daemon.committedSlot(of: 1), IntPoint(400, 34), "second column abuts")
-    // App shrinks its own glass to 300: pitch hugs it.
-    _ = daemon.tick(
-        events: [],
-        frames: { id in
-            let w: Int32 = id == 0 ? 300 : 400
-            let x: Int32 = id == 0 ? 0 : (id == 1 ? 400 : 800)
-            return IntRect(min: IntPoint(x, 0), max: IntPoint(x + w, 700))
-        },
-        viewports: [1: wide], focusedStyle: style
-    )
+    // App shrinks its own glass to 300: pitch hugs it (the model adopts
+    // the settled width; one tick to adopt, one to lay out).
+    let shrunk: (Int32) -> IntRect? = { id in
+        let w: Int32 = id == 0 ? 300 : 400
+        let x: Int32 = id == 0 ? 0 : (id == 1 ? 400 : 800)
+        return IntRect(min: IntPoint(x, 0), max: IntPoint(x + w, 700))
+    }
+    _ = daemon.tick(events: [], frames: shrunk, viewports: [1: wide], focusedStyle: style)
+    _ = daemon.tick(events: [], frames: shrunk, viewports: [1: wide], focusedStyle: style)
     checkEqual(
         daemon.committedSlot(of: 1), IntPoint(300, 34),
         "downstream column hugs the shrunken glass"
     )
     // App grows to 500: pitch follows up too.
-    _ = daemon.tick(
-        events: [],
-        frames: { id in
-            let w: Int32 = id == 0 ? 500 : 400
-            let x: Int32 = id == 0 ? 0 : (id == 1 ? 400 : 800)
-            return IntRect(min: IntPoint(x, 0), max: IntPoint(x + w, 700))
-        },
-        viewports: [1: wide], focusedStyle: style
-    )
+    let grown: (Int32) -> IntRect? = { id in
+        let w: Int32 = id == 0 ? 500 : 400
+        let x: Int32 = id == 0 ? 0 : (id == 1 ? 400 : 800)
+        return IntRect(min: IntPoint(x, 0), max: IntPoint(x + w, 700))
+    }
+    _ = daemon.tick(events: [], frames: grown, viewports: [1: wide], focusedStyle: style)
+    _ = daemon.tick(events: [], frames: grown, viewports: [1: wide], focusedStyle: style)
     checkEqual(
         daemon.committedSlot(of: 1), IntPoint(500, 34),
         "upward live change widens the column"
@@ -4920,8 +4919,9 @@ do {
     )
 }
 
-// A lone column never scrolls: shrinking it resets the offset instead of
-// shifting it (which fought the centering and bounced the window).
+// A lone centered column never scrolls: a swipe offset is reeled home
+// immediately, and the column stays exactly centered through a shrink
+// (no uneven left/right gap).
 do {
     var daemon = DaemonCore()
     daemon.animationsEnabled = false
@@ -4932,16 +4932,21 @@ do {
         events: [.appeared(id: 0, workspace: 1), .focus(id: 0)],
         frames: live, viewport: viewport, focusedStyle: style
     )
+    checkEqual(daemon.committedSlot(of: 0), IntPoint(312, 34), "lone narrow column centers")
     _ = daemon.tick(
         events: [.swipe(delta: -0.2, fingers: 3)],
         frames: live, viewport: viewport, focusedStyle: style
     )
-    check(daemon.offsets[1] != 0, "offset carried before resize")
+    checkEqual(daemon.offsets[1], 0, "lone centered column ignores swipe scroll")
+    checkEqual(
+        daemon.committedSlot(of: 0), IntPoint(312, 34),
+        "lone centered column stays centered after a swipe"
+    )
     _ = daemon.tick(
         events: [.command(.window(.resize(.shrink)))],
         frames: live, viewport: viewport, focusedStyle: style
     )
-    checkEqual(daemon.offsets[1], 0, "lone resize resets the offset")
+    checkEqual(daemon.offsets[1], 0, "lone resize keeps the offset at zero")
 }
 
 // A full-viewport window scrolled fully off its owner hide-parks at the
@@ -5061,6 +5066,47 @@ do {
     }
     checkEqual(daemon.offsets[1], target, "offset settles on the target")
     checkEqual(daemon.offsetTarget(for: 1), target, "target holds after settling")
+}
+
+// Tiled columns never overlap: through a whole focus glide, every pair of
+// co-visible presented frames stays disjoint (the model lays them out
+// adjacent at their pitch). Catches a regression that lets a member
+// exceed its slot or a pitch lag behind the glass.
+do {
+    var daemon = DaemonCore()
+    let vp = IntRect(0, 0, 900, 768)
+    let ids: [Int32] = [0, 1, 2]
+    let live = frames(slots: [
+        0: IntPoint(0, 34), 1: IntPoint(400, 34), 2: IntPoint(800, 34),
+    ])
+    _ = daemon.tick(
+        events: [
+            .appeared(id: 0, workspace: 1), .appeared(id: 1, workspace: 1),
+            .appeared(id: 2, workspace: 1), .focus(id: 0),
+        ],
+        frames: live, viewport: vp, focusedStyle: style
+    )
+    _ = daemon.tick(
+        events: [.focus(id: 2)], frames: live, viewport: vp, focusedStyle: style
+    )
+    for _ in 0..<30 {
+        _ = daemon.tick(events: [], frames: live, viewport: vp, focusedStyle: style)
+        let visible: [IntRect] = ids.compactMap { id in
+            guard let p = daemon.positions[id] else { return nil }
+            let f = IntRect(min: p, max: IntPoint(p.x + 400, p.y + 700))
+            let inter = f.intersected(with: vp)
+            return inter.width > 0 && inter.height > 0 ? f : nil
+        }
+        for i in visible.indices {
+            for j in visible.indices where j > i {
+                let inter = visible[i].intersected(with: visible[j])
+                check(
+                    !(inter.width > 1 && inter.height > 1),
+                    "co-visible tiled columns must not overlap"
+                )
+            }
+        }
+    }
 }
 
 if failures == 0 {
