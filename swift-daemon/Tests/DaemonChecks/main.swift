@@ -4362,6 +4362,154 @@ do {
     )
 }
 
+// Hide-parking: shown-row members scrolled fully off their owner
+// viewport onto a sibling display hide-park just off the owner edge
+// (one invisible glass pixel) instead of bleeding next door. Model
+// slots survive; scroll-back resumes them with one intent. Slots in a
+// void (stairs gaps) and off-union bogus slots keep old behavior.
+do {
+    var daemon = DaemonCore()
+    daemon.animationsEnabled = false
+    daemon.glideBaseMs = 0
+    daemon.offscreenSliverWidth = 9
+    let left = IntRect(0, 0, 800, 600)
+    let right = IntRect(800, 0, 1600, 600)
+    let views: [WorkspaceID: IntRect] = [1: left, 2: right]
+    let r1 = daemon.tick(
+        events: [.appeared(id: 0, workspace: 1), .appeared(id: 1, workspace: 1), .appeared(id: 2, workspace: 1)],
+        frames: frames(slots: [0: IntPoint(0, 0), 1: IntPoint(400, 0), 2: IntPoint(800, 0)]),
+        viewports: views, focusedStyle: style
+    )
+    // Window 2 slots exactly past the owner edge (800 >= 800) onto the
+    // sibling viewport: its presented target hide-parks at the owner
+    // right edge while the model slot stays put.
+    check(
+        r1.axJobs.contains(where: { $0.winID == 2 && $0.origin == IntPoint(791, 0) }),
+        "offscreen member parks a right sliver"
+    )
+    checkEqual(daemon.positions[2], IntPoint(791, 0), "presented truth parks")
+    checkEqual(daemon.committedSlot(of: 2), IntPoint(800, 0), "model slot survives parking")
+
+    // Focusing window 2 scrolls the strip left and resumes its slot.
+    let r2 = daemon.tick(
+        events: [.focus(id: 2)],
+        frames: frames(slots: [0: IntPoint(0, 0), 1: IntPoint(400, 0), 2: IntPoint(791, 0)]),
+        viewports: views, focusedStyle: style
+    )
+    checkEqual(r2.focus, 2, "focus lands on the edge window")
+    checkEqual(daemon.positions[2], IntPoint(400, 0), "revealed member resumes its slot")
+    checkEqual(daemon.committedSlot(of: 2), IntPoint(400, 0), "resumed slot stays modeled")
+
+    // Let the strip rest: minimal-expose reveals wait for a settled
+    // strip, so the return focus below drains immediately.
+    for _ in 0..<8 {
+        _ = daemon.tick(
+            events: [],
+            frames: frames(slots: [0: IntPoint(0, 0), 1: IntPoint(400, 0), 2: IntPoint(791, 0)]),
+            viewports: views, focusedStyle: style
+        )
+    }
+
+    // Focusing window 0 scrolls back right; window 2 exits onto the
+    // neighbor viewport and parks instead of bleeding across.
+    let r3 = daemon.tick(
+        events: [.focus(id: 0)],
+        frames: frames(slots: [0: IntPoint(0, 0), 1: IntPoint(0, 0), 2: IntPoint(400, 0)]),
+        viewports: views, focusedStyle: style
+    )
+    checkEqual(r3.focus, 0, "focus returns to the first window")
+    check(
+        r3.axJobs.contains(where: { $0.winID == 2 && $0.origin == IntPoint(791, 0) }),
+        "scrolled-off member re-parks instead of bleeding"
+    )
+    checkEqual(daemon.positions[2], IntPoint(791, 0), "far exit presents parked")
+    checkEqual(daemon.committedSlot(of: 2), IntPoint(800, 0), "exited slot stays modeled")
+    checkEqual(daemon.positions[0], IntPoint(0, 0), "revealed member resumes its slot")
+}
+
+// Near-void exits park too: the WindowServer will not place
+// fully-offscreen glass, so an unparked void slot can never converge
+// (it churns redrive/audit until something relocates it — often the
+// second display). Only truly far slots stay the drain's to strip.
+do {
+    var daemon = DaemonCore()
+    daemon.animationsEnabled = false
+    daemon.glideBaseMs = 0
+    daemon.offscreenSliverWidth = 9
+    let solo = IntRect(0, 0, 800, 600)
+    let r = daemon.tick(
+        events: [.appeared(id: 0, workspace: 1), .appeared(id: 1, workspace: 1), .appeared(id: 2, workspace: 1)],
+        frames: frames(slots: [0: IntPoint(0, 0), 1: IntPoint(400, 0), 2: IntPoint(400, 0)]),
+        viewports: [1: solo], focusedStyle: style
+    )
+    check(
+        r.axJobs.contains(where: { $0.winID == 2 && $0.origin == IntPoint(791, 0) }),
+        "near-void exit hide-parks at the owner edge"
+    )
+    checkEqual(daemon.positions[2], IntPoint(791, 0), "void exit presents parked")
+    checkEqual(daemon.committedSlot(of: 2), IntPoint(800, 0), "void slot stays modeled")
+}
+
+// Seam jump-cut: a glide leg spanning two displays lands instead of
+// sliding glass across the neighbor mid-flight.
+do {
+    var daemon = DaemonCore()
+    daemon.workspaceRing = [1, 2]
+    let left = IntRect(0, 0, 1024, 768)
+    let right = IntRect(1024, 0, 2048, 768)
+    let views: [WorkspaceID: IntRect] = [1: left, 2: right]
+    _ = daemon.tick(
+        events: [.appeared(id: 0, workspace: 1), .focus(id: 0)],
+        frames: frames(slots: [0: IntPoint(0, 34)]),
+        viewports: views, focusedStyle: style
+    )
+    checkEqual(daemon.positions[0], IntPoint(0, 34), "transfer source starts settled")
+    _ = daemon.tick(
+        events: [.command(.window(.toNextDisplay(.follow)))],
+        frames: frames(slots: [0: IntPoint(0, 34)]),
+        viewports: views, focusedStyle: style
+    )
+    checkEqual(daemon.committedSlot(of: 0), IntPoint(1024, 34), "transfer slots on the new display")
+    checkEqual(daemon.positions[0], IntPoint(1024, 34), "cross-display leg snaps instead of gliding")
+}
+
+// Edge straddle parks too: under unclamped rest offsets a sibling can
+// rest half on the neighbor indefinitely — per the never-on-the-wrong-
+// display rule it hide-parks like a full exit.
+do {
+    var daemon = DaemonCore()
+    daemon.animationsEnabled = false
+    daemon.glideBaseMs = 0
+    daemon.offscreenSliverWidth = 9
+    let left = IntRect(0, 0, 800, 600)
+    let right = IntRect(800, 0, 1600, 600)
+    let views: [WorkspaceID: IntRect] = [1: left, 2: right]
+    let document = """
+        {"v":1,"active_workspace":1,"focus":1,"workspaces":[{"workspace_id":1,"active_row":0,"rows":[{"virtual_index":0,"offset_x":-200,"offset_y":0,"active":true,"columns":[{"Single":0},{"Single":1},{"Single":2}]}],"floating":[]}]}
+        """
+    guard let doc = HandoffDoc.decode(Data(document.utf8)) else {
+        check(false, "straddle handoff decodes")
+        exit(1)
+    }
+    let live: (Int32) -> IntRect? = { id in
+        let origins = [IntPoint(-200, 0), IntPoint(200, 0), IntPoint(600, 0)]
+        let o = origins[Int(id)]
+        return IntRect(min: o, max: IntPoint(o.x + 400, o.y + 700))
+    }
+    daemon.applyHandoff(doc, frames: live, viewports: views)
+    let r = daemon.tick(
+        events: [], frames: live, viewports: views, focusedStyle: style
+    )
+    // Window 2 straddles the seam ([600,1000) over the 800 edge) onto the
+    // sibling: hide-parks at the owner edge, model slot intact.
+    check(
+        r.axJobs.contains(where: { $0.winID == 2 && $0.origin == IntPoint(791, 0) }),
+        "straddling member hide-parks"
+    )
+    checkEqual(daemon.positions[2], IntPoint(791, 0), "straddle presents parked")
+    checkEqual(daemon.committedSlot(of: 2), IntPoint(600, 0), "straddle slot stays modeled")
+}
+
 if failures == 0 {
     print("DaemonChecks: all checks passed")
 } else {

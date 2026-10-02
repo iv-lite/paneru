@@ -444,6 +444,9 @@ core.swipeDirectionSign = resolved.swipeDirection == .reversed ? 1.0 : -1.0
 core.wallClockMs = { DispatchTime.now().uptimeNanoseconds / 1_000_000 }
 // Slots abut; gaps live in per-window AX padding (see applyWindowPadding).
 core.centerSingleColumn = resolved.centerSingleColumn
+// Parked glass keeps a single invisible pixel: the slot-space hide
+// width folds the gap insets the host adds on write.
+core.offscreenSliverWidth = 1 + resolved.gapHorizontal
 core.animationsEnabled = resolved.animationsEnabled
 core.glideBaseMs = resolved.animationDurationMs
 core.glideMinMs = resolved.animationMinDurationMs
@@ -1610,15 +1613,15 @@ nonisolated(unsafe) var scriptWatcher: DispatchSourceFileSystemObject?
         rebuildBaseConfig()
         refreshDerivedConfig()
         print("lua: setup applied (\(bindings.count) bindings, \(windowRules.count) window rules)")
-    } else if setupOptions != nil {
-        // Reload dropped `setup`: the config in force stays, like the
-        // mailbox rule — but only if one was ever loaded.
-        setupOptions = nil
-        setupBindings = nil
-        setupRules = nil
-        rebuildBaseConfig()
-        refreshDerivedConfig()
-        print("lua: setup dropped (running fallback config)")
+    } else {
+        // Reloaded script carries no `setup` (typically a mid-edit save):
+        // keep the running tuning instead of dropping to fallback and
+        // re-tiling the world on defaults. Removing `setup` for real
+        // takes a daemon restart.
+        print("lua: warning: reloaded script has no paneru.setup (keeping current tuning)")
+        mailbox.applyReload(success: false, error: "reloaded script has no paneru.setup")
+        print("lua: loaded \(path)")
+        return
     }
     if !quiet {
         mailbox.applyReload(success: true, keybinds: mailbox.keybinds)
@@ -1686,17 +1689,27 @@ func watchScript(_ path: String) {
     lastScriptMtime = fileMtime(path)
     scriptWatcher = watchFileAndDirectory(path) {
         needScriptReload = true
+        scriptReloadDueAt = Date().addingTimeInterval(hotReloadQuietSecs)
     }
 }
 
 nonisolated(unsafe) var needTuningReload = false
 nonisolated(unsafe) var tuningWatcher: DispatchSourceFileSystemObject?
+/// Hot-reload quiet period: editors (autosave) and multi-step saves emit
+/// several write events per second; acting on the first would re-tile the
+/// world on every keystroke pause — including transient mid-edit states
+/// (no `setup` block yet, or a syntax error away from valid). Each event
+/// rearms the deadline; the reload acts once writes settle.
+let hotReloadQuietSecs = 0.5
+nonisolated(unsafe) var scriptReloadDueAt = Date.distantPast
+nonisolated(unsafe) var tuningReloadDueAt = Date.distantPast
 
 /// Watch the swift.toml fallback for hot-reloads (mirrors `watchScript`).
 func watchTuning(_ path: String) {
     lastTuningMtime = fileMtime(path)
     tuningWatcher = watchFileAndDirectory(path) {
         needTuningReload = true
+        tuningReloadDueAt = Date().addingTimeInterval(hotReloadQuietSecs)
     }
 }
 
@@ -1726,6 +1739,7 @@ core.swipeDirectionSign = resolved.swipeDirection == .reversed ? 1.0 : -1.0
 core.wallClockMs = { DispatchTime.now().uptimeNanoseconds / 1_000_000 }
     // Slots abut; gaps live in per-window AX padding (see applyWindowPadding).
     core.centerSingleColumn = resolved.centerSingleColumn
+    core.offscreenSliverWidth = 1 + resolved.gapHorizontal
     core.animationsEnabled = resolved.animationsEnabled
     core.glideBaseMs = resolved.animationDurationMs
     radiusRulesGen += 1
@@ -1895,7 +1909,7 @@ core.wallClockMs = { DispatchTime.now().uptimeNanoseconds / 1_000_000 }
 /// outbox. Runs before the core tick consumes `pending`.
 @Sendable func drainLuaFrame() {
     guard let bridge = luaBridge else { return }
-    if needScriptReload, let path = scriptPath {
+    if needScriptReload, Date() >= scriptReloadDueAt, let path = scriptPath {
         needScriptReload = false
         // Directory-watch fan-out: only the script's own mtime reloads
         // (the tuning fallback shares the directory).
@@ -2879,7 +2893,9 @@ let perfSlowTickMs = 8.0
     // Hot-reloaded tuning applies before the core consumes this frame.
     // The directory watch fires on any entry change; the mtime filter
     // drops unrelated saves (including init.lua's, which shares the dir).
-    if needTuningReload, let tuningPath {
+    // Autosave bursts settle first (see hotReloadQuietSecs): acting on the
+    // first event would re-tile mid-edit.
+    if needTuningReload, Date() >= tuningReloadDueAt, let tuningPath {
         needTuningReload = false
         if fileMtimeChanged(tuningPath, last: &lastTuningMtime) {
             reloadTuning()

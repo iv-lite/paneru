@@ -357,6 +357,14 @@ public struct DaemonCore: Sendable {
     public var swipeDirectionSign: Double = -1.0
     /// Center a lone column in the viewport (Rust `center_single_column`).
     public var centerSingleColumn = false
+    /// Hide-park width for shown-row members scrolled fully off their
+    /// owner viewport yet overlapping a sibling display, in padded-slot
+    /// space. The host folds the window gap insets in on top of a single
+    /// invisible pixel, so the parked *glass* shows nothing perceptible
+    /// while macOS still counts the window as on-screen and never
+    /// relocates it to another display. Default matches the product
+    /// defaults (1 + 8).
+    public var offscreenSliverWidth: Int32 = 9
     /// Minimum stacked-item height for `binpackHeights` (Rust 200px).
     public var stackMinHeight: Int32 = 200
     /// Model truth for sizes (origins live in `positions`): the last
@@ -1913,6 +1921,12 @@ public struct DaemonCore: Sendable {
 
     /// Last committed slot per window: what release homing restores.
     private var committedSlots: [WindowID: IntPoint] = [:]
+    /// Members whose presented target is sliver-parked on their owner
+    /// viewport edge this tick. Their origins legitimately sit outside
+    /// the display union, so the off-union drain exempts them (without
+    /// this their park intents read as bogus wrong-display targets and
+    /// the windows never park).
+    private var sliverParked = Set<WindowID>()
 
     /// Apply pending transfer-centerings against fresh slots: the
     /// window now at each hole scrolls to viewport center over the next
@@ -2667,6 +2681,10 @@ public struct DaemonCore: Sendable {
         let union = writeUnion(Array(viewports.values))
         for (ws, rows) in strips {
             let home = viewport(for: ws, in: viewports)
+            // Sibling viewports for bleed detection: a shown-row member
+            // whose slot overlaps one of these paints next door and must
+            // hide-park; slots in a void (stairs gaps) stay put.
+            let siblings = viewports.filter { $0.key != ws }.map { $0.value }
             // Sanity-clamp offsets every commit: swipe snap bounds and
             // reveal composition legitimately rest outside the fill range
             // (see the NOTE below), but thousands of px past the content
@@ -2735,7 +2753,7 @@ public struct DaemonCore: Sendable {
                     layoutColumn(
                         column, x: colX, home: home,
                         epoch: epoch, frames: frames, heldMembers: heldMembers,
-                        union: union
+                        union: union, siblings: siblings
                     )
                     // Slots abut: gaps are host-side AX insets, never pitch.
                     x += colW
@@ -2750,8 +2768,8 @@ public struct DaemonCore: Sendable {
         // targets (stale offsets, wrong-display homes) — drop them
         // instead of writing. Model errors (off-union slots) never
         // park here; proven write failures park at audit cadence.
-        // Legit sliver parking sits 10px off-viewport and always
-        // passes (tolerance).
+        // Legit hide-parks sit just off-viewport and pass via the
+        // sliver-parked exemption below.
         dropOffUnionJobs(
             &batch, union: union, frames: frames,
             held: held)
@@ -2803,8 +2821,10 @@ public struct DaemonCore: Sendable {
             // (mates follow the hand), and glide legs interpolate from
             // off-screen glass toward the slot: never strip or park
             // either — the leg converges in-bounds and the hand is
-            // user-driven. Only glideless, handless jobs can be bogus.
-            guard id != held, glides[id] == nil else { continue }
+            // user-driven. Sliver-parked members sit outside the union
+            // by design (their glass stays tabbed on the owner edge).
+            // Only glideless, handless, unparked jobs can be bogus.
+            guard id != held, glides[id] == nil, !sliverParked.contains(id) else { continue }
             guard let origin = job.origin,
                   origin.x < union.min.x || origin.x >= union.max.x
                     || origin.y < union.min.y || origin.y >= union.max.y
@@ -2851,13 +2871,13 @@ public struct DaemonCore: Sendable {
     private mutating func layoutColumn(
         _ column: LayoutColumn, x: Int32, home: IntRect,
         epoch: UInt64, frames: (WindowID) -> IntRect?,
-        heldMembers: Set<WindowID>, union: IntRect?
+        heldMembers: Set<WindowID>, union: IntRect?, siblings: [IntRect]
     ) {
         switch column {
         case .stack(let items) where items.count > 1:
             layoutStackItems(
                 items, x: x, home: home, epoch: epoch,
-                frames: frames, heldMembers: heldMembers, union: union
+                frames: frames, heldMembers: heldMembers, union: union, siblings: siblings
             )
         case .fullscreen:
             // OS-managed: never relocate, keep preserved slots.
@@ -2869,7 +2889,7 @@ public struct DaemonCore: Sendable {
                 committedSlots[member] = slot
                 applyMove(
                     member, to: slot, epoch: epoch,
-                    frames: frames, heldMembers: heldMembers, union: union
+                    frames: frames, heldMembers: heldMembers, union: union, home: home, siblings: siblings
                 )
                 clampMemberSize(member, home: home, epoch: epoch, frames: frames)
             }
@@ -2909,7 +2929,7 @@ public struct DaemonCore: Sendable {
                 committedSlots[member] = placed
                 applyMove(
                     member, to: placed, epoch: epoch,
-                    frames: frames, heldMembers: heldMembers, union: union
+                    frames: frames, heldMembers: heldMembers, union: union, home: home, siblings: siblings
                 )
                 clampMemberSize(member, home: home, epoch: epoch, frames: frames)
             }
@@ -2925,7 +2945,7 @@ public struct DaemonCore: Sendable {
     private mutating func layoutStackItems(
         _ items: [StackItem], x: Int32, home: IntRect,
         epoch: UInt64, frames: (WindowID) -> IntRect?,
-        heldMembers: Set<WindowID>, union: IntRect?
+        heldMembers: Set<WindowID>, union: IntRect?, siblings: [IntRect]
     ) {
         let desired = items.map { item in
             item.windows.compactMap { frames($0)?.height }.max()
@@ -2954,7 +2974,7 @@ public struct DaemonCore: Sendable {
                     committedSlots[member] = slot
                     applyMove(
                         member, to: slot, epoch: epoch,
-                        frames: frames, heldMembers: heldMembers, union: union
+                        frames: frames, heldMembers: heldMembers, union: union, home: home, siblings: siblings
                     )
                     applySize(member, to: target, epoch: epoch, frames: frames)
                 }
@@ -2974,7 +2994,7 @@ public struct DaemonCore: Sendable {
                 committedSlots[member] = slot
                 applyMove(
                     member, to: slot, epoch: epoch,
-                    frames: frames, heldMembers: heldMembers, union: union
+                    frames: frames, heldMembers: heldMembers, union: union, home: home, siblings: siblings
                 )
                 applySize(member, to: target, epoch: epoch, frames: frames)
             }
@@ -3014,6 +3034,72 @@ public struct DaemonCore: Sendable {
         return IntPoint(x, home.min.y + (home.height - liveH) / 2)
     }
 
+    /// Presented hide-park target for a member whose slot would paint on
+    /// a sibling display (Rust `desired_window_frame` offscreen arms,
+    /// extended to straddles): park just off the owner edge on the
+    /// nearest exited side, so no part of the window ever rests next
+    /// door. Full exits park whenever the frame is near the display union
+    /// (void slots included — the WindowServer will not place
+    /// fully-offscreen glass, so an unparked void slot can never
+    /// converge and churns redrive/audit forever); truly far slots stay
+    /// the drain's to strip. Straddles park only on sibling overlap, so
+    /// harmless void peeks keep their owner-visible part. The host folds
+    /// the window gap insets into `offscreenSliverWidth`, so the parked
+    /// *glass* keeps a single invisible pixel on screen and macOS never
+    /// relocates the window to another display. Fully-owner windows,
+    /// viewport-spanning windows (nothing to hide usefully), and
+    /// vertical-only spills (x already shows) never park. Parked members
+    /// take the park-row y clamp into the owner band (oversize frames
+    /// top-align): without it the parked frame can overlap a stair-step
+    /// neighbor's band worse than the slot did. The slot's y is otherwise
+    /// untouched.
+    private func parkOffscreen(
+        _ member: WindowID, slot: IntPoint, home: IntRect,
+        union: IntRect?, siblings: [IntRect], frames: (WindowID) -> IntRect?
+    ) -> IntPoint? {
+        guard let live = frames(member) else { return nil }
+        let width = live.width, height = live.height
+        guard width > 0, height > 0, width < home.width else { return nil }
+        let frame = IntRect(min: slot, max: IntPoint(slot.x + width, slot.y + height))
+        let exitedLeft = slot.x + width <= home.min.x
+        let exitedRight = slot.x >= home.max.x
+        if exitedLeft || exitedRight {
+            // Reachable? Far-bogus slots (stale offsets) stay the drain's
+            // to strip; near ones (scrolled strips, stairs voids) park.
+            if let union {
+                let reach = frame.intersected(with: IntRect(
+                    min: IntPoint(union.min.x - parkedStripSliver, union.min.y - parkedStripSliver),
+                    max: IntPoint(union.max.x + parkedStripSliver, union.max.y + parkedStripSliver)
+                ))
+                guard reach.width > 0 && reach.height > 0 else { return nil }
+            }
+        } else {
+            // Straddling the owner edge: park only on true bleed (a
+            // sibling display shows part of the frame). Void peeks keep
+            // their owner-visible part.
+            let bleeds = siblings.contains {
+                let hit = frame.intersected(with: $0)
+                return hit.width > 0 && hit.height > 0
+            }
+            guard bleeds else { return nil }
+        }
+        let x: Int32
+        if slot.x < home.min.x {
+            x = home.min.x - width + offscreenSliverWidth
+        } else if slot.x + width > home.max.x {
+            x = home.max.x - offscreenSliverWidth
+        } else {
+            return nil
+        }
+        let y: Int32
+        if height >= home.height {
+            y = home.min.y
+        } else {
+            y = min(max(slot.y, home.min.y), home.max.y - height)
+        }
+        return IntPoint(x, y)
+    }
+
     /// Move intent with homing/hand/convergence handling (extracted
     /// verbatim from the commit loop so stack and single paths share it).
     /// Unreachable (off-union) slots rest in the verify arm: the drain
@@ -3022,18 +3108,36 @@ public struct DaemonCore: Sendable {
     private mutating func applyMove(
         _ member: WindowID, to slot: IntPoint, epoch: UInt64,
         frames: (WindowID) -> IntRect?, heldMembers: Set<WindowID>,
-        union: IntRect?
+        union: IntRect?, home: IntRect, siblings: [IntRect]
     ) {
         // Heal-cleared hidden windows rest: the guard already decided
         // they drive nothing until the block lapses.
         guard !hiddenBlocked(member, epoch: epoch) else { return }
+        // Sliver-parked presented target: a shown-row member scrolled fully
+        // off its owner viewport would otherwise hold its slot on a
+        // neighboring display (Rust `desired_window_frame` offscreen arms).
+        // Model truth (`committedSlots`, reveal, homing) keeps the real
+        // slot; only the presented target parks, so scroll-back resumes
+        // the slot with one intent. Held hand truth never parks
+        // (cross-display drags are transfers).
+        let target: IntPoint
+        if heldMembers.contains(member) {
+            target = slot
+            sliverParked.remove(member)
+        } else if let parked = parkOffscreen(member, slot: slot, home: home, union: union, siblings: siblings, frames: frames) {
+            target = parked
+            sliverParked.insert(member)
+        } else {
+            target = slot
+            sliverParked.remove(member)
+        }
         if homing.contains(member) {
             // Release homing restores the slot immediately (the animated
             // glide lives in presentation); snap truth so the next tick
             // rests instead of re-driving.
-            enqueueMove(member, to: slot, epoch: epoch)
+            enqueueMove(member, to: target, epoch: epoch)
             homing.remove(member)
-            positions[member] = slot
+            positions[member] = target
             glides.removeValue(forKey: member)
         } else if heldMembers.contains(member) {
             // Armed hand truth flows to the OS so mates follow; the
@@ -3043,25 +3147,25 @@ public struct DaemonCore: Sendable {
             if dragArmed, let hand = positions[member] {
                 enqueueMove(member, to: hand, epoch: epoch)
             }
-        } else if positions[member] != slot {
+        } else if positions[member] != target {
             // Converged live frames snap with no intent (dedup): glides
             // only traverse real distance, so settled ticks stay silent.
             if let live = frames(member),
-               abs(live.min.x - slot.x) <= axDeadbandPx,
-               abs(live.min.y - slot.y) <= axDeadbandPx
+               abs(live.min.x - target.x) <= axDeadbandPx,
+               abs(live.min.y - target.y) <= axDeadbandPx
             {
-                positions[member] = slot
+                positions[member] = target
                 glides.removeValue(forKey: member)
             } else if !animationsEnabled || glideBaseMs == 0 {
-                enqueueMove(member, to: slot, epoch: epoch)
-                positions[member] = slot
+                enqueueMove(member, to: target, epoch: epoch)
+                positions[member] = target
                 glides.removeValue(forKey: member)
             } else {
-                let from = positions[member] ?? slot
-                let step = glideStep(member, from: from, to: slot, epoch: epoch)
+                let from = positions[member] ?? target
+                let step = glideStep(member, from: from, to: target, epoch: epoch, displays: [home] + siblings)
                 enqueueMove(member, to: step, epoch: epoch)
                 positions[member] = step
-                if step == slot { glides.removeValue(forKey: member) }
+                if step == target { glides.removeValue(forKey: member) }
             }
         } else {
             // Verify against live truth: manual moves,
@@ -3074,16 +3178,16 @@ public struct DaemonCore: Sendable {
             // target matches the last intent. Cooldown
             // keeps mid-glide frames from spamming AX.
                             if let live = frames(member),
-                               abs(live.min.x - slot.x) > axDeadbandPx
-                                || abs(live.min.y - slot.y) > axDeadbandPx,
+                               abs(live.min.x - target.x) > axDeadbandPx
+                                || abs(live.min.y - target.y) > axDeadbandPx,
                                // Unreachable slots rest: the drain strips
                                // off-union origins, so re-driving only
                                // grows the backoff for a position no
                                // write can reach. Reachable again on
                                // scroll-back (else arm resets below).
                                union.map({
-                                   slot.x >= $0.min.x && slot.x < $0.max.x
-                                    && slot.y >= $0.min.y && slot.y < $0.max.y
+                                   target.x >= $0.min.x && target.x < $0.max.x
+                                    && target.y >= $0.min.y && target.y < $0.max.y
                                }) ?? true,
                                // Degraded writer: repair only the focused
                                // window (Rust `STUCK_DEGRADE` rung).
@@ -3123,8 +3227,8 @@ public struct DaemonCore: Sendable {
                 if due {
                     ax.invalidateSent(member)
                     positions[member] = IntPoint(live.min.x, live.min.y)
-                    enqueueMove(member, to: slot, epoch: epoch)
-                    positions[member] = slot
+                    enqueueMove(member, to: target, epoch: epoch)
+                    positions[member] = target
                     lastRedrive[member] = epoch
                     redriveLastLive[member] = live
                     redriveStreak[member] = min(streak + 1, 5)
@@ -3216,8 +3320,21 @@ public struct DaemonCore: Sendable {
     /// and an anti-stall nudge so pixel rounding can never pin a leg one
     /// pixel short forever. Epoch-clocked at ~16ms each.
     private mutating func glideStep(
-        _ member: WindowID, from: IntPoint, to: IntPoint, epoch: UInt64
+        _ member: WindowID, from: IntPoint, to: IntPoint, epoch: UInt64,
+        displays: [IntRect]
     ) -> IntPoint {
+        // Seam jump-cut (Rust `seam_snap_target`): a leg spanning two
+        // displays would slide glass across the neighbor mid-flight —
+        // land it instead, so no intermediate frame ever paints next
+        // door. Points in no display (parked slivers in the gutter,
+        // stair voids) never match, so those legs ease exactly as before.
+        if let a = displays.first(where: { $0.contains(from) }),
+           let b = displays.first(where: { $0.contains(to) }),
+           a != b
+        {
+            glides.removeValue(forKey: member)
+            return to
+        }
         let nowMs = wallClockMs?() ?? epoch &* 16
         if let deadline = glideBurstDeadlineMs, nowMs > deadline {
             glideBurstDeadlineMs = nil
