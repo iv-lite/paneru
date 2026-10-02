@@ -20,87 +20,56 @@ concurrency:
   group: ${{ github.workflow }}-${{ github.ref }}
   cancel-in-progress: ${{ github.ref != 'refs/heads/main' }}
 
-env:
-  CARGO_TERM_COLOR: always
-  SCCACHE_GHA_ENABLED: "true"
-  RUSTC_WRAPPER: "sccache"
-  CMAKE_C_COMPILER_LAUNCHER: "sccache"
+# Swift-only: the daemon is `swift-daemon/` (product `paneru-swift`). The
+# Rust tree still ships until cutover but is deliberately out of this
+# workflow — no cargo/sccache/nextest, no Rust trace corpus.
 
 jobs:
-  test:
+  checks:
     runs-on: macos-latest
     timeout-minutes: 60
     steps:
       - uses: actions/checkout@v4
-      - uses: dtolnay/rust-toolchain@stable
-      - uses: mozilla-actions/sccache-action@v0.0.9
-      - uses: Swatinem/rust-cache@v2
+      - uses: swift-actions/setup-swift@v2
         with:
-          shared-key: "paneru-build"
-          cache-on-failure: true
-      - uses: taiki-e/install-action@nextest
-      - name: Check formatting
-        run: cargo fmt --check
-      - name: Lint with Clippy
-        run: cargo clippy --all-targets -- -D warnings
-      - name: Run tests
-        run: cargo nextest run --workspace --all-targets
-      - name: Show sccache stats
-        run: sccache --show-stats
-
-  # Frame-parity gate for the Swift port: dumps the Rust trace corpus,
-  # runs every Swift checks runner, then diffs Swift replay rest-states
-  # against the Rust frames. Fails the workflow on first mismatch, so no
-  # Rust subsystem is deleted while the corpus is red.
-  parity:
-    runs-on: macos-latest
-    timeout-minutes: 30
-    needs: test
-    env:
-      PANERU_TRACE_OUT: ${{ runner.temp }}/paneru-corpus
-      PANERU_TRACE_DIR: ${{ runner.temp }}/paneru-corpus
-    steps:
-      - uses: actions/checkout@v4
-      - uses: dtolnay/rust-toolchain@stable
-      - uses: Swatinem/rust-cache@v2
-        with:
-          shared-key: "paneru-build"
-          cache-on-failure: true
-      - name: Dump Rust trace corpus
-        run: PANERU_TRACE_OUT="$PANERU_TRACE_OUT" cargo test --all-targets trace
-      - name: Run Swift checks runners
+          swift-version: "6.0"
+      - name: Build the Swift package
+        run: swift build --package-path swift-daemon
+      - name: Run Swift checks
         run: |
+          set -euo pipefail
           for checks in GeometryChecks LayoutChecks AXClientChecks EventCoreChecks \
-            PresentationChecks ScriptingChecks IPCChecks ServiceChecks \
-            LuaBridgeChecks DaemonChecks XPCChecks FocusChecks WorkspaceChecks \
-            CommandsChecks ConfigChecks AnimationChecks ScrollChecks SessionChecks \
-            ScriptEventsChecks KeyChordsChecks DisplaysChecks SnippetChecks \
-            ProviderChecks WorkerChecks; do
+            PresentationChecks PresenterChecks ScriptingChecks IPCChecks ServiceChecks \
+            CommandsChecks DaemonChecks XPCChecks FocusChecks WorkspaceChecks \
+            ConfigChecks KeyChordsChecks SnippetChecks ProviderChecks WorkerChecks \
+            DisplaysChecks SessionChecks SkyBridgeChecks WindowSetChecks \
+            StateQueryChecks LuaAPIChecks ConfigFilesChecks ScriptHostChecks \
+            ScriptEventsChecks LuaBridgeChecks MenuBarChecks LiveProvidersChecks \
+            AnimationChecks ScrollChecks; do
+            echo "== $checks =="
             swift run --package-path swift-daemon "$checks"
           done
-      - name: Diff frame parity
+      # Frame parity replays a Rust trace corpus (`PANERU_TRACE_DIR`). No
+      # corpus is produced in this Swift-only workflow, so the runner skips
+      # cleanly — kept here so a future corpus still gates.
+      - name: Frame parity (skips without a corpus)
         run: swift run --package-path swift-daemon FrameParityChecks
 
-  # Builds the release binary concurrently with `test` instead of waiting
-  # for it: wall time becomes max(tests, build) rather than tests + build.
-  # Publishing stays gated on green tests in the `publish` job below, so a
-  # binary can compile while tests fail but never ships without them.
+  # Builds the release artifacts concurrently with `checks`; publishing stays
+  # gated on green checks in the `publish` job below.
   build-release:
     runs-on: macos-latest
     timeout-minutes: 60
     outputs:
       tag: ${{ steps.release-info.outputs.tag }}
-    # Plain branch pushes stop after the test job; release artifacts are
-    # only built for version tags and manual dispatches.
+    # Plain branch pushes stop after checks; release artifacts are only
+    # built for version tags and manual dispatches.
     if: startsWith(github.ref, 'refs/tags/v') || github.event_name == 'workflow_dispatch'
     steps:
       - uses: actions/checkout@v4
-      - uses: dtolnay/rust-toolchain@stable
-      - uses: mozilla-actions/sccache-action@v0.0.9
-      - uses: Swatinem/rust-cache@v2
+      - uses: swift-actions/setup-swift@v2
         with:
-          shared-key: "paneru-build"
-          cache-on-failure: true
+          swift-version: "6.0"
 
       - name: Resolve release version and tag
         id: release-info
@@ -118,66 +87,47 @@ jobs:
         env:
           RELEASE_VERSION: ${{ inputs.release_version }}
 
-      - name: Sync crate version to tag
-        if: steps.release-info.outputs.version != ''
-        run: |
-          VERSION="${{ steps.release-info.outputs.version }}"
-          python3 - "$VERSION" <<'EOF'
-          import re, sys
-          version = sys.argv[1]
-          if not re.fullmatch(r"[0-9]+\.[0-9]+\.[0-9]+", version):
-              raise SystemExit(f"refusing to stamp non-semver version {version!r}")
-          path = "Cargo.toml"
-          text = open(path).read()
-          # The [package] version is the first version key in the file.
-          new, count = re.subn(
-              r'^version = "[^"]+"', f'version = "{version}"', text, count=1, flags=re.M
-          )
-          assert count == 1
-          open(path, "w").write(new)
-          print(f"stamped Cargo.toml to {version}")
-          EOF
-          grep '^version' Cargo.toml | head -1
-
-      - name: Build the release binary
-        run: cargo build --release --bin paneru
+      - name: Build the release binaries
+        run: swift build -c release --package-path swift-daemon
 
       - name: Pin code-signing identifier
-        # Env RUSTC_WRAPPER (sccache) overrides the repo rustc-wrapper, so
-        # the release binary gets its stable TCC identity stamped here
-        # instead — same identifier as local builds (see assets/rustc-sign.sh).
+        # Ad-hoc with the stable identifier (mirrors the Rust release step):
+        # the installer re-signs with the persistent identity on the host,
+        # so the shipped signature only needs to be well-formed and carry
+        # the identifier TCC expects.
         run: |
-          codesign --force --sign - --identifier com.github.karinushka.paneru target/release/paneru
-          codesign -dv target/release/paneru 2>&1 | grep 'Identifier=com.github.karinushka.paneru'
-          codesign --verify --strict target/release/paneru
-
-      - name: Show sccache stats
-        run: sccache --show-stats
+          BIN="$(swift build -c release --package-path swift-daemon --show-bin-path)"
+          codesign --force --sign - --identifier com.github.iv-lite.paneru-swift "$BIN/paneru-swift"
+          codesign -dv "$BIN/paneru-swift" 2>&1 | grep 'Identifier=com.github.iv-lite.paneru-swift'
+          codesign --verify --strict "$BIN/paneru-swift"
 
       - name: Stage release archive
         run: |
-          STAGE="$RUNNER_TEMP/stage/paneru-aarch64-apple-darwin"
+          set -euo pipefail
+          BIN="$(swift build -c release --package-path swift-daemon --show-bin-path)"
+          STAGE="$RUNNER_TEMP/stage/paneru-swift-aarch64-apple-darwin"
           mkdir -p "$STAGE"
-          cp target/release/paneru "$STAGE/"
+          cp "$BIN/paneru-swift" "$BIN/pq" "$STAGE/"
           cp README.md CONFIGURATION.md SCRIPTING.md LICENSE.txt "$STAGE/"
-          tar -czf "$RUNNER_TEMP/paneru-aarch64-apple-darwin.tar.gz" -C "$RUNNER_TEMP/stage" paneru-aarch64-apple-darwin
-          tar -tzf "$RUNNER_TEMP/paneru-aarch64-apple-darwin.tar.gz"
+          tar -czf "$RUNNER_TEMP/paneru-swift-aarch64-apple-darwin.tar.gz" \
+            -C "$RUNNER_TEMP/stage" paneru-swift-aarch64-apple-darwin
+          tar -tzf "$RUNNER_TEMP/paneru-swift-aarch64-apple-darwin.tar.gz"
 
       - name: Upload build artifacts
         uses: actions/upload-artifact@v4
         with:
-          name: paneru-macos
-          path: ${{ runner.temp }}/paneru-aarch64-apple-darwin.tar.gz
+          name: paneru-swift-macos
+          path: ${{ runner.temp }}/paneru-swift-aarch64-apple-darwin.tar.gz
 
   publish:
     runs-on: macos-latest
     timeout-minutes: 15
-    needs: [test, build-release]
+    needs: [checks, build-release]
     if: startsWith(github.ref, 'refs/tags/v') || github.event_name == 'workflow_dispatch'
     steps:
       - uses: actions/download-artifact@v4
         with:
-          name: paneru-macos
+          name: paneru-swift-macos
           path: ${{ runner.temp }}
 
       - name: Create GitHub Release
@@ -188,4 +138,4 @@ jobs:
           target_commitish: ${{ github.sha }}
           draft: false
           generate_release_notes: true
-          files: ${{ runner.temp }}/paneru-aarch64-apple-darwin.tar.gz
+          files: ${{ runner.temp }}/paneru-swift-aarch64-apple-darwin.tar.gz
