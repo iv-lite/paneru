@@ -1027,8 +1027,27 @@ nonisolated(unsafe) var rotatedAt: [WorkspaceID: Date] = [:]
     let onScreenIDs = Set(current.map { windowID($0) })
     let homeless = core.unstashVisible(onScreenIDs)
     stashedMembers.subtract(homeless)
+    // Self-heal for layout loss: any rostered, on-screen, tiled window
+    // with no workspace (its strip was emptied by a flaked space rotation
+    // or a missed re-append) is re-managed here. `unstashVisible` only
+    // recovers windows still in the stash; a window whose row was already
+    // dropped has no stash entry and would stay strip-less forever — the
+    // live failure this repairs (`strips: {}` while windows were visible).
     if restorePlanner == nil {
-        for id in homeless {
+        var toManage = homeless
+        for (wid, window) in roster {
+            let id = windowID(wid)
+            guard current.contains(wid),
+                  workspaceOfWindow(id) == nil,
+                  !stashedMembers.contains(id),
+                  !core.unmanaged.contains(id),
+                  !minimizedWindows.contains(id),
+                  !fullscreenFloated.contains(id),
+                  !window.cachedFullscreen
+            else { continue }
+            toManage.insert(id)
+        }
+        for id in toManage {
             guard let window = roster[CGWindowID(id)],
                   workspaceOfWindow(id) == nil,
                   !core.unmanaged.contains(id),

@@ -1797,8 +1797,13 @@ do {
         daemon.spaceStash[22]?.rows[0]?.allWindows, [0, 1],
         "live stashes survive pruning"
     )
+    // Soft prune: a single absent read keeps the stash (an SLS glitch must
+    // not destroy the only copy of a Space's row order); only sustained
+    // absence drops it.
     daemon.pruneSpaces(keeping: [11])
-    checkEqual(daemon.spaceStash[22], nil, "destroyed spaces prune")
+    check(daemon.spaceStash[22] != nil, "one absent read keeps the stash")
+    for _ in 0..<8 { daemon.pruneSpaces(keeping: [11]) }
+    checkEqual(daemon.spaceStash[22], nil, "sustained absence prunes the stash")
     checkEqual(daemon.strips[1]?[0]?.allWindows, [0, 1], "live strips survive pruning")
     daemon.pruneSpaces(keeping: nil)
     check(daemon.spaceStash.isEmpty, "nil enumeration skips pruning")
@@ -5357,6 +5362,22 @@ do {
         events: [.focus(id: 2)], frames: live, viewport: vp, focusedStyle: style
     )
     checkEqual(daemon.focus, 2, "visible ambient focus still lands")
+}
+
+// A single absent space read must not destroy a stash: soft prune keeps
+// it across transient absences and only drops it after the limit.
+do {
+    var daemon = DaemonCore()
+    _ = daemon.tick(
+        events: [.appeared(id: 0, workspace: 1), .appeared(id: 1, workspace: 1)],
+        frames: frames(slots: [0: IntPoint(0, 0), 1: IntPoint(400, 0)]),
+        viewport: viewport, focusedStyle: style
+    )
+    _ = daemon.resolveSpace(workspace: 1, space: 111)
+    _ = daemon.resolveSpace(workspace: 1, space: 222)
+    // A nil live set never prunes.
+    daemon.pruneSpaces(keeping: nil)
+    check(daemon.spaceStash[111] != nil, "nil live set never prunes")
 }
 
 if failures == 0 {

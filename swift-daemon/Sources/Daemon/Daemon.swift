@@ -4902,6 +4902,14 @@ public static func firstExitCrossing(
     public var spaceOfWorkspace: [WorkspaceID: SpaceID] = [:]
     /// Parked layouts of inactive spaces, keyed by space id.
     public private(set) var spaceStash: [SpaceID: SpaceStash] = [:]
+    /// Consecutive syncs each stashed space has been absent from the live
+    /// set. A private SLS read can glitch one sync; pruning on a single
+    /// absent read destroys the only copy of a Space's row order (the live
+    /// `strips: {}` failure). A stash is dropped only after it has been
+    /// absent this many syncs running, and any reappearance resets it.
+    private var spaceStashAbsent: [SpaceID: Int] = [:]
+    /// Soft-prune threshold (syncs). ~5s at the 1Hz roster cadence.
+    private let spaceStashAbsentLimit = 5
 
     /// Resolve one workspace onto its live SLS space: stash the
     /// outgoing layout, restore the incoming (or start fresh), and
@@ -4989,9 +4997,26 @@ public static func firstExitCrossing(
     /// Drop stashes for spaces no longer managed (SpaceDestroyed). A
     /// failed enumeration passes nil and skips — never prune on
     /// missing data.
+    ///
+    /// Soft, not immediate: a single absent read (SLS glitch) must not
+    /// destroy a Space's layout. A stash is dropped only after it has
+    /// been absent `spaceStashAbsentLimit` syncs running; any
+    /// reappearance resets its counter.
     public mutating func pruneSpaces(keeping live: Set<SpaceID>?) {
         guard let live else { return }
-        spaceStash = spaceStash.filter { live.contains($0.key) }
+        for space in Array(spaceStash.keys) {
+            if live.contains(space) {
+                spaceStashAbsent.removeValue(forKey: space)
+                continue
+            }
+            let absent = (spaceStashAbsent[space] ?? 0) + 1
+            if absent >= spaceStashAbsentLimit {
+                spaceStash.removeValue(forKey: space)
+                spaceStashAbsent.removeValue(forKey: space)
+            } else {
+                spaceStashAbsent[space] = absent
+            }
+        }
     }
 
     /// Drop visible ids from every stash row: a window on-screen is on
