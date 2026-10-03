@@ -2208,6 +2208,10 @@ nonisolated(unsafe) var lastWarpEval = Date.distantPast
     // mid-glide and never retried it once the cursor held still — the
     // "sometimes focus-follows-mouse doesn't fire" symptom.
     let moved = tap.lastMouseMovedAt > lastPointerPoll
+    // User motion, not a programmatic warp: a warp posts a mouse-move event
+    // the tap sees as motion, but the user did not move — hover must ignore
+    // it or the warp → hover → focus → warp loop never settles.
+    let userMoved = moved && tap.lastMouseMovedAt > lastMffWarpAt
     if moved {
         lastPointerPoll = Date()
         // Shadow never warps (the evaluation only feeds warps); hover focus
@@ -2231,11 +2235,12 @@ nonisolated(unsafe) var lastWarpEval = Date.distantPast
         frames: { roster[CGWindowID(bitPattern: $0)]?.frame },
         cursor: cursor
     )
-    // Motion-gated decision: a still cursor must never re-focus the window
-    // under it, or it undoes keyboard focus and mouse-follows-focus warps on
-    // the next tick. A hover the rest gate defers is remembered and retried
-    // on later polls, so a hover that arrives mid-glide still lands.
-    if moved {
+    // Motion-gated decision: a still cursor (or a programmatic warp) must
+    // never re-focus the window under it, or it undoes keyboard focus and
+    // mouse-follows-focus warps on the next tick. A hover the rest gate
+    // defers is remembered and retried on later polls, so a hover that
+    // arrives mid-glide still lands.
+    if userMoved {
         if let hovered, hovered != core.focus {
             if hoverStripRested(hovered) {
                 hoverPendingID = nil
@@ -2560,6 +2565,11 @@ nonisolated(unsafe) var prevMffFocus: WindowID?
 /// fresh hover never warp — Rust's skip-reshuffle generation, host-side.
 nonisolated(unsafe) var lastHoverID: WindowID?
 nonisolated(unsafe) var lastHoverAt = Date.distantPast
+/// Last programmatic cursor warp (display hop or mouse-follows-focus). A
+/// warp posts a mouse-move event, so the tap sees it as motion; hover must
+/// not treat that as the user arriving on a window, or the warp → hover →
+/// focus → warp loop never settles.
+nonisolated(unsafe) var lastMffWarpAt = Date.distantPast
 /// Hover the rest gate deferred (cursor moved onto a traveling strip):
 /// retried on later polls once the strip rests, without needing new motion.
 nonisolated(unsafe) var hoverPendingID: WindowID?
@@ -3346,6 +3356,7 @@ nonisolated(unsafe) var statJobs = 0
             // Teleports rebase the warp segment: the next evaluation
             // must measure from the landing, not across the jump.
             lastWarpSample = (IntPoint(warp.x, warp.y), Date())
+            lastMffWarpAt = Date()
             print("mouse: hop warp \(warp.x),\(warp.y)")
         }
     }
@@ -3438,6 +3449,7 @@ nonisolated(unsafe) var statJobs = 0
                         } else {
                             warpMouse(to: CGPoint(x: Double(target.x), y: Double(target.y)))
                             lastWarpSample = (target, Date())
+                            lastMffWarpAt = Date()
                             print("mouse: follow warp \(target.x),\(target.y) window=\(id) cause=\(cause)")
                         }
                     }
