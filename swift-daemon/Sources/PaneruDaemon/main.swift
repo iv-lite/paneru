@@ -3380,6 +3380,11 @@ nonisolated(unsafe) var statJobs = 0
     if resolved.mouseFollowsFocus,
        let id = result.focus, id != prevMffFocus,
        !tap.leftButtonHeld,
+       // Never warp at a window that is hidden this tick: the focus-heal
+       // clears it in the same pass, so warping hover-echoes focus right
+       // back onto a ghost and the clear→warp→hover→refocus loop never
+       // drains. Its glass is off-screen anyway.
+       !minimizedWindows.contains(id), !stashedMembers.contains(id),
        arriveCause == .keyboard || !(id == lastHoverID
            && Date().timeIntervalSince(lastHoverAt) < mouseFollowHoverEcho),
        Date().timeIntervalSince(tap.lastSwipe) >= mouseFollowSwipeQuiet,

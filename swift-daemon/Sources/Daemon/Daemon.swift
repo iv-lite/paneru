@@ -2294,7 +2294,8 @@ public struct DaemonCore: Sendable {
         // Targets ease in commit — no same-tick jump.
         if next.x != (offsetTargets[owner] ?? offset) {
             guard !revealFlapBlocked(
-                owner: owner, proposed: next.x, from: offset, epoch: epoch
+                owner: owner, proposed: next.x, from: offset, epoch: epoch,
+                keyed: raise
             ) else { return }
             offsetTargets[owner] = next.x
             dirty.formUnion([.layout, .motion])
@@ -2306,10 +2307,18 @@ public struct DaemonCore: Sendable {
     /// the strip's reveal direction every tick, scrolling a viewport back
     /// and forth forever. Count consecutive direction reversals; past the
     /// limit, stand reveals down for a cooldown so the loop drains instead
-    /// of churning the strip. A genuine user focus run rarely reverses.
+    /// of churning the strip.
+    ///
+    /// **Keyed arrivals are never blocked.** The breaker exists to damp
+    /// *ambient* hover/echo oscillation; a deliberate keypress or command
+    /// must always scroll the strip, or the window manager looks dead
+    /// ("focus won't glide"). Blocking keyed reveals was the regression
+    /// that made scrolling stop working.
     private mutating func revealFlapBlocked(
-        owner: WorkspaceID, proposed: Int32, from: Int32, epoch: UInt64
+        owner: WorkspaceID, proposed: Int32, from: Int32, epoch: UInt64,
+        keyed: Bool
     ) -> Bool {
+        if keyed { return false }
         if epoch < (revealCooldownUntil[owner] ?? 0) {
             return true
         }
@@ -2363,7 +2372,8 @@ public struct DaemonCore: Sendable {
             if hi - lo >= width { return }
         }
         guard !revealFlapBlocked(
-            owner: owner, proposed: target, from: offset, epoch: epoch
+            owner: owner, proposed: target, from: offset, epoch: epoch,
+            keyed: true
         ) else { return }
         offsetTargets[owner] = target
         dirty.formUnion([.layout, .motion])

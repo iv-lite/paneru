@@ -5144,6 +5144,52 @@ do {
     )
 }
 
+// Keyed focus must always scroll, even while the ambient flap breaker is
+// cooling down: a deliberate keypress that doesn't move the strip makes
+// the window manager look dead ("focus won't glide").
+do {
+    var daemon = DaemonCore()
+    daemon.animationsEnabled = false
+    daemon.glideBaseMs = 0
+    let vp = IntRect(0, 0, 900, 768)
+    let live: (Int32) -> IntRect? = { id in
+        let x = Int32(id) * 400
+        return IntRect(min: IntPoint(x, 34), max: IntPoint(x + 400, 734))
+    }
+    _ = daemon.tick(
+        events: [
+            .appeared(id: 0, workspace: 1), .appeared(id: 1, workspace: 1),
+            .appeared(id: 2, workspace: 1), .appeared(id: 3, workspace: 1),
+            .appeared(id: 4, workspace: 1), .focus(id: 0),
+        ],
+        frames: live, viewport: vp, focusedStyle: style
+    )
+    // Trip the ambient breaker (focus ping-pong), ending on window 0.
+    for i in 0..<10 {
+        _ = daemon.tick(
+            events: [.focus(id: (i % 2 == 0) ? 4 : 0)],
+            frames: live, viewport: vp, focusedStyle: style
+        )
+    }
+    // Now drive focus right by keyed command (raise=true): the reveal
+    // must fire even though ambient reveals are stood down. The reveal
+    // waits for the strip to rest (8 epochs), so settle after the keys.
+    for _ in 0..<4 {
+        _ = daemon.tick(
+            events: [.command(.window(.focus(.east)))],
+            frames: live, viewport: vp, focusedStyle: style
+        )
+    }
+    for _ in 0..<40 {
+        _ = daemon.tick(events: [], frames: live, viewport: vp, focusedStyle: style)
+    }
+    checkEqual(daemon.focus, 4, "keyed focus reaches the far window")
+    check(
+        (daemon.offsets[1] ?? 0) < 0,
+        "keyed focus scrolls during the ambient flap cooldown"
+    )
+}
+
 // Normal navigation is not a flap: direction changes spaced beyond the
 // flap window keep gliding the strip.
 do {
