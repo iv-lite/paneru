@@ -217,15 +217,15 @@ do {
         back.evaluate(old: 10, read: 20, corroborated: false, managed: [10, 20], now: t0),
         .rotate, "silent A->B rotates"
     )
-    let later = t0.addingTimeInterval(11.0)
-    _ = back.evaluate(old: 20, read: 10, corroborated: false, managed: [10, 20], now: later)
+    let afterFlapCooldown = t0.addingTimeInterval(11.0)
+    _ = back.evaluate(old: 20, read: 10, corroborated: false, managed: [10, 20], now: afterFlapCooldown)
     checkEqual(
-        back.evaluate(old: 20, read: 10, corroborated: false, managed: [10, 20], now: later),
+        back.evaluate(old: 20, read: 10, corroborated: false, managed: [10, 20], now: afterFlapCooldown),
         .ignore, "silent B->A flap is ignored"
     )
-    _ = back.evaluate(old: 20, read: 30, corroborated: false, managed: [20, 30], now: later)
+    _ = back.evaluate(old: 20, read: 30, corroborated: false, managed: [20, 30], now: afterFlapCooldown)
     checkEqual(
-        back.evaluate(old: 20, read: 30, corroborated: false, managed: [20, 30], now: later),
+        back.evaluate(old: 20, read: 30, corroborated: false, managed: [20, 30], now: afterFlapCooldown),
         .rotate, "a genuinely new space still rotates"
     )
 }
