@@ -560,8 +560,12 @@ nonisolated(unsafe) var flipCheckCounter = 0
 nonisolated(unsafe) var axWorker = DispatchQueue(
     label: "com.github.iv-lite.paneru-swift.ax", qos: .userInitiated
 )
-/// Monotonic lane generation, bumped on each retirement. Read on the
-/// worker; written on main.
+/// Monotonic lane generation, bumped on each retirement (main). Read on
+/// the worker; the off-main read is a deliberate word-sized `Int` load
+/// with no lock (a torn read is impossible on arm64, and the counter is
+/// only ever compared for equality against a value captured on main). A
+/// lock here would serialize every AX-issuing worker block for a check
+/// that is already inherently racy by design.
 nonisolated(unsafe) var axLaneGeneration = 0
 /// Whether the currently executing worker block still belongs to the live
 /// lane. Call at the top of any AX-issuing worker block.
@@ -926,7 +930,21 @@ nonisolated(unsafe) var rotatedAt: [WorkspaceID: Date] = [:]
     print("window: closed \(id)")
 }
 
+/// Main-confinement contract for the executable's model.
+///
+/// Top-level `main.swift` storage cannot carry a global actor (the compiler
+/// rejects `@MainActor` on top-level `var`s), so the model is
+/// `nonisolated(unsafe)` and main-confined *by construction*: every entry
+/// point — `tick()` (main-runloop Timer), `tapEvent` (the tap's main
+/// Mach-port source), and the worker hops below — runs on the main thread.
+/// Where the compiler cannot check that (the `nonisolated(unsafe)` globals),
+/// a `dispatchPrecondition` at each entry point traps immediately on a
+/// future off-main caller instead of racing silently. Worker hops that
+/// touch `@MainActor` APIs (Presenter/MenuBar) carry a checked
+/// `@MainActor @Sendable` body; the compiler already requires those (an
+/// un-wrapped Presenter call is an `ActorIsolatedCall` error).
 @Sendable func syncRoster() {
+    dispatchPrecondition(condition: .onQueue(.main))
     guard let onScreen = onScreenWindowIDs() else { return }
     lastRosterSync = Date()
     rosterSyncedOnce = true
@@ -1000,12 +1018,13 @@ nonisolated(unsafe) var rotatedAt: [WorkspaceID: Date] = [:]
                 }
             }
             DispatchQueue.main.async { [flips, minFlips] in
-                // Main queue means main thread by construction, so
-                // assuming the actor is sound (and traps loudly if the
-                // premise ever breaks) — and it keeps the called global
-                // functions nonisolated instead of cascading @Sendable
-                // through half the file.
-                MainActor.assumeIsolated {
+                // The `@MainActor @Sendable` body type makes the compiler
+                // check touches of actor-isolated APIs (Presenter/MenuBar)
+                // from this hop; `assumeIsolated` supplies the runtime
+                // assertion that we really are on the main thread (traps
+                // loudly otherwise). The `nonisolated(unsafe)` model globals
+                // stay main-confined by the entry-point preconditions.
+                let apply: @MainActor @Sendable () -> Void = {
                     // Clear in-flight first: failures retry on the next pass.
                     probing.subtract(attempted)
                     adoptNewcomers(adopted)
@@ -1016,6 +1035,7 @@ nonisolated(unsafe) var rotatedAt: [WorkspaceID: Date] = [:]
                     // the next backstop.
                     wakeTicker()
                 }
+                MainActor.assumeIsolated(apply)
             }
         }
     }
@@ -1159,7 +1179,10 @@ nonisolated(unsafe) var rotatedAt: [WorkspaceID: Date] = [:]
                 fullscreen.append((windowID(wid), flags.fullscreen))
             }
             DispatchQueue.main.async {
-                MainActor.assumeIsolated {
+                // Checked `@MainActor` body (see the sibling hop above):
+                // the compiler verifies actor-isolated touches and
+                // `assumeIsolated` asserts we really are on main.
+                let apply: @MainActor @Sendable () -> Void = {
                     for (id, isMin) in minimized where isMin {
                         minimizedWindows.insert(id)
                         vanishedPending.remove(id)
@@ -1182,6 +1205,7 @@ nonisolated(unsafe) var rotatedAt: [WorkspaceID: Date] = [:]
                     rosterDirty = true
                     wakeTicker()
                 }
+                MainActor.assumeIsolated(apply)
             }
         }
     }
@@ -1454,6 +1478,9 @@ screenParamsObserver = NotificationCenter.default.addObserver(
 /// lifecycle, vertical ticks the core does not model) map to nil and are
 /// dropped — they used to sink a `.printState` per HID burst.
 func tapEvent(_ event: TapEvent) -> DaemonEvent? {
+    // Main-confinement contract: the tap's Mach-port source is on the main
+    // runloop (see the `tap` install). Trap on a future off-main caller.
+    dispatchPrecondition(condition: .onQueue(.main))
     switch event {
     case .swipe(let delta, _):
         // Raw finger travel scaled like the Rust fold (`total_delta *
@@ -3352,6 +3379,10 @@ nonisolated(unsafe) var statOver16 = 0
 nonisolated(unsafe) var statJobs = 0
 
 @Sendable func tick() {
+    // Main-confinement contract: the tick is driven by a main-runloop
+    // Timer (or the idle backstop), and the worker hops re-enter via
+    // `DispatchQueue.main`. Trap on a future off-main caller.
+    dispatchPrecondition(condition: .onQueue(.main))
     tickCount += 1
     // Slow-tick phase timing (diagnostics only): with PANERU_PERF set,
     // full ticks slower than the threshold log one phase breakdown
@@ -3688,6 +3719,10 @@ nonisolated(unsafe) var statJobs = 0
                 DispatchQueue.main.async { wakeTicker() }
                 return
             }
+            // Dead element flags found on the worker: `deadElements` is
+            // main-owned, so collect here and insert on the main hop below
+            // (a direct insert would race `syncRoster`'s read-and-clear).
+            var newlyDead: [CGWindowID] = []
             for (window, job) in batch {
                 // Per-call denial capture: a later success clears the
                 // shared slot, so read the code before the next call.
@@ -3705,10 +3740,8 @@ nonisolated(unsafe) var statJobs = 0
                 // Dead element: flag for drop + re-adopt on the next
                 // roster sync (a parked window reads glass through the
                 // same dead ref, so it can never re-arm on its own).
-                if let code = denied,
-                   code == AXError.invalidUIElement.rawValue,
-                   deadElements.insert(CGWindowID(job.winID)).inserted {
-                    print("ax: window=\(job.winID) element dead (-25202); re-adopting")
+                if let code = denied, code == AXError.invalidUIElement.rawValue {
+                    newlyDead.append(CGWindowID(job.winID))
                 }
                 ackBox.append(AXWriteAck(
                     winID: job.winID, seq: job.seq, epoch: job.epoch,
@@ -3717,8 +3750,15 @@ nonisolated(unsafe) var statJobs = 0
             }
             // Completions land on the worker: wake the idle clock so the
             // tick drains acks (and re-evaluates convergence) now rather
-            // than at the next backstop. Main queue by construction.
-            DispatchQueue.main.async { wakeTicker() }
+            // than at the next backstop. Main queue by construction; the
+            // dead-element flags apply here so they stay main-confined.
+            let dead = newlyDead
+            DispatchQueue.main.async {
+                for id in dead where deadElements.insert(id).inserted {
+                    print("ax: window=\(id) element dead (-25202); re-adopting")
+                }
+                wakeTicker()
+            }
         }
     }
     // Stuck-writer watchdog: past the degrade threshold the core repairs
