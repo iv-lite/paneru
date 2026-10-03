@@ -3065,6 +3065,13 @@ nonisolated(unsafe) var statJobs = 0
     let filteredEvents = events.filter { event in
         guard case .focus(let id) = event, let id else { return true }
         if dontFocus.contains(id) { return false }
+        // Minimized/stashed windows never take an ambient arrival: the OS
+        // observer re-reports them as focused, which would otherwise
+        // enqueue a dropped event every notification (and, before the
+        // core guard, bounce focus hidden→clear→hidden).
+        if minimizedWindows.contains(id) || stashedMembers.contains(id) {
+            return false
+        }
         if id == core.focus { return true }
         return workspaceOfWindow(id) != nil
             || core.unmanaged.contains(id)
@@ -3126,6 +3133,10 @@ nonisolated(unsafe) var statJobs = 0
     {
         axWorker.async { _ = window.updateFrame() }
     }
+    // Ambient focus must never land on a hidden window: the OS observer
+    // re-reports minimized/stashed windows as focused after the heal's
+    // rest window lapses, which bounces focus (and the strip) forever.
+    core.hiddenFromAmbientFocus = minimizedWindows.union(stashedMembers)
     let result = core.tick(
         events: filteredEvents,
         frames: { roster[CGWindowID(bitPattern: $0)]?.frame },

@@ -221,6 +221,14 @@ public struct DaemonCore: Sendable {
     /// Floating (unmanaged) windows: out of every strip, positioned by
     /// hand or the OS. Toggling back re-appends to the active strip.
     public private(set) var unmanaged: Set<WindowID> = []
+    /// Ambient-hidden windows (minimized, or stashed on an inactive
+    /// Space), host-synced each tick. Ambient `.focus` arrivals for these
+    /// are dropped permanently. Without this, the OS/AX observer keeps
+    /// re-reporting a hidden window as focused once the heal's rest
+    /// window lapses, bouncing focus hidden→clear→hidden forever with the
+    /// cursor still (the hands-off oscillation). Keyed focus goes through
+    /// commands, which deminimize on arrival, so it bypasses this.
+    public var hiddenFromAmbientFocus: Set<WindowID> = []
     /// Full-width marker: width ratio (of the viewport) to restore when
     /// the toggle flips off. Mirrors `FullWidthMarker`.
     private var fullWidth: [WindowID: Double] = [:]
@@ -940,6 +948,13 @@ public struct DaemonCore: Sendable {
                 // before ingest (see tick); same-value echoes short-circuit
                 // inside `setFocus` (no reveal churn). Heal-cleared hidden
                 // windows rest briefly instead of refocus→clear looping.
+                //
+                // A minimized/stashed window is refused outright, not just
+                // for the brief rest window: the OS observer re-reports it
+                // as focused after that lapses, so a time-limited block
+                // merely paces the hidden→clear→hidden bounce instead of
+                // stopping it (hands-off view oscillation).
+                if let hid = id, hiddenFromAmbientFocus.contains(hid) { continue }
                 if let hid = id, hiddenBlocked(hid, epoch: epoch) { continue }
                 // Adopt-on-arrival: a live but strip-less window the user
                 // just touched is a missed adoption (appeared-while-stashed

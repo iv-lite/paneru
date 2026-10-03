@@ -5283,6 +5283,43 @@ do {
     )
 }
 
+// A minimized/stashed window is refused as an ambient focus target
+// permanently: the OS observer keeps re-reporting it as focused after the
+// heal's rest window lapses, so a time-limited block only paces the
+// hidden→clear→hidden bounce (the hands-off view oscillation).
+do {
+    var daemon = DaemonCore()
+    daemon.animationsEnabled = false
+    daemon.glideBaseMs = 0
+    let vp = IntRect(0, 0, 900, 768)
+    let live: (Int32) -> IntRect? = { id in
+        let x = Int32(id) * 400
+        return IntRect(min: IntPoint(x, 34), max: IntPoint(x + 400, 734))
+    }
+    _ = daemon.tick(
+        events: [
+            .appeared(id: 0, workspace: 1), .appeared(id: 1, workspace: 1),
+            .appeared(id: 2, workspace: 1), .focus(id: 0),
+        ],
+        frames: live, viewport: vp, focusedStyle: style
+    )
+    daemon.hiddenFromAmbientFocus = [2]
+    // Outlive the heal rest window, then re-report the hidden window.
+    for _ in 0..<90 {
+        _ = daemon.tick(events: [], frames: live, viewport: vp, focusedStyle: style)
+    }
+    _ = daemon.tick(
+        events: [.focus(id: 2)], frames: live, viewport: vp, focusedStyle: style
+    )
+    checkEqual(daemon.focus, 0, "ambient focus refuses a hidden window")
+    // Once it is no longer hidden, the same arrival lands.
+    daemon.hiddenFromAmbientFocus = []
+    _ = daemon.tick(
+        events: [.focus(id: 2)], frames: live, viewport: vp, focusedStyle: style
+    )
+    checkEqual(daemon.focus, 2, "visible ambient focus still lands")
+}
+
 if failures == 0 {
     print("DaemonChecks: all checks passed")
 } else {
