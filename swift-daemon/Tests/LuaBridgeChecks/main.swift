@@ -474,6 +474,74 @@ do {
     try? FileManager.default.removeItem(at: dir)
 }
 
+// The worker lane's whole point: a slow handler blocks the lane, never the
+// caller. A handler that spins ~300ms must not delay `sendBind` by anything
+// like that long, and its effects still arrive once the lane drains.
+do {
+    let worker = LuaWorker()
+    let dir = FileManager.default.temporaryDirectory
+        .appendingPathComponent("paneru-lua-worker-slow-\(UUID().uuidString)")
+    try! FileManager.default.createDirectory(at: dir, withIntermediateDirectories: true)
+    let script = dir.appendingPathComponent("init.lua")
+    try! """
+        paneru.bind("alt-s", function()
+          local deadline = os.clock() + 0.3
+          while os.clock() < deadline do end
+          paneru.run("window focus west")
+        end)
+        """.write(to: script, atomically: true, encoding: .utf8)
+
+    func drainReplies() -> [LuaWorkerReply] {
+        var seen: [LuaWorkerReply] = []
+        for _ in 0..<500 {
+            seen.append(contentsOf: worker.drainReplies())
+            if seen.contains(where: { if case .effects = $0 { return true }; return false }) {
+                return seen
+            }
+            usleep(10_000)
+        }
+        check(false, "slow-handler effects never arrived")
+        return seen
+    }
+
+    worker.load(path: script.path, quiet: true)
+    // Wait for the publication so the bind exists.
+    var publication: LuaPublication?
+    for _ in 0..<500 {
+        for reply in worker.drainReplies() {
+            if case .published(let p) = reply { publication = p }
+        }
+        if publication != nil { break }
+        usleep(10_000)
+    }
+    guard let id = publication?.keybinds.first?.id else {
+        check(false, "slow-handler bind published")
+        exit(1)
+    }
+    let snapshot = ScriptSnapshot(
+        state: .success(QueryState()),
+        windowSet: .success(WindowSet()),
+        scriptState: .success(ScriptState())
+    )
+    let started = Date()
+    worker.sendBind(id: id, snapshot: snapshot)
+    let handoffMs = Date().timeIntervalSince(started) * 1000.0
+    check(
+        handoffMs < 150,
+        "sendBind returns without waiting on the handler (took \(Int(handoffMs))ms)"
+    )
+    let replied = drainReplies()
+    let commands = replied.compactMap { reply -> [PaneruCommand]? in
+        if case .effects(let e) = reply {
+            return e.compactMap { if case .command(let c) = $0 { return c }; return nil }
+        }
+        return nil
+    }.flatMap { $0 }
+    check(commands.contains(.window(.focus(.west))), "slow handler's command still lands")
+    worker.shutdown()
+    try? FileManager.default.removeItem(at: dir)
+}
+
 if failures == 0 {
     print("LuaBridgeChecks: all checks passed")
 } else {
