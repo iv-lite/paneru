@@ -3407,16 +3407,29 @@ public struct DaemonCore: Sendable {
 
     /// The transition decision: given the frame's relation to the owner
     /// viewport and whether it is already parked, should it park now?
-    /// Parking fires only on a **full** exit (the slot is entirely off the
+    /// Parking fires on a **full** exit (the slot is entirely off the
     /// owner), so the strip scrolls rigidly and visible columns always stay
     /// adjacent with their gaps — a partly-visible window is never hidden
     /// mid-run (that reserved-slot hole read as a gap the size of the
     /// leaving window). Once parked, a member stays parked until its whole
     /// frame is back inside.
+    ///
+    /// A full exit always parks, **however far off it sits**: the
+    /// WindowServer refuses to place fully-offscreen glass (it clamps the
+    /// window back on-screen), so an unparked far column can never
+    /// converge — it churns redrive/audit forever and bleeds over its
+    /// visible neighbor. The old "only park near the union" gate assumed a
+    /// column exits by passing through a narrow band, which a fast reveal
+    /// or a snapped offset (space restore) skips entirely, stranding
+    /// full-width scrolling columns. Stale/void far slots park too: the
+    /// owner-edge park is a valid on-screen target that self-corrects when
+    /// the offset settles, so there is nothing to strip.
     private func wantsPark(
         member: WindowID, slot: IntPoint, width: Int32, height: Int32,
         home: IntRect, union: IntRect?, siblings: [IntRect]
     ) -> Bool {
+        _ = height
+        _ = union
         _ = siblings
         let fullyInside = slot.x >= home.min.x && slot.x + width <= home.max.x
         if parkedMembers.contains(member) {
@@ -3424,16 +3437,7 @@ public struct DaemonCore: Sendable {
         }
         let exitedLeft = slot.x + width <= home.min.x
         let exitedRight = slot.x >= home.max.x
-        guard exitedLeft || exitedRight else { return false }
-        // Reachable? Far-bogus slots (stale offsets) stay the drain's to
-        // strip; near ones (scrolled strips, stairs voids) park.
-        guard let union else { return true }
-        let frame = IntRect(min: slot, max: IntPoint(slot.x + width, slot.y + height))
-        let reach = frame.intersected(with: IntRect(
-            min: IntPoint(union.min.x - parkedStripSliver, union.min.y - parkedStripSliver),
-            max: IntPoint(union.max.x + parkedStripSliver, union.max.y + parkedStripSliver)
-        ))
-        return reach.width > 0 && reach.height > 0
+        return exitedLeft || exitedRight
     }
 
     /// Hide-park x/y for a slot the caller already decided to park: the

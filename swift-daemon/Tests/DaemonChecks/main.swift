@@ -2115,9 +2115,11 @@ do {
     check(jobsAfterPark > 0, "expiry retries the repair")
 }
 
-// Stale-offset slots never park: an off-union slot blames the model
-// (stale restore offset), so the origin strips but the breaker stays
-// out — parking waits for proven write failures.
+// Stale-offset slots park at the owner edge instead of writing the
+// bogus far origin: a full exit always hide-parks (the WindowServer
+// clamps fully-offscreen glass, so the far slot can never converge), and
+// the edge park is a valid on-screen target that self-corrects as the
+// offset settles. The audit breaker stays out (no proven write failure).
 do {
     var daemon = DaemonCore()
     daemon.animationsEnabled = false
@@ -2137,8 +2139,11 @@ do {
         events: [], frames: live, viewport: viewport, focusedStyle: style
     )
     let job = r.axJobs.first(where: { $0.winID == 0 })
-    check(job?.origin == nil, "stale-offset slot strips the origin")
-    check(daemon.auditParkedLive[0] == nil, "stale-offset slot never parks")
+    check(
+        job?.origin != nil && (job?.origin?.x ?? 0) > -400,
+        "stale-offset slot parks at the owner edge, not the far slot"
+    )
+    check(daemon.auditParkedLive[0] == nil, "stale-offset slot never audit-parks")
     checkEqual(daemon.auditSurvivors[0] ?? 0, 0, "stale-offset slot feeds no survivor")
 }
 
