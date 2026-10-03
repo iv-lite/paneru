@@ -2606,6 +2606,7 @@ public struct DaemonCore: Sendable {
                                 + " slot=\(slot.x),\(slot.y) live=\(live.min.x),\(live.min.y)"
                                 + " liveSize=\(live.width)x\(live.height)"
                                 + (flags.isEmpty ? "" : " [\(flags.joined(separator: ","))]")
+                                + writeDetail(member)
                         )
                     }
                     if lines.count >= 8 {
@@ -2638,6 +2639,20 @@ public struct DaemonCore: Sendable {
         return flags
     }
 
+    /// Compact AX write state for a divergent window: issued/acked sequence
+    /// and the last origin sent. Pins a stuck write to never-sent (seq 0),
+    /// sent-but-unacked (issued > acked), or sent-to-the-wrong-target (the
+    /// sent origin differs from the committed slot). Empty when nothing was
+    /// ever issued.
+    private func writeDetail(_ member: WindowID) -> String {
+        let issued = ax.issuedSeq(for: member)
+        let acked = ax.ackedSeq(for: member)
+        let sent = ax.lastSentTarget(for: member)
+        guard issued > 0 || sent != nil else { return "" }
+        return " wseq=\(issued)/\(acked)"
+            + (sent.map { " sent=\($0.x),\($0.y)" } ?? "")
+    }
+
     /// Chronic-divergence snapshot: windows the audit repaired on three
     /// or more consecutive runs. A survivor proves a repair path fires
     /// but glass never follows (wedged app, hung lane, OS clamp) — the
@@ -2656,6 +2671,7 @@ public struct DaemonCore: Sendable {
                     + " live=\(live.min.x),\(live.min.y)"
                     + " audits=\(audits)"
                     + (flags.isEmpty ? "" : " [\(flags.joined(separator: ","))]")
+                    + writeDetail(member)
             )
             if lines.count >= 8 { break }
         }

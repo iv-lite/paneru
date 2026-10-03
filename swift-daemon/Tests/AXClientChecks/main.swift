@@ -167,6 +167,20 @@ do {
     state.invalidateSent(99)
 }
 
+// write_state_accessors_pin_a_stuck_write
+do {
+    var state = AXWriteState()
+    let e1 = state.beginFrame()
+    let target = IntPoint(3000, 34)
+    state.recordSent(7, target: target)
+    let seq = state.issue(7, epoch: e1)
+    checkEqual(state.issuedSeq(for: 7), seq, "issued seq exposed")
+    checkEqual(state.ackedSeq(for: 7), 0, "unacked window has no ack seq")
+    checkEqual(state.lastSentTarget(for: 7), target, "last sent origin exposed")
+    state.acknowledge(7, seq: seq, epoch: e1)
+    checkEqual(state.ackedSeq(for: 7), seq, "ack seq advances")
+}
+
 // lost_ack_ages_out_of_the_read_gate
 do {
     var state = AXWriteState()

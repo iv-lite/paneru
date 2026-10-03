@@ -148,6 +148,19 @@ public struct AXWriteState: Sendable {
         issued[winID] ?? 0
     }
 
+    /// Sequence the worker last acknowledged (for diagnostics). Equal to
+    /// `issuedSeq` when the newest intent has landed.
+    public func ackedSeq(for winID: WindowID) -> UInt64 {
+        acked[winID] ?? 0
+    }
+
+    /// Newest origin actually sent to the window (nil until a move is
+    /// sent). With `issuedSeq`/`ackedSeq` this pins a stuck write to
+    /// never-sent, sent-but-unacked, or sent-to-the-wrong-target.
+    public func lastSentTarget(for winID: WindowID) -> IntPoint? {
+        lastSent[winID]
+    }
+
     /// Open a new commit frame. Called once per commit tick, whether or not
     /// it pushes: the epoch counter is the frame clock, and empty epochs
     /// land vacuously.
