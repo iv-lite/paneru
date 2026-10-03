@@ -470,6 +470,13 @@ nonisolated(unsafe) var vanishedPending = Set<WindowID>()
 /// Vanish confirmed as a real close by the worker read: the next sync
 /// drops it without re-asking.
 nonisolated(unsafe) var confirmedVanishes = Set<WindowID>()
+/// Consecutive roster syncs each window has been strip-less. Self-heal
+/// (re-manage) waits for `stripLessHealSyncs` so a transient Space-switch
+/// gap is never mistaken for genuine layout loss (the re-manage-then-
+/// rotate bounce).
+nonisolated(unsafe) var stripLessSyncs: [WindowID: Int] = [:]
+/// Syncs a window must stay strip-less before self-heal re-manages it.
+let stripLessHealSyncs = 3
 nonisolated(unsafe) var observers: [pid_t: LiveObserver] = [:]
 nonisolated(unsafe) var pending: [DaemonEvent] = []
 /// Windows whose rules suppress focus arrival.
@@ -1033,6 +1040,12 @@ nonisolated(unsafe) var rotatedAt: [WorkspaceID: Date] = [:]
     // recovers windows still in the stash; a window whose row was already
     // dropped has no stash entry and would stay strip-less forever — the
     // live failure this repairs (`strips: {}` while windows were visible).
+    //
+    // Gated on consecutive strip-less syncs: a Space switch transiently
+    // leaves windows strip-less while the rotation settles, and healing on
+    // the first such sync re-manages them onto the wrong workspace, which
+    // the rotation then undoes — the visible bounce. Only a window that
+    // stays strip-less across several syncs is a genuine loss.
     if restorePlanner == nil {
         var toManage = homeless
         for (wid, window) in roster {
@@ -1044,8 +1057,19 @@ nonisolated(unsafe) var rotatedAt: [WorkspaceID: Date] = [:]
                   !minimizedWindows.contains(id),
                   !fullscreenFloated.contains(id),
                   !window.cachedFullscreen
-            else { continue }
-            toManage.insert(id)
+            else {
+                stripLessSyncs.removeValue(forKey: id)
+                continue
+            }
+            let seen = (stripLessSyncs[id] ?? 0) + 1
+            stripLessSyncs[id] = seen
+            if seen >= stripLessHealSyncs {
+                toManage.insert(id)
+            }
+        }
+        // Drop counters for windows that regained a workspace.
+        if stripLessSyncs.count > 64 {
+            stripLessSyncs = stripLessSyncs.filter { workspaceOfWindow($0.key) == nil }
         }
         for id in toManage {
             guard let window = roster[CGWindowID(id)],
@@ -1056,6 +1080,7 @@ nonisolated(unsafe) var rotatedAt: [WorkspaceID: Date] = [:]
                   !window.cachedFullscreen
             else { continue }
             let ws = workspaceForFrame(window.frame)
+            stripLessSyncs.removeValue(forKey: id)
             pending.append(.appeared(id: id, workspace: ws))
             print("space: re-managed visible window \(id) on ws=\(ws)")
         }
@@ -2956,6 +2981,7 @@ let stateFilePath =
         }
         strips[String(ws)] = [
             "offset": Int(core.offset(for: ws)),
+            "offsetTarget": core.offsetTarget(for: ws).map { Int($0) } ?? NSNull(),
             "activeRow": Int(core.activeVirtual[ws] ?? 0),
             "rows": rows,
         ] as [String: Any]
@@ -3008,6 +3034,16 @@ let stateFilePath =
         "glass": glass,
         "viewportFallbacks": core.viewportFallbacks.sorted().map { Int($0) },
         "parkedWrites": core.auditParkedLive.keys.sorted().map { Int($0) },
+        "quietInputs": [
+            "noWriterGap": core.writerGap() == nil,
+            "writerGap": core.writerGap().map { Int($0) } ?? NSNull(),
+            "rosterDirty": rosterDirty,
+            "pending": pending.count,
+            "probing": probing.count,
+            "restorePlanner": restorePlanner != nil,
+            "drag": dragGrabbed != nil,
+            "tuning": needTuningReload,
+        ] as [String: Any],
         "spaceStash": stashed,
     ]
     guard let data = try? JSONSerialization.data(withJSONObject: document) else { return }
@@ -3225,6 +3261,10 @@ nonisolated(unsafe) var statJobs = 0
         // later tick, and sleeping here would strand a fresh launch with
         // an empty world (observed: slept at tick 1, roster 0).
         && tickCount > 1 && rosterSyncedOnce && probing.isEmpty
+        // Never idle with an open writer gap: an issued-but-unacked write
+        // is in-flight work, and sleeping would strand it (and stop the
+        // roster syncs that would adopt the rest of the desktop).
+        && core.writerGap() == nil
     slowDutyJustRan = false
     if quiet {
         let now = Date()
@@ -4277,6 +4317,7 @@ nonisolated(unsafe) var statJobs = 0
         && restorePlanner == nil && restorePending.isEmpty && dragGrabbed == nil
         && !terminationRequested
         && tickCount > 1 && rosterSyncedOnce && probing.isEmpty
+        && core.writerGap() == nil
     if endedQuiet {
         let now = Date()
         let backstop = nextBackstopMs(pointerDue: false, slowDue: false, now: now)

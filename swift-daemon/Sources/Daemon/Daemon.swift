@@ -655,7 +655,15 @@ public struct DaemonCore: Sendable {
         // instead of stranding the window on a stale target. Skipped
         // mid-drag (the pointer owns the layout there) and on focus
         // change (already pended above); silent unless the target moves.
-        if let id = focus, id == prevFocus, held == nil,
+        // Resize-aware reveal re-pend. Gated to STRIP windows: a floating/
+        // unmanaged window has no strip to scroll, and re-pending it (its
+        // width churns while it is repositioned) made reveal skip every
+        // tick forever — the "unknown workspace" spin. Upstream's
+        // autocenter acts only on `get_managed`; mirror that.
+        let focusOnStrip = focus.flatMap { id in
+            workspaceOf(id) != nil && !unmanaged.contains(id) ? id : nil
+        }
+        if let id = focusOnStrip, id == prevFocus, held == nil,
            let width = frames(id)?.width
         {
             if let last = lastRevealWidth, last.id == id, last.width != width {
@@ -664,7 +672,9 @@ public struct DaemonCore: Sendable {
             }
             lastRevealWidth = (id, width)
         } else {
-            lastRevealWidth = focus.flatMap { id in frames(id).map { (id, $0.width) } }
+            lastRevealWidth = focusOnStrip.flatMap { id in
+                frames(id).map { (id, $0.width) }
+            }
         }
         // Focus arrival reveals: scroll the minimal shortfall so the
         // focused window is fully visible (mirrors ensure_visible; the
@@ -2269,7 +2279,13 @@ public struct DaemonCore: Sendable {
         raise: Bool, epoch: UInt64
     ) {
         guard let owner = workspaceOf(id) else {
-            print("focus: reveal skipped window=\(id) (unknown workspace)")
+            // Unmanaged/floating windows have no strip: skipping is
+            // expected, not an anomaly (upstream's autocenter acts only on
+            // managed windows). Only a managed window with no workspace is
+            // worth a line.
+            if !unmanaged.contains(id) {
+                print("focus: reveal skipped window=\(id) (unknown workspace)")
+            }
             return
         }
         guard strips[owner]?[activeVirtual[owner] ?? 0]?.contains(id) == true else {
