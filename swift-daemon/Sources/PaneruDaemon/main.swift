@@ -1879,7 +1879,7 @@ core.wallClockMs = { DispatchTime.now().uptimeNanoseconds / 1_000_000 }
     var out: [ScriptEvent] = []
     for event in events {
         switch event {
-        case .focus(let id):
+        case .focus(let id), .focusKeyed(let id):
             if let id { out.append(.windowFocused(windowID: id)) }
         case .appeared(let id, _):
             let meta = core.windowMetadata[id]

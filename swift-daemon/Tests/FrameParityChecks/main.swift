@@ -197,7 +197,7 @@ var ran = 0
 if let rust = loadCorpus(traceDir, "quiescence") {
     ran += 1
     let swift = runScenario(workspace: 2, windows: [0, 1], ticks: [
-        [.focus(id: 0)],
+        [.focusKeyed(id: 0)],
         [.command(.window(.focus(.last)))],
         [],
         [],
@@ -209,7 +209,7 @@ if let rust = loadCorpus(traceDir, "quiescence") {
 if let rust = loadCorpus(traceDir, "tiling") {
     ran += 1
     let swift = runScenario(workspace: 2, windows: [0, 1, 2], ticks: [
-        [.focus(id: 0)],
+        [.focusKeyed(id: 0)],
         [.command(.window(.focus(.last)))],
         [],
     ])
@@ -221,7 +221,7 @@ if let rust = loadCorpus(traceDir, "tiling") {
 if let rust = loadCorpus(traceDir, "virtual") {
     ran += 1
     let swift = runScenario(workspace: 2, windows: [0, 1], ticks: [
-        [.focus(id: 0)],
+        [.focusKeyed(id: 0)],
         [.command(.window(.focus(.last)))],
         [.command(.window(.virtualMoveNumber(1, .follow)))],
         [],
@@ -235,7 +235,7 @@ if let rust = loadCorpus(traceDir, "virtual") {
 if let rust = loadCorpus(traceDir, "drag") {
     ran += 1
     let swift = runScenario(workspace: 2, windows: [0, 1], ticks: [
-        [.focus(id: 0)],
+        [.focusKeyed(id: 0)],
         [],
         [.dragMoved(id: 0, dx: 100)],
         [.released],
@@ -249,7 +249,7 @@ if let rust = loadCorpus(traceDir, "drag") {
 if let rust = loadCorpus(traceDir, "tiling_gaps") {
     ran += 1
     let swift = runScenario(workspace: 2, windows: [0, 1, 2], ticks: [
-        [.focus(id: 0)],
+        [.focusKeyed(id: 0)],
         [.command(.window(.focus(.last)))],
         [],
     ])
@@ -260,7 +260,7 @@ if let rust = loadCorpus(traceDir, "tiling_gaps") {
 if let rust = loadCorpus(traceDir, "virtual_gaps") {
     ran += 1
     let swift = runScenario(workspace: 2, windows: [0, 1], ticks: [
-        [.focus(id: 0)],
+        [.focusKeyed(id: 0)],
         [.command(.window(.focus(.last)))],
         [.command(.window(.virtualMoveNumber(1, .follow)))],
         [],
@@ -272,7 +272,7 @@ if let rust = loadCorpus(traceDir, "virtual_gaps") {
 if let rust = loadCorpus(traceDir, "drag_gaps") {
     ran += 1
     let swift = runScenario(workspace: 2, windows: [0, 1], ticks: [
-        [.focus(id: 0)],
+        [.focusKeyed(id: 0)],
         [],
         [.dragMoved(id: 0, dx: 100)],
         [.released],
@@ -290,7 +290,7 @@ if let rust = loadCorpus(traceDir, "pair_centered") {
     let swift = runScenario(
         workspace: 2, windows: [0, 1],
         ticks: [
-            [.focus(id: 0)],
+            [.focusKeyed(id: 0)],
             [.command(.window(.focus(.last)))],
             [],
         ],
@@ -306,7 +306,7 @@ if let rust = loadCorpus(traceDir, "virtual_centered") {
     let swift = runScenario(
         workspace: 2, windows: [0, 1],
         ticks: [
-            [.focus(id: 0)],
+            [.focusKeyed(id: 0)],
             [.command(.window(.focus(.last)))],
             [.command(.window(.virtualMoveNumber(1, .follow)))],
             [],
@@ -322,7 +322,7 @@ if let rust = loadCorpus(traceDir, "drag_centered") {
     let swift = runScenario(
         workspace: 2, windows: [0, 1],
         ticks: [
-            [.focus(id: 0)],
+            [.focusKeyed(id: 0)],
             [],
             [.dragMoved(id: 0, dx: 100)],
             [.released],

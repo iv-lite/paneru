@@ -46,6 +46,12 @@ public enum DaemonEvent: Equatable, Sendable {
     case disappeared(id: WindowID)
     /// Focus landed (nil = nothing focused).
     case focus(id: WindowID?)
+    /// A **keyed** focus arrival (menu open, explicit selection): claims,
+    /// raises, and re-centers under `auto_center` even when the id is
+    /// already focused (Rust `focus_with`). The live host reaches keyed
+    /// focus through commands; this exists for the frame-parity harness to
+    /// replay Rust's `MenuOpened` without weakening ambient `.focus`.
+    case focusKeyed(id: WindowID?)
     /// Held-column drag delta for a window's whole column.
     case dragMoved(id: WindowID, dx: Int32)
     /// Button released: held columns glide home.
@@ -973,6 +979,30 @@ public struct DaemonCore: Sendable {
                     adoptArrival(hid, frame: live, viewports: viewports)
                 }
                 setFocus(id, raise: false)
+            case .focusKeyed(let id):
+                // Keyed arrival: claim + raise, and force a re-center under
+                // `auto_center` even when the id is already focused (Rust
+                // `focus_with` re-centers on a menu/command arrival). Same
+                // hidden/adoption guards as the ambient path; only the
+                // raise semantics differ.
+                if let hid = id, hiddenFromAmbientFocus.contains(hid) { continue }
+                if let hid = id, hiddenBlocked(hid, epoch: epoch) { continue }
+                if let hid = id,
+                   workspaceOf(hid) == nil,
+                   !unmanaged.contains(hid),
+                   !inParkedOrStashed(hid),
+                   let live = frames(hid)
+                {
+                    adoptArrival(hid, frame: live, viewports: viewports)
+                }
+                setFocus(id, raise: true)
+                if let id {
+                    // Re-pend explicitly: a same-id keyed arrival does not
+                    // change focus, so tick's change-gated pend would skip
+                    // it and the re-center would never run.
+                    pendingReveals.insert(id)
+                    pendingRevealRaise[id] = true
+                }
             case .dragMoved(let id, let dx):
                 held = id
                 driveColumn(of: id, dx: dx)
@@ -3024,10 +3054,17 @@ public struct DaemonCore: Sendable {
                         let target: IntPoint
                         if let live = frames(member), live.width > 0,
                            live.height > 0, live.width < home.width {
-                            target = parkTarget(
+                            var corner = parkTarget(
                                 slot: IntPoint(home.max.x, home.max.y),
                                 width: live.width, height: live.height, home: home
                             )
+                            // Rust parks a non-shown row at
+                            // `viewport.max - PARKED_STRIP_SLIVER` (10). `parkTarget`
+                            // uses the host-tuned `offscreenSliverWidth` for shown-row
+                            // hide-parks, so pin x to the Rust corner here; only the
+                            // x is compared/meaningful (y stays void-clamped).
+                            corner.x = home.max.x - parkedStripSliver
+                            target = corner
                         } else {
                             target = parked
                         }
