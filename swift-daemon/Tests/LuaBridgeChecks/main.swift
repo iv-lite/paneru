@@ -1,6 +1,10 @@
 import Foundation
 import LuaBridge
 import Scripting
+import ScriptHost
+import Commands
+import StateQuery
+import WindowSet
 
 // Live checks against the vendored PUC-Rio Lua: load, state snapshot
 // round-trips, outbox drains, error propagation, and int/float separation.
@@ -55,6 +59,49 @@ do {
     checkEqual(try! lua.call("on_space_changed"), .int(42), "handler reads snapshot")
     checkEqual(lua.drainCommands(), ["window focus east", "count=42"], "outbox drains in order")
     checkEqual(lua.drainCommands(), [], "outbox resets after drain")
+}
+
+// `paneru.state` reads and writes the mirror and records writes for the
+// host, with read-your-writes: set/remove/mutate update the mirror the
+// prelude reads, and `drainStoreWrites` hands the host what to apply.
+do {
+    let lua = freshBridge()
+    try! lua.installPrelude()
+    lua.pushStore(ScriptState(["count": .int(41), "name": .str("term")]))
+    try! lua.load("""
+        function bump()
+          paneru.state.set("count", (paneru.state.get("count") or 0) + 1)
+          paneru.state.set("seen", "yes")
+          paneru.state.remove("name")
+        end
+        function bumpBy(n)
+          return paneru.state.mutate("count", function(c) return (c or 0) + n end)
+        end
+        """)
+    try! lua.call("bump")
+    // Read-your-writes: the mirror reflects the writes immediately.
+    checkEqual(lua.readStore().get("count"), .int(42), "set updates the mirror")
+    checkEqual(lua.readStore().get("seen"), .str("yes"), "new keys land")
+    checkEqual(lua.readStore().get("name"), nil, "remove clears the mirror")
+    let writes = lua.drainStoreWrites()
+    checkEqual(writes.count, 3, "each write is recorded")
+    checkEqual(writes[0].key, "count", "keys record in order")
+    checkEqual(writes[0].value, .int(42), "values record")
+    checkEqual(writes[0].expected, .anything, "writes are unconditional")
+    checkEqual(writes[1].key, "seen", "second write records")
+    checkEqual(writes[2].key, "name", "remove records as a write")
+    checkEqual(writes[2].value, nil, "remove carries a nil value")
+    check(lua.drainStoreWrites().isEmpty, "write drain resets")
+    checkEqual(try! lua.call("bumpBy", args: ["2"]), .int(44), "mutate returns the new value")
+    checkEqual(lua.readStore().get("count"), .int(44), "mutate writes the mirror")
+    checkEqual(lua.drainStoreWrites().map(\.key), ["count"], "mutate records one write")
+    // Non-JSON values are rejected loudly.
+    do {
+        try lua.load("paneru.state.set('bad', function() end)")
+        check(false, "function values must throw")
+    } catch let err as LuaBridgeError {
+        check(err.message.contains("paneru.state"), "bad values name the call")
+    }
 }
 
 // Nested state round-trips through the bridge whole.
@@ -343,6 +390,88 @@ do {
         ["seen window_focused", "again window_focused"],
         "handlers run in registration order with the name"
     )
+}
+
+// The worker lane: load on its own thread, dispatch a function bind, and
+// confirm store writes and commands come back as replies (never blocking
+// the caller). One-way data: snapshot in, effects + writes out.
+do {
+    let worker = LuaWorker()
+    let dir = FileManager.default.temporaryDirectory
+        .appendingPathComponent("paneru-lua-worker-\(UUID().uuidString)")
+    try! FileManager.default.createDirectory(at: dir, withIntermediateDirectories: true)
+    let script = dir.appendingPathComponent("init.lua")
+    try! """
+        paneru.state.set("greeting", "hi")
+        paneru.bind("alt-t", function()
+          paneru.state.set("hits", (paneru.state.get("hits") or 0) + 1)
+          paneru.run("window focus east")
+        end)
+        """.write(to: script, atomically: true, encoding: .utf8)
+
+    func drainUntil(
+        _ predicate: ([LuaWorkerReply]) -> Bool,
+        _ label: String
+    ) -> [LuaWorkerReply] {
+        var seen: [LuaWorkerReply] = []
+        for _ in 0..<500 { // up to ~5s; the lane is fast in practice
+            seen.append(contentsOf: worker.drainReplies())
+            if predicate(seen) { return seen }
+            usleep(10_000)
+        }
+        check(false, "timed out waiting for \(label)")
+        return seen
+    }
+
+    worker.load(path: script.path, quiet: true)
+    let loaded = drainUntil(
+        { $0.contains { if case .published = $0 { return true }; return false } },
+        "publication"
+    )
+    guard let publication = loaded.compactMap({ reply -> LuaPublication? in
+        if case .published(let p) = reply { return p }
+        return nil
+    }).last else {
+        check(false, "worker publishes")
+        exit(1)
+    }
+    checkEqual(publication.keybinds.count, 1, "worker publishes the bind")
+    checkEqual(publication.sawSetup, false, "no setup in a plain script")
+    guard let id = publication.keybinds.first?.id else {
+        check(false, "published bind has an id")
+        exit(1)
+    }
+    check(publication.bindRefs[id] != nil, "function binds carry a ref")
+    // The load-time `paneru.state.set` is emitted as a store write.
+    check(
+        loaded.contains { if case .storeWrites(let w) = $0 { return w.contains { $0.key == "greeting" } }; return false },
+        "load records state writes"
+    )
+
+    let snapshot = ScriptSnapshot(
+        state: .success(QueryState()),
+        windowSet: .success(WindowSet()),
+        scriptState: .success(ScriptState(["hits": .int(0)]))
+    )
+    worker.sendBind(id: id, snapshot: snapshot)
+    let replied = drainUntil(
+        { $0.contains { if case .effects = $0 { return true }; return false } },
+        "bind effects"
+    )
+    let writes = replied.compactMap { reply -> [ScriptStateWrite]? in
+        if case .storeWrites(let w) = reply { return w }
+        return nil
+    }.flatMap { $0 }
+    check(writes.contains { $0.key == "hits" && $0.value == .int(1) }, "bind records the state write")
+    let commands = replied.compactMap { reply -> [PaneruCommand]? in
+        if case .effects(let e) = reply {
+            return e.compactMap { if case .command(let c) = $0 { return c }; return nil }
+        }
+        return nil
+    }.flatMap { $0 }
+    check(commands.contains(.window(.focus(.east))), "bind records its command")
+    worker.shutdown()
+    try? FileManager.default.removeItem(at: dir)
 }
 
 if failures == 0 {

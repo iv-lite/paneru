@@ -71,10 +71,15 @@ let package = Package(
             path: "Sources/Scripting"
         ),
         // Live Lua bridge over the vendored PUC-Rio interpreter:
-        // snapshot in, command strings out.
+        // snapshot in, command strings out. Also hosts the worker lane
+        // (interpreter on its own thread), so it depends on the mailbox
+        // protocol, command vocabulary, keybinds, and event taxonomy.
         .target(
             name: "LuaBridge",
-            dependencies: ["CLua", "Scripting"],
+            dependencies: [
+                "CLua", "Commands", "KeyChords", "ScriptEvents",
+                "ScriptHost", "Scripting",
+            ],
             path: "Sources/LuaBridge"
         ),
         // Script-visible event taxonomy (`src/lua/convert.rs`).
@@ -281,7 +286,10 @@ let package = Package(
         ),
         .executableTarget(
             name: "LuaBridgeChecks",
-            dependencies: ["LuaBridge", "Scripting"],
+            dependencies: [
+                "LuaBridge", "Scripting", "ScriptHost", "Commands",
+                "StateQuery", "WindowSet",
+            ],
             path: "Tests/LuaBridgeChecks"
         ),
         .executableTarget(

@@ -1702,6 +1702,11 @@ func answerQueryDocument(_ data: Data) -> Data {
 nonisolated(unsafe) var mailbox = ScriptMailbox()
 nonisolated(unsafe) var scriptStore = ScriptState()
 nonisolated(unsafe) var luaBridge: LuaBridge?
+/// Lua worker lane (default on): the interpreter runs on its own thread so
+/// a slow handler or `paneru.exec` cannot stall the tick. Set
+/// `PANERU_LUA_WORKER=0` to fall back to the in-tick path (bake/opt-out).
+nonisolated(unsafe) var luaWorker: LuaWorker?
+let luaWorkerMode = ProcessInfo.processInfo.environment["PANERU_LUA_WORKER"] != "0"
 nonisolated(unsafe) var scriptPath: String?
 nonisolated(unsafe) var scriptHandlers: [(name: String, ref: Int32)] = []
 /// Compiled `paneru.match` filters by handler registry ref. Reset with
@@ -1711,6 +1716,114 @@ nonisolated(unsafe) var bindRefs: [UInt32: Int32] = [:]
 nonisolated(unsafe) var keybindEntries: [(code: UInt8, mods: KeyModifiers, id: UInt32)] = []
 nonisolated(unsafe) var needScriptReload = false
 nonisolated(unsafe) var scriptWatcher: DispatchSourceFileSystemObject?
+
+/// Apply a worker publication: republish keybinds/handlers/bind refs into
+/// the same host tables the in-tick path uses, so the tap and dispatch are
+/// identical either way. Match filters compile host-side (the compile lives
+/// in LuaAPI, which the worker does not link). A bad filter fails the whole
+/// publication (keeping the old runtime), matching `publishScript`.
+@Sendable func applyLuaPublication(_ publication: LuaPublication) -> Bool {
+    var matchers: [Int32: WindowMatcher] = [:]
+    for reg in publication.handlers {
+        if let filter = reg.filter {
+            do {
+                if let matcher = try compileMatchFilter(filter) {
+                    matchers[reg.ref] = matcher
+                }
+            } catch {
+                print("lua: \(error) (keeping previous runtime)")
+                return false
+            }
+        }
+    }
+    scriptHandlers = publication.handlers.map { (name: $0.name, ref: $0.ref) }
+    handlerMatchers = matchers
+    bindRefs = publication.bindRefs
+    keybindEntries = publication.keybinds.map {
+        ($0.keycode, KeyModifiers(rawValue: UInt16(truncatingIfNeeded: $0.modifiers)), $0.id)
+    }
+    return true
+}
+
+/// Apply the writes a non-worker dispatch recorded on the interpreter
+/// (`paneru.state.set/remove/mutate`). The interpreter held a local mirror;
+/// the host store is the authority, so the write lands here and the next
+/// `pushStore` reflects it.
+@Sendable func applyDrainedStoreWrites(_ bridge: LuaBridge) {
+    applyStoreWrites(bridge.drainStoreWrites())
+}
+
+/// Apply writes to the authoritative `scriptStore`, logging any that were
+/// rejected or lost a race. Shared by the worker reply path and the in-tick
+/// path; `.applied` (changed or not) is silent.
+@Sendable func applyStoreWrites(_ writes: [ScriptStateWrite]) {
+    for write in writes {
+        switch scriptStore.apply(write) {
+        case .success(.applied):
+            break
+        case .success(.conflict(let current)):
+            print("lua: state '\(write.key)' write conflicted (now \(String(describing: current)))")
+        case .failure(let failure):
+            print("lua: state '\(write.key)' rejected: \(failure.message)")
+        }
+    }
+}
+
+/// Drain worker replies: publications republish the tables; effects join
+/// `pending`/`pendingFlashes` (the tick consumes them next frame); store
+/// writes fold into the authoritative `scriptStore`; load errors flash;
+/// other errors log. Runs before the core consumes `pending`.
+@Sendable func drainLuaWorkerReplies() {
+    guard let worker = luaWorker else { return }
+    for reply in worker.drainReplies() {
+        switch reply {
+        case .published(let publication):
+            guard applyLuaPublication(publication) else { break }
+            if publication.sawSetup, let setup = publication.setup {
+                if let document = try? decodeSetupDocument(setup) {
+                    setupOptions = document.options
+                    setupBindings = document.bindings
+                    setupRules = document.rules
+                    rebuildBaseConfig()
+                    refreshDerivedConfig()
+                    print("lua: setup applied (\(bindings.count) bindings, \(windowRules.count) window rules)")
+                }
+                if !publication.quiet {
+                    pendingFlashes.append((reloadFlashMessage, reloadFlashDuration))
+                }
+            } else {
+                // Reloaded script carries no `paneru.setup` (typically a
+                // mid-edit save): keep the running tuning rather than
+                // dropping to fallback and re-tiling on defaults. Matches
+                // the in-tick `loadScript` "keep current tuning" branch.
+                print("lua: warning: reloaded script has no paneru.setup (keeping current tuning)")
+            }
+            print("lua: published \(publication.keybinds.count) binds, \(publication.handlers.count) handlers")
+        case .loadFailed(let message):
+            // A reload failed (bad syntax, bad filter, unreadable file):
+            // the worker kept its previous runtime; surface the error the
+            // way the in-tick path does.
+            print("lua: \(message) (keeping previous runtime)")
+            pendingFlashes.append(("Lua error: \(message)", reloadErrorFlashDuration))
+        case .effects(let effects):
+            for effect in effects {
+                switch effect {
+                case .command(let command): pending.append(.command(command))
+                case .flash(let text, let duration): pendingFlashes.append((text, duration))
+                case .configChanged: break
+                }
+            }
+        case .storeWrites(let writes):
+            // The interpreter kept a local mirror; the host store is the
+            // authority. Apply each recorded write here — the next snapshot
+            // reflects whatever actually landed (a lost CAS or rejected key
+            // just leaves the store as it was).
+            applyStoreWrites(writes)
+        case .error(let message):
+            print("lua worker: \(message)")
+        }
+    }
+}
 
 /// Publish one loaded script: keybinds, binds, handlers. Match-filter
 /// compile failures and unknown event names throw per handler: a bad
@@ -1778,6 +1891,13 @@ nonisolated(unsafe) var scriptWatcher: DispatchSourceFileSystemObject?
 /// Rust only announces inside `reload()`); watcher-driven reloads
 /// announce. Error toasts are always actionable, quiet or not.
 @Sendable func loadScript(from path: String, quiet: Bool = false) {
+    // Worker lane: hand the load to the interpreter's own thread; the
+    // publication arrives through `drainLuaWorkerReplies`. No interpreter
+    // touch on this (main) thread at all.
+    if let worker = luaWorker {
+        worker.load(path: path, quiet: quiet)
+        return
+    }
     guard let bridge = LuaBridge() else {
         print("lua: warning: could not allocate Lua state (keeping previous runtime)")
         mailbox.applyReload(success: false, error: "could not allocate Lua state")
@@ -1801,6 +1921,9 @@ nonisolated(unsafe) var scriptWatcher: DispatchSourceFileSystemObject?
         return
     }
     luaBridge = bridge
+    // A script's top-level `paneru.state.set/remove` ran at load time;
+    // apply those writes to the authoritative store now.
+    applyDrainedStoreWrites(bridge)
     if let document {
         setupOptions = document.options
         setupBindings = document.bindings
@@ -2114,6 +2237,47 @@ core.wallClockMs = { DispatchTime.now().uptimeNanoseconds / 1_000_000 }
 /// One frame of script hosting: reloads, bind dispatch, events, store,
 /// outbox. Runs before the core tick consumes `pending`.
 @Sendable func drainLuaFrame() {
+    // Worker lane (the default; `PANERU_LUA_WORKER=0` opts out): the
+    // interpreter runs on its own thread. This frame only marshals — build
+    // one snapshot, hand binds and events to the lane, then fold its replies
+    // back into `pending`. No interpreter call happens on this (main) thread.
+    if let worker = luaWorker {
+        if needScriptReload, Date() >= scriptReloadDueAt, let path = scriptPath {
+            needScriptReload = false
+            if fileMtimeChanged(path, last: &lastScriptMtime) {
+                loadScript(from: path)
+            }
+        }
+        // Split binds (dispatch now) from events, and drop lua commands
+        // from `pending` (the worker owns them).
+        var kept: [DaemonEvent] = []
+        kept.reserveCapacity(pending.count)
+        var bindIDs: [UInt32] = []
+        var events: [DaemonEvent] = []
+        for event in pending {
+            if case .command(.lua(let id)) = event {
+                bindIDs.append(id)
+            } else {
+                kept.append(event)
+                events.append(event)
+            }
+        }
+        pending = kept
+        let snapshot = ScriptSnapshot(
+            state: .success(buildQueryState()),
+            windowSet: .success(scriptWindowSet()),
+            scriptState: .success(scriptStore)
+        )
+        for id in bindIDs {
+            worker.sendBind(id: id, snapshot: snapshot)
+        }
+        let scriptable = scriptEvents(for: events)
+        if !scriptable.isEmpty {
+            worker.sendEvents(scriptable, snapshot: snapshot)
+        }
+        drainLuaWorkerReplies()
+        return
+    }
     guard let bridge = luaBridge else { return }
     if needScriptReload, Date() >= scriptReloadDueAt, let path = scriptPath {
         needScriptReload = false
@@ -2149,6 +2313,7 @@ core.wallClockMs = { DispatchTime.now().uptimeNanoseconds / 1_000_000 }
                     commands: bridge.drainCommands().compactMap(parseScriptCommand),
                     flashes: bridge.drainFlashes().map { ($0.message, $0.duration) }
                 )
+                applyDrainedStoreWrites(bridge)
             } catch {
                 print("lua: bind \(id): \(error)")
             }
@@ -2212,6 +2377,7 @@ core.wallClockMs = { DispatchTime.now().uptimeNanoseconds / 1_000_000 }
                         commands: commands,
                         flashes: bridge.drainFlashes().map { ($0.message, $0.duration) }
                     )
+                    applyDrainedStoreWrites(bridge)
                 } catch {
                     print("lua: handler \(handler.name): \(error)")
                 }
@@ -3160,6 +3326,10 @@ nonisolated(unsafe) var radiusRulesGen = 0
 /// commands, and SIGTERM/SIGINT delivery alike — every controlled shutdown
 /// leaves a fresh snapshot behind instead of a stale 30s-dirty write.
 @Sendable func cleanExit() -> Never {
+    // The worker lane is a thread of its own; stop it before the process
+    // tears down (the queue is async, so this is a best-effort nudge — the
+    // process exits immediately after, which reclaims the lane anyway).
+    luaWorker?.shutdown()
     saveSessionState()
     clearSessionRunning(statePath: sessionStatePath())
     exit(0)
@@ -3552,8 +3722,12 @@ nonisolated(unsafe) var statJobs = 0
         }
     }
     // Stuck-writer watchdog: past the degrade threshold the core repairs
-    // only the focused window (see `pollWriterStall`).
-    if let gap = core.pollWriterStall() {
+    // only the focused window (see `pollWriterStall`). The restore grace
+    // is expected congestion — re-adopting a whole desktop queues dozens
+    // of real AX writes on the serial lane, so a gap past the warn
+    // threshold there is backlog, not a wedge; stay quiet until the plan
+    // drops (a genuine wedge still retires the lane below).
+    if let gap = core.pollWriterStall(), restorePlanner == nil {
         print("ax: writer stall (gap \(gap) epochs, focused-only repair)")
     }
     // Worker-lane retirement: timeouts bound wedged apps, but a hung
@@ -4356,6 +4530,10 @@ case .createDefault:
     }
 }
 if let scriptPath {
+    if luaWorkerMode {
+        luaWorker = LuaWorker()
+        print("lua: worker lane enabled (interpreter off the main thread)")
+    }
     loadScript(from: scriptPath, quiet: true)
     watchScript(scriptPath)
 } else {

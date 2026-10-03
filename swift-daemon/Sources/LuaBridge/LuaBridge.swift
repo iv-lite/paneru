@@ -42,6 +42,9 @@ private let luaRegistryIndex: Int32 = -1_073_742_823
 /// skips loudly instead of failing the script, and `query`/`state`
 /// remain loud errors, not silent nils.
 public let luaPrelude = """
+    paneru_state = paneru_state or {}
+    paneru_outbox = paneru_outbox or {}
+    paneru_flashes = paneru_flashes or {}
     paneru = { _binds = {}, _setup = nil }
     function paneru.bind(chord, handler)
       if type(handler) ~= "function" and type(handler) ~= "string" then
@@ -106,6 +109,46 @@ public let luaPrelude = """
         return self
       end
       return ws
+    end
+    -- paneru.state: a named store surviving reloads/restarts. Reads and
+    -- writes hit the local mirror (`paneru_state`) with read-your-writes,
+    -- and each write is recorded on `paneru._writes` for the host to apply
+    -- after the handler returns (the host owns the store). `set(k, nil)`
+    -- removes; values must be JSON-representable (functions, coroutines and
+    -- userdata are rejected here rather than silently dropped).
+    paneru._writes = {}
+    local function _state_type_ok(v)
+      local t = type(v)
+      return t == "nil" or t == "boolean" or t == "number"
+        or t == "string" or t == "table"
+    end
+    local function _state_check(v)
+      if not _state_type_ok(v) then
+        error("paneru.state: value must be JSON-representable, got " .. type(v))
+      end
+    end
+    paneru.state = {}
+    function paneru.state.get(key)
+      return paneru_state[key]
+    end
+    function paneru.state.set(key, value)
+      _state_check(value)
+      if value == nil then
+        paneru_state[key] = nil
+        table.insert(paneru._writes, { key = key, remove = true })
+      else
+        paneru_state[key] = value
+        table.insert(paneru._writes, { key = key, value = value })
+      end
+    end
+    function paneru.state.remove(key)
+      paneru.state.set(key, nil)
+    end
+    function paneru.state.mutate(key, transform)
+      local current = paneru_state[key]
+      local next = transform(current)
+      paneru.state.set(key, next)
+      return next
     end
     """
 
@@ -176,12 +219,11 @@ private func paneruExecImpl(_ state: OpaquePointer?) -> Int32 {
     // Bounded wait: poll so overruns kill the child instead of wedging
     // the owning thread past the cap.
     //
-    // NOTE: the Lua runtime (and thus `paneru.exec`) runs on the main
-    // thread inside `drainLuaFrame`, so a slow child here blocks the tick
-    // (and the event tap it owns). The proper fix — moving the Lua worker
-    // to its own thread like Rust's `src/lua/worker.rs` — is a larger
-    // change tracked separately; until then a slow exec is logged loudly
-    // so it is diagnosable instead of a silent stall.
+    // NOTE: the bridge itself is synchronous — `paneru.exec` blocks whoever
+    // calls it. In the daemon the worker lane (default) owns the bridge, so
+    // a slow child blocks scripts, not the tick; the in-tick opt-out path
+    // and bare bridges block their caller. A slow exec is logged loudly so
+    // it is diagnosable instead of a silent stall.
     let deadline = Date().addingTimeInterval(execTimeoutSecs)
     while process.isRunning, Date() < deadline {
         Thread.sleep(forTimeInterval: 0.05)
@@ -197,8 +239,8 @@ private func paneruExecImpl(_ state: OpaquePointer?) -> Int32 {
     let elapsedMs = Date().timeIntervalSince(started) * 1000.0
     if elapsedMs >= 50 {
         print("lua: exec '\(command)' blocked for \(Int(elapsedMs))ms"
-            + " (Lua handlers run on the daemon thread; keep helpers fast —"
-            + " a Lua worker thread is the fix, tracked separately)")
+            + " (paneru.exec is synchronous; keep helpers fast —"
+            + " the worker lane keeps this off the tick)")
     }
     let stdout = String(
         data: outPipe.fileHandleForReading.readDataToEndOfFile(), encoding: .utf8
@@ -288,6 +330,57 @@ public final class LuaBridge {
             }
         }
         return ScriptState(fields)
+    }
+
+    /// Drain the writes `paneru.state.set/remove/mutate` recorded on
+    /// `paneru._writes` during the last dispatch, resetting the list. The
+    /// host applies them to its store (the interpreter only kept a local
+    /// mirror). A `nil` value is a remove; `expected` is always `.anything`
+    /// (the mirror already resolved any CAS locally for `mutate`).
+    public func drainStoreWrites() -> [ScriptStateWrite] {
+        var out: [ScriptStateWrite] = []
+        guard lua_getglobal(state, "paneru") == LUA_TTABLE else {
+            pop(1)
+            return out
+        }
+        lua_getfield(state, -1, "_writes")
+        guard lua_type(state, -1) == LUA_TTABLE else {
+            pop(2)
+            return out
+        }
+        let count = Int(lua_rawlen(state, -1))
+        if count > 0 {
+            for i in 1...count {
+                lua_geti(state, -1, Int64(i))
+                if lua_type(state, -1) == LUA_TTABLE {
+                    lua_getfield(state, -1, "key")
+                    let key = tostring(at: -1)
+                    pop(1)
+                    lua_getfield(state, -1, "remove")
+                    let isRemove = lua_type(state, -1) == LUA_TBOOLEAN
+                        && lua_toboolean(state, -1) != 0
+                    pop(1)
+                    var value: ScriptValue?
+                    if !isRemove {
+                        lua_getfield(state, -1, "value")
+                        value = readValue(at: -1)
+                        pop(1)
+                    }
+                    if let key {
+                        out.append(ScriptStateWrite(
+                            key: key, value: value, expected: .anything
+                        ))
+                    }
+                }
+                pop(1)
+            }
+        }
+        pop(1)
+        // Reset the list for the next dispatch.
+        lua_createtable(state, 0, 0)
+        lua_setfield(state, -2, "_writes")
+        pop(1)
+        return out
     }
 
     /// Call global `name` with string arguments; converts the single result.
