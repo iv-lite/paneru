@@ -508,6 +508,9 @@ logEffectiveTuning()
 nonisolated(unsafe) var lastRosterSync = Date.distantPast
 let rosterSyncInterval: TimeInterval = 1.0
 nonisolated(unsafe) var rosterDirty = true
+/// Front-to-back on-screen window order, refreshed at roster sync (1Hz).
+/// The ~4Hz hover poll reads this instead of walking the window list.
+nonisolated(unsafe) var cachedOnScreenOrder: [WindowID] = []
 /// Space-switch observer token (retained: dropping it unregisters).
 /// Swift is Space-blind — off-Space windows read as vanished — so a
 /// switch re-resolves immediately instead of waiting the backstop.
@@ -894,6 +897,9 @@ nonisolated(unsafe) var rotatedAt: [WorkspaceID: Date] = [:]
 @Sendable func syncRoster() {
     guard let onScreen = onScreenWindowIDs() else { return }
     lastRosterSync = Date()
+    // Cache the front-to-back order for the hover poll: it runs at ~4Hz
+    // and doesn't need its own `CGWindowListCopyWindowInfo` walk per poll.
+    cachedOnScreenOrder = onScreen.map { windowID($0) }
     // Signal- vs backstop-driven: notificationless backstops still
     // vanish-drop and adopt, but skip the per-window AX flip reads
     // (fullscreen/minimize probes across the whole roster). Missed
@@ -2216,7 +2222,7 @@ nonisolated(unsafe) var lastWarpEval = Date.distantPast
     else { return }
     guard resolved.focusFollowsMouse else { return }
     let hovered = core.hoverFocusTarget(
-        frontToBack: (onScreenWindowIDs() ?? []).map { windowID($0) },
+        frontToBack: cachedOnScreenOrder,
         focusable: Set(core.strips.values.flatMap {
             $0.values.flatMap { $0.allWindows }
         })
