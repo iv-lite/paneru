@@ -134,6 +134,35 @@ do {
     checkEqual(clock.settle(work: true, backstopMs: 100), .run, "work stays running")
 }
 
+// StripMotionArbiter: keyed always wins and resets; non-keyed flaps damp.
+do {
+    var arb = StripMotionArbiter(flapReversals: 3, flapWindowEpochs: 30, cooldownEpochs: 120)
+    // Keyed always allowed, even mid-cooldown.
+    check(arb.allow(cause: .keyed, from: 0, to: 100, epoch: 1), "keyed moves")
+    check(arb.allow(cause: .keyed, from: 100, to: 0, epoch: 2), "keyed reverses freely")
+    // A keyed move resets state, so a following ambient move starts clean.
+    check(arb.allow(cause: .ambient, from: 0, to: 50, epoch: 3), "ambient after keyed")
+    // Ambient alternation trips the flap after flapReversals reversals.
+    check(arb.allow(cause: .ambient, from: 50, to: 10, epoch: 4), "ambient reversal 1")
+    check(arb.allow(cause: .ambient, from: 10, to: 60, epoch: 5), "ambient reversal 2")
+    check(!arb.allow(cause: .ambient, from: 60, to: 5, epoch: 6), "ambient reversal 3 trips")
+    // Cooldown refuses ambient but keyed still passes.
+    check(!arb.allow(cause: .ambient, from: 5, to: 90, epoch: 7), "cooldown refuses ambient")
+    check(arb.allow(cause: .keyed, from: 5, to: 90, epoch: 8), "keyed beats cooldown")
+
+    // Slow reversals are navigation, not a flap: they never trip.
+    var nav = StripMotionArbiter(flapReversals: 3, flapWindowEpochs: 30, cooldownEpochs: 120)
+    check(nav.allow(cause: .ambient, from: 0, to: 50, epoch: 0), "nav 1")
+    check(nav.allow(cause: .ambient, from: 50, to: 10, epoch: 100), "nav 2 (stale window)")
+    check(nav.allow(cause: .ambient, from: 10, to: 60, epoch: 200), "nav 3 (stale window)")
+    check(nav.allow(cause: .ambient, from: 60, to: 5, epoch: 300), "nav 4 (stale window)")
+
+    // autoCenter outranks ambient in intent, but both damp alike here.
+    var center = StripMotionArbiter()
+    check(center.allow(cause: .autoCenter, from: 0, to: 200, epoch: 1), "autoCenter moves")
+    check(center.allow(cause: .keyed, from: 200, to: 0, epoch: 2), "keyed over autoCenter")
+}
+
 if failures == 0 {
     print("EventCoreChecks: all checks passed")
 } else {

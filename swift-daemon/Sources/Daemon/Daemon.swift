@@ -352,20 +352,11 @@ public struct DaemonCore: Sendable {
     /// quickly, and per-window pending removes the flap-loss the long
     /// gate compensated for.)
     private let revealRestEpochs: UInt64 = 8
-    /// Reveal flap guard (focus oscillation, e.g. FFM⇄MFF ping-pong):
-    /// consecutive direction reversals of a workspace's reveal target past
-    /// this count stand reveals down for a cooldown, so the loop drains
-    /// instead of scrolling the strip back and forth forever.
-    private let revealFlapReversals = 3
-    private let revealFlapCooldownEpochs: UInt64 = 120
-    /// Only reversals within this window count as a flap. A user changing
-    /// focus direction a second apart is normal navigation, not an
-    /// oscillation, and must never be stood down.
-    private let revealFlapWindowEpochs: UInt64 = 30
-    private var revealLastDir: [WorkspaceID: Int] = [:]
-    private var revealReversals: [WorkspaceID: Int] = [:]
-    private var revealCooldownUntil: [WorkspaceID: UInt64] = [:]
-    private var revealLastAt: [WorkspaceID: UInt64] = [:]
+    /// Reveal flap guard, one arbiter per workspace: the single owner of
+    /// "who may move this strip". Replaces the reversal-counter plus
+    /// cooldown latches — a keyed arrival always wins and resets, ambient
+    /// oscillation damps (see `StripMotionArbiter`).
+    private var stripMotion: [WorkspaceID: StripMotionArbiter] = [:]
     /// Hidden fraction of the focused window above which arrival
     /// reveals. Mirrors `window_hidden_ratio`: 0 always reveals on any
     /// shortfall (legacy), 1 only when fully hidden (quiet clicks —
@@ -2348,9 +2339,9 @@ public struct DaemonCore: Sendable {
         // (key creation), which the rest gate would misread as motion.
         // Targets ease in commit — no same-tick jump.
         if next.x != (offsetTargets[owner] ?? offset) {
-            guard !revealFlapBlocked(
+            guard stripMayMove(
                 owner: owner, proposed: next.x, from: offset, epoch: epoch,
-                keyed: raise
+                cause: raise ? .keyed : .ambient
             ) else { return }
             offsetTargets[owner] = next.x
             dirty.formUnion([.layout, .motion])
@@ -2358,52 +2349,27 @@ public struct DaemonCore: Sendable {
         }
     }
 
-    /// Reveal flap guard: a focus oscillation (FFM⇄MFF ping-pong) reverses
-    /// the strip's reveal direction every tick, scrolling a viewport back
-    /// and forth forever. Count consecutive direction reversals; past the
-    /// limit, stand reveals down for a cooldown so the loop drains instead
-    /// of churning the strip.
-    ///
-    /// **Keyed arrivals are never blocked.** The breaker exists to damp
-    /// *ambient* hover/echo oscillation; a deliberate keypress or command
-    /// must always scroll the strip, or the window manager looks dead
-    /// ("focus won't glide"). Blocking keyed reveals was the regression
-    /// that made scrolling stop working.
-    private mutating func revealFlapBlocked(
+    /// Ask the workspace's arbiter whether the strip may move to `proposed`
+    /// from `from`, under `cause`. One owner per workspace decides; keyed
+    /// moves always win and reset the oscillation state (the regression
+    /// this guards against was keyed reveals being blocked, which made
+    /// scrolling look dead).
+    private mutating func stripMayMove(
         owner: WorkspaceID, proposed: Int32, from: Int32, epoch: UInt64,
-        keyed: Bool
+        cause: StripMotionArbiter.Cause
     ) -> Bool {
-        if keyed { return false }
-        if epoch < (revealCooldownUntil[owner] ?? 0) {
-            return true
+        var arbiter = stripMotion[owner] ?? StripMotionArbiter()
+        let allowed = arbiter.allow(
+            cause: cause, from: from, to: proposed, epoch: epoch
+        )
+        stripMotion[owner] = arbiter
+        if !allowed {
+            print(
+                "focus: strip motion stood down on ws=\(owner)"
+                    + " (cause \(cause), \(from) → \(proposed))"
+            )
         }
-        let dir = proposed > from ? 1 : (proposed < from ? -1 : 0)
-        guard dir != 0 else { return false }
-        // Stale reversals don't count: only a rapid back-and-forth is a
-        // flap. A direction change after a pause resets the run.
-        if let at = revealLastAt[owner], epoch &- at > revealFlapWindowEpochs {
-            revealReversals[owner] = 0
-            revealLastDir[owner] = 0
-        }
-        revealLastAt[owner] = epoch
-        if let last = revealLastDir[owner], last != 0, last != dir {
-            let n = (revealReversals[owner] ?? 0) + 1
-            if n >= revealFlapReversals {
-                revealCooldownUntil[owner] = epoch &+ revealFlapCooldownEpochs
-                revealReversals[owner] = 0
-                revealLastDir[owner] = 0
-                print(
-                    "focus: reveal flap on ws=\(owner) — standing reveals down"
-                        + " \(revealFlapCooldownEpochs) epochs"
-                )
-                return true
-            }
-            revealReversals[owner] = n
-        } else {
-            revealReversals[owner] = 0
-        }
-        revealLastDir[owner] = dir
-        return false
+        return allowed
     }
 
     /// Center the focused window in its viewport by moving the strip
@@ -2426,9 +2392,9 @@ public struct DaemonCore: Sendable {
             let hi = min(slot.x + width, viewport.max.x)
             if hi - lo >= width { return }
         }
-        guard !revealFlapBlocked(
+        guard stripMayMove(
             owner: owner, proposed: target, from: offset, epoch: epoch,
-            keyed: true
+            cause: .autoCenter
         ) else { return }
         offsetTargets[owner] = target
         dirty.formUnion([.layout, .motion])

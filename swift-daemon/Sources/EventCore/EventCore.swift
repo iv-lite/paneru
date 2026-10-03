@@ -113,7 +113,108 @@ public func pumpTimeoutMs(
     return lowPower ? lowPowerTimeoutMs : idleTimeoutMs
 }
 
-// MARK: - Frame clock (idle-when-static scheduling)
+// MARK: - Strip-motion arbiter
+
+/// One arbiter per workspace decides who may move the strip this frame.
+/// Before this, focus arrival, reveal, hover, and auto-center each carried
+/// their own ad-hoc latch (a reversal counter, cooldowns, hover echo
+/// windows), which is how the focus/reveal/hover flap kept coming back:
+/// no single place owned "who moves the strip".
+///
+/// Cause priority is explicit and total: `.keyed` (keyboard/command/
+/// transfer) always wins and resets the oscillation state; `.autoCenter`
+/// (declarative focus centering) is next; `.ambient` (hover echoes) is
+/// last and is the only cause the flap guard damps. The guard itself is
+/// direction reversal within a short window — a genuine navigation that
+/// changes direction a second later resets rather than counting.
+///
+/// Pure and clock-agnostic (callers pass epochs), so the policy is
+/// unit-pinned without a tick.
+public struct StripMotionArbiter: Sendable {
+    /// Who wants the strip to move, most authoritative first.
+    public enum Cause: Int, Sendable, Comparable {
+        case ambient = 0
+        case autoCenter = 1
+        case keyed = 2
+
+        public static func < (lhs: Cause, rhs: Cause) -> Bool {
+            lhs.rawValue < rhs.rawValue
+        }
+    }
+
+    /// Consecutive reversals of the same non-keyed cause past this count
+    /// stand the strip down for a cooldown (the flap drains).
+    public let flapReversals: Int
+    /// Reversals further apart than this are navigation, not a flap.
+    public let flapWindowEpochs: UInt64
+    /// How long reveals stay down once a flap trips.
+    public let cooldownEpochs: UInt64
+
+    private var lastCause: Cause?
+    private var lastDir: Int
+    private var reversals: Int
+    private var lastAt: UInt64
+    private var cooldownUntil: UInt64
+
+    public init(
+        flapReversals: Int = 3,
+        flapWindowEpochs: UInt64 = 30,
+        cooldownEpochs: UInt64 = 120
+    ) {
+        self.flapReversals = flapReversals
+        self.flapWindowEpochs = flapWindowEpochs
+        self.cooldownEpochs = cooldownEpochs
+        self.lastCause = nil
+        self.lastDir = 0
+        self.reversals = 0
+        self.lastAt = 0
+        self.cooldownUntil = 0
+    }
+
+    /// Whether a proposed move (`to`, from `from`) is allowed under
+    /// `cause` at `epoch`. Keyed moves are always allowed and reset the
+    /// flap state. Non-keyed moves are refused during a cooldown and
+    /// trip one after too many rapid reversals.
+    public mutating func allow(
+        cause: Cause, from: Int32, to: Int32, epoch: UInt64
+    ) -> Bool {
+        if cause == .keyed {
+            // A deliberate move clears any oscillation state.
+            lastCause = .keyed
+            lastDir = 0
+            reversals = 0
+            cooldownUntil = 0
+            lastAt = epoch
+            return true
+        }
+        if epoch < cooldownUntil { return false }
+        let dir = to > from ? 1 : (to < from ? -1 : 0)
+        guard dir != 0 else { return true }
+        // Stale reversals do not count.
+        if epoch &- lastAt > flapWindowEpochs {
+            reversals = 0
+            lastDir = 0
+        }
+        lastAt = epoch
+        if lastDir != 0, lastDir != dir, lastCause != .keyed {
+            let n = reversals + 1
+            if n >= flapReversals {
+                cooldownUntil = epoch &+ cooldownEpochs
+                reversals = 0
+                lastDir = 0
+                lastCause = cause
+                return false
+            }
+            reversals = n
+        } else {
+            reversals = 0
+        }
+        lastDir = dir
+        lastCause = cause
+        return true
+    }
+}
+
 
 /// The tick cadence decision, split out from the timer so it is a pure,
 /// testable state machine. The daemon's problem was an always-on 60–120Hz
