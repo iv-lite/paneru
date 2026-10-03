@@ -203,6 +203,30 @@ do {
     check(!state.unackedTimedOut(7), "converged clears the timeout")
 }
 
+// forget retires a vanished window so its unacked sequence cannot hold a
+// gap open forever (the permanent-retry / never-idle bug).
+do {
+    var state = AXWriteState()
+    let e1 = state.beginFrame()
+    state.issue(1, epoch: e1)
+    state.issue(2, epoch: e1)
+    state.acknowledge(1, seq: state.issuedSeq(for: 1), epoch: e1)
+    // Window 2 never acks: the epoch is stuck and the gap grows.
+    for _ in 0..<stuckWriterEpochs { state.beginFrame() }
+    check(state.openGap() != nil, "unacked window holds a gap open")
+    check(state.unacked(2), "vanished window still reads unacked")
+    // Forgetting it (it disappeared) lands the epoch.
+    state.forget(2)
+    check(!state.unacked(2), "forget clears the unacked window")
+    checkEqual(state.openGap(), nil, "forget lands the stuck epoch")
+    checkEqual(state.issuedSeq(for: 2), 0, "forget resets issued sequence")
+    checkEqual(state.ackedSeq(for: 2), 0, "forget resets acked sequence")
+    // A recycled id starts clean.
+    let e2 = state.beginFrame()
+    let seq = state.issue(2, epoch: e2)
+    checkEqual(seq, 1, "recycled id starts from sequence 1")
+}
+
 // open_gap_reports_without_disturbing_the_edge
 do {
     var state = AXWriteState()

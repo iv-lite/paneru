@@ -5380,6 +5380,70 @@ do {
     check(daemon.spaceStash[111] != nil, "nil live set never prunes")
 }
 
+// Rigid strip: during an animated reveal glide, every column's committed
+// slot shifts by the SAME offset delta, so the spacing between neighbours
+// never changes (no gap opens mid-animation). This is the core guarantee
+// that columns glide together.
+do {
+    var daemon = DaemonCore()
+    daemon.animationsEnabled = true
+    daemon.glideBaseMs = 200
+    daemon.autoCenter = false
+    let clock = ManualClock()
+    daemon.wallClockMs = { clock.now }
+    let live = frames(slots: [
+        0: IntPoint(0, 0), 1: IntPoint(400, 0), 2: IntPoint(800, 0),
+    ])
+    _ = daemon.tick(
+        events: [
+            .appeared(id: 0, workspace: 1),
+            .appeared(id: 1, workspace: 1),
+            .appeared(id: 2, workspace: 1),
+        ],
+        frames: live, viewport: viewport, focusedStyle: style
+    )
+    // Focus the far window: minimal expose scrolls the strip left.
+    _ = daemon.tick(
+        events: [.focusKeyed(id: 2)],
+        frames: live, viewport: viewport, focusedStyle: style
+    )
+    // Walk the glide; spacing must hold on every frame.
+    var sawTravel = false
+    var lastOffset: Int32?
+    for step in 1...20 {
+        clock.now += 16
+        let before = daemon.offsets[1] ?? 0
+        _ = daemon.tick(
+            events: [], frames: live, viewport: viewport, focusedStyle: style
+        )
+        let after = daemon.offsets[1] ?? 0
+        let slots = [0, 1, 2].compactMap { daemon.committedSlot(of: $0) }
+        guard slots.count == 3 else {
+            check(false, "step \(step): all columns hold a slot")
+            break
+        }
+        checkEqual(
+            slots[1].x - slots[0].x, 400,
+            "step \(step): spacing 0→1 stays 400 during glide"
+        )
+        checkEqual(
+            slots[2].x - slots[1].x, 400,
+            "step \(step): spacing 1→2 stays 400 during glide"
+        )
+        if after != before { sawTravel = true }
+        if let last = lastOffset {
+            // The whole strip moves by one delta: no column lags.
+            checkEqual(
+                slots[0].x - last, after - before,
+                "step \(step): every column shifts by the strip delta"
+            )
+        }
+        lastOffset = slots[0].x
+    }
+    check(sawTravel, "the reveal actually animated")
+    checkEqual(daemon.offsetTarget(for: 1), -176, "glide settles at the reveal target")
+}
+
 if failures == 0 {
     print("DaemonChecks: all checks passed")
 } else {

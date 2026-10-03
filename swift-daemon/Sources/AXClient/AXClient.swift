@@ -285,6 +285,25 @@ public struct AXWriteState: Sendable {
     public mutating func invalidateSent(_ winID: WindowID) {
         lastSent.removeValue(forKey: winID)
     }
+
+    /// Retire a window from the write ledger (it vanished/closed). Its
+    /// still-traveling sequences can never be acked by a live worker, so
+    /// leaving them in place makes `openGap()` report a gap that grows
+    /// forever — which keeps the frame non-quiescent and (with an idle
+    /// clock) pins the daemon at full rate retrying a window that is gone.
+    /// Dropping the window from every unlanded epoch lets those epochs
+    /// land; a later window reusing the id starts from a clean slate.
+    public mutating func forget(_ winID: WindowID) {
+        issued.removeValue(forKey: winID)
+        acked.removeValue(forKey: winID)
+        issuedAt.removeValue(forKey: winID)
+        ackedEpoch.removeValue(forKey: winID)
+        lastSent.removeValue(forKey: winID)
+        for epoch in epochMembers.keys {
+            epochMembers[epoch]?.remove(winID)
+        }
+        advanceLanded()
+    }
 }
 
 // MARK: - Read tracker

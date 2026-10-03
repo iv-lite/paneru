@@ -917,6 +917,10 @@ public struct DaemonCore: Sendable {
                 homing.remove(id)
                 redriveLastLive.removeValue(forKey: id)
                 fullWidth.removeValue(forKey: id)
+                // Retire the write ledger: an unacked sequence for a gone
+                // window makes openGap() grow forever (permanent
+                // non-quiescence / full-rate retry).
+                forgetWrites(id)
                 auditSurvivors.removeValue(forKey: id)
                 auditParkedLive.removeValue(forKey: id)
                 auditParkedSlot.removeValue(forKey: id)
@@ -4040,6 +4044,14 @@ public struct DaemonCore: Sendable {
     /// Record a worker completion, as the ack drain does.
     public mutating func acknowledge(winID: WindowID, seq: UInt64, epoch: UInt64) {
         ax.acknowledge(winID, seq: seq, epoch: epoch)
+    }
+
+    /// Retire a vanished window's write ledger. Without this its unacked
+    /// sequences linger, `openGap()` grows forever, and the daemon never
+    /// reaches quiescence (a permanent full-rate retry loop). Called on
+    /// `.disappeared`.
+    public mutating func forgetWrites(_ winID: WindowID) {
+        ax.forget(winID)
     }
 
     /// Record an answered refusal (denial or timeout, never traveling):
