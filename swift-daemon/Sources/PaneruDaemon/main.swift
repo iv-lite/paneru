@@ -4865,24 +4865,65 @@ func loadRestoreState() {
 // serves direct (NSXPCConnection) clients.
 let subscriptions = SubscriptionRegistry()
 
+/// Carrier for an XPC reply block across a main-queue hop. `NSXPCConnection`
+/// reply blocks are thread-safe by contract (the connection serializes
+/// replies), so vouching `@unchecked Sendable` is truthful; it is the one
+/// seam the Swift 6 checker cannot see through (`@escaping` `@objc`
+/// closures are not `Sendable`).
+private final class XPCReply<T>: @unchecked Sendable {
+    let call: (T) -> Void
+    init(_ call: @escaping (T) -> Void) { self.call = call }
+}
+
+/// Carries a thread-safe AppKit/XPC object (`NSXPCConnection`, an exported
+/// handler) across a main-queue hop. These objects guard their own state;
+/// the checker just cannot see it.
+private final class SendableBox<T>: @unchecked Sendable {
+    let value: T
+    init(_ value: T) { self.value = value }
+}
+
 /// One exported object per connection, so pushes route back down the
 /// connection they subscribed on. Dead connections prune their ids.
+///
+/// NSXPCListener delivers these methods on its own private queue, never the
+/// main runloop. The daemon's model (`pending`, the tick timer, query
+/// state) is main-confined — `wakeTicker()` schedules a Timer on the
+/// calling thread's runloop, which would be the XPC queue's (never run) —
+/// so every method hops to the main queue before touching it and replies
+/// from there. `PaneruCommand`/`DaemonEvent`/`Data`/`String` are all
+/// `Sendable`, so the hop is a clean value hand-off.
+///
+/// `subscriptions` is `@unchecked Sendable` (thread-safe registry) and
+/// `ids` is only touched on the main queue, so it needs no lock.
 final class ConnectionHandler: NSObject, PaneruXPCProtocol {
     var connection: NSXPCConnection?
+    /// Guarded by the main queue: only ever read/written inside
+    /// `DispatchQueue.main.async` hops (prune closures hop too).
     var ids: [String] = []
 
     func runCommand(_ argv: [String], withReply reply: @escaping (String) -> Void) {
+        // Parse off-main (pure, no shared state), then hop to apply.
+        let command: PaneruCommand
         do {
-            pending.append(.command(try parseCommand(argv)))
-            wakeTicker()
-            reply("ok")
+            command = try parseCommand(argv)
         } catch {
             reply(xpcError("\(error)"))
+            return
+        }
+        let reply = XPCReply(reply)
+        DispatchQueue.main.async {
+            pending.append(.command(command))
+            wakeTicker()
+            reply.call("ok")
         }
     }
 
     func answerQuery(_ requestJSON: Data, withReply reply: @escaping (Data) -> Void) {
-        reply(answerQueryDocument(requestJSON))
+        let reply = XPCReply(reply)
+        DispatchQueue.main.async {
+            reply.call(answerQueryDocument(requestJSON))
+        }
     }
 
     func subscribe(withReply reply: @escaping (String) -> Void) {
@@ -4890,17 +4931,25 @@ final class ConnectionHandler: NSObject, PaneruXPCProtocol {
             reply(xpcError("no connection"))
             return
         }
-        let token = subscriptions.add { batch in
-            (connection.remoteObjectProxy as? PaneruXPCClientProtocol)?
-                .deliverEvents(batch)
+        let reply = XPCReply(reply)
+        let boxedConnection = SendableBox(connection)
+        let boxedSelf = SendableBox(self)
+        DispatchQueue.main.async {
+            let token = subscriptions.add { batch in
+                (boxedConnection.value.remoteObjectProxy as? PaneruXPCClientProtocol)?
+                    .deliverEvents(batch)
+            }
+            boxedSelf.value.ids.append(token)
+            reply.call(token)
         }
-        ids.append(token)
-        reply(token)
     }
 
     func unsubscribe(_ id: String) {
-        subscriptions.remove(id)
-        ids.removeAll { $0 == id }
+        let boxed = SendableBox(self)
+        DispatchQueue.main.async {
+            subscriptions.remove(id)
+            boxed.value.ids.removeAll { $0 == id }
+        }
     }
 }
 
@@ -4914,10 +4963,16 @@ final class CommandListener: NSObject, NSXPCListenerDelegate {
         connection.exportedInterface = NSXPCInterface(with: PaneruXPCProtocol.self)
         connection.exportedObject = handler
         connection.remoteObjectInterface = NSXPCInterface(with: PaneruXPCClientProtocol.self)
-        // Prune everything this connection owns on death.
+        // Prune everything this connection owns on death. Interruption/
+        // invalidation handlers fire on an XPC thread; `ids` is
+        // main-confined, so the prune hops like every other touch.
         let prune = { [weak handler] in
-            for id in handler?.ids ?? [] {
-                subscriptions.remove(id)
+            guard let handler else { return }
+            let boxed = SendableBox(handler)
+            DispatchQueue.main.async {
+                for id in boxed.value.ids {
+                    subscriptions.remove(id)
+                }
             }
         }
         connection.interruptionHandler = prune

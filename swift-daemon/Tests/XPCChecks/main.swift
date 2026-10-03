@@ -128,6 +128,79 @@ do {
     withExtendedLifetime((listener, client, sink)) {}
 }
 
+// XPC delivery contract: exported-object methods are invoked on a private
+// queue, NOT the main runloop. The daemon's ConnectionHandler depends on
+// this — it hops every model touch to the main queue because the tick
+// timer (`Timer.scheduledTimer`) is scheduled on the calling thread's
+// runloop, which is never run on the XPC queue. If a future refactor ever
+// makes delivery main-threaded, this check flags that the hop is no longer
+// load-bearing (and the daemon can trust a direct call).
+do {
+    let (listener, client, _) = pair()
+    final class Probe: @unchecked Sendable {
+        private let lock = NSLock()
+        private var _serverThreadWasMain = true
+        private var _deliveredOnMain: Bool?
+        var serverThreadWasMain: Bool {
+            get { lock.withLock { _serverThreadWasMain } }
+            set { lock.withLock { _serverThreadWasMain = newValue } }
+        }
+        var deliveredOnMain: Bool? {
+            get { lock.withLock { _deliveredOnMain } }
+            set { lock.withLock { _deliveredOnMain = newValue } }
+        }
+    }
+    let probe = Probe()
+    listener.server.onCommand = { argv in
+        // Set from the XPC queue; read back on the test's main thread.
+        probe.serverThreadWasMain = Thread.isMainThread
+        if argv == ["probe"] {
+            // Reply from a main hop, then confirm it lands on main.
+            DispatchQueue.main.async {
+                probe.deliveredOnMain = Thread.isMainThread
+            }
+        }
+        return "ok"
+    }
+    checkEqual(client.runCommandSync(["probe"]), "ok", "probe round-trips")
+    let deadline = Date().addingTimeInterval(2)
+    while probe.deliveredOnMain == nil, Date() < deadline {
+        _ = RunLoop.current.run(mode: .default, before: Date().addingTimeInterval(0.05))
+    }
+    check(probe.deliveredOnMain == true, "main hop runs on the main thread")
+    check(
+        probe.serverThreadWasMain == false,
+        "XPC exported methods arrive off-main (hop is load-bearing)"
+    )
+    withExtendedLifetime((listener, client)) {}
+}
+
+// Main-queue confinement helper used by the daemon: a hopped closure can
+// assert it is on the main queue. Pin that a `dispatchPrecondition` on
+// `.main` succeeds from a `DispatchQueue.main.async` block, so the
+// daemon's hop primitive is sound.
+do {
+    final class Flag: @unchecked Sendable {
+        private let lock = NSLock()
+        private var _ran = false
+        var ran: Bool {
+            get { lock.withLock { _ran } }
+            set { lock.withLock { _ran = newValue } }
+        }
+    }
+    let flag = Flag()
+    DispatchQueue.main.async {
+        dispatchPrecondition(condition: .onQueue(.main))
+        flag.ran = true
+    }
+    // Pump until the async block lands.
+    let deadline = Date().addingTimeInterval(2)
+    while !flag.ran, Date() < deadline {
+        _ = RunLoop.current.run(mode: .default, before: Date().addingTimeInterval(0.05))
+    }
+    check(flag.ran, "main-hop confinement precondition holds")
+}
+
 if failures == 0 {
     print("XPCChecks: all checks passed")
 } else {
