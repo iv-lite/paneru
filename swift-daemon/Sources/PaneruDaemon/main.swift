@@ -1278,6 +1278,17 @@ workspaceTerminateObserver = NSWorkspace.shared.notificationCenter.addObserver(
 ) { _ in
     rosterDirty = true
 }
+// Screen geometry is a per-tick input, but `NSScreen.screens` walks every
+// screen — so viewport derivation only re-probes when the set actually
+// changed (this signal) or on a slow backstop, instead of every tick.
+nonisolated(unsafe) var displaysDirty = true
+nonisolated(unsafe) var screenParamsObserver: NSObjectProtocol?
+screenParamsObserver = NotificationCenter.default.addObserver(
+    forName: NSApplication.didChangeScreenParametersNotification,
+    object: nil, queue: .main
+) { _ in
+    displaysDirty = true
+}
 
 /// Tap callback results with no daemon analog (pointer motion, touchpad
 /// lifecycle, vertical ticks the core does not model) map to nil and are
@@ -2421,7 +2432,13 @@ nonisolated(unsafe) var tickTimer: Timer?
 /// Orphan workspaces (unplugged displays) fall back to the main
 /// viewport so their parked windows stay reachable.
 @Sendable func workspaceViewports() -> [WorkspaceID: IntRect] {
-    refreshDisplays()
+    // Re-probe screen geometry only when it changed (notification) or on
+    // the slow backstop; the cached `displayScreens`/`displayUsable` serve
+    // every other tick.
+    if displaysDirty || tickCount % 30 == 0 {
+        displaysDirty = false
+        refreshDisplays()
+    }
     var out: [WorkspaceID: IntRect] = [:]
     let mainFrame = displayScreens.first?.frame
     // Mapped workspaces plus orphan strip owners (unplugged displays):
@@ -3075,13 +3092,15 @@ let perfSlowTickMs = 8.0
     // Focused-frame boost before the core reads frames: borders track
     // the roster's cached frame (halves refresh each window at ~1Hz),
     // so a just-focused or still-gliding window wears a stale border
-    // until the next refresh — most visible when focus hops displays.
-    // One synchronous read while anything moves or focus just changed;
-    // quiescent ticks rest on exact cached truth.
+    // Focused-frame refresh, off-main: a just-focused or still-gliding
+    // window is re-read on the AX lane, and the tick uses the cached frame
+    // (one tick stale at worst — imperceptible, and the border rides the
+    // model tween anyway). The runloop also owns the event tap, so an AX
+    // round trip here (0.25s timeout on a hung app) must never block it.
     if let focus = core.focus, focus != prevTickFocus || !lastQuiescent,
        let window = roster[CGWindowID(focus)]
     {
-        _ = window.updateFrame()
+        axWorker.async { _ = window.updateFrame() }
     }
     let result = core.tick(
         events: filteredEvents,
