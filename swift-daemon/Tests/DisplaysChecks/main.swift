@@ -209,6 +209,25 @@ do {
         .hold, "competing read restarts the vote"
     )
     checkEqual(torn.voteSpace, 3, "competing read replaces pending vote")
+    // Flap-back guard: a silent read returning to the space we just
+    // rotated away from is ignored; a genuinely new space still rotates.
+    var back = SpaceVoter()
+    _ = back.evaluate(old: 10, read: 20, corroborated: false, managed: [10, 20], now: t0)
+    checkEqual(
+        back.evaluate(old: 10, read: 20, corroborated: false, managed: [10, 20], now: t0),
+        .rotate, "silent A->B rotates"
+    )
+    let later = t0.addingTimeInterval(11.0)
+    _ = back.evaluate(old: 20, read: 10, corroborated: false, managed: [10, 20], now: later)
+    checkEqual(
+        back.evaluate(old: 20, read: 10, corroborated: false, managed: [10, 20], now: later),
+        .ignore, "silent B->A flap is ignored"
+    )
+    _ = back.evaluate(old: 20, read: 30, corroborated: false, managed: [20, 30], now: later)
+    checkEqual(
+        back.evaluate(old: 20, read: 30, corroborated: false, managed: [20, 30], now: later),
+        .rotate, "a genuinely new space still rotates"
+    )
 }
 
 if failures == 0 {
