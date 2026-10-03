@@ -1,9 +1,21 @@
 <div align="center">
-  <img src="./images/paneru.png" alt="Paneru" width="600"/>
+  <img src="./images/paneru.png" alt="paneru-swift" width="600"/>
 </div>
 
-##
+# paneru-swift
+
 A sliding, tiling window manager for MacOS.
+
+> **Fork notice.** `paneru-swift` is a fork of
+> [karinushka/paneru](https://github.com/karinushka/paneru) by
+> [Karinushka](https://github.com/karinushka). Upstream Paneru is a Bevy/ECS
+> Rust window manager; this fork keeps that Rust tree and adds **`paneru-swift`**,
+> a native Swift daemon (`swift-daemon/`) that ports the same tiling core,
+> AppKit presentation, XPC command/query/subscribe server, Lua scripting, and
+> launchd agent — no Rust toolchain needed to run it. All of the original
+> design credit (the sliding-strip model and its MacOS window techniques) goes
+> to the upstream project; see [Inspiration](#inspiration) and
+> [Installing the Swift daemon](#installing-the-swift-daemon).
 
 ## About
 
@@ -177,22 +189,22 @@ NixOS/darwin modules (see below).
 
 ### Installing the Swift daemon
 
-The Swift daemon (`paneru-swift`) is the native port: same tiling core,
-AppKit presentation, XPC command/query/subscribe server, Lua binds and
+The Swift daemon (`paneru-swift`) is this fork's native port: same tiling
+core, AppKit presentation, XPC command/query/subscribe server, Lua binds and
 event handlers, and a launchd agent — no Rust toolchain needed.
 
 ```shell
-$ git clone https://github.com/karinushka/paneru.git
-$ cd paneru
+$ git clone https://github.com/iv-lite/paneru-swift.git
+$ cd paneru-swift
 $ swift-daemon/install-service.sh install
 ```
 
-The script builds the release binary, installs it to `~/.local/bin`,
-ad-hoc signs it with a stable identifier (so the Accessibility grant
-survives rebuilds), renders the agent plist, and bootstraps it with
-`launchctl`. Then grant Accessibility (System Settings → Privacy &
-Security → Accessibility) — the daemon exits loudly without it — and it
-tiles on the next login too (`RunAtLoad`).
+The script builds the release binary, installs it to `~/.local/bin`, signs
+it with a persistent `Paneru Local` code-signing identity (so the
+Accessibility grant survives rebuilds), renders the agent plist, and
+bootstraps it with `launchctl`. Then grant Accessibility (System Settings →
+Privacy & Security → Accessibility) — the daemon exits loudly without it —
+and it tiles on the next login too (`RunAtLoad`).
 
 Start, stop, and remove:
 

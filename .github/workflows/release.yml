@@ -1,4 +1,4 @@
-name: build-and-release
+name: paneru-swift-release
 
 on:
   push:
@@ -132,6 +132,7 @@ jobs:
         if: ${{ needs.build-release.outputs.tag != '' }}
         uses: softprops/action-gh-release@v2
         with:
+          name: paneru-swift ${{ needs.build-release.outputs.tag }}
           tag_name: ${{ needs.build-release.outputs.tag }}
           target_commitish: ${{ github.sha }}
           draft: false
