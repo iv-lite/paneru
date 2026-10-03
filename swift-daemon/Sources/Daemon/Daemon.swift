@@ -3069,23 +3069,15 @@ public struct DaemonCore: Sendable {
         var batch: [WindowID: AXWriteJob] = [:]
         for (_, job) in inbox { coalesceJobs(&batch, job) }
         inbox.removeAll()
-        // Containment guarantee: no managed strip member may rest on a
-        // sibling display, whatever path produced its target. Genuine
-        // bleeds (the layout path already parks, so this is the safety
-        // net for surgery/transfer/drag-release/audit) are projected to
-        // the owner-edge hide-park. Held hand truth and glide legs are
-        // exempt — they are transient by design and converge in-bounds.
-        enforceOwnerDisplays(
-            &batch, viewports: viewports, held: held, frames: frames)
-        // Off-union guard: origins outside every display are bogus
-        // targets (stale offsets, wrong-display homes) — drop them
-        // instead of writing. Model errors (off-union slots) never
-        // park here; proven write failures park at audit cadence.
-        // Legit hide-parks sit just off-viewport and pass via the
-        // sliver-parked exemption below.
-        dropOffUnionJobs(
-            &batch, union: union, frames: frames,
-            held: held)
+        // One reconciliation pass over the queued writes: (1) bogus
+        // off-union targets (stale offsets, wrong-display homes) are
+        // stripped, and (2) a managed member whose frame fully exits its
+        // owner viewport is projected to the owner-edge hide-park — the
+        // containment guarantee for surgery/transfer/drag/audit paths the
+        // layout didn't already handle. Held hand truth and glide legs are
+        // transient by design and exempt.
+        reconcileDrain(
+            &batch, viewports: viewports, union: union, held: held, frames: frames)
         var ordered = drainOrder(batch)
         for i in ordered.indices {
             let seq = ax.issue(ordered[i].winID, epoch: ordered[i].epoch)
@@ -3119,20 +3111,59 @@ public struct DaemonCore: Sendable {
                 union.max.x + parkedStripSliver, union.max.y + parkedStripSliver))
     }
 
-    /// Containment safety net: rewrite any queued move whose target frame
-    /// would rest on a sibling display to the owner-edge hide-park, so no
-    /// code path can leave a strip member bleeding next door. Managed
-    /// strip members only; held hand truth and glide legs are transient
-    /// by design and exempt. Also keeps the model presented truth
-    /// (`positions`) in step with the corrected target.
-    private mutating func enforceOwnerDisplays(
+    /// Single reconciliation pass over the queued AX writes (replaces the
+    /// former `enforceOwnerDisplays` + `dropOffUnionJobs` pair):
+    ///
+    /// 1. **Off-union targets** are bogus (stale offsets, wrong-display
+    ///    homes): strip the origin (a surviving resize still issues) and
+    ///    park the window for the write circuit breaker when its committed
+    ///    slot is on-union. Genuine model errors (the slot is off-union
+    ///    too) are left to the next commit as offsets settle.
+    /// 2. **Owner containment**: a managed member whose frame fully exits
+    ///    its owner viewport is projected to the owner-edge hide-park, so
+    ///    no path can leave a strip member resting on a sibling display.
+    ///    A partly-visible window is left to the rigid strip (hiding it
+    ///    would leave a reserved-slot hole).
+    ///
+    /// Held hand truth, glide legs, and already-sliver-parked members are
+    /// exempt: transient by design, and they converge in-bounds.
+    private mutating func reconcileDrain(
         _ batch: inout [WindowID: AXWriteJob],
-        viewports: [WorkspaceID: IntRect], held: WindowID?,
-        frames: (WindowID) -> IntRect?
+        viewports: [WorkspaceID: IntRect], union: IntRect?,
+        held: WindowID?, frames: (WindowID) -> IntRect?
     ) {
         for (id, job) in batch {
-            guard id != held, glides[id] == nil, let origin = job.origin,
-                  let ws = workspaceOf(id), let live = frames(id),
+            guard id != held, glides[id] == nil, !sliverParked.contains(id),
+                  let origin = job.origin
+            else { continue }
+            // (1) Off-union: strip the bogus origin.
+            if let union,
+               origin.x < union.min.x || origin.x >= union.max.x
+                || origin.y < union.min.y || origin.y >= union.max.y
+            {
+                var stripped = job
+                stripped.origin = nil
+                if stripped.size == nil {
+                    batch.removeValue(forKey: id)
+                } else {
+                    batch[id] = stripped
+                }
+                if let slot = committedSlots[id],
+                   slot.x < union.min.x || slot.x >= union.max.x
+                    || slot.y < union.min.y || slot.y >= union.max.y {
+                    continue
+                }
+                if let live = frames(id) {
+                    auditParkedLive[id] = live
+                    if let slot = committedSlots[id] {
+                        auditParkedSlot[id] = slot
+                    }
+                    auditSurvivors[id] = min((auditSurvivors[id] ?? 0) + 1, 100)
+                }
+                continue
+            }
+            // (2) Owner containment: park a full exit at the owner edge.
+            guard let ws = workspaceOf(id), let live = frames(id),
                   live.width > 0, live.height > 0
             else { continue }
             let home = viewport(for: ws, in: viewports)
@@ -3141,10 +3172,6 @@ public struct DaemonCore: Sendable {
                 min: origin,
                 max: IntPoint(origin.x + live.width, origin.y + live.height)
             )
-            // Only a *full* exit is corrected: a partly-visible window is
-            // left to the rigid strip (hiding it would leave a reserved-slot
-            // hole), and a fully-inside window is fine. Matches
-            // `parkOffscreen`.
             guard frame.max.x <= home.min.x || frame.min.x >= home.max.x else {
                 continue
             }
@@ -3156,62 +3183,6 @@ public struct DaemonCore: Sendable {
             fixed.origin = corrected
             batch[id] = fixed
             positions[id] = corrected
-        }
-    }
-
-    /// Strip origins outside the display union (bogus targets the OS
-    /// rejects): park the window when its live frame is known so the
-    /// write circuit breaker owns it until glass moves. A surviving
-    /// resize still issues (positionless); a fully empty job drops.
-    private mutating func dropOffUnionJobs(
-        _ batch: inout [WindowID: AXWriteJob],
-        union: IntRect?, frames: (WindowID) -> IntRect?,
-        held: WindowID?
-    ) {
-        guard let union else { return }
-        for (id, job) in batch {
-            // Armed hand truth transiently leaves the union mid-drag
-            // (mates follow the hand), and glide legs interpolate from
-            // off-screen glass toward the slot: never strip or park
-            // either — the leg converges in-bounds and the hand is
-            // user-driven. Sliver-parked members sit outside the union
-            // by design (their glass stays tabbed on the owner edge).
-            // Only glideless, handless, unparked jobs can be bogus.
-            guard id != held, glides[id] == nil, !sliverParked.contains(id) else { continue }
-            guard let origin = job.origin,
-                  origin.x < union.min.x || origin.x >= union.max.x
-                    || origin.y < union.min.y || origin.y >= union.max.y
-            else { continue }
-            var stripped = job
-            stripped.origin = nil
-            if stripped.size == nil {
-                batch.removeValue(forKey: id)
-            } else {
-                batch[id] = stripped
-            }
-            // Model error, not a write failure: the committed slot is
-            // off-union too, so the strip offset that baked it is stale
-            // (stale restore offset, transfer ping-pong). Strip the
-            // bogus origin but do NOT park the window for it — parking
-            // waits for proven write failures at audit cadence, and the
-            // next commit re-derives the slot as offsets settle. (Slots
-            // with no record — direct surgery moves — keep the old
-            // strip-and-park path below.)
-            if let slot = committedSlots[id],
-               slot.x < union.min.x || slot.x >= union.max.x
-                || slot.y < union.min.y || slot.y >= union.max.y {
-                continue
-            }
-            if let live = frames(id) {
-                auditParkedLive[id] = live
-                if let slot = committedSlots[id] {
-                    auditParkedSlot[id] = slot
-                }
-                // Feed the survivor count so the systemic verdict and
-                // watch list see drain-parked windows too (capped; the
-                // audit roll preserves parked entries).
-                auditSurvivors[id] = min((auditSurvivors[id] ?? 0) + 1, 100)
-            }
         }
     }
 
