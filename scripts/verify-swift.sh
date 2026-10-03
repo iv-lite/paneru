@@ -46,6 +46,69 @@ if grep -E 'warning:' /tmp/verify-swift-build.log > /tmp/verify-swift-warnings.l
 fi
 echo "build: clean"
 
+echo "== main-confinement lint =="
+# The executable's model is nonisolated(unsafe) — top-level main.swift
+# storage cannot carry a global actor — and main-confined by construction.
+# Off-main worker blocks (axWorker/shadowQueue) must hop back to main
+# (DispatchQueue.main.async / MainActor.assumeIsolated) before touching
+# those globals; a direct touch is a data race. This caught a real one
+# (`deadElements`, fixed) and guards against the next. `axWorker` itself
+# (the dispatch line) and `axLaneGeneration` (a documented torn-read-safe
+# Int check) are exempt.
+#
+# Hop scope is tracked by brace depth: a global touch is legal only when
+# it sits inside a hop closure. A hop in a sibling branch does not cover
+# the touch. Depth only ever counts brace characters, which is exact for
+# this source (no braces-in-strings on these lines).
+MAIN_SWIFT="$PKG/Sources/PaneruDaemon/main.swift"
+if command -v awk >/dev/null 2>&1; then
+    if ! awk '
+        function is_offmain(l) { return (l ~ /axWorker\.async/ || l ~ /shadowQueue\.async/) }
+        function is_hop(l) { return (l ~ /DispatchQueue\.main\.async/ || l ~ /MainActor\.assumeIsolated/) }
+        function braces(code,   k, ch, n) {
+            n = 0
+            for (k = 1; k <= length(code); k++) {
+                ch = substr(code, k, 1)
+                if (ch == "{") n++
+                else if (ch == "}") n--
+            }
+            return n
+        }
+        /^nonisolated\(unsafe\)[[:space:]]+(var|let)[[:space:]]/ {
+            name = $3; globals[name] = 1; next
+        }
+        {
+            code = $0; sub(/\/\/.*/, "", code)
+            if (!inblock && is_offmain(code)) {
+                inblock = 1; depth = 0; hopdepth = -1
+            }
+            if (inblock) {
+                # A hop opening here enters hop scope at the depth it opens.
+                if (is_hop(code) && hopdepth < 0) hopdepth = depth
+                if (hopdepth < 0) {
+                    n = split(code, toks, /[^A-Za-z0-9_]+/)
+                    for (i = 1; i <= n; i++) {
+                        g = toks[i]
+                        if ((g in globals) && g != "axWorker" && g != "axLaneGeneration") {
+                            printf "  off-main touch: %s:%d  %s\n", FILENAME, FNR, $0
+                            bad = 1
+                        }
+                    }
+                }
+                depth += braces(code)
+                # Leave hop scope once we close back past where it opened.
+                if (hopdepth >= 0 && depth <= hopdepth) hopdepth = -1
+                if (depth <= 0) inblock = 0
+            }
+        }
+        END { exit bad }
+    ' "$MAIN_SWIFT"; then
+        echo "verify-swift: off-main global touch without a main hop (see above)" >&2
+        exit 1
+    fi
+fi
+echo "confinement: clean"
+
 echo "== checks =="
 CHECK_LIST="GeometryChecks LayoutChecks AXClientChecks EventCoreChecks \
 PresentationChecks PresenterChecks ScriptingChecks IPCChecks ServiceChecks \
