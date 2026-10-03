@@ -3579,8 +3579,9 @@ let perfSlowTickMs = 8.0
     }
     // Live state file for hand-run diagnostics (`pq` covers launchd
     // runs over XPC; a listener endpoint cannot be shared by file).
-    // Refreshed ~2Hz; readers tolerate partial writes via atomic swap.
-    if tickCount % 30 == 0 {
+    // Refreshed slowly — encoding the whole world on main every 0.5s was
+    // pure overhead; XPC/KPC queries serve live state.
+    if tickCount % 300 == 0 {
         writeStateFile(
             tick: tickCount, focus: result.focus, quiescent: result.quiescent,
             jobs: result.axJobs.count, events: events.count
