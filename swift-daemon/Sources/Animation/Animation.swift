@@ -63,6 +63,34 @@ public func tweenPoint(start: IntPoint, end: IntPoint, t: Float) -> IntPoint {
     return IntPoint(lerp(start.x, end.x), lerp(start.y, end.y))
 }
 
+/// Size twin of `tweenPoint`: interpolates `start -> end` (IntSize) at
+/// eased factor `t`, rounded to whole pixels.
+public func tweenSize(start: IntSize, end: IntSize, t: Float) -> IntSize {
+    if t >= 1.0 { return end }
+    if t <= 0.0 { return start }
+    func lerp(_ a: Int32, _ b: Int32) -> Int32 {
+        Int32((Float(a) + (Float(b) - Float(a)) * t).rounded())
+    }
+    return IntSize(lerp(start.x, end.x), lerp(start.y, end.y))
+}
+
+/// Size twin of `kickStart`: guarantees visible first-tick motion on a
+/// fresh leg so it never rounds to a dead frame.
+public func kickSize(from start: IntSize, to end: IntSize) -> IntSize {
+    IntSize(
+        start.x + stepped(end.x - start.x, by: firstTickKickPx),
+        start.y + stepped(end.y - start.y, by: firstTickKickPx)
+    )
+}
+
+/// Size twin of `nudgeLanding`: 1px toward the target so the tail commits.
+public func nudgeSizeLanding(from current: IntSize, to target: IntSize) -> IntSize {
+    IntSize(
+        current.x + stepped(target.x - current.x, by: landingNudgePx),
+        current.y + stepped(target.y - current.y, by: landingNudgePx)
+    )
+}
+
 // MARK: - Burst phase
 
 /// Birth phase for a fresh leg: births within the join window adopt the

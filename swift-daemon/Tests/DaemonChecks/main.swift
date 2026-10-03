@@ -1,3 +1,4 @@
+import AXClient
 import Commands
 import Foundation
 import Daemon
@@ -2345,6 +2346,10 @@ do {
 // resize/equalize/balance enqueue size intents, manage toggles the strip.
 do {
     var daemon = DaemonCore()
+    // These assert the size *intent*; the eased resize tween is covered
+    // separately, so pin snap-mode (the Rust harness default too).
+    daemon.animationsEnabled = false
+    daemon.glideBaseMs = 0
     _ = daemon.tick(
         events: [.appeared(id: 0, workspace: 1), .appeared(id: 1, workspace: 1), .appeared(id: 2, workspace: 1), .focus(id: 0)],
         frames: frames(slots: [0: IntPoint(0, 0), 1: IntPoint(0, 0), 2: IntPoint(0, 0)]),
@@ -2453,6 +2458,10 @@ do {
 // Vertical resize and equalize share heights across one stack.
 do {
     var daemon = DaemonCore()
+    // Height-sharing asserts the size intent; the eased resize is covered
+    // separately, so pin snap-mode.
+    daemon.animationsEnabled = false
+    daemon.glideBaseMs = 0
     _ = daemon.tick(
         events: [.appeared(id: 0, workspace: 1), .appeared(id: 1, workspace: 1), .focus(id: 1)],
         frames: frames(slots: [0: IntPoint(0, 0), 1: IntPoint(0, 0)]),
@@ -2568,6 +2577,8 @@ do {
 // LayoutOp replay: float toggles, swaps, moves, views, stacks.
 do {
     var daemon = DaemonCore()
+    daemon.animationsEnabled = false
+    daemon.glideBaseMs = 0
     _ = daemon.tick(
         events: [.appeared(id: 0, workspace: 1), .appeared(id: 1, workspace: 1), .focus(id: 0)],
         frames: frames(slots: [0: IntPoint(0, 0), 1: IntPoint(400, 0)]),
@@ -2623,6 +2634,8 @@ do {
 // intents; singles keep preserved-y slots.
 do {
     var daemon = DaemonCore()
+    daemon.animationsEnabled = false
+    daemon.glideBaseMs = 0
     _ = daemon.tick(
         events: [.appeared(id: 0, workspace: 1), .appeared(id: 1, workspace: 1), .focus(id: 1)],
         frames: frames(slots: [0: IntPoint(0, 0), 1: IntPoint(0, 0)]),
@@ -2672,6 +2685,8 @@ do {
 // fitting windows record and rest with no AX traffic.
 do {
     var daemon = DaemonCore()
+    daemon.animationsEnabled = false
+    daemon.glideBaseMs = 0
     _ = daemon.tick(
         events: [.appeared(id: 0, workspace: 1)],
         frames: frames(slots: [0: IntPoint(0, 0)]),
@@ -3463,6 +3478,8 @@ do {
 // again instead of hammering.
 do {
     var daemon = DaemonCore()
+    daemon.animationsEnabled = false
+    daemon.glideBaseMs = 0
     let huge: (Int32) -> IntRect? = { id in
         guard id == 0 else { return nil }
         return IntRect(min: IntPoint(0, 0), max: IntPoint(2000, 2000))
@@ -4540,6 +4557,8 @@ do {
 // maximizes the window for the destination.
 do {
     var daemon = DaemonCore()
+    daemon.animationsEnabled = false
+    daemon.glideBaseMs = 0
     daemon.workspaceRing = [1, 2]
     let left = IntRect(0, 0, 1024, 768)
     let right = IntRect(1024, 0, 2048, 768)
@@ -4845,6 +4864,73 @@ do {
     check(
         (daemon.committedSlot(of: 1)?.x ?? 0) < 1024,
         "column did not stay at the old wide tile after a shrink"
+    )
+}
+
+// Size eases on the position glide's burst (Rust `animate_resize_entities`):
+// a core-driven width change (preset resize) must write the size in step
+// with the neighbour's position, so the abutting gap between the columns
+// never opens mid-flight. Measures the gap from the AX jobs (written origin
+// + written size) every tick; without the size tween the glass edge jumps
+// to the final width while the neighbour is still gliding.
+do {
+    var daemon = DaemonCore()
+    daemon.animationsEnabled = true
+    daemon.glideBaseMs = 200
+    daemon.autoCenter = false
+    let clock = ManualClock()
+    daemon.wallClockMs = { clock.now }
+    let wide = IntRect(0, 0, 2048, 768)
+    var live: [Int32: IntPoint] = [0: .init(0, 34), 1: .init(400, 34)]
+    func liveFrames() -> (Int32) -> IntRect? {
+        { id in
+            let o = live[id] ?? .init(0, 0)
+            return IntRect(min: o, max: IntPoint(o.x + (id == 0 ? 400 : 400), o.y + 700))
+        }
+    }
+    _ = daemon.tick(
+        events: [.appeared(id: 0, workspace: 1), .appeared(id: 1, workspace: 1), .focus(id: 0)],
+        frames: liveFrames(), viewport: wide, focusedStyle: style
+    )
+    for _ in 0..<40 {
+        clock.now += 16
+        _ = daemon.tick(events: [], frames: liveFrames(), viewport: wide, focusedStyle: style)
+        for i in [0, 1] { if let p = daemon.positions[Int32(i)] { live[Int32(i)] = p } }
+    }
+    // Grow column 0 to 0.5 of the viewport (a core-driven width change);
+    // column 1 must glide right while column 0's width eases in step.
+    let growTick = daemon.tick(
+        events: [.command(.window(.resize(.grow)))],
+        frames: liveFrames(), viewport: wide, focusedStyle: style
+    )
+    var origin0 = daemon.positions[0] ?? IntPoint(0, 0)
+    var width0: Int32 = 400
+    var origin1 = daemon.positions[1] ?? IntPoint(400, 0)
+    func absorb(_ jobs: [AXWriteJob]) {
+        for job in jobs {
+            if job.winID == 0 {
+                if let o = job.origin { origin0 = o }
+                if let sz = job.size { width0 = sz.x }
+            }
+            if job.winID == 1, let o = job.origin { origin1 = o }
+        }
+    }
+    absorb(growTick.axJobs)
+    var maxGapDrift: Int32 = 0
+    for _ in 1...15 {
+        clock.now += 16
+        let r = daemon.tick(events: [], frames: liveFrames(), viewport: wide, focusedStyle: style)
+        // Written truth per window: last origin/size the daemon sent.
+        absorb(r.axJobs)
+        print("  GAP3 jobs=\(r.axJobs.map { "\($0.winID):o=\($0.origin.map { "\($0.x)" } ?? "-")s=\($0.size.map { "\($0.x)" } ?? "-")" }) o0=\(origin0.x) w0=\(width0) o1=\(origin1.x)")
+        // Abutting gap: neighbour's left minus (this column's left + width).
+        let gap = origin1.x - (origin0.x + width0)
+        if abs(gap) > abs(maxGapDrift) { maxGapDrift = gap }
+        for i in [0, 1] { if let p = daemon.positions[Int32(i)] { live[Int32(i)] = p } }
+    }
+    check(
+        maxGapDrift <= 2 && maxGapDrift >= -2,
+        "gap stays shut through a width-change glide (max drift \(maxGapDrift))"
     )
 }
 

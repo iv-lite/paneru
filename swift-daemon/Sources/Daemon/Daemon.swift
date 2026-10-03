@@ -429,6 +429,24 @@ public struct DaemonCore: Sendable {
         var durationMs: UInt64
     }
     private var glides: [WindowID: GlideLeg] = [:]
+    /// Size legs for eased resizes (Rust `SizeDrive`): the tween twin of
+    /// `GlideLeg`. A width change that snapped while the position glided
+    /// opened the configured gap mid-flight (the glass edge jumped to the
+    /// new width while the neighbour was still traveling); easing the size
+    /// on the same burst as the position keeps them in step, so the gap
+    /// holds. Snap-mode (animations off, glide 0, `snapMovesThisTick`)
+    /// still writes the final size directly.
+    private struct SizeLeg: Equatable {
+        var start: IntSize
+        var target: IntSize
+        var bornMs: UInt64
+        var durationMs: UInt64
+    }
+    private var sizeLegs: [WindowID: SizeLeg] = [:]
+    /// Last size actually enqueued per window: the "from" a new size leg
+    /// eases away from, so a mid-flight retarget picks up where the glass
+    /// is instead of jumping. Seeded from the first intent's target.
+    private var writtenSizes: [WindowID: IntSize] = [:]
     /// Burst phase: legs born inside the join window share the deadline
     /// (Rust `BurstClock`), so one focus/swap/reveal lands lockstep.
     private var glideBurstOpenedMs: UInt64?
@@ -950,6 +968,8 @@ public struct DaemonCore: Sendable {
                 sizeStreak.removeValue(forKey: id)
                 lastSizeRedrive.removeValue(forKey: id)
                 lastLiveWidth.removeValue(forKey: id)
+                sizeLegs.removeValue(forKey: id)
+                writtenSizes.removeValue(forKey: id)
                 if focus == id {
                     // Synchronous heal (Rust `give_away_focus`): hand off
                     // to the nearest surviving neighbor instead of
@@ -3778,6 +3798,9 @@ public struct DaemonCore: Sendable {
             sizeStreak[member] = 0
             lastSizeRedrive[member] = epoch
         }
+        // The tween lives in `enqueueResize` (all size intents funnel there),
+        // so the size eases on the position glide's burst regardless of
+        // which path issued it.
         enqueueResize(member, to: target, epoch: epoch)
         sizes[member] = target
     }
@@ -3908,6 +3931,82 @@ public struct DaemonCore: Sendable {
         return step
     }
 
+    /// One eased step along a size leg (Rust `SizeDrive` / the
+    /// `animate_resize_entities` tween). Shares the position glide's burst
+    /// (`glideBurstOpenedMs`/`glideBurstDeadlineMs`), so a core-driven
+    /// width change and the neighbour's position shift are born into the
+    /// same burst and ease on one curve — the configured gap holds
+    /// throughout instead of opening while the size snaps and the position
+    /// glides. `to` is the target slot size; `from` is the live size the
+    /// glass actually shows.
+    private mutating func sizeStep(
+        _ member: WindowID, from: IntSize, to: IntSize, epoch: UInt64
+    ) -> IntSize {
+        let nowMs = wallClockMs?() ?? epoch &* 16
+        if let deadline = glideBurstDeadlineMs, nowMs > deadline {
+            glideBurstDeadlineMs = nil
+            glideBurstOpenedMs = nil
+        }
+        let dist: Float = {
+            let dx = Float(to.x - from.x), dy = Float(to.y - from.y)
+            return (dx * dx + dy * dy).squareRoot()
+        }()
+        var leg = sizeLegs[member]
+        // Retargeted legs carry phase when the drift is small; a genuine
+        // jump restarts priced for the remainder (mirrors `glideStep`).
+        var restartedTotal: Float?
+        if var live = leg, live.target != to {
+            let drift: Float = {
+                let dx = Float(to.x - live.target.x), dy = Float(to.y - live.target.y)
+                return (dx * dx + dy * dy).squareRoot()
+            }()
+            let elapsed = nowMs >= live.bornMs ? nowMs - live.bornMs : 0
+            if shouldCarryPhase(elapsedMs: elapsed, durationMs: live.durationMs, driftPx: drift) {
+                live.target = to
+                leg = live
+            } else {
+                let dx = Float(to.x - live.start.x), dy = Float(to.y - live.start.y)
+                restartedTotal = (dx * dx + dy * dy).squareRoot()
+                leg = nil
+            }
+        }
+        if leg == nil {
+            let (stamp, opened) = birthPhase(nowMs: nowMs, burstOpenedMs: glideBurstOpenedMs)
+            if opened { glideBurstOpenedMs = stamp }
+            var own = proportionalDuration(
+                distancePx: dist, baseMs: glideBaseMs,
+                minMs: glideMinMs, maxMs: glideMaxMs, referencePx: glideReferencePx
+            )
+            if let total = restartedTotal, total > Float.ulpOfOne {
+                own = min(own, retargetDuration(
+                    remainingPx: dist, totalPx: total,
+                    baseMs: glideBaseMs, minMs: glideMinMs
+                ))
+            }
+            let duration = joinDuration(
+                ownMs: own, nowMs: nowMs, deadlineMs: glideBurstDeadlineMs
+            )
+            glideBurstDeadlineMs = max(glideBurstDeadlineMs ?? 0, stamp + duration)
+            leg = SizeLeg(start: from, target: to, bornMs: stamp, durationMs: duration)
+        }
+        guard let live = leg else { return to }
+        sizeLegs[member] = live
+        let elapsed = nowMs >= live.bornMs ? nowMs - live.bornMs : 0
+        if tweenFinished(elapsedMs: elapsed, durationMs: live.durationMs) { return to }
+        let t = easedFactor(elapsedMs: elapsed, durationMs: live.durationMs)
+        var step = tweenSize(start: live.start, end: live.target, t: t)
+        if step == live.start, elapsed <= firstTickWindowMs {
+            step = kickSize(from: live.start, to: live.target)
+        }
+        if step != live.target
+            && (step == live.start
+                || abs(step.x - live.target.x) + abs(step.y - live.target.y) <= 2)
+        {
+            step = nudgeSizeLanding(from: step, to: live.target)
+        }
+        return step
+    }
+
     /// Ease programmatic offset targets toward live offsets (one
     /// workspace at a time, burst-joined with window legs). Snaps when
     /// animations are off. Direct-manipulation writes set both sides,
@@ -3999,10 +4098,32 @@ public struct DaemonCore: Sendable {
     }
 
     /// Size twin of `enqueueMove`: coalesces into the same per-window job
-    /// (origin and size travel together through one drain).
+    /// (origin and size travel together through one drain). Eases the size
+    /// on the position glide's burst (Rust `animate_resize_entities`): a
+    /// core-driven width change that snapped here while the neighbour's
+    /// position glided opened the configured gap mid-flight. All size
+    /// intents funnel through here, so the tween covers every path.
+    /// Snap-mode (animations off, glide 0, `snapMovesThisTick`) writes the
+    /// final size directly.
     private mutating func enqueueResize(_ id: WindowID, to size: IntSize, epoch: UInt64) {
+        let target = size
+        let written: IntSize
+        if snapMovesThisTick || !animationsEnabled || glideBaseMs == 0 {
+            sizeLegs.removeValue(forKey: id)
+            written = target
+        } else {
+            let from = writtenSizes[id] ?? sizes[id] ?? target
+            if from == target {
+                sizeLegs.removeValue(forKey: id)
+                written = target
+            } else {
+                written = sizeStep(id, from: from, to: target, epoch: epoch)
+                if written == target { sizeLegs.removeValue(forKey: id) }
+            }
+        }
+        writtenSizes[id] = written
         var job = inbox[id] ?? AXWriteJob(winID: id)
-        job.size = size
+        job.size = written
         job.epoch = epoch
         job.priority = (id == focus)
         inbox[id] = job
