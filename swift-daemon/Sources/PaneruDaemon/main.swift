@@ -2883,6 +2883,13 @@ nonisolated(unsafe) var perfTimingEnabled: Bool =
 /// Slow-tick threshold: half a 60Hz frame. Smaller would spam on
 /// animation-heavy ticks that are merely busy, not stuck.
 let perfSlowTickMs = 8.0
+/// Always-on tick budget stats (cheap monotonic delta): a summary line
+/// every ~30s so performance is visible without `PANERU_PERF`.
+nonisolated(unsafe) var statTicks = 0
+nonisolated(unsafe) var statTotalNanos: UInt64 = 0
+nonisolated(unsafe) var statMaxNanos: UInt64 = 0
+nonisolated(unsafe) var statOver16 = 0
+nonisolated(unsafe) var statJobs = 0
 
 @Sendable func tick() {
     tickCount += 1
@@ -2893,6 +2900,7 @@ let perfSlowTickMs = 8.0
     // Idle-skip ticks return before the print; disabled builds pay one
     // predictable branch per stamp.
     let t0: Date? = perfTimingEnabled ? Date() : nil
+    let statStart = DispatchTime.now().uptimeNanoseconds
     // Process control lands here, never in the core (which ignores
     // `.quit`/`.restart` by contract): a pending quit/restart — or a
     // caught termination signal — saves and exits before any AX work.
@@ -3886,6 +3894,29 @@ let perfSlowTickMs = 8.0
     }
     subscriptions.publish(fired)
     lastQuiescent = result.quiescent
+    // Always-on tick budget summary: average/max main-thread tick time and
+    // how many exceeded a 60Hz frame, plus AX jobs issued. Prints ~every
+    // 30s (1800 ticks).
+    let statElapsed = DispatchTime.now().uptimeNanoseconds &- statStart
+    statTicks += 1
+    statTotalNanos &+= statElapsed
+    if statElapsed > statMaxNanos { statMaxNanos = statElapsed }
+    if statElapsed > 16_000_000 { statOver16 += 1 }
+    statJobs += result.axJobs.count
+    if statTicks >= 1800 {
+        let avgMs = Double(statTotalNanos) / Double(statTicks) / 1_000_000.0
+        let maxMs = Double(statMaxNanos) / 1_000_000.0
+        print(
+            "perf: \(statTicks) ticks avg=\(String(format: "%.2f", avgMs))ms"
+                + " max=\(String(format: "%.2f", maxMs))ms"
+                + " over16ms=\(statOver16) axJobs=\(statJobs)"
+        )
+        statTicks = 0
+        statTotalNanos = 0
+        statMaxNanos = 0
+        statOver16 = 0
+        statJobs = 0
+    }
     if let t0, let t1, let t2, let t3, let t4 {
         let t5 = Date()
         let ms = { (a: Date, b: Date) in b.timeIntervalSince(a) * 1000.0 }
