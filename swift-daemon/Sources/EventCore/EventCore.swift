@@ -113,7 +113,62 @@ public func pumpTimeoutMs(
     return lowPower ? lowPowerTimeoutMs : idleTimeoutMs
 }
 
-// MARK: - Scheduling predicates
+// MARK: - Frame clock (idle-when-static scheduling)
+
+/// The tick cadence decision, split out from the timer so it is a pure,
+/// testable state machine. The daemon's problem was an always-on 60–120Hz
+/// timer that woke the main runloop (which also owns the event tap) even
+/// when every flag was quiet — burning CPU and adding worst-case input
+/// latency. This clock runs the timer only while there is work and drops
+/// to a single one-shot backstop at rest, mirroring the Rust pump ladder
+/// (`pump_timeout_ms`): active → idle, woken by real events.
+///
+/// Pure math only: the host owns the `Timer` objects and calls
+/// `wake` / `settle` at the boundaries.
+public struct FrameClock: Sendable {
+    /// What the host should do with its timers after a decision.
+    public enum Action: Equatable, Sendable {
+        /// (Re)start (or keep) the repeating full-cadence timer.
+        case run
+        /// Cancel the repeating timer and arm a one-shot backstop for
+        /// `afterMs`. 0 means arm no backstop (pure event-driven idle).
+        case sleep(afterMs: UInt32)
+    }
+
+    /// True while the full-cadence timer should be running.
+    public private(set) var active: Bool
+
+    public init(active: Bool = true) {
+        self.active = active
+    }
+
+    /// A real event (tap, observer, XPC, notification) demands a full
+    /// frame. Returns the action the host must apply: `.run` exactly when
+    /// the clock was asleep (so the host only pays the restart on a real
+    /// wakeup, not on every event while already active).
+    public mutating func wake() -> Action {
+        if active { return .run }
+        active = true
+        return .run
+    }
+
+    /// Decide whether this frame may idle. `work` is true when any dirty
+    /// flag, pending event, animation, drag, or restore is outstanding.
+    /// `backstopMs` is the next slow-cadence duty (display refresh,
+    /// touchpad poll, audit, state file, tap health) — 0 when none is
+    /// pending. At rest the clock sleeps until that duty; a true
+    /// event-driven idle (no duty at all) sleeps with no backstop.
+    public mutating func settle(work: Bool, backstopMs: UInt32) -> Action {
+        if work {
+            if active { return .run }
+            active = true
+            return .run
+        }
+        active = false
+        return .sleep(afterMs: backstopMs)
+    }
+}
+
 
 /// Whether an echo must not be adopted: a native session the daemon never
 /// saw (no holder, no marker, unmanaged window, button physically held).

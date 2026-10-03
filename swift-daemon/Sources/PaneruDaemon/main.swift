@@ -18,6 +18,7 @@ import CoreGraphics
 import Daemon
 import Darwin
 import Displays
+import EventCore
 import Focus
 import Foundation
 import Geometry
@@ -508,6 +509,11 @@ logEffectiveTuning()
 nonisolated(unsafe) var lastRosterSync = Date.distantPast
 let rosterSyncInterval: TimeInterval = 1.0
 nonisolated(unsafe) var rosterDirty = true
+/// Set after the first successful `syncRoster`: the idle clock will not
+/// sleep before then (a fresh launch must adopt before it rests), without
+/// demanding a non-empty roster (an empty or other-Space desktop is a
+/// legitimate settled state and must still idle).
+nonisolated(unsafe) var rosterSyncedOnce = false
 /// Front-to-back on-screen window order, refreshed at roster sync (1Hz).
 /// The ~4Hz hover poll reads this instead of walking the window list.
 nonisolated(unsafe) var cachedOnScreenOrder: [WindowID] = []
@@ -897,6 +903,7 @@ nonisolated(unsafe) var rotatedAt: [WorkspaceID: Date] = [:]
 @Sendable func syncRoster() {
     guard let onScreen = onScreenWindowIDs() else { return }
     lastRosterSync = Date()
+    rosterSyncedOnce = true
     // Cache the front-to-back order for the hover poll: it runs at ~4Hz
     // and doesn't need its own `CGWindowListCopyWindowInfo` walk per poll.
     cachedOnScreenOrder = onScreen.map { windowID($0) }
@@ -978,6 +985,10 @@ nonisolated(unsafe) var rotatedAt: [WorkspaceID: Date] = [:]
                     adoptNewcomers(adopted)
                     applyFullscreenFlips(flips)
                     applyMinimizeFlips(minFlips)
+                    // Adoption lands off-tick (main.async): wake the idle
+                    // clock so the new roster is ingested now instead of at
+                    // the next backstop.
+                    wakeTicker()
                 }
             }
         }
@@ -1183,6 +1194,8 @@ struct WindowInfo {
 }
 
 @Sendable func observeFired(app: LiveApp) {
+    // Real OS notification: wake the idle clock so the resync runs now.
+    wakeTicker()
     // Cheap re-read: focus may have moved; roster sync heals the rest on
     // its own cadence (never inline here — observer callbacks arrive on
     // the main runloop, and a synchronous WindowServer + AX walk per
@@ -1237,6 +1250,8 @@ tap.sink = {
         if pending.count < 1024 {
             pending.append(event)
         }
+        // Real input: wake the idle clock so the frame runs now.
+        wakeTicker()
     }
 }
 // Scroll modifiers from config; nil (unset) disables interception so
@@ -1283,6 +1298,7 @@ workspaceSpaceObserver = NSWorkspace.shared.notificationCenter.addObserver(
 ) { _ in
     rosterDirty = true
     spaceChangedAt = Date()
+    wakeTicker()
     print("display: space changed (resyncing)")
 }
 // App quit resyncs at once for the same reason: the dead app's observer
@@ -1293,6 +1309,7 @@ workspaceTerminateObserver = NSWorkspace.shared.notificationCenter.addObserver(
     object: nil, queue: .main
 ) { _ in
     rosterDirty = true
+    wakeTicker()
 }
 // Screen geometry is a per-tick input, but `NSScreen.screens` walks every
 // screen — so viewport derivation only re-probes when the set actually
@@ -1304,6 +1321,7 @@ screenParamsObserver = NotificationCenter.default.addObserver(
     object: nil, queue: .main
 ) { _ in
     displaysDirty = true
+    wakeTicker()
 }
 
 /// Tap callback results with no daemon analog (pointer motion, touchpad
@@ -1421,12 +1439,16 @@ if !shadowMode {
     switch command {
     case .setWidth(let ratio):
         pending.append(.command(.window(.setWidth(ratio))))
+        wakeTicker()
     case .center:
         pending.append(.command(.window(.center)))
+        wakeTicker()
     case .toggleManaged:
         pending.append(.command(.window(.manage)))
+        wakeTicker()
     case .copyRule:
         pending.append(.command(.window(.copyRule)))
+        wakeTicker()
     case .quit:
         cleanExit()
     case .openAccessibilitySettings, .showAccessibilityInstructions:
@@ -1533,6 +1555,7 @@ func answerQueryDocument(_ data: Data) -> Data {
     case .command(let argv):
         do {
             pending.append(.command(try parseCommand(argv)))
+            wakeTicker()
             return Data("ok".utf8)
         } catch {
             return Data(xpcError("\(error)").utf8)
@@ -1736,6 +1759,7 @@ func watchScript(_ path: String) {
     scriptWatcher = watchFileAndDirectory(path) {
         needScriptReload = true
         scriptReloadDueAt = Date().addingTimeInterval(hotReloadQuietSecs)
+        wakeTicker()
     }
 }
 
@@ -1756,6 +1780,7 @@ func watchTuning(_ path: String) {
     tuningWatcher = watchFileAndDirectory(path) {
         needTuningReload = true
         tuningReloadDueAt = Date().addingTimeInterval(hotReloadQuietSecs)
+        wakeTicker()
     }
 }
 
@@ -2300,6 +2325,13 @@ nonisolated(unsafe) var displayMaxHz = 60.0
 /// The 60–120Hz tick timer, recreated when the fastest display
 /// changes (invalidating the old one first).
 nonisolated(unsafe) var tickTimer: Timer?
+/// One-shot timer that wakes the daemon from an event-driven idle at the
+/// next slow-cadence duty (display refresh, pointer poll, audit, state
+/// file, tap health). nil while the repeating timer is active.
+nonisolated(unsafe) var backstopTimer: Timer?
+/// The idle-when-static cadence decision (see `FrameClock`). Main-owned
+/// like every runloop object here.
+nonisolated(unsafe) var frameClock = FrameClock()
 
 /// Display refresh for one display id, Hz. The modern rate property
 /// needs macOS 15+; older systems keep today's 60Hz behavior (no
@@ -2314,14 +2346,57 @@ nonisolated(unsafe) var tickTimer: Timer?
     }
 }
 
-/// Tick timer follows the fastest display (60Hz floor, 120Hz cap).
-/// Tweens run on wall time so any rate is safe; the idle backoff
-/// keeps faster ticks free at rest. Main thread only (runloop-owned).
-@Sendable func rescheduleTickTimer() {
-    tickTimer?.invalidate()
+/// Start (or restart) the repeating full-cadence timer. Idempotent while
+/// already running at the current rate only when `force` is false: a
+/// cadence change (display refresh) passes `force: true`.
+@Sendable func startTickTimer() {
+    backstopTimer?.invalidate()
+    backstopTimer = nil
+    guard tickTimer == nil else { return }
     let hz = min(max(displayMaxHz, 60.0), 120.0)
     tickTimer = Timer.scheduledTimer(withTimeInterval: 1.0 / hz, repeats: true) { _ in
         tick()
+    }
+}
+
+/// Drop the repeating timer and arm a one-shot backstop for `afterMs`
+/// (0 = no backstop; a real event will wake us). Called from `tick`'s
+/// quiet-exit path via `FrameClock.settle`.
+@Sendable func sleepTickTimer(afterMs: UInt32) {
+    tickTimer?.invalidate()
+    tickTimer = nil
+    backstopTimer?.invalidate()
+    backstopTimer = nil
+    guard afterMs > 0 else { return }
+    let delay = Double(afterMs) / 1000.0
+    backstopTimer = Timer.scheduledTimer(withTimeInterval: delay, repeats: false) { _ in
+        backstopTimer = nil
+        _ = frameClock.wake()
+        startTickTimer()
+    }
+}
+
+/// A real event demands a full frame: wake the clock and (re)start the
+/// repeating timer if it was asleep. Every wake source (tap sink,
+/// observer callback, XPC command/query, display/space/termination
+/// notifications, config watchers) funnels through here. Cheap at rest:
+/// when already active the clock returns without touching the runloop.
+@Sendable func wakeTicker() {
+    _ = frameClock.wake()
+    startTickTimer()
+}
+
+/// Tick timer follows the fastest display (60Hz floor, 120Hz cap).
+/// Tweens run on wall time so any rate is safe. Idle-when-static: quiet
+/// frames drop to a backstop via `FrameClock`, so the runloop (which
+/// also owns the event tap) is free at rest.
+@Sendable func rescheduleTickTimer() {
+    tickTimer?.invalidate()
+    tickTimer = nil
+    // A display cadence change only matters while running; if the clock
+    // is idle, the backstop path restarts at the new rate.
+    if frameClock.active {
+        startTickTimer()
     }
 }
 /// Re-enumerate displays when the set changes (count, identity,
@@ -2454,10 +2529,12 @@ nonisolated(unsafe) var tickTimer: Timer?
 /// viewport so their parked windows stay reachable.
 @Sendable func workspaceViewports() -> [WorkspaceID: IntRect] {
     // Re-probe screen geometry only when it changed (notification) or on
-    // the slow backstop; the cached `displayScreens`/`displayUsable` serve
-    // every other tick.
-    if displaysDirty || tickCount % 30 == 0 {
+    // a ~1s wall-clock backstop; the cached `displayScreens`/`displayUsable`
+    // serve every other tick.
+    let now = Date()
+    if displaysDirty || now.timeIntervalSince(lastDisplayProbeAt) >= displayProbeInterval {
         displaysDirty = false
+        lastDisplayProbeAt = now
         refreshDisplays()
     }
     var out: [WorkspaceID: IntRect] = [:]
@@ -2609,6 +2686,49 @@ let mouseFollowHoverEcho = 1.0
 /// Last pointer-poll time: hover and edge checks run ~4Hz but only
 /// after motion, so a still cursor costs no WindowServer round trips.
 nonisolated(unsafe) var lastPointerPoll = Date.distantPast
+/// Backstop cadences for the idle clock (see `FrameClock` and the quiet
+/// path in `tick`): the pointer poll keeps a ~4Hz floor (edge warp and
+/// hover must sample while the layout rests), and the display/audit/state
+/// duties keep their existing ~5s cadence. `lastSlowDutyAt` is the last
+/// time a slow-duty backstop ran.
+let pointerPollInterval: TimeInterval = 0.25
+let slowDutyInterval: TimeInterval = 5.0
+nonisolated(unsafe) var lastSlowDutyAt = Date.distantPast
+/// Frame-refresh cadence (~1Hz per window, staggered halves) and the
+/// session-save cadence (~30s), both wall-clock so they fire on time
+/// whether the tick runs at display rate or from an idle backstop.
+let frameRefreshInterval: TimeInterval = 1.0
+let sessionSaveInterval: TimeInterval = 30.0
+/// Display re-probe backstop (~1s) when no change notification arrived.
+let displayProbeInterval: TimeInterval = 1.0
+nonisolated(unsafe) var lastFrameRefreshAt = Date.distantPast
+nonisolated(unsafe) var lastSessionSaveAt = Date.distantPast
+nonisolated(unsafe) var lastDisplayProbeAt = Date.distantPast
+
+/// Whether a slow-cadence duty is due: purely the ~5s wall-clock interval
+/// (state file, audit, tap health, corner probe). Independent of tick
+/// rate, so it fires on time whether the tick runs at display rate or
+/// from an idle backstop. Returns true and stamps the clock when due.
+@Sendable func slowDutyDue(now: Date) -> Bool {
+    if now.timeIntervalSince(lastSlowDutyAt) >= slowDutyInterval {
+        lastSlowDutyAt = now
+        return true
+    }
+    return false
+}
+
+/// Milliseconds until the next slow-cadence duty, for the idle
+/// backstop. Zero when a duty is already due (never sleeps past one).
+@Sendable func nextBackstopMs(
+    pointerDue: Bool, slowDue: Bool, now: Date
+) -> UInt32 {
+    if pointerDue || slowDue { return 0 }
+    let toPointer = pointerPollInterval - now.timeIntervalSince(lastPointerPoll)
+    let toSlow = slowDutyInterval - now.timeIntervalSince(lastSlowDutyAt)
+    let seconds = max(min(toPointer, toSlow), 0)
+    // Ceil to whole ms so the backstop never lands before a duty is due.
+    return UInt32((seconds * 1000.0).rounded(.up))
+}
 /// Pointer-drag grab state: press candidate → promoted grab past the
 /// 4px click threshold → per-tick folded drive → drop or release.
 /// Folds accumulate between ticks; the tick flushes them ahead of the
@@ -2623,10 +2743,17 @@ nonisolated(unsafe) var dragLastX = 0.0
 /// Last shown drop ghost (retained to skip steady-state rewrites).
 nonisolated(unsafe) var lastGhostRect: CGRect?
 /// Audit-report spam throttle: fingerprint of the last printed
-/// divergence block + tick, so a stuck roster prints once per change
-/// (or hourly) instead of every 5s audit.
+/// divergence block + when it printed, so a stuck roster prints once per
+/// change (or hourly) instead of every slow-duty audit.
 nonisolated(unsafe) var lastAuditFingerprint = ""
-nonisolated(unsafe) var lastAuditPrintTick = 0
+nonisolated(unsafe) var lastAuditPrintAt = Date.distantPast
+/// Shadow heartbeat throttle (30s).
+nonisolated(unsafe) var lastShadowHeartbeatAt = Date.distantPast
+/// Whether this tick ran a slow-cadence duty (set once per tick from the
+/// quiet path or `slowDutyDue`); gates the state file, audit, corner
+/// probe, and tap health so they fire on the same wall-clock cadence
+/// whether the tick runs at display rate or from an idle backstop.
+nonisolated(unsafe) var slowDutyJustRan = false
 /// Last observed Accessibility grant state (transition-printed: loss
 /// explains systemic write denial far better than per-window spam).
 nonisolated(unsafe) var axGrantTrusted = true
@@ -2973,23 +3100,54 @@ nonisolated(unsafe) var statJobs = 0
         }
     }
     let t1: Date? = perfTimingEnabled ? Date() : nil
-    // Idle backoff: a fully quiet tick skips the scan/present work and
-    // just advances the clock; every 30th tick still runs full (display
-    // and state cadences). Chronic audit survivors break the quiet
-    // (a quiescent model with wrong glass must keep full ticks coming
-    // so backoff-gated redrives fire on schedule). The pointer poll keeps its own 4Hz floor on
-    // skip ticks (edge warp and hover must sample while the layout
-    // rests). Mirrors the Rust idle/low-power sleep ladder; the 60Hz
-    // timer stays, so wakeups are a frame away.
-    if lastQuiescent, pending.isEmpty, !rosterDirty, !needTuningReload,
-       restorePlanner == nil, restorePending.isEmpty, dragGrabbed == nil,
-       !terminationRequested, core.auditSurvivors.isEmpty, tickCount % 30 != 0
-    {
-        tickCount += 1
-        if tickCount % 15 == 0 {
+    // Idle-when-static: this frame is quiet when nothing is pending and no
+    // model work remains. A quiet frame no longer spins the runloop at
+    // display rate — it tells the `FrameClock` to drop the repeating timer
+    // and arm a one-shot backstop for the next slow-cadence duty (pointer
+    // poll, display refresh, audit, state file, tap health). Real events
+    // wake us through `wakeTicker`. This mirrors the Rust pump ladder
+    // (`pump_timeout_ms`) and frees the runloop — which also owns the event
+    // tap — at rest.
+    //
+    // Chronic audit survivors (a window an app keeps refusing to move) do
+    // NOT force full-rate ticks: their redrive is audit-gated (~5s), which
+    // the slow-duty backstop already covers. Pinning the daemon at display
+    // rate for one wedged app is exactly the always-on behavior this clock
+    // removes. The 4Hz pointer poll and the slow duties still fire on the
+    // backstop; between backstops nothing runs.
+    let quiet =
+        lastQuiescent && pending.isEmpty && !rosterDirty && !needTuningReload
+        && restorePlanner == nil && restorePending.isEmpty && dragGrabbed == nil
+        && !terminationRequested
+        // Never idle before the roster has been synced at least once, and
+        // never while AX newcomer probes are in flight: those adopt on a
+        // later tick, and sleeping here would strand a fresh launch with
+        // an empty world (observed: slept at tick 1, roster 0).
+        && tickCount > 1 && rosterSyncedOnce && probing.isEmpty
+    slowDutyJustRan = false
+    if quiet {
+        let now = Date()
+        let pointerDue = now.timeIntervalSince(lastPointerPoll) >= pointerPollInterval
+        let slowDue = slowDutyDue(now: now)
+        slowDutyJustRan = slowDue
+        if pointerDue {
             pollPointer(viewports: lastViewports)
         }
-        return
+        if !slowDue {
+            // Nothing but (maybe) the pointer poll was due: the frame is
+            // pure overhead, so re-sleep (or sleep, on a bare wake).
+            let backstop = nextBackstopMs(pointerDue: false, slowDue: false, now: now)
+            if case .sleep(let afterMs) = frameClock.settle(work: false, backstopMs: backstop) {
+                sleepTickTimer(afterMs: afterMs)
+            }
+            return
+        }
+        // A slow-duty backstop falls through so the state file, audit,
+        // frame refresh, and tap health run, then the tail re-sleeps.
+    } else {
+        // A full (non-quiet) tick still owes the slow duties on the wall
+        // clock; `slowDutyDue` keeps them from firing every frame.
+        slowDutyJustRan = slowDutyDue(now: Date())
     }
     // Per-window border radius for this frame (previous focus — the plan
     // diffs styles, so a change reskins on the next present).
@@ -3229,6 +3387,10 @@ nonisolated(unsafe) var statJobs = 0
                     ok: denied == nil
                 ))
             }
+            // Completions land on the worker: wake the idle clock so the
+            // tick drains acks (and re-evaluates convergence) now rather
+            // than at the next backstop. Main queue by construction.
+            DispatchQueue.main.async { wakeTicker() }
         }
     }
     // Stuck-writer watchdog: past the degrade threshold the core repairs
@@ -3545,10 +3707,9 @@ nonisolated(unsafe) var statJobs = 0
         }
     }
     prevActiveWS = core.activeWorkspace
-    // Pointer poll (~4Hz, movement-gated); see `pollPointer`.
-    if tickCount % 15 == 0 {
-        pollPointer(viewports: viewports)
-    }
+    // Pointer poll (~4Hz, movement-gated); see `pollPointer`. The idle
+    // path also polls on its own backstop; this covers the full-tick case.
+    pollPointer(viewports: viewports)
     // Restore placement runs after the core ingests this frame's
     // `.appeared` events (placing earlier gets undone when they land)
     // and after this frame's move jobs apply, so the plan wins.
@@ -3600,13 +3761,15 @@ nonisolated(unsafe) var statJobs = 0
         }
         lastFlashMessage = nil
     }
-    // Frame refresh on the AX worker, staggered halves (~1Hz per
-    // window instead of a 2Hz full-roster hammer): each read is two AX
-    // round trips per window. The cached frame is lock-guarded, so the
-    // worker refreshes while the next tick reads. Nothing periodic does
-    // AX on main anymore.
-    if tickCount % 30 == 0 {
-        let takeEven = tickCount % 60 == 0
+    // Frame refresh on the AX worker, staggered halves (~1Hz per window):
+    // each read is two AX round trips per window. The cached frame is
+    // lock-guarded, so the worker refreshes while the next tick reads.
+    // Nothing periodic does AX on main. Wall-clock gated so it fires on
+    // time whether the tick runs at display rate or from an idle backstop.
+    if Date().timeIntervalSince(lastFrameRefreshAt) >= frameRefreshInterval {
+        let now = Date()
+        lastFrameRefreshAt = now
+        let takeEven = (Int(now.timeIntervalSince1970 * 2) % 2) == 0
         let windows: [LiveProviders.LiveWindow] = roster.keys.sorted().enumerated().compactMap {
             (index, wid) in
             guard (index % 2 == 0) == takeEven else { return nil }
@@ -3615,7 +3778,7 @@ nonisolated(unsafe) var statJobs = 0
         // Detected corners only change on theme/scale switches: re-probe
         // the focused window on the refresh cadence so borders track.
         // Rule-overridden windows skip: configured radius always wins.
-        if tickCount % 300 == 0, let focus = result.focus,
+        if slowDutyJustRan, let focus = result.focus,
            ruleRadiusFor(focus) == nil,
            case .auto = resolved.borderRadius, let cid = skyCID
         {
@@ -3631,9 +3794,9 @@ nonisolated(unsafe) var statJobs = 0
     }
     // Live state file for hand-run diagnostics (`pq` covers launchd
     // runs over XPC; a listener endpoint cannot be shared by file).
-    // Refreshed slowly — encoding the whole world on main every 0.5s was
+    // Refreshed on the slow-duty cadence — encoding the whole world is
     // pure overhead; XPC/KPC queries serve live state.
-    if tickCount % 300 == 0 {
+    if slowDutyJustRan {
         writeStateFile(
             tick: tickCount, focus: result.focus, quiescent: result.quiescent,
             jobs: result.axJobs.count, events: events.count
@@ -3644,7 +3807,7 @@ nonisolated(unsafe) var statJobs = 0
     // diagnoses itself instead of needing a forensic session. Repeats
     // stay silent (fingerprint throttle): a stuck roster prints once
     // per change instead of every audit.
-    if tickCount % 300 == 0 {
+    if slowDutyJustRan {
         // Grant transitions explain systemic denial outright: per-window
         // "denied" spam means nothing next to a lost grant.
         let trusted = hasAccessibilityGrant()
@@ -3685,25 +3848,28 @@ nonisolated(unsafe) var statJobs = 0
                     + " check the Accessibility grant for paneru-swift")
         }
         let fingerprint = block.joined(separator: "\n")
-        if fingerprint != lastAuditFingerprint || tickCount - lastAuditPrintTick >= 216000 {
+        if fingerprint != lastAuditFingerprint
+            || Date().timeIntervalSince(lastAuditPrintAt) >= 3600
+        {
             for line in block {
                 print(line)
             }
             lastAuditFingerprint = fingerprint
-            lastAuditPrintTick = tickCount
+            lastAuditPrintAt = Date()
         }
     }
-    // Shadow observer poll (tick-cadenced): fetch async off-thread,
-    // diff at rest on-thread. The normal path never pays for this.
+    // Shadow observer poll (cadence): fetch async off-thread, diff at
+    // rest on-thread. The normal path never pays for this.
     if shadowMode {
-        if tickCount % 60 == 0 {
+        if slowDutyJustRan {
             requestShadowPoll()
         }
         consumeShadowPoll(swiftQuiet: result.quiescent)
     }
     // Shadow heartbeat (30s): dropped-intent count proves the observer
     // keeps deciding while writing nothing.
-    if shadowMode, tickCount % 1800 == 0 {
+    if shadowMode, Date().timeIntervalSince(lastShadowHeartbeatAt) >= 30 {
+        lastShadowHeartbeatAt = Date()
         print(
             "shadow: tick=\(tickCount) droppedJobs=\(shadowDroppedJobs)"
                 + " roster=\(roster.count) focus=\(result.focus.map(String.init) ?? "-")"
@@ -3712,9 +3878,9 @@ nonisolated(unsafe) var statJobs = 0
     // Tap health ladder (~5s cadence): a tap the OS disabled
     // (timeout/user-input) re-arms here instead of silently going deaf
     // for half a minute (during which native gestures win outright).
-    // The healthy path is two cheap C calls. Matches
-    // `tapHealthCheckInterval` order.
-    if tickCount % 300 == 0 {
+    // The healthy path is two cheap C calls. Matches the slow-duty
+    // cadence, which is what `tapHealthCheckInterval` approximates.
+    if slowDutyJustRan {
         switch tap.ensureAlive() {
         case .healthy:
             break
@@ -3724,11 +3890,14 @@ nonisolated(unsafe) var statJobs = 0
             print("input: warning: event tap dead (commands still arrive via the menubar)")
         }
     }
-    // Saved-state persistence, Rust 30s dirty cadence: a quiet
-    // interval skips the write entirely. Shadow never saves (restore
-    // reads stay on for fidelity, but the live daemon owns the file).
-    if tickCount % 1800 == 0, stateDirty, !shadowMode {
+    // Saved-state persistence, ~30s dirty cadence: a quiet interval skips
+    // the write entirely. Shadow never saves (restore reads stay on for
+    // fidelity, but the live daemon owns the file).
+    if Date().timeIntervalSince(lastSessionSaveAt) >= sessionSaveInterval,
+       stateDirty, !shadowMode
+    {
         stateDirty = false
+        lastSessionSaveAt = Date()
         saveSessionState()
     }
     // Present borders. An empty plan means steady state: the pool already
@@ -3975,6 +4144,24 @@ nonisolated(unsafe) var statJobs = 0
                     + " post=\(String(format: "%.2f", ms(t4, t5)))"
             )
         }
+    }
+    // A full tick that ended settled and empty sleeps immediately instead
+    // of paying one more frame to re-discover quiet at the top. `work`
+    // mirrors the top-of-tick quiet predicate (this frame's own work has
+    // been consumed by now). Backstops still fire from the sleep path.
+    let endedQuiet =
+        result.quiescent && pending.isEmpty && !rosterDirty && !needTuningReload
+        && restorePlanner == nil && restorePending.isEmpty && dragGrabbed == nil
+        && !terminationRequested
+        && tickCount > 1 && rosterSyncedOnce && probing.isEmpty
+    if endedQuiet {
+        let now = Date()
+        let backstop = nextBackstopMs(pointerDue: false, slowDue: false, now: now)
+        if case .sleep(let afterMs) = frameClock.settle(work: false, backstopMs: backstop) {
+            sleepTickTimer(afterMs: afterMs)
+        }
+    } else {
+        _ = frameClock.settle(work: true, backstopMs: 0)
     }
 }
 
@@ -4345,6 +4532,7 @@ final class ConnectionHandler: NSObject, PaneruXPCProtocol {
     func runCommand(_ argv: [String], withReply reply: @escaping (String) -> Void) {
         do {
             pending.append(.command(try parseCommand(argv)))
+            wakeTicker()
             reply("ok")
         } catch {
             reply(xpcError("\(error)"))

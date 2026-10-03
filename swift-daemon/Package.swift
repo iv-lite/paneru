@@ -249,7 +249,7 @@ let package = Package(
             name: "paneru-swift",
             dependencies: [
                 "Commands", "Config", "ConfigFiles", "Daemon", "Displays",
-                "Geometry", "IPC", "KeyChords", "Layout", "LiveProviders",
+                "EventCore", "Geometry", "IPC", "KeyChords", "Layout", "LiveProviders",
                 "LuaAPI", "LuaBridge", "MenuBar", "PaneruXPC", "Presentation",
                 "Presenter",                 "ScriptEvents", "ScriptHost", "Scripting",
                 "Focus", "Scroll", "Session", "SkyBridge", "StateQuery", "WindowSet",

@@ -110,6 +110,30 @@ do {
     check(!flags.contains(.paint) && flags.contains(.layout), "passes consume their flags")
 }
 
+// FrameClock: idle-when-static decisions. A real wake starts the timer;
+// a quiet settle drops to a one-shot backstop; flagged work stays active.
+do {
+    var clock = FrameClock()
+    // Default is active: boot runs full frames.
+    checkEqual(clock.settle(work: true, backstopMs: 0), .run, "work keeps running")
+
+    // Quiet settle sleeps until the next slow-cadence duty.
+    checkEqual(clock.settle(work: false, backstopMs: 33), .sleep(afterMs: 33), "quiet sleeps to backstop")
+    check(!clock.active, "asleep after quiet settle")
+
+    // A real event wakes it.
+    checkEqual(clock.wake(), .run, "event wakes to run")
+    check(clock.active, "active after wake")
+
+    // A settle that is still quiet re-sleeps (idempotent), and a truly
+    // event-driven rest (no duty) arms no backstop.
+    checkEqual(clock.settle(work: false, backstopMs: 0), .sleep(afterMs: 0), "rest with no duty arms nothing")
+    _ = clock.wake()
+    checkEqual(clock.settle(work: true, backstopMs: 100), .run, "work after wake runs")
+    // Work while already active is still .run (host keeps its timer).
+    checkEqual(clock.settle(work: true, backstopMs: 100), .run, "work stays running")
+}
+
 if failures == 0 {
     print("EventCoreChecks: all checks passed")
 } else {
