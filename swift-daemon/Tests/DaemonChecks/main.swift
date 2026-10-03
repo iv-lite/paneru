@@ -5144,6 +5144,45 @@ do {
     )
 }
 
+// Normal navigation is not a flap: direction changes spaced beyond the
+// flap window keep gliding the strip.
+do {
+    var daemon = DaemonCore()
+    daemon.animationsEnabled = false
+    daemon.glideBaseMs = 0
+    let vp = IntRect(0, 0, 900, 768)
+    let live: (Int32) -> IntRect? = { id in
+        let x = Int32(id) * 400
+        return IntRect(min: IntPoint(x, 34), max: IntPoint(x + 400, 734))
+    }
+    _ = daemon.tick(
+        events: [
+            .appeared(id: 0, workspace: 1), .appeared(id: 1, workspace: 1),
+            .appeared(id: 2, workspace: 1), .appeared(id: 3, workspace: 1),
+            .appeared(id: 4, workspace: 1), .focus(id: 0),
+        ],
+        frames: live, viewport: vp, focusedStyle: style
+    )
+    func settle() {
+        for _ in 0..<40 {
+            _ = daemon.tick(events: [], frames: live, viewport: vp, focusedStyle: style)
+        }
+    }
+    for i in 0..<4 {
+        let far = i % 2 == 0
+        _ = daemon.tick(
+            events: [.focus(id: far ? 4 : 0)],
+            frames: live, viewport: vp, focusedStyle: style
+        )
+        let target = daemon.offsetTarget(for: 1) ?? 0
+        check(
+            far ? target < 0 : target == 0,
+            "spaced focus move \(i) still reveals"
+        )
+        settle()
+    }
+}
+
 if failures == 0 {
     print("DaemonChecks: all checks passed")
 } else {

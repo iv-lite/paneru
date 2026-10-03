@@ -344,9 +344,14 @@ public struct DaemonCore: Sendable {
     /// instead of scrolling the strip back and forth forever.
     private let revealFlapReversals = 3
     private let revealFlapCooldownEpochs: UInt64 = 120
+    /// Only reversals within this window count as a flap. A user changing
+    /// focus direction a second apart is normal navigation, not an
+    /// oscillation, and must never be stood down.
+    private let revealFlapWindowEpochs: UInt64 = 30
     private var revealLastDir: [WorkspaceID: Int] = [:]
     private var revealReversals: [WorkspaceID: Int] = [:]
     private var revealCooldownUntil: [WorkspaceID: UInt64] = [:]
+    private var revealLastAt: [WorkspaceID: UInt64] = [:]
     /// Hidden fraction of the focused window above which arrival
     /// reveals. Mirrors `window_hidden_ratio`: 0 always reveals on any
     /// shortfall (legacy), 1 only when fully hidden (quiet clicks —
@@ -2310,6 +2315,13 @@ public struct DaemonCore: Sendable {
         }
         let dir = proposed > from ? 1 : (proposed < from ? -1 : 0)
         guard dir != 0 else { return false }
+        // Stale reversals don't count: only a rapid back-and-forth is a
+        // flap. A direction change after a pause resets the run.
+        if let at = revealLastAt[owner], epoch &- at > revealFlapWindowEpochs {
+            revealReversals[owner] = 0
+            revealLastDir[owner] = 0
+        }
+        revealLastAt[owner] = epoch
         if let last = revealLastDir[owner], last != 0, last != dir {
             let n = (revealReversals[owner] ?? 0) + 1
             if n >= revealFlapReversals {
