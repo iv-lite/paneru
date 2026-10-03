@@ -3727,12 +3727,17 @@ nonisolated(unsafe) var statJobs = 0
                 // Per-call denial capture: a later success clears the
                 // shared slot, so read the code before the next call.
                 var denied: Int32?
-                if let origin = job.origin {
-                    _ = window.reposition(to: origin)
-                    denied = window.lastDeniedCode()
-                }
+                // Size before position (Rust `resize` order): a job that
+                // changes both must never occupy (new origin, old size) —
+                // that intermediate frame moves the glass edge relative to
+                // the neighbour and breathes the inter-window gap mid-glide.
+                // Rust writes `set_ax_size` then `set_ax_position`; match it.
                 if let size = job.size {
                     _ = window.resize(to: size, origin: job.origin)
+                    denied = window.lastDeniedCode()
+                }
+                if let origin = job.origin {
+                    _ = window.reposition(to: origin)
                     if denied == nil {
                         denied = window.lastDeniedCode()
                     }

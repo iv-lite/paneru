@@ -5444,6 +5444,77 @@ do {
     checkEqual(daemon.offsetTarget(for: 1), -176, "glide settles at the reveal target")
 }
 
+// Gap rigid under a combined move+resize: the host AX layer must write
+// size before position (Rust `resize` order), or a window briefly
+// occupies (new origin, old size) and breathes the inter-window glass
+// gap. This pins the order contract the worker must follow: size-first
+// keeps the glass gap at exactly 2*hPad on every intermediate state,
+// position-first opens it. (The worker in main.swift applies jobs in this
+// order; this is the invariant that order protects.)
+do {
+    let hPad: Int32 = 4 // gapHorizontal 8 -> 2*hPad == 8px glass gap
+    let vPad: Int32 = 4
+    // Slot-space layout: two abutting 400-wide columns.
+    let slot0 = IntPoint(0, 34)
+    let slot1 = IntPoint(400, 34)
+    // A width change on the left column (400 -> 512) shifts the right
+    // column's slot (400 -> 512): both windows get origin+size jobs.
+    let newSlot0 = IntPoint(0, 34)
+    let newSlot1 = IntPoint(512, 34)
+    let newW0: Int32 = 512
+    let newW1: Int32 = 400
+    // Glass rect from a padded slot (raw = padded shrunk by the insets).
+    func glass(_ slot: IntPoint, _ w: Int32) -> IntRect {
+        IntRect(
+            min: IntPoint(slot.x + hPad, slot.y + vPad),
+            max: IntPoint(slot.x + w - hPad, slot.y + 700 - vPad)
+        )
+    }
+    // Apply window A's and B's writes in a given order and report the
+    // glass gap AFTER the first write of each (the worst intermediate
+    // state). Returns (holdsExact, sawIntermediateBreath).
+    func run(sizeFirst: Bool) -> (exact: Bool, breathed: Bool) {
+        var a = glass(slot0, 400)
+        var b = glass(slot1, 400)
+        // Raw write helpers mirroring LiveAX: position adds pad, size
+        // subtracts 2*pad.
+        func pos(_ r: inout IntRect, _ o: IntPoint) {
+            let w = r.width
+            let h = r.height
+            r.min = IntPoint(o.x + hPad, o.y + vPad)
+            r.max = IntPoint(r.min.x + w, r.min.y + h)
+        }
+        func size(_ r: inout IntRect, _ s: IntSize) {
+            r.max = IntPoint(r.min.x + s.x - 2 * hPad, r.min.y + s.y - 2 * vPad)
+        }
+        let jobsA = (origin: newSlot0, size: IntSize(newW0, 700))
+        let jobsB = (origin: newSlot1, size: IntSize(newW1, 700))
+        var exact = true
+        var breathed = false
+        func checkGap() {
+            let gap = b.min.x - a.max.x
+            if gap != 2 * hPad { exact = false; breathed = true }
+        }
+        if sizeFirst {
+            size(&a, jobsA.size); pos(&a, jobsA.origin)
+            size(&b, jobsB.size); pos(&b, jobsB.origin)
+        } else {
+            pos(&a, jobsA.origin); size(&a, jobsA.size)
+            // Intermediate: A at (new origin, old size).
+            checkGap()
+            pos(&b, jobsB.origin); size(&b, jobsB.size)
+            checkGap()
+        }
+        // Final state must be exact either way.
+        checkGap()
+        return (exact, breathed)
+    }
+    let good = run(sizeFirst: true)
+    check(good.exact && !good.breathed, "size-first keeps the glass gap exact")
+    let bad = run(sizeFirst: false)
+    check(bad.breathed, "position-first breathes the glass gap (the bug)")
+}
+
 if failures == 0 {
     print("DaemonChecks: all checks passed")
 } else {
