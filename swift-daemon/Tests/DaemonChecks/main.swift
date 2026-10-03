@@ -5183,6 +5183,55 @@ do {
     }
 }
 
+// A sliver-parked member (glass resting at the owner-edge hide-park, its
+// model slot scrolled off-view) is *converged*, not drifted or overlapping.
+// The diagnostics judge glass against the presented target and skip
+// parked members, so a scroll no longer floods `drift:`/`overlap:` with
+// intended off-slot rest and buries the real signal.
+do {
+    var daemon = DaemonCore()
+    daemon.animationsEnabled = false
+    daemon.glideBaseMs = 0
+    let document = """
+        {"v":1,"active_workspace":1,"focus":1,"workspaces":[{"workspace_id":1,"active_row":0,"rows":[{"virtual_index":0,"offset_x":-400,"offset_y":0,"active":true,"columns":[{"Single":0},{"Single":1},{"Single":2}]}],"floating":[]}]}
+        """
+    guard let doc = HandoffDoc.decode(Data(document.utf8)) else {
+        check(false, "hide-park handoff decodes")
+        exit(1)
+    }
+    // Live glass sits at the raw scrolled slots; the commit must then
+    // project the exited column to the owner-edge park.
+    let scrolled: (Int32) -> IntRect? = { id in
+        let x: Int32 = [0: -400, 1: 0, 2: 400][id] ?? 0
+        return IntRect(min: IntPoint(x, 34), max: IntPoint(x + 400, 734))
+    }
+    daemon.applyHandoff(doc, frames: scrolled, viewports: [1: viewport])
+    _ = daemon.tick(events: [], frames: scrolled, viewport: viewport, focusedStyle: style)
+    let park = daemon.positions[0] ?? IntPoint(0, 0)
+    check(
+        park.x > -400 && park.x < 0,
+        "window 0 hide-parks at the owner edge (got \(park.x))"
+    )
+    // Glass follows to the park; from here there is no divergence at all.
+    let parked: (Int32) -> IntRect? = { id in
+        let x: Int32 = [0: park.x, 1: 0, 2: 400][id] ?? 0
+        return IntRect(min: IntPoint(x, 34), max: IntPoint(x + 400, 734))
+    }
+    for _ in 0..<20 {
+        _ = daemon.tick(events: [], frames: parked, viewport: viewport, focusedStyle: style)
+    }
+    let drift = daemon.divergenceReport(frames: parked)
+    check(
+        !drift.contains { $0.contains("window=0") },
+        "a converged hide-park is not drift: \(drift)"
+    )
+    let overlaps = daemon.overlapReport(frames: parked)
+    check(
+        !overlaps.contains { $0.contains("a=0") || $0.contains("b=0") },
+        "a converged hide-park is not overlap: \(overlaps)"
+    )
+}
+
 if failures == 0 {
     print("DaemonChecks: all checks passed")
 } else {

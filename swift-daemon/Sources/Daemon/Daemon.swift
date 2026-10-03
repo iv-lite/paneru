@@ -2580,10 +2580,20 @@ public struct DaemonCore: Sendable {
                     let position = positions[member]
                     let size = sizes[member]
                     let flags = excuseFlags(member)
-                    let posOff = position.map {
-                        abs($0.x - slot.x) + abs($0.y - slot.y)
-                    } ?? -1
-                    let liveOff = abs(live.min.x - slot.x) + abs(live.min.y - slot.y)
+                    // Presented truth is the model's target: for a
+                    // sliver-parked member that is the owner-edge park,
+                    // not the scrolled-off slot. Judge glass against the
+                    // presented target, and skip the model-vs-slot check
+                    // for parked members (their off-slot rest is by
+                    // design) — otherwise every parked member reports
+                    // `drift` forever and drowns the real signal.
+                    let presented = position ?? slot
+                    let parked = sliverParked.contains(member)
+                    let posOff: Int32 =
+                        parked
+                        ? 0
+                        : position.map { abs($0.x - slot.x) + abs($0.y - slot.y) } ?? -1
+                    let liveOff = abs(live.min.x - presented.x) + abs(live.min.y - presented.y)
                     let sizeOff: Int32
                     if let size {
                         sizeOff = abs(live.width - size.x) + abs(live.height - size.y)
@@ -2618,6 +2628,7 @@ public struct DaemonCore: Sendable {
         if glides[member] != nil { flags.append("leg") }
         if homing.contains(member) { flags.append("homing") }
         if held == member { flags.append("held") }
+        if sliverParked.contains(member) { flags.append("sliver") }
         if isUnacked(member) { flags.append("unacked") }
         if redriveStreak[member, default: 0] > 0 {
             flags.append("streak\(redriveStreak[member] ?? 0)")
@@ -2675,6 +2686,16 @@ public struct DaemonCore: Sendable {
                               !ax.unackedLive(member),
                               let live = frames(member)
                         else { continue }
+                        // A sliver-parked member resting at its owner-edge
+                        // park is fully intended (at most a 1px edge
+                        // touch): only a parked member whose glass drifted
+                        // off its park target can genuinely overlap.
+                        if sliverParked.contains(member),
+                           let p = positions[member],
+                           abs(live.min.x - p.x) <= axDeadbandPx,
+                           abs(live.min.y - p.y) <= axDeadbandPx {
+                            continue
+                        }
                         visible.append((member, live))
                     }
                 }
