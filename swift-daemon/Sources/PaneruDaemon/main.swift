@@ -1203,6 +1203,16 @@ struct WindowInfo {
        !dontFocus.contains(windowID(focused)),
        windowID(focused) != core.focus
     {
+        // Minimized glass is hidden: focusing it only bounces off the
+        // heal once the (async) minimize flip lands. Check synchronously
+        // here — an app-switch focus event can beat the worker's flip and
+        // briefly re-focus a minimized window. One bool read, same cost
+        // class as `focusedWindowID()` above.
+        if let live = roster[CGWindowID(bitPattern: windowID(focused))], live.isMinimized {
+            rosterDirty = true
+            return
+        }
+        print("focus: arrival src=observer id=\(windowID(focused))")
         pending.append(.focus(id: windowID(focused)))
     }
     rosterDirty = true

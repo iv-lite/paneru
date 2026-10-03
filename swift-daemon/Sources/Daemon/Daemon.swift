@@ -640,9 +640,19 @@ public struct DaemonCore: Sendable {
         // Focus arrivals pend their reveal (drained below against fresh
         // slots); the raise latch follows arrivals while focus holds so
         // late-adopted windows still actuate on appearance.
-        if focus != prevFocus, let id = focus {
-            pendingReveals.insert(id)
-            pendingRevealRaise[id] = lastFocusRaise
+        if focus != prevFocus {
+            // Only the current focus may reveal: stale ids left in the set
+            // are drained together once the strip rests, and the
+            // last-sorted one wins the offset target — scrolling the strip
+            // to a window the user already left (the app-switch "columns
+            // don't glide to it" misfire). Drop them; the resize re-pend
+            // below only ever re-inserts the current focus.
+            pendingReveals.removeAll()
+            pendingRevealRaise.removeAll()
+            if let id = focus {
+                pendingReveals.insert(id)
+                pendingRevealRaise[id] = lastFocusRaise
+            }
         }
         if focus != prevFocus {
             focusRaiseLatched = (focus != nil && lastFocusRaise)
@@ -693,7 +703,7 @@ public struct DaemonCore: Sendable {
             offsets == offsetsBeforeTick && !gestureFresh && held == nil
         }
         if !pendingReveals.isEmpty, autoCenter, arrivalReady() {
-            for id in pendingReveals.sorted() {
+            for id in pendingReveals.sorted() where id == focus {
                 revealOwner(
                     id, frames: frames, viewports: viewports,
                     raise: pendingRevealRaise[id] ?? false, epoch: epoch
@@ -702,7 +712,7 @@ public struct DaemonCore: Sendable {
             pendingReveals.removeAll()
             pendingRevealRaise.removeAll()
         } else if !pendingReveals.isEmpty, rested() {
-            for id in pendingReveals.sorted() {
+            for id in pendingReveals.sorted() where id == focus {
                 revealOwner(
                     id, frames: frames, viewports: viewports,
                     raise: pendingRevealRaise[id] ?? false, epoch: epoch

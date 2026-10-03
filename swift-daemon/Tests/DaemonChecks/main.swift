@@ -5141,11 +5141,50 @@ do {
         _ = daemon.tick(
             events: [.focus(id: id)], frames: live, viewport: vp, focusedStyle: style
         )
+        // Let the rest-gated reveal drain before the next flip: the
+        // breaker counts *revealed* reversals, and a queued one never
+        // reveals (only the current focus does).
+        for _ in 0..<10 {
+            _ = daemon.tick(events: [], frames: live, viewport: vp, focusedStyle: style)
+        }
         targets.append(daemon.offsetTarget(for: 1) ?? 0)
     }
     checkEqual(
         targets[targets.count - 1], targets[targets.count - 2],
         "reveal flap stands down after repeated direction reversals"
+    )
+}
+
+// App-switch misfire: a reveal queued for a window the user already left
+// must never be drained. Queued stale ids would be revealed *after* the
+// current focus and win the offset target, scrolling the strip away from
+// the window that actually has focus ("columns don't glide to it").
+do {
+    var daemon = DaemonCore() // animations on: reveals defer mid-glide
+    let vp = IntRect(0, 0, 700, 768)
+    let live: (Int32) -> IntRect? = { id in
+        let x = Int32(id) * 400
+        return IntRect(min: IntPoint(x, 34), max: IntPoint(x + 400, 734))
+    }
+    _ = daemon.tick(
+        events: [
+            .appeared(id: 0, workspace: 1), .appeared(id: 1, workspace: 1),
+            .appeared(id: 2, workspace: 1), .appeared(id: 3, workspace: 1),
+            .focus(id: 0),
+        ],
+        frames: live, viewport: vp, focusedStyle: style
+    )
+    // Start a glide, then queue two more focuses before the strip rests.
+    _ = daemon.tick(events: [.focus(id: 2)], frames: live, viewport: vp, focusedStyle: style)
+    _ = daemon.tick(events: [.focus(id: 3)], frames: live, viewport: vp, focusedStyle: style)
+    _ = daemon.tick(events: [.focus(id: 0)], frames: live, viewport: vp, focusedStyle: style)
+    for _ in 0..<80 {
+        _ = daemon.tick(events: [], frames: live, viewport: vp, focusedStyle: style)
+    }
+    checkEqual(daemon.focus, 0, "focus follows the last arrival")
+    checkEqual(
+        daemon.offsets[1] ?? 999, 0,
+        "the strip settles on the current focus, not a queued stale one"
     )
 }
 
