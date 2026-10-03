@@ -339,6 +339,12 @@ public struct DaemonCore: Sendable {
     /// the window oversized forever.
     private var sizeStreak: [WindowID: UInt8] = [:]
     private var lastSizeRedrive: [WindowID: UInt64] = [:]
+    /// Last live width seen per window. A live width that *changes* to a
+    /// narrower value than the tile is the app/user resizing, not our own
+    /// in-flight step (which lands at the size we sent) — the signal native
+    /// shrink adoption keys on, so it fires immediately instead of waiting
+    /// out the re-drive streak.
+    private var lastLiveWidth: [WindowID: Int32] = [:]
     /// Last epoch the strip offsets moved: focus arrival reveals only
     /// when the strip is at rest, never mid-flight. Nil until the first
     /// move — a fresh core is at rest by definition (and short harnesses
@@ -943,6 +949,7 @@ public struct DaemonCore: Sendable {
                 redriveStreak.removeValue(forKey: id)
                 sizeStreak.removeValue(forKey: id)
                 lastSizeRedrive.removeValue(forKey: id)
+                lastLiveWidth.removeValue(forKey: id)
                 if focus == id {
                     // Synchronous heal (Rust `give_away_focus`): hand off
                     // to the nearest surviving neighbor instead of
@@ -3723,6 +3730,26 @@ public struct DaemonCore: Sendable {
             // (read-only) for glass movement and re-arms; no repeat
             // writes fire. Fresh targets below still send once.
             guard auditParkedLive[member] == nil else { return }
+            // Native shrink adoption (Rust `window_resized_update_frame`):
+            // the app or user resized the glass *narrower* than the tile.
+            // Our own in-flight resize lands at the size we sent, so a live
+            // width that changed to a narrower value is real new truth —
+            // adopt it immediately so the column shrinks to match, instead
+            // of re-issuing the larger target and fighting the shrink.
+            // Only narrower is adopted: a wider live frame is OS drift and
+            // would grow the window to viewport size.
+            let prevLive = lastLiveWidth[member]
+            if live.width > 0, live.width < target.x - axDeadbandPx,
+               prevLive != live.width
+            {
+                modelWidths[member] = live.width
+                sizes[member] = IntSize(live.width, live.height)
+                sizeStreak[member] = 0
+                lastSizeRedrive.removeValue(forKey: member)
+                lastLiveWidth[member] = live.width
+                return
+            }
+            lastLiveWidth[member] = live.width
             let streak = sizeStreak[member, default: 0]
             if streak >= 5 {
                 // Chronic clamp (app can't reach the tile): give up and

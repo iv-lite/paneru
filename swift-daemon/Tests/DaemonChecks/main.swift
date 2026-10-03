@@ -4787,6 +4787,67 @@ do {
     checkEqual(daemon.committedSlot(of: 0), IntPoint(0, 34), "grown column rests full width")
 }
 
+// Native shrink adoption (Rust `window_resized_update_frame`): an app that
+// shrinks itself narrower than the tile is adopted immediately, so the
+// column shrinks to match and the neighbour slots inward — instead of the
+// daemon re-issuing the larger target and fighting the shrink. Only a
+// *narrower* landing adopts; a wider one is OS drift and is never adopted.
+do {
+    var daemon = DaemonCore()
+    daemon.animationsEnabled = false
+    daemon.glideBaseMs = 0
+    daemon.maximizeTiledWindows = true
+    daemon.defaultRatio = 1.0
+    // Column 0 grows to the tile width (1024); its neighbour slots at 1024.
+    _ = daemon.tick(
+        events: [
+            .appeared(id: 0, workspace: 1), .appeared(id: 1, workspace: 1),
+            .focus(id: 0),
+        ],
+        frames: frames(slots: [0: IntPoint(0, 34), 1: IntPoint(1024, 34)]),
+        viewport: viewport, focusedStyle: style
+    )
+    // Settle: both windows land at their tile widths (col0 1024, col1 1024;
+    // viewport 1024 holds one, col1 parked/off — but the model width of col0
+    // drives its neighbour's slot).
+    for _ in 0..<3 {
+        let r = daemon.tick(
+            events: [],
+            frames: { _ in IntRect(min: IntPoint(0, 34), max: IntPoint(1024, 734)) },
+            viewport: viewport, focusedStyle: style
+        )
+        for job in r.axJobs {
+            daemon.acknowledge(winID: job.winID, seq: job.seq, epoch: job.epoch)
+        }
+    }
+    // The app shrinks column 0 to 500 (glass lands narrower than the tile).
+    var shrank = false
+    for _ in 0..<3 {
+        let r = daemon.tick(
+            events: [],
+            frames: { id in
+                let origin = id == 0 ? IntPoint(0, 34) : IntPoint(500, 34)
+                return IntRect(min: origin, max: IntPoint(origin.x + 500, origin.y + 700))
+            },
+            viewport: viewport, focusedStyle: style
+        )
+        for job in r.axJobs {
+            daemon.acknowledge(winID: job.winID, seq: job.seq, epoch: job.epoch)
+        }
+        // The shrink is adopted: no re-grow fight, column 0 hugs 500 and
+        // the neighbour's slot starts at 500 (not 1024).
+        if daemon.committedSlot(of: 1)?.x == 500 {
+            shrank = true
+            break
+        }
+    }
+    check(shrank, "native shrink adopts: neighbour slots inward to 500")
+    check(
+        (daemon.committedSlot(of: 1)?.x ?? 0) < 1024,
+        "column did not stay at the old wide tile after a shrink"
+    )
+}
+
 // mid_strip_slot (Rust `insert_windows_mid_strip` math): the moved
 // column lands at the destination boundary nearest its on-screen x, and
 // the returned offset places that boundary there.
