@@ -113,13 +113,13 @@ Before concluding a task, creating a commit, or presenting work as complete, age
    ```
    `cargo nextest run --workspace --all-targets` also works and is the CI runner. Each harness command gets a 200ms simulated window (`COMMAND_WINDOW` in `src/tests/harness.rs`, just above the 150ms delayed-refresh timeout); tests asserting exact rest positions of long-settling animations opt back into 500ms via `TestHarness::with_command_window`. Suite logs default to `warn` — `RUST_LOG` overrides still apply.
 
-4. **Frame-parity replay (Swift ↔ Rust):** after any `swift-daemon/Sources` change, replay the Rust trace corpus against the Swift core — this is part of the CI suite and is otherwise **skipped silently** without the corpus:
+4. **Frame-parity replay (Swift ↔ Rust):** after any `swift-daemon/Sources` change, replay the Rust trace corpus against the Swift core. The corpus is committed at `swift-daemon/Tests/FrameParityChecks/corpus/` and `FrameParityChecks` falls back to it when `PANERU_TRACE_DIR` is unset, so a bare run is a real gate (it fails, never skips, without a corpus). Regenerate it after any Rust-side layout change:
    ```sh
    trace="$(mktemp -d)"
    PANERU_TRACE_OUT="$trace" cargo test --all-targets trace
-   PANERU_TRACE_DIR="$trace" swift run -c release --package-path swift-daemon FrameParityChecks
+   cp "$trace"/*.jsonl swift-daemon/Tests/FrameParityChecks/corpus/
    ```
-   A `FrameParityChecks: skipped` line means the corpus was missing — treat it as a failure, not a pass. (`rift-wm-installer/scripts/verify-swift` runs this automatically.)
+   `scripts/verify-swift.sh` runs the full Swift gate (release build with zero warnings, every `*Checks` runner, then the parity replay) and is the single command to run before merging Swift changes.
 
 ## 7. Contribution Workflow
 

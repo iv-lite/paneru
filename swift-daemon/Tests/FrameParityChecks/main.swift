@@ -184,11 +184,35 @@ private func checkEqual<T: Equatable>(_ a: T, _ b: T, _ message: String) {
 
 // MARK: - Corpora
 
-guard let traceDir = ProcessInfo.processInfo.environment["PANERU_TRACE_DIR"],
-      !traceDir.isEmpty
-else {
-    print("FrameParityChecks: skipped (set PANERU_TRACE_DIR to a Rust-dumped corpus)")
-    exit(0)
+// Corpus resolution: explicit `PANERU_TRACE_DIR` wins (CI dumps a fresh
+// corpus there); otherwise fall back to the committed corpus beside this
+// runner (`Tests/FrameParityChecks/corpus`), so a bare `swift run ...
+// FrameParityChecks` is a real gate instead of a silent skip. The
+// fallback path walks up from the executable because `swift run` launches
+// from a build directory.
+func committedCorpusDir() -> String? {
+    // `#filePath` is Sources/Tests-relative and stable across build layouts.
+    let here = URL(fileURLWithPath: #filePath)
+        .deletingLastPathComponent()  // FrameParityChecks/
+        .appendingPathComponent("corpus")
+        .path
+    return FileManager.default.fileExists(atPath: here) ? here : nil
+}
+
+let traceDir: String = {
+    if let env = ProcessInfo.processInfo.environment["PANERU_TRACE_DIR"], !env.isEmpty {
+        return env
+    }
+    if let committed = committedCorpusDir() {
+        print("FrameParityChecks: using committed corpus at \(committed)")
+        return committed
+    }
+    return ""
+}()
+
+guard !traceDir.isEmpty else {
+    print("FrameParityChecks: no corpus (no PANERU_TRACE_DIR, no committed corpus)")
+    exit(1)
 }
 
 var ran = 0
@@ -338,8 +362,17 @@ if ran == 0 {
     exit(1)
 }
 
+// The committed corpus is ten scenarios. A partial corpus (a hand-trimmed
+// directory, a failed dump) must fail loudly rather than silently gate on
+// fewer scenarios than the Rust side emits.
+let expected = 10
+if ran != expected {
+    print("FrameParityChecks: ran \(ran) of \(expected) corpora in \(traceDir)")
+    exit(1)
+}
+
 if failures == 0 {
-    print("FrameParityChecks: all checks passed")
+    print("FrameParityChecks: all checks passed (\(ran) corpora)")
 } else {
     print("FrameParityChecks: \(failures) failure(s)")
     exit(1)

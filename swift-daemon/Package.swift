@@ -128,7 +128,12 @@ let package = Package(
         .executableTarget(
             name: "FrameParityChecks",
             dependencies: ["Daemon", "Commands", "Geometry", "Presentation"],
-            path: "Tests/FrameParityChecks"
+            path: "Tests/FrameParityChecks",
+            // The Rust-dumped trace corpus ships beside the runner so a
+            // bare `swift run FrameParityChecks` is a real gate. Excluded
+            // as build inputs (read at runtime via `#filePath`, not
+            // bundled), which keeps SwiftPM from warning about them.
+            exclude: ["corpus"]
         ),
         .executableTarget(
             name: "AnimationChecks",
