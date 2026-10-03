@@ -463,6 +463,13 @@ nonisolated(unsafe) var roster: [CGWindowID: LiveProviders.LiveWindow] = [:]
 /// dropped and re-adopted on the next roster sync so a recycled id
 /// gets a live ref instead of retrying dead glass forever.
 nonisolated(unsafe) var deadElements = Set<CGWindowID>()
+/// Windows that left the on-screen list with no cached lifecycle answer:
+/// awaiting a worker minimize/fullscreen read before the drop decision
+/// (a real close is confirmed and dropped on the next sync).
+nonisolated(unsafe) var vanishedPending = Set<WindowID>()
+/// Vanish confirmed as a real close by the worker read: the next sync
+/// drops it without re-asking.
+nonisolated(unsafe) var confirmedVanishes = Set<WindowID>()
 nonisolated(unsafe) var observers: [pid_t: LiveObserver] = [:]
 nonisolated(unsafe) var pending: [DaemonEvent] = []
 /// Windows whose rules suppress focus arrival.
@@ -535,11 +542,23 @@ nonisolated(unsafe) var flipCheckCounter = 0
 /// all input delivery). Results hop back to main for roster/model
 /// application. One lane keeps per-window ordering sane. `var` (not
 /// `let`) so lane retirement can replace a hung queue (see the
-/// watchdog); in-flight blocks on the old lane complete against stale
-/// sequences the core ignores.
+/// watchdog).
+///
+/// Lane generation: retiring the lane `DispatchQueue` does NOT cancel
+/// blocks already queued on it, so a wedged lane's backlog would keep
+/// issuing AX against the fresh lane. Every dispatched block captures the
+/// generation it was created under and skips AX when the live generation
+/// has moved on — so a retirement genuinely stops the old lane's work
+/// instead of racing it.
 nonisolated(unsafe) var axWorker = DispatchQueue(
     label: "com.github.iv-lite.paneru-swift.ax", qos: .userInitiated
 )
+/// Monotonic lane generation, bumped on each retirement. Read on the
+/// worker; written on main.
+nonisolated(unsafe) var axLaneGeneration = 0
+/// Whether the currently executing worker block still belongs to the live
+/// lane. Call at the top of any AX-issuing worker block.
+@Sendable func axLaneCurrent(_ generation: Int) -> Bool { axLaneGeneration == generation }
 /// Last worker completion (wall time): the lane-health clock. Any ack
 /// proves the lane alive; thirty ackless seconds with frames traveling
 /// retires it (capped per boot).
@@ -1015,13 +1034,18 @@ nonisolated(unsafe) var rotatedAt: [WorkspaceID: Date] = [:]
                   !core.unmanaged.contains(id),
                   !minimizedWindows.contains(id),
                   !fullscreenFloated.contains(id),
-                  !window.isFullscreen
+                  !window.cachedFullscreen
             else { continue }
             let ws = workspaceForFrame(window.frame)
             pending.append(.appeared(id: id, workspace: ws))
             print("space: re-managed visible window \(id) on ws=\(ws)")
         }
     }
+    // Vanish decisions that need a fresh lifecycle read run on the AX
+    // worker (never a synchronous AX call on the tap-owning runloop). A
+    // window that left the on-screen list is either a real close or a
+    // minimize/fullscreen; the cached flags usually answer, but when they
+    // don't (never refreshed, or stale) the read is deferred one sync.
     for wid in known.subtracting(current) {
         let id = windowID(wid)
         // Stashed-but-listed members (carried across a rotation) take
@@ -1036,9 +1060,9 @@ nonisolated(unsafe) var rotatedAt: [WorkspaceID: Date] = [:]
             }
         }
         // Minimized windows leave the on-screen list but keep roster
-        // and strip membership (Rust parity): one main-thread AX read
-        // tells them apart from real closes. Vanishes are rare (close
-        // or minimize), so this never becomes a periodic AX walk.
+        // and strip membership (Rust parity). The cached flag (refreshed
+        // on the worker) is the fast path; an ambiguous vanish defers to
+        // a worker read so no AX call runs on main.
         if minimizedWindows.contains(id) {
             // App quit while minimized: drop like a real close
             // instead of haunting the strips.
@@ -1047,20 +1071,18 @@ nonisolated(unsafe) var rotatedAt: [WorkspaceID: Date] = [:]
             } else {
                 continue
             }
-        } else if let window = roster[wid], window.isMinimized {
+        } else if let window = roster[wid], window.cachedMinimized {
             minimizedWindows.insert(id)
             print("window: minimized \(id)")
             continue
         }
         // Native-fullscreen windows leave the on-screen list for their
         // own Space but keep roster and strip membership (Rust
-        // `NativeFullscreenMarker` parity): one main-thread AX read
-        // tells them apart from real closes, same as minimized. The
-        // worker flip owns `fullscreenFloated` and the float itself;
-        // this only refuses the drop. App quit while fullscreen drops
-        // like a real close instead of haunting the strips.
+        // `NativeFullscreenMarker` parity), same as minimized: the worker
+        // flip owns `fullscreenFloated` and the float itself; this only
+        // refuses the drop.
         if fullscreenFloated.contains(id)
-            || (roster[wid]?.isFullscreen ?? false)
+            || (roster[wid]?.cachedFullscreen ?? false)
         {
             if NSRunningApplication(processIdentifier: windowPIDs[id] ?? -1) == nil {
                 fullscreenFloated.remove(id)
@@ -1068,7 +1090,56 @@ nonisolated(unsafe) var rotatedAt: [WorkspaceID: Date] = [:]
                 continue
             }
         }
+        // Ambiguous: no cached lifecycle answer. Confirm on the worker
+        // before dropping (a single sync of latency, and only for real
+        // vanishes — rare). Already-pending ids retry below.
+        if roster[wid] != nil, !confirmedVanishes.contains(id) {
+            vanishedPending.insert(id)
+            continue
+        }
+        confirmedVanishes.remove(id)
         dropRosterEntry(wid)
+    }
+    if !vanishedPending.isEmpty {
+        let confirm = vanishedPending.compactMap { id -> (CGWindowID, LiveProviders.LiveWindow)? in
+            let wid = CGWindowID(id)
+            guard let window = roster[wid] else { return nil }
+            return (wid, window)
+        }
+        axWorker.async {
+            var minimized: [(WindowID, Bool)] = []
+            var fullscreen: [(WindowID, Bool)] = []
+            for (wid, window) in confirm {
+                let flags = window.refreshLifecycle()
+                minimized.append((windowID(wid), flags.minimized))
+                fullscreen.append((windowID(wid), flags.fullscreen))
+            }
+            DispatchQueue.main.async {
+                MainActor.assumeIsolated {
+                    for (id, isMin) in minimized where isMin {
+                        minimizedWindows.insert(id)
+                        vanishedPending.remove(id)
+                        print("window: minimized \(id)")
+                    }
+                    for (id, isFull) in fullscreen where isFull {
+                        fullscreenFloated.insert(id)
+                        vanishedPending.remove(id)
+                        pending.append(.command(.layout([.setFloating(window: id, floating: true)])))
+                        print("fullscreen: window=\(id) enter")
+                    }
+                    // Everything else is a real close: confirm and let the
+                    // next sync drop it (roster is main-owned).
+                    for (wid, _) in confirm {
+                        let id = windowID(wid)
+                        if !minimizedWindows.contains(id), !fullscreenFloated.contains(id) {
+                            confirmedVanishes.insert(id)
+                        }
+                    }
+                    rosterDirty = true
+                    wakeTicker()
+                }
+            }
+        }
     }
     // Dead AX elements flagged in the write drain: the ref is stale
     // (window recreated under a recycled id) — drop so the live window
@@ -1119,12 +1190,22 @@ nonisolated(unsafe) var rotatedAt: [WorkspaceID: Date] = [:]
     // Rotation-settle cutoff: windows owned by (or physically inside)
     // a just-rotated workspace keep their home until frames land.
     let rotateCutoff = Date().addingTimeInterval(-1.0)
+    // Fresh-space frame confirmation runs on the AX worker: a synchronous
+    // per-window AX frame read here (up to 8) would block the tap-owning
+    // runloop. The loop reads the cached frames the worker refreshes; the
+    // two-sync stability rule below tolerates the one-sync lag.
+    if spaceFresh {
+        let windows = roster.values
+        axWorker.async {
+            for window in windows { _ = window.updateFrame() }
+            DispatchQueue.main.async { wakeTicker() }
+        }
+    }
     for (wid, window) in roster {
         let id = windowID(wid)
         if spaceFresh, confirms < 8,
            let home = workspaceOfWindow(id),
-           home != workspaceForFrame(window.frame),
-           window.updateFrame() != nil
+           home != workspaceForFrame(window.frame)
         {
             confirms += 1
         }
@@ -1217,11 +1298,12 @@ struct WindowInfo {
        windowID(focused) != core.focus
     {
         // Minimized glass is hidden: focusing it only bounces off the
-        // heal once the (async) minimize flip lands. Check synchronously
-        // here — an app-switch focus event can beat the worker's flip and
-        // briefly re-focus a minimized window. One bool read, same cost
-        // class as `focusedWindowID()` above.
-        if let live = roster[CGWindowID(bitPattern: windowID(focused))], live.isMinimized {
+        // heal once the (async) minimize flip lands. Read the CACHED flag
+        // (refreshed on the AX worker) — never a synchronous AX call on
+        // the tap-owning runloop. A stale "not minimized" at worst defers
+        // one arrival; the vanish path owns the real minimize/drop
+        // decision, so correctness is unaffected.
+        if let live = roster[CGWindowID(bitPattern: windowID(focused))], live.cachedMinimized {
             rosterDirty = true
             return
         }
@@ -3359,7 +3441,24 @@ nonisolated(unsafe) var statJobs = 0
         }
         shadowDroppedJobs += latest.count
     } else if !batch.isEmpty {
+        // Capture the lane generation: a retirement before this block
+        // runs makes it a no-op for AX (the fresh lane owns convergence),
+        // so the old backlog can never fight the new lane.
+        let laneGen = axLaneGeneration
         axWorker.async {
+            guard axLaneCurrent(laneGen) else {
+                // Stale lane: converge the sequences so the watchdog's
+                // unacked state does not leak, but issue nothing. The
+                // fresh lane re-issues the live intents.
+                for (_, job) in batch {
+                    ackBox.append(AXWriteAck(
+                        winID: job.winID, seq: job.seq, epoch: job.epoch,
+                        ok: true
+                    ))
+                }
+                DispatchQueue.main.async { wakeTicker() }
+                return
+            }
             for (window, job) in batch {
                 // Per-call denial capture: a later success clears the
                 // shared slot, so read the code before the next call.
@@ -3413,6 +3512,11 @@ nonisolated(unsafe) var statJobs = 0
     {
         workerRetirements += 1
         lastAckAt = Date()
+        // Bump the generation FIRST: every block already queued on the
+        // retired lane will see the mismatch and skip its AX calls, so the
+        // wedged backlog stops driving glass instead of racing the fresh
+        // lane (a retired DispatchQueue does not cancel queued work).
+        axLaneGeneration += 1
         axWorker = DispatchQueue(
             label: "com.github.iv-lite.paneru-swift.ax", qos: .userInitiated
         )

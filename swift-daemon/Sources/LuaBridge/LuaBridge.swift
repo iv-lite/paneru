@@ -167,6 +167,7 @@ private func paneruExecImpl(_ state: OpaquePointer?) -> Int32 {
     let errPipe = Pipe()
     process.standardOutput = outPipe
     process.standardError = errPipe
+    let started = Date()
     do {
         try process.run()
     } catch {
@@ -174,6 +175,13 @@ private func paneruExecImpl(_ state: OpaquePointer?) -> Int32 {
     }
     // Bounded wait: poll so overruns kill the child instead of wedging
     // the owning thread past the cap.
+    //
+    // NOTE: the Lua runtime (and thus `paneru.exec`) runs on the main
+    // thread inside `drainLuaFrame`, so a slow child here blocks the tick
+    // (and the event tap it owns). The proper fix — moving the Lua worker
+    // to its own thread like Rust's `src/lua/worker.rs` — is a larger
+    // change tracked separately; until then a slow exec is logged loudly
+    // so it is diagnosable instead of a silent stall.
     let deadline = Date().addingTimeInterval(execTimeoutSecs)
     while process.isRunning, Date() < deadline {
         Thread.sleep(forTimeInterval: 0.05)
@@ -185,6 +193,12 @@ private func paneruExecImpl(_ state: OpaquePointer?) -> Int32 {
         code = 124
     } else {
         code = process.terminationStatus
+    }
+    let elapsedMs = Date().timeIntervalSince(started) * 1000.0
+    if elapsedMs >= 50 {
+        print("lua: exec '\(command)' blocked for \(Int(elapsedMs))ms"
+            + " (Lua handlers run on the daemon thread; keep helpers fast —"
+            + " a Lua worker thread is the fix, tracked separately)")
     }
     let stdout = String(
         data: outPipe.fileHandleForReading.readDataToEndOfFile(), encoding: .utf8

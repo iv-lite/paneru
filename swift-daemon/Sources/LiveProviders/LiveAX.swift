@@ -116,6 +116,17 @@ public final class LiveWindow: @unchecked Sendable {
         get { frameLock.withLock { _frame } }
         set { frameLock.withLock { _frame = newValue } }
     }
+    /// Cached lifecycle flags (minimized, native-fullscreen), refreshed on
+    /// the AX worker so the main tick reads them without an AX round trip
+    /// (a wedged app's 0.25s timeout on the main runloop stalls the event
+    /// tap). The worker calls `refreshLifecycle()`; main reads the cache.
+    /// Lock-guarded like `frame`; the cached value is last-known truth,
+    /// which is all the host decisions (vanish-vs-minimize, focus arrival,
+    /// float/unfloat) need.
+    private var _minimized = false
+    private var _fullscreen = false
+    public var cachedMinimized: Bool { frameLock.withLock { _minimized } }
+    public var cachedFullscreen: Bool { frameLock.withLock { _fullscreen } }
     public var horizontalPadding: Int32
     public var verticalPadding: Int32
     /// Dry-run latch for `--shadow` observers: when set, every write
@@ -319,6 +330,20 @@ public final class LiveWindow: @unchecked Sendable {
         )
         frame = padded
         return padded
+    }
+
+    /// Refresh the cached minimized/fullscreen flags from AX. Runs on the
+    /// worker; main reads the cache via `cachedMinimized`/`cachedFullscreen`
+    /// instead of making its own AX round trip. Returns the fresh pair.
+    @discardableResult
+    public func refreshLifecycle() -> (minimized: Bool, fullscreen: Bool) {
+        let minimized = isMinimized
+        let fullscreen = isFullscreen
+        frameLock.withLock {
+            _minimized = minimized
+            _fullscreen = fullscreen
+        }
+        return (minimized, fullscreen)
     }
 
     // MARK: Writes
