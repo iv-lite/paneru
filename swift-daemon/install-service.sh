@@ -14,10 +14,9 @@
 # requirement, so every rebuild looks like a new app to TCC and voids the
 # Accessibility grant (the earlier "stable identifier" claim was wrong —
 # the identifier is not part of an ad-hoc DR). Sign with a persistent
-# identity instead, resolved via the sibling installer's
-# `ensure-signing-identity` when present, else the "Paneru Local" cert
-# directly, so grants survive rebuilds. Override with
-# $PANERU_SIGN_IDENTITY (or force ad-hoc with "-").
+# identity instead, resolved via the local `ensure-signing-identity`
+# helper (this repo's canonical copy), so grants survive rebuilds.
+# Override with $PANERU_SIGN_IDENTITY (or force ad-hoc with "-").
 set -eu
 
 LABEL="com.github.iv-lite.paneru-swift"
@@ -33,12 +32,14 @@ ROOT="$(cd "$(dirname "$0")/.." && pwd)"
 OUT_LOG="/tmp/${LABEL}_${UID_NUM}.out.log"
 ERR_LOG="/tmp/${LABEL}_${UID_NUM}.err.log"
 XDG_HOME="${XDG_CONFIG_HOME:-$HOME/.config}"
-# Sibling installer's helper (creates/reads the "Paneru Local" identity).
-ENSURE_IDENTITY="$ROOT/../rift-wm-installer/scripts/ensure-signing-identity"
+# Local canonical helper (this repo owns it; the installer prefers this
+# copy when a sibling checkout exists).
+ENSURE_IDENTITY="$ROOT/swift-daemon/ensure-signing-identity"
 
 # Resolve the code-signing identity. Order: explicit $PANERU_SIGN_IDENTITY,
-# the sibling helper, then the "Paneru Local" cert directly in the login
-# keychain. "-" means ad-hoc (grants will not survive rebuilds).
+# the local helper (creates/reads the "Paneru Local" cert), then the cert
+# directly in the login keychain. "-" means ad-hoc (grants will not survive
+# rebuilds).
 resolve_sign_identity() {
     if [ -n "${PANERU_SIGN_IDENTITY:-}" ]; then
         echo "$PANERU_SIGN_IDENTITY"

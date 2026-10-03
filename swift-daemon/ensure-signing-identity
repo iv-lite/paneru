@@ -1,0 +1,108 @@
+#!/usr/bin/env bash
+# Prints the code-signing identity the daemon/installer should use.
+#
+# Canonical copy: this file lives in the daemon repo
+# (`iv-lite/paneru/swift-daemon/ensure-signing-identity`). The installer
+# (`rift-wm-installer`) prefers this copy when a sibling checkout exists
+# and keeps its own byte-identical fallback for standalone Rust installs;
+# keep the two in sync (they must stay identical).
+#
+#   PANERU_SIGN_CERT="${PANERU_SIGN_CERT:-Paneru Local}"
+#   PANERU_SIGN_IDENTITY (explicit override, e.g. a paid Developer ID)
+#
+# Stdout is exactly one line: the identity name (or "-" for ad-hoc fallback).
+# All human chatter goes to stderr so callers can capture stdout cleanly:
+#
+#   PANERU_SIGN_IDENTITY="$(bash "$SCRIPT_DIR/ensure-signing-identity" 2>/dev/null)" || PANERU_SIGN_IDENTITY="-"
+#
+# Why this exists: ad-hoc signatures (`codesign --sign -`) embed a cdhash-only
+# designated requirement, so every rebuild looks like a new app to TCC and
+# voids the Accessibility grant. Signing every install with one persistent
+# identity (a self-signed "Paneru Local" cert in the login keychain) gives a
+# stable identifier+certificate DR, so grants survive rebuilds. The cert is
+# long-lived and must never be regenerated once grants exist against it.
+set -u
+
+CERT="${PANERU_SIGN_CERT:-Paneru Local}"
+
+# Explicit override wins (paid Developer ID, CI-provided identity, or "-").
+if [ -n "${PANERU_SIGN_IDENTITY:-}" ]; then
+	echo "$PANERU_SIGN_IDENTITY"
+	exit 0
+fi
+
+# Non-macOS: no keychain/codesign story — fall back to ad-hoc.
+if ! command -v security >/dev/null 2>&1 || ! command -v codesign >/dev/null 2>&1; then
+	echo "-"
+	exit 0
+fi
+if [ "$(uname -s 2>/dev/null || echo Unknown)" != "Darwin" ]; then
+	echo "-"
+	exit 0
+fi
+
+if security find-identity -v -p codesigning 2>/dev/null | grep -qF "$CERT"; then
+	echo "$CERT"
+	exit 0
+fi
+
+# The cert is not a valid codesigning identity. It may still exist as an
+# orphan (private key gone after a keychain reset/migration), which would
+# collide with importing a fresh key+cert pair under the same CN. Delete
+# it first, and best-effort unlock the login keychain (a TTY may prompt).
+security unlock-keychain "$HOME/Library/Keychains/login.keychain-db" >/dev/null 2>&1 || true
+if security find-certificate -c "$CERT" >/dev/null 2>&1; then
+	echo "  → Removing orphaned '$CERT' cert (no usable private key)..." >&2
+	security delete-certificate -c "$CERT" >/dev/null 2>&1 || true
+fi
+
+# Best-effort creation. Never fatal: callers fall back to ad-hoc ("-") with
+# a warning when this fails (headless CI, locked keychain, missing openssl).
+echo "  → Creating self-signed code-signing identity '$CERT' (one-time)..." >&2
+tmp="$(mktemp -d)" || { echo "-"; exit 0; }
+trap 'rm -rf "$tmp"' EXIT
+cat > "$tmp/cert.cfg" <<EOF
+[ req ]
+distinguished_name = req_dn
+[ req_dn ]
+CN = $CERT
+[ extensions ]
+keyUsage = digitalSignature
+extendedKeyUsage = codeSigning
+EOF
+if ! command -v openssl >/dev/null 2>&1; then
+	echo "  ⚠ openssl not found — falling back to ad-hoc signing (grants will not survive rebuilds)" >&2
+	echo "-"
+	exit 0
+fi
+if ! openssl req -x509 -newkey rsa:2048 -keyout "$tmp/dev.key" -out "$tmp/dev.crt" \
+	-days 3650 -nodes -config "$tmp/cert.cfg" -extensions extensions \
+	-subj "/CN=$CERT" >/dev/null 2>&1; then
+	echo "  ⚠ Could not generate self-signed cert — falling back to ad-hoc signing" >&2
+	echo "-"
+	exit 0
+fi
+# Import key + cert into the login keychain with codesign access. A Keychain
+# UI prompt may appear once here; that is the one-time approval.
+if ! security import "$tmp/dev.key" -k "$HOME/Library/Keychains/login.keychain-db" \
+	-T /usr/bin/codesign >/dev/null 2>&1; then
+	echo "  ⚠ Keychain import (key) failed — falling back to ad-hoc signing" >&2
+	echo "-"
+	exit 0
+fi
+if ! security import "$tmp/dev.crt" -k "$HOME/Library/Keychains/login.keychain-db" \
+	-T /usr/bin/codesign >/dev/null 2>&1; then
+	echo "  ⚠ Keychain import (cert) failed — falling back to ad-hoc signing" >&2
+	echo "-"
+	exit 0
+fi
+security add-trusted-cert -d -r trustRoot \
+	-k "$HOME/Library/Keychains/login.keychain-db" "$tmp/dev.crt" >/dev/null 2>&1 || true
+if security find-identity -v -p codesigning 2>/dev/null | grep -qF "$CERT"; then
+	echo "  ✓ Code-signing identity '$CERT' ready (grants from here on survive rebuilds)" >&2
+	echo "$CERT"
+	exit 0
+fi
+echo "  ⚠ Cert created but not visible to codesigning — falling back to ad-hoc signing" >&2
+echo "-"
+exit 0
