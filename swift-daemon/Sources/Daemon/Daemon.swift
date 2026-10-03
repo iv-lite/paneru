@@ -338,6 +338,15 @@ public struct DaemonCore: Sendable {
     /// quickly, and per-window pending removes the flap-loss the long
     /// gate compensated for.)
     private let revealRestEpochs: UInt64 = 8
+    /// Reveal flap guard (focus oscillation, e.g. FFM⇄MFF ping-pong):
+    /// consecutive direction reversals of a workspace's reveal target past
+    /// this count stand reveals down for a cooldown, so the loop drains
+    /// instead of scrolling the strip back and forth forever.
+    private let revealFlapReversals = 3
+    private let revealFlapCooldownEpochs: UInt64 = 120
+    private var revealLastDir: [WorkspaceID: Int] = [:]
+    private var revealReversals: [WorkspaceID: Int] = [:]
+    private var revealCooldownUntil: [WorkspaceID: UInt64] = [:]
     /// Hidden fraction of the focused window above which arrival
     /// reveals. Mirrors `window_hidden_ratio`: 0 always reveals on any
     /// shortfall (legacy), 1 only when fully hidden (quiet clicks —
@@ -668,7 +677,7 @@ public struct DaemonCore: Sendable {
             for id in pendingReveals.sorted() {
                 revealOwner(
                     id, frames: frames, viewports: viewports,
-                    raise: pendingRevealRaise[id] ?? false
+                    raise: pendingRevealRaise[id] ?? false, epoch: epoch
                 )
             }
             pendingReveals.removeAll()
@@ -677,7 +686,7 @@ public struct DaemonCore: Sendable {
             for id in pendingReveals.sorted() {
                 revealOwner(
                     id, frames: frames, viewports: viewports,
-                    raise: pendingRevealRaise[id] ?? false
+                    raise: pendingRevealRaise[id] ?? false, epoch: epoch
                 )
             }
             pendingReveals.removeAll()
@@ -703,12 +712,12 @@ public struct DaemonCore: Sendable {
         // waits for rest.
         if !transferReveals.isEmpty, autoCenter, arrivalReady() {
             for id in transferReveals.sorted() {
-                revealOwner(id, frames: frames, viewports: viewports, raise: true)
+                revealOwner(id, frames: frames, viewports: viewports, raise: true, epoch: epoch)
             }
             transferReveals.removeAll()
         } else if !transferReveals.isEmpty, rested() {
             for id in transferReveals.sorted() {
-                revealOwner(id, frames: frames, viewports: viewports, raise: true)
+                revealOwner(id, frames: frames, viewports: viewports, raise: true, epoch: epoch)
             }
             transferReveals.removeAll()
         }
@@ -2144,10 +2153,13 @@ public struct DaemonCore: Sendable {
     /// commands) may center; ambient arrivals (hover) only expose.
     private mutating func revealOwner(
         _ id: WindowID, frames: (WindowID) -> IntRect?,
-        viewports: [WorkspaceID: IntRect], raise: Bool
+        viewports: [WorkspaceID: IntRect], raise: Bool, epoch: UInt64
     ) {
         let owner = workspaceOf(id) ?? activeWorkspace
-        revealFocus(id, frames: frames, viewport: viewport(for: owner, in: viewports), raise: raise)
+        revealFocus(
+            id, frames: frames, viewport: viewport(for: owner, in: viewports),
+            raise: raise, epoch: epoch
+        )
         // Under autoCenter the centering target owns out-of-range offsets
         // (Rust: the edge invariant is unenforced); clamping here would
         // uncenter edge windows and fight the glide. Manual gesture travel
@@ -2199,7 +2211,7 @@ public struct DaemonCore: Sendable {
     /// the neighbor and flaps focus back and forth.
     private mutating func revealFocus(
         _ id: WindowID, frames: (WindowID) -> IntRect?, viewport: IntRect,
-        raise: Bool
+        raise: Bool, epoch: UInt64
     ) {
         guard let owner = workspaceOf(id) else {
             print("focus: reveal skipped window=\(id) (unknown workspace)")
@@ -2251,7 +2263,10 @@ public struct DaemonCore: Sendable {
         // re-polls hover on the neighbor). Ambient falls through to
         // the minimal expose below, which rests for visible slots.
         if autoCenter && raise {
-            centerFocus(slot: slot, width: width, offset: offset, viewport: viewport, owner: owner)
+            centerFocus(
+                slot: slot, width: width, offset: offset,
+                viewport: viewport, owner: owner, epoch: epoch
+            )
             return
         }
         let view = IntRect(
@@ -2273,10 +2288,46 @@ public struct DaemonCore: Sendable {
         // (key creation), which the rest gate would misread as motion.
         // Targets ease in commit — no same-tick jump.
         if next.x != (offsetTargets[owner] ?? offset) {
+            guard !revealFlapBlocked(
+                owner: owner, proposed: next.x, from: offset, epoch: epoch
+            ) else { return }
             offsetTargets[owner] = next.x
             dirty.formUnion([.layout, .motion])
             print("focus: reveal window=\(id) target=\(next.x) (was \(offset))")
         }
+    }
+
+    /// Reveal flap guard: a focus oscillation (FFM⇄MFF ping-pong) reverses
+    /// the strip's reveal direction every tick, scrolling a viewport back
+    /// and forth forever. Count consecutive direction reversals; past the
+    /// limit, stand reveals down for a cooldown so the loop drains instead
+    /// of churning the strip. A genuine user focus run rarely reverses.
+    private mutating func revealFlapBlocked(
+        owner: WorkspaceID, proposed: Int32, from: Int32, epoch: UInt64
+    ) -> Bool {
+        if epoch < (revealCooldownUntil[owner] ?? 0) {
+            return true
+        }
+        let dir = proposed > from ? 1 : (proposed < from ? -1 : 0)
+        guard dir != 0 else { return false }
+        if let last = revealLastDir[owner], last != 0, last != dir {
+            let n = (revealReversals[owner] ?? 0) + 1
+            if n >= revealFlapReversals {
+                revealCooldownUntil[owner] = epoch &+ revealFlapCooldownEpochs
+                revealReversals[owner] = 0
+                revealLastDir[owner] = 0
+                print(
+                    "focus: reveal flap on ws=\(owner) — standing reveals down"
+                        + " \(revealFlapCooldownEpochs) epochs"
+                )
+                return true
+            }
+            revealReversals[owner] = n
+        } else {
+            revealReversals[owner] = 0
+        }
+        revealLastDir[owner] = dir
+        return false
     }
 
     /// Center the focused window in its viewport by moving the strip
@@ -2288,7 +2339,7 @@ public struct DaemonCore: Sendable {
     /// target would restart the glide and jog a settled strip.
     private mutating func centerFocus(
         slot: IntPoint, width: Int32, offset: Int32,
-        viewport: IntRect, owner: WorkspaceID
+        viewport: IntRect, owner: WorkspaceID, epoch: UInt64
     ) {
         let centerX = viewport.min.x + viewport.width / 2
         let target = centerX - width / 2 - (slot.x - offset)
@@ -2299,6 +2350,9 @@ public struct DaemonCore: Sendable {
             let hi = min(slot.x + width, viewport.max.x)
             if hi - lo >= width { return }
         }
+        guard !revealFlapBlocked(
+            owner: owner, proposed: target, from: offset, epoch: epoch
+        ) else { return }
         offsetTargets[owner] = target
         dirty.formUnion([.layout, .motion])
         print("focus: center window target=\(target) (was \(offset))")

@@ -5109,6 +5109,41 @@ do {
     }
 }
 
+// Reveal flap breaker: alternating focus between two far-apart columns
+// reverses the strip's reveal direction every tick (the FFM⇄MFF
+// ping-pong). After a few reversals reveals stand down, so the strip
+// stops scrolling back and forth forever.
+do {
+    var daemon = DaemonCore()
+    daemon.animationsEnabled = false
+    daemon.glideBaseMs = 0
+    let vp = IntRect(0, 0, 900, 768)
+    let live: (Int32) -> IntRect? = { id in
+        let x = Int32(id) * 400
+        return IntRect(min: IntPoint(x, 34), max: IntPoint(x + 400, 734))
+    }
+    _ = daemon.tick(
+        events: [
+            .appeared(id: 0, workspace: 1), .appeared(id: 1, workspace: 1),
+            .appeared(id: 2, workspace: 1), .appeared(id: 3, workspace: 1),
+            .appeared(id: 4, workspace: 1), .focus(id: 0),
+        ],
+        frames: live, viewport: vp, focusedStyle: style
+    )
+    var targets: [Int32] = []
+    for i in 0..<10 {
+        let id: Int32 = (i % 2 == 0) ? 4 : 0
+        _ = daemon.tick(
+            events: [.focus(id: id)], frames: live, viewport: vp, focusedStyle: style
+        )
+        targets.append(daemon.offsetTarget(for: 1) ?? 0)
+    }
+    checkEqual(
+        targets[targets.count - 1], targets[targets.count - 2],
+        "reveal flap stands down after repeated direction reversals"
+    )
+}
+
 if failures == 0 {
     print("DaemonChecks: all checks passed")
 } else {
