@@ -113,6 +113,14 @@ Before concluding a task, creating a commit, or presenting work as complete, age
    ```
    `cargo nextest run --workspace --all-targets` also works and is the CI runner. Each harness command gets a 200ms simulated window (`COMMAND_WINDOW` in `src/tests/harness.rs`, just above the 150ms delayed-refresh timeout); tests asserting exact rest positions of long-settling animations opt back into 500ms via `TestHarness::with_command_window`. Suite logs default to `warn` — `RUST_LOG` overrides still apply.
 
+4. **Frame-parity replay (Swift ↔ Rust):** after any `swift-daemon/Sources` change, replay the Rust trace corpus against the Swift core — this is part of the CI suite and is otherwise **skipped silently** without the corpus:
+   ```sh
+   trace="$(mktemp -d)"
+   PANERU_TRACE_OUT="$trace" cargo test --all-targets trace
+   PANERU_TRACE_DIR="$trace" swift run -c release --package-path swift-daemon FrameParityChecks
+   ```
+   A `FrameParityChecks: skipped` line means the corpus was missing — treat it as a failure, not a pass. (`rift-wm-installer/scripts/verify-swift` runs this automatically.)
+
 ## 7. Contribution Workflow
 
 *   **Testing branch:** Use the `testing` branch as a base for the PR, unless the change is very small or is an urgent fix for an issue in the `main` branch. This way the changes get additional baking before unleashin them into the `main` population.
