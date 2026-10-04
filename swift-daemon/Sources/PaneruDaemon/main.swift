@@ -4309,7 +4309,12 @@ nonisolated(unsafe) var statJobs = 0
         borderRects.removeValue(forKey: focus)
         borderStyles.removeValue(forKey: focus)
     }
-    if result.focus == nil, !borderRects.isEmpty {
+    // Focusless ticks prune outright: only focused windows earn borders, so
+    // leftovers are orphans by definition. Sync unconditionally (an empty
+    // sync is a no-op when the pool is already empty) so a stale overlay
+    // can never survive a focus==nil tick -- the "closed window's border
+    // stays" hole.
+    if result.focus == nil {
         borderRects.removeAll()
         borderStyles.removeAll()
         if !shadowMode {
