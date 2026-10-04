@@ -432,6 +432,12 @@ nonisolated(unsafe) var workspaceSpaceObserver: NSObjectProtocol?
 nonisolated(unsafe) var workspaceTerminateObserver: NSObjectProtocol?
 /// Newcomers with an AX probe in flight (see `syncRoster`).
 nonisolated(unsafe) var probing: Set<CGWindowID> = []
+/// When the current probe batch went in flight, for age-based release: a
+/// read that wedges the serial lane (with no traveling write, the
+/// write-gated retirement alone never fires) otherwise strands the roster —
+/// `probing` keeps the ids excluded from every future newcomer pass and
+/// the desktop is never adopted. Reset whenever `probing` drains.
+nonisolated(unsafe) var probingDispatchedAt = Date.distantPast
 /// Syncs since the last full flip-check pass (see `syncRoster`).
 nonisolated(unsafe) var flipCheckCounter = 0
 
@@ -863,32 +869,48 @@ nonisolated(unsafe) var rotatedAt: [WorkspaceID: Date] = [:]
     let refresh = roster.map { ($0.key, $0.value) }
     if !newcomers.isEmpty || !refresh.isEmpty {
         probing.formUnion(newcomers.map { $0.0 })
-        axWorker.async { [newcomers, refresh, fullFlips] in
+        if !newcomers.isEmpty { probingDispatchedAt = Date() }
+        // Capture the lane generation like the write batch does: a
+        // retirement before this block runs must make it a no-op for AX
+        // (the fresh lane owns adoption), and the completion must STILL
+        // clear `probing` — otherwise the stranded ids stay excluded from
+        // every future newcomer pass (`subtracting(probing)` below) and
+        // the roster freezes at whatever was adopted before the wedge.
+        let laneGen = axLaneGeneration
+        axWorker.async { [newcomers, refresh, fullFlips, laneGen] in
+            let laneAlive = axLaneCurrent(laneGen)
             var adopted: [(AdoptedWindow, AXUIElement)] = []
-            for (wid, pid) in newcomers {
-                let app = LiveApp(pid: pid)
-                guard let element = app.windowListElements()?.first(where: {
-                    LiveWindow.windowID(of: $0) == wid
-                }) else { continue }
-                let probe = LiveWindow(
-                    id: windowID(wid), element: element,
-                    frame: IntRect(min: IntPoint(0, 0), max: IntPoint(0, 0))
-                )
-                guard let raw = probe.readRawFrame() else { continue }
-                adopted.append((
-                    AdoptedWindow(
-                        wid: wid, ownerPID: pid,
-                        // Center-size rounding (Rust `irect_from` parity,
-                        // like `updateFrame`): per-edge rounding drifts
-                        // widths by a pixel against abutting columns.
-                        frame: irectFrom(raw),
-                        title: probe.title ?? "", appName: "", bundleID: "",
-                        role: probe.role ?? "", subrole: probe.subrole ?? "",
-                        identifier: probe.identifier ?? "main",
-                        isFullscreen: probe.isFullscreen
-                    ),
-                    element
-                ))
+            if laneAlive {
+                for (wid, pid) in newcomers {
+                    // Re-check per window: a retirement lands while the old
+                    // lane drains; stale work must stop issuing AX (the
+                    // fresh lane re-adopts) while still clearing `probing`
+                    // on the completion hop below.
+                    guard axLaneCurrent(laneGen) else { break }
+                    let app = LiveApp(pid: pid)
+                    guard let element = app.windowListElements()?.first(where: {
+                        LiveWindow.windowID(of: $0) == wid
+                    }) else { continue }
+                    let probe = LiveWindow(
+                        id: windowID(wid), element: element,
+                        frame: IntRect(min: IntPoint(0, 0), max: IntPoint(0, 0))
+                    )
+                    guard let raw = probe.readRawFrame() else { continue }
+                    adopted.append((
+                        AdoptedWindow(
+                            wid: wid, ownerPID: pid,
+                            // Center-size rounding (Rust `irect_from` parity,
+                            // like `updateFrame`): per-edge rounding drifts
+                            // widths by a pixel against abutting columns.
+                            frame: irectFrom(raw),
+                            title: probe.title ?? "", appName: "", bundleID: "",
+                            role: probe.role ?? "", subrole: probe.subrole ?? "",
+                            identifier: probe.identifier ?? "main",
+                            isFullscreen: probe.isFullscreen
+                        ),
+                        element
+                    ))
+                }
             }
             let attempted = Set(newcomers.map { $0.0 })
             // Fullscreen flips of already-adopted windows ride along on
@@ -896,10 +918,11 @@ nonisolated(unsafe) var rotatedAt: [WorkspaceID: Date] = [:]
             // `syncRoster`): two AX reads per window per sync is the
             // steady-state tax this removes. Worker-side AX reads run
             // over the main-taken snapshot only; the roster itself stays
-            // main-owned.
+            // main-owned. Skipped entirely on a stale lane (the fresh lane
+            // re-reads on its own sync).
             var flips: [(WindowID, Bool)] = []
             var minFlips: [(WindowID, Bool)] = []
-            if fullFlips {
+            if laneAlive, fullFlips {
                 for (wid, window) in refresh {
                     flips.append((windowID(wid), window.isFullscreen))
                     minFlips.append((windowID(wid), window.isMinimized))
@@ -914,7 +937,17 @@ nonisolated(unsafe) var rotatedAt: [WorkspaceID: Date] = [:]
                 // stay main-confined by the entry-point preconditions.
                 let apply: @MainActor @Sendable () -> Void = {
                     // Clear in-flight first: failures retry on the next pass.
+                    // Run unconditionally (even for a stale lane) so the
+                    // fresh lane's next sync re-probes rather than keeping
+                    // the ids pinned forever.
                     probing.subtract(attempted)
+                    if probing.isEmpty { probingDispatchedAt = Date.distantPast }
+                    if !laneAlive {
+                        // Stale lane: adopt nothing; the fresh lane owns the
+                        // roster. Waking now re-syncs immediately.
+                        wakeTicker()
+                        return
+                    }
                     adoptNewcomers(adopted)
                     applyFullscreenFlips(flips)
                     applyMinimizeFlips(minFlips)
@@ -2571,15 +2604,20 @@ nonisolated(unsafe) var frameClock = FrameClock()
 }
 
 /// Drop the repeating timer and arm a one-shot backstop for `afterMs`
-/// (0 = no backstop; a real event will wake us). Called from `tick`'s
+/// (never 0: the previous "0 = no backstop; a real event will wake us"
+/// contract is unsafe here because pointer motion is not a sink/wake
+/// source — a 0 backstop would park the daemon in idle forever, killing
+/// edge warp, hover, and the whole model). Called from `tick`'s
 /// quiet-exit path via `FrameClock.settle`.
 @Sendable func sleepTickTimer(afterMs: UInt32) {
     tickTimer?.invalidate()
     tickTimer = nil
     backstopTimer?.invalidate()
     backstopTimer = nil
-    guard afterMs > 0 else { return }
-    let delay = Double(afterMs) / 1000.0
+    // Floor to the pointer poll interval: the runloop always keeps a
+    // scheduled wake, and the poll re-evaluates quiet each time.
+    let delayMs = afterMs > 0 ? afterMs : UInt32(pointerPollInterval * 1000.0)
+    let delay = Double(delayMs) / 1000.0
     backstopTimer = Timer.scheduledTimer(withTimeInterval: delay, repeats: false) { _ in
         backstopTimer = nil
         _ = frameClock.wake()
@@ -2941,14 +2979,27 @@ nonisolated(unsafe) var lastDisplayProbeAt = Date.distantPast
 }
 
 /// Milliseconds until the next slow-cadence duty, for the idle
-/// backstop. Zero when a duty is already due (never sleeps past one).
+/// backstop. Never zero: a zero backstop would drop BOTH runloop timers
+/// and park the daemon in pure event-driven idle, and since pointer
+/// motion is not a sink/wake source, the tick would never resume (edge
+/// warp, hover, and the whole model die). The pointer poll is the floor
+/// cadence: warp/hover sampling must keep running at rest, so an overdue
+/// poll still resolves to that interval. Slow-duty overruns degrade to
+/// the same floor instead of parking.
 @Sendable func nextBackstopMs(
     pointerDue: Bool, slowDue: Bool, now: Date
 ) -> UInt32 {
-    if pointerDue || slowDue { return 0 }
     let toPointer = pointerPollInterval - now.timeIntervalSince(lastPointerPoll)
     let toSlow = slowDutyInterval - now.timeIntervalSince(lastSlowDutyAt)
-    let seconds = max(min(toPointer, toSlow), 0)
+    // Floor the pointer arm at the poll interval: a paused pointer leaves
+    // `lastPointerPoll` stale (pollPointer only stamps it on motion), so
+    // the naive elapsed would go negative and clamp the whole backstop to
+    // zero. The next poll is still one interval away.
+    let pointerSeconds = max(toPointer, TimeInterval(pointerPollInterval))
+    // Never under-floor the slow arm either: an overdue duty still needs
+    // a scheduled wake to service it (one cadence away).
+    let slowSeconds = max(toSlow, TimeInterval(pointerPollInterval))
+    let seconds = min(pointerSeconds, slowSeconds)
     // Ceil to whole ms so the backstop never lands before a duty is due.
     return UInt32((seconds * 1000.0).rounded(.up))
 }
@@ -3671,7 +3722,17 @@ nonisolated(unsafe) var statJobs = 0
     // of duplicating (stale completions from the old lane carry old
     // sequences and are ignored). Capped per boot; beyond that the
     // degraded writer plus the watch list carry the diagnosis.
-    if core.writerGap() != nil,
+    //
+    // Probe reads count as traveling work too: a wedged newcomer
+    // probe holds the serial lane without any writer gap (`probing`
+    // non-empty, no write intents), so the write-gated test below
+    // alone would never fire. Age the probe batch and retire on it
+    // as well; the fresh lane re-issues the stranded probes (they
+    // are released from `probing` here) instead of pinning the
+    // roster at whatever was adopted before the wedge.
+    let probeStuck = !probing.isEmpty
+        && Date().timeIntervalSince(probingDispatchedAt) > workerRetireTimeoutSecs
+    if (core.writerGap() != nil || probeStuck),
        Date().timeIntervalSince(lastAckAt) > workerRetireTimeoutSecs,
        workerRetirements < workerMaxRetirements
     {
@@ -3685,6 +3746,15 @@ nonisolated(unsafe) var statJobs = 0
         axWorker = DispatchQueue(
             label: "com.github.iv-lite.paneru-swift.ax", qos: .userInitiated
         )
+        // Release stranded probes: `syncRoster` excludes ids still in
+        // `probing`, so a wedged batch left there would never re-adopt.
+        probing.removeAll()
+        probingDispatchedAt = Date.distantPast
+        if probeStuck {
+            // Notify the roster clock so the fresh lane re-probes now
+            // instead of waiting for the 1Hz backstop.
+            wakeTicker()
+        }
         print("ax: worker lane retired (#\(workerRetirements)): re-issuing on a fresh queue")
     }
     // Retirement budget is renewable, not lifetime: completions flowing

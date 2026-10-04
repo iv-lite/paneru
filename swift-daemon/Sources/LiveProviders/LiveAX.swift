@@ -153,6 +153,16 @@ public final class LiveWindow: @unchecked Sendable {
     ) {
         self.id = id
         self.element = element
+        // Read timeouts apply to the WINDOW element too, not just the app
+        // root (`LiveApp`): probe reads (`readRawFrame`, `title`, `role`,
+        // `subrole`, `identifier`, `isFullscreen`) run against this element,
+        // and the AX 6s default would block the serial worker lane behind a
+        // beachballed app — up to 8 reads × 29 windows ≈ minutes, or worse
+        // when an app ignores the timeout entirely. Without this bound a
+        // wedged app freezes startup adoption (roster stuck, `probing`
+        // never clears). Writes are unaffected (they size from this element
+        // with the same 0.25s bound, matching the app root).
+        AXUIElementSetMessagingTimeout(element, axMessagingTimeout)
         self._frame = frame
         self.horizontalPadding = horizontalPadding
         self.verticalPadding = verticalPadding
