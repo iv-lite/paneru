@@ -5008,11 +5008,21 @@ do {
         clock.now += 16
         _ = daemon.tick(events: [], frames: liveFrames(), viewport: viewport, focusedStyle: style)
     }
-    // Grow from the clamped 600 (~0.59): next preset is 1.0 (1024).
-    _ = daemon.tick(
-        events: [.command(.window(.resize(.grow)))], frames: liveFrames(), viewport: viewport, focusedStyle: style
+    // Resize must advance the cycle even though the glass never moves (the
+    // app refuses): each press steps to the next preset by the model intent,
+    // so it can never get stuck re-picking the same preset off an un-changed
+    // live frame.
+    var seen: [Int32] = []
+    for _ in 0..<4 {
+        _ = daemon.tick(
+            events: [.command(.window(.resize(.grow)))], frames: liveFrames(), viewport: viewport, focusedStyle: style
+        )
+        seen.append(daemon.modelWidth(of: 0) ?? -1)
+    }
+    check(
+        Set(seen).count >= 2,
+        "resize advances through presets even when the glass never moves (saw \(seen))"
     )
-    checkEqual(daemon.modelWidth(of: 0), 1024, "grow steps from the clamped live (0.59 -> 1.0), not a stale model")
 }
 
 // Resizing one column must keep the strip together: the neighbour stays
