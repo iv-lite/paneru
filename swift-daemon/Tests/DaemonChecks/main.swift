@@ -5640,6 +5640,62 @@ do {
     checkEqual(daemon.offsetTarget(for: 1), -176, "glide settles at the reveal target")
 }
 
+// All columns glide together through a reveal: focusing an off-viewport
+// column must translate EVERY shown-row column by the same delta on every
+// tick (Rust `ride_strip_motion`), not park the off-edge ones and let them
+// jump in later (the "one column lags" bug). Parking resumes only once the
+// strip rests.
+do {
+    var daemon = DaemonCore()
+    daemon.animationsEnabled = true
+    daemon.glideBaseMs = 200
+    daemon.autoCenter = false
+    let clock = ManualClock()
+    daemon.wallClockMs = { clock.now }
+    var live: [Int32: IntPoint] = [0: .init(0, 0), 1: .init(400, 0), 2: .init(800, 0), 3: .init(1200, 0)]
+    func liveFrames() -> (Int32) -> IntRect? { frames(slots: live) }
+    _ = daemon.tick(
+        events: (0..<4).map { .appeared(id: Int32($0), workspace: 1) },
+        frames: liveFrames(), viewport: viewport, focusedStyle: style
+    )
+    for _ in 0..<20 {
+        clock.now += 16
+        _ = daemon.tick(events: [], frames: liveFrames(), viewport: viewport, focusedStyle: style)
+        for i in 0..<4 { if let p = daemon.positions[Int32(i)] { live[Int32(i)] = p } }
+    }
+    _ = daemon.tick(events: [.focusKeyed(id: 3)], frames: liveFrames(), viewport: viewport, focusedStyle: style)
+    var prev: [Int32: Int32] = [:]
+    var sawTravel = false
+    var lagged = false
+    for _ in 1...12 {
+        clock.now += 16
+        let beforeOff = daemon.offsets[1] ?? 0
+        _ = daemon.tick(events: [], frames: liveFrames(), viewport: viewport, focusedStyle: style)
+        let stripMoving = (daemon.offsets[1] ?? 0) != beforeOff
+        var deltas: [Int32] = []
+        for i in 0..<4 {
+            if let p = daemon.positions[Int32(i)] {
+                if let last = prev[Int32(i)] { deltas.append(p.x - last) }
+                prev[Int32(i)] = p.x
+            }
+        }
+        // While the strip offset moves, every column rides the SAME delta
+        // (rigid). Once it lands, off-edge columns park (their own ease) —
+        // that is expected, not a lag.
+        if stripMoving {
+            // Rigid while the strip makes real travel; the last 1-2px tick
+            // and the parking ease at the edge are below this and not a lag.
+            if let first = deltas.first, abs(first) >= 4 {
+                sawTravel = true
+                if deltas.contains(where: { abs($0 - first) > 2 }) { lagged = true }
+            }
+        }
+        for i in 0..<4 { if let p = daemon.positions[Int32(i)] { live[Int32(i)] = p } }
+    }
+    check(sawTravel, "the reveal actually glided the strip")
+    check(!lagged, "no column lags: every column rides one delta each tick")
+}
+
 // Gap rigid under a combined move+resize: the host AX layer must write
 // size before position (Rust `resize` order), or a window briefly
 // occupies (new origin, old size) and breathes the inter-window glass

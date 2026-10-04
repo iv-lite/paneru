@@ -3620,7 +3620,15 @@ public struct DaemonCore: Sendable {
         if heldMembers.contains(member) {
             target = slot
             sliverParked.remove(member)
-        } else if let parked = parkOffscreen(member, slot: slot, home: home, union: union, siblings: siblings, frames: frames) {
+        } else if !rideStripOffset,
+                  let parked = parkOffscreen(member, slot: slot, home: home, union: union, siblings: siblings, frames: frames)
+        {
+            // Park only when the strip is at rest. Mid-glide every shown-row
+            // member rides the offset as one (Rust `ride_strip_motion`): a
+            // parked column holds a fixed sliver corner, so parking during a
+            // glide left it behind and it *jumped* when the slot crossed back
+            // on-screen -- the "one column lags" bug. At rest the off-screen
+            // column parks normally.
             target = parked
             sliverParked.insert(member)
         } else {
