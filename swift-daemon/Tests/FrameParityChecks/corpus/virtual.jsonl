@@ -1,4 +1,4 @@
 {"frame":0,"strips":{"2:0":[[0],[1]]},"positions":{"1":[400,20],"0":[0,20]},"focus":0,"quiescent":true}
 {"frame":1,"strips":{"2:0":[[0],[1]]},"positions":{"1":[400,20],"0":[0,20]},"focus":1,"quiescent":true}
-{"frame":2,"strips":{"2:1":[[1]],"2:0":[[0]]},"positions":{"1":[0,20],"0":[1014,758]},"focus":1,"quiescent":true}
-{"frame":3,"strips":{"2:0":[[0]],"2:1":[[1]]},"positions":{"1":[0,20],"0":[1014,758]},"focus":1,"quiescent":true}
+{"frame":2,"strips":{"2:1":[[1]],"2:0":[[0]]},"positions":{"0":[1014,758],"1":[0,20]},"focus":1,"quiescent":true}
+{"frame":3,"strips":{"2:1":[[1]],"2:0":[[0]]},"positions":{"1":[0,20],"0":[1014,758]},"focus":1,"quiescent":true}
