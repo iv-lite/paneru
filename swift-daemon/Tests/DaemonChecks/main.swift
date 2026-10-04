@@ -94,12 +94,13 @@ do {
     checkEqual(daemon.positions[1], IntPoint(400, 34), "mates stay unless grabbed")
     check(dragged.axJobs.contains { $0.winID == 0 }, "hand truth flows to AX")
     check(!dragged.quiescent, "drag tick works")
-    // Driving rung: the ring rides the committed slot (100,34) even
-    // though live glass still reports (0,34) — no lagging outline.
-    checkEqual(dragged.borderPlan.moved.map { $0.0 }, [0], "border tracks the driving slot")
+    // Ring glued to the window glass: it paints the live rect, so it never
+    // leads the window edge (the old driving rung painted the model slot
+    // while the glass lagged). Live glass here still reports (0,34), so the
+    // ring holds it -- no outline ahead of the window.
     check(
-        dragged.borderPlan.moved.first?.1 == CGRect(x: 100, y: 34, width: 400, height: 700),
-        "border sits on the slot, not stale glass (got \(dragged.borderPlan.moved.first?.1.debugDescription ?? "none"))"
+        dragged.borderPlan.moved.isEmpty,
+        "ring does not lead the glass during a drag (got \(dragged.borderPlan.moved.map { $0.0 }))"
     )
 
     let released = daemon.tick(
@@ -109,12 +110,11 @@ do {
     )
     checkEqual(daemon.positions[0], IntPoint(0, 34), "release restores the slot")
     check(released.axJobs.contains { $0.winID == 0 }, "homing flows once")
-    // The ring jumps home with the slot on the release tick itself
-    // instead of trailing the glass for another frame.
-    checkEqual(released.borderPlan.moved.map { $0.0 }, [0], "border jumps home on release")
+    // The ring follows the live glass wherever it is (here 100,34), never
+    // leading it home.
     check(
-        released.borderPlan.moved.first?.1 == CGRect(x: 0, y: 34, width: 400, height: 700),
-        "released border sits on the home slot (got \(released.borderPlan.moved.first?.1.debugDescription ?? "none"))"
+        released.borderPlan.moved.first?.1 == CGRect(x: 100, y: 34, width: 400, height: 700),
+        "ring holds the live glass on release (got \(released.borderPlan.moved.first?.1.debugDescription ?? "none"))"
     )
 
     let homing = daemon.tick(
@@ -122,7 +122,11 @@ do {
         frames: frames(slots: [0: IntPoint(0, 34), 1: IntPoint(400, 34)]),
         viewport: viewport, focusedStyle: style
     )
-    check(homing.borderPlan.isEmpty, "converged glass holds the ring steady")
+    // The ring follows the glass home (100 -> 0) once, then holds.
+    check(
+        homing.borderPlan.moved.first?.1 == CGRect(x: 0, y: 34, width: 400, height: 700),
+        "ring follows the glass home"
+    )
     check(homing.axJobs.isEmpty, "no AX traffic while homing")
 
     let settled = daemon.tick(
@@ -130,6 +134,7 @@ do {
         frames: frames(slots: [0: IntPoint(0, 34), 1: IntPoint(400, 34)]),
         viewport: viewport, focusedStyle: style
     )
+    check(settled.borderPlan.isEmpty, "converged glass holds the ring steady")
     check(settled.quiescent, "post-release tick rests")
 }
 
@@ -153,7 +158,7 @@ do {
         frames: frames(slots: [0: IntPoint(0, 34), 1: IntPoint(400, 34)]),
         viewport: viewport, focusedStyle: style
     )
-    checkEqual(dragged.borderPlan.moved.map { $0.0 }, [0], "driving ring tracks the slot")
+    check(dragged.borderPlan.moved.isEmpty, "ring holds live glass through the drag")
     guard let job = dragged.axJobs.first(where: { $0.winID == 0 }) else {
         check(false, "drag issues an AX job to deny")
         exit(1)
@@ -167,12 +172,9 @@ do {
         frames: frames(slots: [0: IntPoint(0, 34), 1: IntPoint(400, 34)]),
         viewport: viewport, focusedStyle: style
     )
-    // Glass never left (0,34): the ring returns there even though the
-    // model slot still reads (100,34).
-    check(
-        denied.borderPlan.moved.first?.1 == CGRect(x: 0, y: 34, width: 400, height: 700),
-        "denied ring hugs live glass (got \(denied.borderPlan.moved.first?.1.debugDescription ?? "none"))"
-    )
+    // Glass never left (0,34); the ring tracks the live glass, so it stays
+    // there whether or not the model slot reads (100,34).
+    check(denied.borderPlan.isEmpty, "denied ring hugs live glass (no drift)")
 }
 
 // Disappear removes everywhere and heals focus to a surviving neighbor.
@@ -4981,6 +4983,60 @@ do {
     )
     drain(40)
     checkEqual(daemon.modelWidth(of: 0), 512, "second grow steps 0.3 -> 0.5 preset (from the model, not the live)")
+}
+
+// Focus ring glued to the window glass through a resize: the ring must be
+// painted at the SAME rect the glass shows every tick, never at the new
+// size/position ahead of the still-easing window ("window lags behind its
+// border"). Frames track the written size, so the ring should match them.
+do {
+    var daemon = DaemonCore()
+    daemon.animationsEnabled = true
+    daemon.glideBaseMs = 300
+    daemon.maximizeTiledWindows = true
+    daemon.defaultRatio = 1.0
+    daemon.presetWidths = [0.3, 0.5, 1.0]
+    let clock = ManualClock()
+    daemon.wallClockMs = { clock.now }
+    var liveW: Int32 = 1024
+    var liveX: Int32 = 0
+    func liveFrames() -> (Int32) -> IntRect? {
+        { _ in IntRect(min: IntPoint(liveX, 34), max: IntPoint(liveX + liveW, 734)) }
+    }
+    _ = daemon.tick(
+        events: [.appeared(id: 0, workspace: 1), .focusKeyed(id: 0)],
+        frames: liveFrames(), viewport: viewport, focusedStyle: style
+    )
+    for _ in 0..<5 {
+        clock.now += 16
+        _ = daemon.tick(events: [], frames: liveFrames(), viewport: viewport, focusedStyle: style)
+    }
+    // Shrink to 0.5; while it eases, the ring must match the glass size.
+    _ = daemon.tick(
+        events: [.command(.window(.resize(.shrink)))], frames: liveFrames(), viewport: viewport, focusedStyle: style
+    )
+    var mismatched = false
+    var sawEase = false
+    for _ in 0..<40 {
+        clock.now += 16
+        let r = daemon.tick(events: [], frames: liveFrames(), viewport: viewport, focusedStyle: style)
+        // Apply written glass (position/size) into the frames for the next
+        // tick, mirroring what the OS would hold.
+        for job in r.axJobs where job.winID == 0 {
+            if let o = job.origin { liveX = o.x }
+            if let s = job.size { liveW = s.x }
+        }
+        // The ring (desired) must equal the glass we just wrote.
+        let ring = r.borderPlan.added.first?.1 ?? r.borderPlan.moved.first?.1
+        if let ring {
+            if ring.width != Double(liveW) || ring.origin.x != Double(liveX) {
+                mismatched = true
+            }
+            if liveW != 1024 { sawEase = true }
+        }
+    }
+    check(sawEase, "the resize actually eased the width")
+    check(!mismatched, "ring matches the glass size/position through the resize")
 }
 
 // mid_strip_slot (Rust `insert_windows_mid_strip` math): the moved

@@ -4188,24 +4188,13 @@ public struct DaemonCore: Sendable {
     ) -> BorderSyncPlan {
         var desired: [(WindowID, CGRect, BorderStyle)] = []
         if let focus, let live = frames(focus) {
-            // Driving rung (Rust `border_frame_for` + `DriveTrust::Full`):
-            // while this window's writes still travel, paint the model's
-            // presented origin (`positions`: hand truth mid-drag, eased
-            // steps mid-glide) with live size. The glass converges there
-            // within a tick or two, while the stale live rect would leave
-            // the ring lagging behind for the whole glide (plus the host's
-            // roster lag after it). Acked or timed-out windows fall through
-            // to live glass (the clamped rung): a slot the glass will never
-            // reach must not wear the ring.
-            let frame: IntRect
-            if ax.unackedLive(focus), let pos = positions[focus] {
-                frame = IntRect(
-                    min: pos,
-                    max: IntPoint(pos.x + live.width, pos.y + live.height)
-                )
-            } else {
-                frame = live
-            }
+            // Ring glued to the window glass: paint the LIVE rect the OS
+            // holds, always. The old driving rung mixed the model origin
+            // (`positions`) with the live size, so during a resize the ring
+            // showed the new geometry while the glass was still easing
+            // behind it ("window lags behind its border"). One source (live)
+            // keeps ring and window edge together through moves and resizes.
+            let frame = live
             let cg = CGRect(
                 x: Double(frame.min.x), y: Double(frame.min.y),
                 width: Double(frame.width), height: Double(frame.height)
