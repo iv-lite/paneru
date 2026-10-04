@@ -822,6 +822,10 @@ public struct DaemonCore: Sendable {
     /// Committed slot origins for external diagnostics (state file):
     /// window id → slot origin. Read-only snapshot.
     public func committedSlotMap() -> [WindowID: IntPoint] { committedSlots }
+    /// Column model width for a window (padded): the pitch the layout uses.
+    /// Read by checks to assert the resize cycle steps from the model rather
+    /// than the live frame.
+    public func modelWidth(of id: WindowID) -> Int32? { modelWidths[id] }
 
     /// Viewport for a workspace: its own when the host supplied one,
     /// else its own last-good rect (transiently viewport-less strips
@@ -1490,7 +1494,18 @@ public struct DaemonCore: Sendable {
     ) {
         guard let id = focus, let frame = frames(id) else { return }
         let vw = max(viewport.width, 1)
-        let current = Double(frame.width) / Double(vw)
+        // Seed the written-size ledger so the resize eases from the glass
+        // (a missing seed snaps, which reads as an app shrink).
+        if writtenSizes[id] == nil {
+            writtenSizes[id] = IntSize(max(frame.width, 0), max(frame.height, 0))
+        }
+        // Step from the model intent, not the live frame: with the resize
+        // tween in flight the live width is an intermediate value, so a
+        // second press mid-glide would read it and land on the wrong preset
+        // (the "two steps to cycle" bug). The model width is the last target
+        // the cycle actually chose, so presses step consecutively.
+        let current = Double(modelWidths[id] ?? sizes[id]?.x ?? frame.width) / Double(vw)
+
         let fallback = presetWidths.first ?? 0.5
         let next: Double
         if let ratio = setWidth, ratio.isFinite, ratio > 0 {
@@ -3735,6 +3750,33 @@ public struct DaemonCore: Sendable {
     ) {
         guard !hiddenBlocked(member, epoch: epoch) else { return }
         guard let live = frames(member) else { return }
+        // Seed the written-size ledger from the glass the first time we see
+        // this window: `enqueueResize` eases from it, and without a seed the
+        // first resize has no "from" and snaps.
+        if writtenSizes[member] == nil {
+            writtenSizes[member] = IntSize(max(live.width, 0), max(live.height, 0))
+        }
+        // Native shrink adoption (Rust `window_resized_update_frame`): the
+        // app or user resized the glass *narrower*. Adopt it the moment it
+        // arrives so the column shrinks to match, instead of re-issuing the
+        // larger tile and fighting it. Guards: only *strictly shrinking*
+        // (`live < prevLive` — a first sight or our own growing tween must
+        // not trip it), no resize of ours in flight (`sizeLegs` absent — a
+        // grow/retarget eases the live narrower than the target legitimately),
+        // and the ledger already seeded. Only narrower is ever adopted: a
+        // wider live frame is OS drift and would grow the window to viewport.
+        let prevLive = lastLiveWidth[member]
+        lastLiveWidth[member] = live.width
+        if live.width > 0, let prev = prevLive, live.width < prev - axDeadbandPx,
+           sizeLegs[member] == nil
+        {
+            modelWidths[member] = live.width
+            sizes[member] = IntSize(live.width, live.height)
+            sizeStreak[member] = 0
+            lastSizeRedrive.removeValue(forKey: member)
+            writtenSizes[member] = IntSize(live.width, live.height)
+            return
+        }
         guard abs(live.width - target.x) > 1 || abs(live.height - target.y) > 1 else {
             sizes[member] = target
             sizeStreak[member] = 0
@@ -3750,26 +3792,6 @@ public struct DaemonCore: Sendable {
             // (read-only) for glass movement and re-arms; no repeat
             // writes fire. Fresh targets below still send once.
             guard auditParkedLive[member] == nil else { return }
-            // Native shrink adoption (Rust `window_resized_update_frame`):
-            // the app or user resized the glass *narrower* than the tile.
-            // Our own in-flight resize lands at the size we sent, so a live
-            // width that changed to a narrower value is real new truth —
-            // adopt it immediately so the column shrinks to match, instead
-            // of re-issuing the larger target and fighting the shrink.
-            // Only narrower is adopted: a wider live frame is OS drift and
-            // would grow the window to viewport size.
-            let prevLive = lastLiveWidth[member]
-            if live.width > 0, live.width < target.x - axDeadbandPx,
-               prevLive != live.width
-            {
-                modelWidths[member] = live.width
-                sizes[member] = IntSize(live.width, live.height)
-                sizeStreak[member] = 0
-                lastSizeRedrive.removeValue(forKey: member)
-                lastLiveWidth[member] = live.width
-                return
-            }
-            lastLiveWidth[member] = live.width
             let streak = sizeStreak[member, default: 0]
             if streak >= 5 {
                 // Chronic clamp (app can't reach the tile): give up and

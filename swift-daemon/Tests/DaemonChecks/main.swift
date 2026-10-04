@@ -4934,6 +4934,55 @@ do {
     )
 }
 
+// Resize cycle steps from the model, not the live frame: the live frame
+// is an intermediate value while the resize tween runs, so a press mid-glide
+// must not pick a preset from it (the "two steps to cycle" bug). Two
+// consecutive grows advance through consecutive presets even though the
+// frames lag the tween. Frames track the written size (a real app grows).
+do {
+    var daemon = DaemonCore()
+    daemon.animationsEnabled = true
+    daemon.glideBaseMs = 400
+    daemon.maximizeTiledWindows = true
+    daemon.defaultRatio = 1.0
+    daemon.presetWidths = [0.3, 0.5, 1.0]
+    let clock = ManualClock()
+    daemon.wallClockMs = { clock.now }
+    var liveW: Int32 = 1024
+    func liveFrames() -> (Int32) -> IntRect? {
+        { _ in IntRect(min: IntPoint(0, 0), max: IntPoint(liveW, 700)) }
+    }
+    _ = daemon.tick(
+        events: [.appeared(id: 0, workspace: 1)],
+        frames: liveFrames(), viewport: viewport, focusedStyle: style
+    )
+    _ = daemon.tick(
+        events: [.focusKeyed(id: 0)],
+        frames: liveFrames(), viewport: viewport, focusedStyle: style
+    )
+    func drain(_ frames: Int) {
+        for _ in 0..<frames {
+            clock.now += 16
+            let r = daemon.tick(events: [], frames: liveFrames(), viewport: viewport, focusedStyle: style)
+            for job in r.axJobs where job.winID == 0 { if let sz = job.size { liveW = sz.x } }
+        }
+    }
+    drain(5)
+    // First grow: 0.39 -> 0.5 (512). Track the frames while it eases.
+    _ = daemon.tick(
+        events: [.command(.window(.resize(.grow)))], frames: liveFrames(), viewport: viewport, focusedStyle: style
+    )
+    checkEqual(daemon.modelWidth(of: 0), 307, "first grow wraps 1.0 -> 0.3 preset")
+    drain(2)
+    // Second grow mid-glide: steps from the model target (512) to the NEXT
+    // preset (1.0 = 1024), never re-picking 0.5 off the intermediate live.
+    _ = daemon.tick(
+        events: [.command(.window(.resize(.grow)))], frames: liveFrames(), viewport: viewport, focusedStyle: style
+    )
+    drain(40)
+    checkEqual(daemon.modelWidth(of: 0), 512, "second grow steps 0.3 -> 0.5 preset (from the model, not the live)")
+}
+
 // mid_strip_slot (Rust `insert_windows_mid_strip` math): the moved
 // column lands at the destination boundary nearest its on-screen x, and
 // the returned offset places that boundary there.
