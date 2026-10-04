@@ -6,16 +6,17 @@
 
 A sliding, tiling window manager for MacOS.
 
-> **Fork notice.** `paneru-swift` is a fork of
+> **Origin.** `paneru-swift` is a fork of
 > [karinushka/paneru](https://github.com/karinushka/paneru) by
 > [Karinushka](https://github.com/karinushka). Upstream Paneru is a Bevy/ECS
-> Rust window manager; this fork keeps that Rust tree and adds **`paneru-swift`**,
-> a native Swift daemon (`swift-daemon/`) that ports the same tiling core,
+> Rust window manager; this fork is a **native Swift daemon**
+> (`swift-daemon/`, product `paneru-swift`) that ports the same tiling core,
 > AppKit presentation, XPC command/query/subscribe server, Lua scripting, and
-> launchd agent — no Rust toolchain needed to run it. All of the original
-> design credit (the sliding-strip model and its MacOS window techniques) goes
-> to the upstream project; see [Inspiration](#inspiration) and
-> [Installing the Swift daemon](#installing-the-swift-daemon).
+> launchd agent — no Rust toolchain needed. The Rust daemon was removed; its
+> trace corpus lives on as the frozen parity-truth behind the `FrameParityChecks`
+> gate. All of the original design credit (the sliding-strip model and its
+> MacOS window techniques) goes to the upstream project; see
+> [Inspiration](#inspiration) and [Installation](#installation).
 
 ## About
 
@@ -155,85 +156,21 @@ display becomes active; focus-follows-mouse and mouse-follows-focus are
 independent, and animation glide timing is owned by the daemon itself
 (single `animations` toggle — see `CONFIGURATION.md`).
 
-### Legacy Rust daemon (unsupported)
+### CLI: `pq`
 
-The Rust daemon (`paneru`) remains in-tree as the legacy fallback
-(snap-only — glide timing lives in the Swift daemon) and is no longer the
-supported install path.
-
-### Installing from Crates.io
-
-Paneru is built using Rust's `cargo`. It can be installed directly from
-`crates.io` or if you need the latest version, by fetching the source from Github.
+`pq` (built with the daemon) talks to the running daemon over its Mach
+XPC service:
 
 ```shell
-$ cargo install paneru
+$ pq state | active | virtual-workspaces | on-screen     # JSON snapshots
+$ pq run window focus east                                # any hotkey command
+$ pq apply '[{"focus":1}]'                                # window-set ops
+$ pq subscribe                                            # stream event JSON
+$ pq state-get <key>   # / state-write <key> <json> [--exactly <json>] / state-remove <key>
 ```
 
-### Installing from Github
-
-```shell
-$ git clone https://github.com/karinushka/paneru.git
-$ cd paneru
-$ cargo build --release
-$ cargo install --path .
-```
-
-A locally built binary carries a fresh ad-hoc signature every time, which
-macOS treats as a new app: after (re)installing, re-grant it Accessibility
-access (System Settings → Privacy & Security → Accessibility) and restart
-the service, or paneru will sit in the menu bar without tiling. Source
-builds pin a stable signing identifier automatically (via the `rustc`
-wrapper in `.cargo/config.toml`), but ad-hoc signatures still change hash
-per build, so currently every reinstall needs a fresh grant; for an
-already-installed binary, pin it by hand once:
-
-```shell
-$ codesign --force --sign - --identifier com.github.karinushka.paneru "$(which paneru)"
-```
-
-By default, Paneru builds with the embedded Lua runtime using a vendored LuaJIT compiled from source, requiring no system-wide Lua installation or `pkg-config` setup.
-
-If you prefer to link against a system- or version-manager-installed Lua (e.g. via `mise`, `asdf`, or Homebrew), disable default features and pass `--features lua`, making sure `PKG_CONFIG_PATH` contains the directory with `luajit.pc`:
-
-```shell
-# When using mise:
-$ PKG_CONFIG_PATH="$(mise where luajit)/lib/pkgconfig:$PKG_CONFIG_PATH" cargo build --release --no-default-features --features lua
-
-# When using Homebrew:
-$ cargo build --release --no-default-features --features lua
-```
-
-It can run directly from the command line or as a service.
-Note that you will need to grant accessibility privileges to the binary.
-
-### Installing with Homebrew
-
-If you are using Homebrew, you can install from the formula with:
-
-```shell
-$ brew install paneru
-```
-
-Or by first adding the tap and then installing by name:
-
-```shell
-$ brew tap karinushka/paneru
-$ brew install paneru
-```
-
-### Installing with Nix
-
-Nix packaging was removed: the Swift daemon replaces `nix run` and the
-NixOS/darwin modules (see below).
-
-### Installing the Swift daemon
-
-See **Installing (recommended): the Swift daemon** at the top of this
-section — `swift-daemon/install-service.sh install` is the shipped path.
-The agent runs under its own label and Mach port
-(com.github.iv-lite.paneru-swift); if a legacy Rust agent is still
-installed, quit it before running the Swift daemon over the same windows.
+Without launchd, live state is available at
+`cat /tmp/paneru-swift-state.json`.
 
 ### Configuration
 
@@ -308,50 +245,14 @@ configured with `[restore]`; see the
 **[Session Restore](./CONFIGURATION.md#session-restore)** section in the
 configuration guide.
 
-### Legacy Rust service, app launcher & `send-cmd`
+### CLI: sending commands & querying state
 
-The sections below drive the **legacy Rust daemon**. On the shipped Swift
-daemon, service management is `swift-daemon/install-service.sh
-start|stop|uninstall` (see above), and the command-line query tool is
-`pq` (built with the daemon; `pq` talks to the same Mach service over
-XPC).
+`pq` (built with the daemon) drives a running Paneru over its Mach XPC
+service. Any command that can be bound to a hotkey can be sent
+programmatically with `pq run`:
 
 ```shell
-$ paneru install
-$ paneru start
-```
-
-### Installing an app launcher
-
-To start Paneru from Spotlight, Alfred, Raycast, or another application launcher,
-install the lightweight app wrapper:
-
-```shell
-$ paneru install-app
-```
-
-This creates `$HOME/Applications/Paneru.app`. Opening the app starts the
-installed Paneru launch agent and exits immediately. Remove the wrapper with:
-
-```shell
-$ paneru uninstall-app
-```
-
-### Running in the foreground
-
-```shell
-$ paneru
-```
-
-### Sending Commands
-
-Paneru exposes a `send-cmd` subcommand that lets you control the running
-instance from the command line over a Mach service
-(`com.github.karinushka.paneru`). Any
-command that can be bound to a hotkey can also be sent programmatically:
-
-```shell
-$ paneru send-cmd <command> [args...]
+$ pq run <command [args...]>
 ```
 
 #### Available commands
@@ -386,7 +287,7 @@ $ paneru send-cmd <command> [args...]
 | `window snap`              | Snap the focused window into the visible viewport |
 | `mouse nextdisplay`        | Warp the mouse pointer to the next display       |
 | `mouse previousdisplay`    | Warp the mouse pointer to the previous display   |
-| `printstate`               | Print the internal ECS state to the debug log    |
+| `printstate`               | Print the internal daemon state to the debug log |
 | `quit`                     | Quit Paneru                                      |
 | `restart`                  | Restart the Paneru service                         |
 
@@ -397,75 +298,72 @@ Window numbers are 1-based and count columns from left to right.
 
 ```shell
 # Move focus one window to the right.
-$ paneru send-cmd window focus east
+$ pq run window focus east
 
 # Swap the current window to the left.
-$ paneru send-cmd window swap west
+$ pq run window swap west
 
 # Center and resize in one shot (two separate calls).
-$ paneru send-cmd window center && paneru send-cmd window resize
+$ pq run window center && pq run window resize
 
 # Balance all columns to the focused window's width.
-$ paneru send-cmd window balance
+$ pq run window balance
 
 # Cycle backward through preset widths.
-$ paneru send-cmd window shrink
+$ pq run window shrink
 
 # Grow the focused window's height inside its stack.
-$ paneru send-cmd window vertical grow
+$ pq run window vertical grow
 
 # Jump to the left-most window.
-$ paneru send-cmd window focus first
+$ pq run window focus first
 
 # Jump to the second window from the left.
-$ paneru send-cmd window focus 2
+$ pq run window focus 2
 
 # Switch directly to virtual workspace 3.
-$ paneru send-cmd window virtualnum 3
+$ pq run window virtualnum 3
 
 # Send the focused window to virtual workspace 3 without following it.
-$ paneru send-cmd window virtualsendnum 3
+$ pq run window virtualsendnum 3
 ```
 
-### Querying and Subscribing to State
+#### Querying and subscribing to state
 
-Paneru also exposes structured JSON state for scripts and status bars:
+Paneru exposes structured JSON state for scripts and status bars:
 
 ```shell
-$ paneru query state --json
-$ paneru query virtual-workspaces --json
-$ paneru query active --json
-$ paneru subscribe --json
+$ pq state | active | virtual-workspaces | on-screen   # JSON snapshot, exits
+$ pq subscribe                                         # line-delimited JSON events
 ```
 
-`query` prints a JSON snapshot and exits. `subscribe --json` keeps the channel
-open and emits line-delimited JSON events for changes that integrations usually
-care about, including focus changes, virtual workspace changes, window-list
-changes, title changes, and display changes. See
-[`QUERY_AND_SUBSCRIBE_FORMAT.md`](./QUERY_AND_SUBSCRIBE_FORMAT.md) for the
-full payload contract.
+`subscribe` keeps the channel open and emits line-delimited JSON events for
+changes that integrations usually care about, including focus changes,
+virtual workspace changes, window-list changes, title changes, and display
+changes. See [`QUERY_AND_SUBSCRIBE_FORMAT.md`](./QUERY_AND_SUBSCRIBE_FORMAT.md)
+for the full payload contract.
 
 #### Scripting ideas
 
-Because `send-cmd` talks to the running daemon, you can drive Paneru from shell
+Because `pq run` talks to the running daemon, you can drive Paneru from shell
 scripts, `cron` jobs, or other automation tools:
 
 - **Launch-and-arrange workflow.** Open an application and immediately position
-  it: `open -a Safari && sleep 0.5 && paneru send-cmd window resize`.
-- **One-key layout reset.** Use `paneru send-cmd window balance` to make every
+  it: `open -a Safari && sleep 0.5 && pq run window resize`.
+- **One-key layout reset.** Use `pq run window balance` to make every
   column the same width as the focused window — great for resetting layouts
   after unplugging a monitor or when windows get shuffled.
 - **Integration with other tools.** Pipe focus events from tools like
   [Hammerspoon](https://www.hammerspoon.org) or
-  [skhd](https://github.com/koekeishiya/skhd) into `paneru send-cmd` for
+  [skhd](https://github.com/koekeishiya/skhd) into `pq run` for
   compound actions that go beyond a single hotkey.
 - **Multi-display orchestration.** Move a window to the next display and
   immediately warp the mouse there:
   ```shell
-  paneru send-cmd window nextdisplay && paneru send-cmd mouse nextdisplay
+  pq run window nextdisplay && pq run mouse nextdisplay
   ```
-- **Status bar integration.** Use `paneru query state --json` to render the
-  initial workspace labels, then keep them current with `paneru subscribe --json`.
+- **Status bar integration.** Use `pq state` to render the
+  initial workspace labels, then keep them current with `pq subscribe`.
 
 
 ## Future Enhancements
@@ -484,17 +382,16 @@ ask any questions.
 ## Architecture Overview
 
 For a detailed high-level overview of Paneru's internal design, data flow, and
-ECS patterns, please refer to the **[Architecture Guide](./ARCHITECTURE.md)**.
+verification model, please refer to the **[Architecture Guide](./ARCHITECTURE.md)**.
 
-Paneru's architecture is built around the **Bevy ECS (Entity Component
-System)**, which manages the window manager's state as a collection of entities
-(displays, workspaces, applications, and windows) and components.
-
-The system is decoupled into three primary layers:
-
-1.  **Platform Layer (`src/platform/`)**: Directly interfaces with macOS via `objc2` and Core Graphics. It runs the native Cocoa event loop and pumps OS events into a channel consumed by Bevy.
-2.  **Management Layer (`src/manager/`)**: Defines OS-agnostic traits (`WindowManagerApi`, `WindowApi`) that abstract window manipulation. The macOS-specific implementations (`WindowManagerOS`, `WindowOS`) bridge these traits to the Accessibility and SkyLight APIs.
-3.  **ECS Layer (`src/ecs/`)**: The "brain" of the application. Bevy systems process incoming events, handle input triggers, and manage animations.
+Paneru's architecture is a **serial, pure-core Swift daemon** (`swift-daemon/`):
+`DaemonCore` runs `ingest → layout → commit → paint` per 60Hz tick against
+injected frame providers, with all window-manager state as value types in
+pure modules (`Geometry`, `Layout`, `Focus`, `Animation`, `Session`, …) and
+the macOS seams — AX reads/writes, the event tap, presenter, menu bar, and
+XPC — kept in `LiveProviders`/`Presenter`/`PaneruDaemon` on the main thread.
+Layout truth (the sliding-strip model) is covered by a frozen frame-parity
+corpus replayed by `FrameParityChecks`.
 
 ### Repository Structure
 

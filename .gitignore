@@ -1,8 +1,5 @@
-/target
-
 # Claude Code project config
 CLAUDE.md
 **/.DS_Store
 flamegraph.svg
-overlay-swift/.build/
 swift-daemon/.build/

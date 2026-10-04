@@ -284,32 +284,19 @@ func keyModifiers(_ tap: TapModifiers) -> KeyModifiers {
 // Concurrency vouch for this file (Swift 6): every global below is
 // main-thread-confined by architecture — AppKit, the event tap, XPC
 // delegate delivery, timers, and signal sources all run on the main
-// thread/runloop, and the two worker lanes (AX, shadow fetch) touch
-// shared state only through Sendable boxes (`AckBox`,
-// `ShadowPollBox`) or Sendable values (`LiveWindow`). `nonisolated(unsafe)`
-// marks that vouch explicitly: it silences checking without changing
-// behavior, so audit thread-affinity (not the annotation) when touching
-// dispatch. The one known audit item is `ConnectionHandler`, whose
-// listener queue macOS chooses — its body only appends model events,
-// exactly as before.
-
-/// Shadow-observer mode (`--shadow`): replicate the Rust daemon's
-/// decisions from live AX reads with zero side effects — no AX writes
-/// (dropped at dispatch AND latched in `LiveWindow.dryRun`), no raise
-/// or focus actuation, no cursor warps, no overlay paint, no menubar,
-/// no XPC command serving, no session saves, separate state file.
-/// Reads, observers, model, Lua binds, and restore planning run
-/// normally so the replication stays faithful.
-let shadowMode = CommandLine.arguments.contains("--shadow")
-
-/// AX intents dropped while shadowing (diagnostic counter).
-nonisolated(unsafe) var shadowDroppedJobs = 0
+// thread/runloop, and the AX worker lane touches shared state only
+// through Sendable boxes (`AckBox`) or Sendable values (`LiveWindow`).
+// `nonisolated(unsafe)` marks that vouch explicitly: it silences checking
+// without changing behavior, so audit thread-affinity (not the annotation)
+// when touching dispatch. The one known audit item is
+// `ConnectionHandler`, whose listener queue macOS chooses — its body only
+// appends model events, exactly as before.
 
 // MARK: - Flip adoption
 
-/// Cutover handoff (`--flip-from <path>`): adopt the live Rust session
-/// without moving a window. The document loads once at startup; the
-/// tick applies it when every referenced window is rostered (or after
+/// Cutover handoff (`--flip-from <path>`): adopt a handoff session
+/// document without moving a window. The document loads once at startup;
+/// the tick applies it when every referenced window is rostered (or after
 /// ~10s, logging stragglers), then snaps truth so the first live tick
 /// issues nothing for converged windows. Fresh-start only: a running
 /// model is never reseeded.
@@ -330,103 +317,6 @@ do {
         } else {
             print("flip: warning: unreadable handoff at \(path) (running fresh)")
         }
-    }
-}
-
-// MARK: - Shadow poll
-
-let shadowQueue = DispatchQueue(label: "com.github.iv-lite.paneru-swift.shadow")
-
-/// Async Rust-state fetch plumbing: the 60Hz thread never blocks on the
-/// CLI subprocess (a wedged Rust daemon must stall nothing but the
-/// diff). A Sendable box (not loose globals) so the handoff is sound:
-///
-/// - `requestShadowPoll` (main) starts at most one fetch;
-/// - the worker delivers the outcome into the box;
-/// - `consumeShadowPoll` (main) takes it once.
-final class ShadowPollBox: @unchecked Sendable {
-    private let lock = NSLock()
-    private var inflight = false
-    private var result: (QueryState?, RustStateError?)?
-
-    /// Claim a fetch slot; false when one is already running.
-    func beginFetch() -> Bool {
-        lock.withLock {
-            guard !inflight else { return false }
-            inflight = true
-            return true
-        }
-    }
-
-    func finishFetch(_ delivered: (QueryState?, RustStateError?)) {
-        lock.withLock {
-            result = delivered
-            inflight = false
-        }
-    }
-
-    func takeResult() -> (QueryState?, RustStateError?)? {
-        lock.withLock {
-            let out = result
-            result = nil
-            return out
-        }
-    }
-}
-
-let shadowPollBox = ShadowPollBox()
-/// Last Rust document (settle gate: diff only against a repeated doc).
-nonisolated(unsafe) var lastRustDoc: QueryState?
-/// Latched outage log (one line per outage, not per poll).
-nonisolated(unsafe) var shadowDownLatched = false
-
-/// Request one async Rust read (coalesced while one is in flight).
-@Sendable func requestShadowPoll() {
-    guard shadowPollBox.beginFetch() else { return }
-    shadowQueue.async {
-        let delivered: (QueryState?, RustStateError?)
-        do {
-            delivered = (try queryRustState(timeout: 2), nil)
-        } catch let error as RustStateError {
-            delivered = (nil, error)
-        } catch {
-            delivered = (nil, .launchFailed("\(error)"))
-        }
-        shadowPollBox.finishFetch(delivered)
-    }
-}
-
-/// Consume a delivered fetch: settle-gate, diff at rest, report in
-/// parity-FAIL format (capped per poll so transitions never flood).
-@Sendable func consumeShadowPoll(swiftQuiet: Bool) {
-    guard let delivered = shadowPollBox.takeResult() else { return }
-    guard let doc = delivered.0 else {
-        if !shadowDownLatched {
-            print("shadow: rust unreachable (\(delivered.1.map { "\($0)" } ?? "unknown"))")
-            shadowDownLatched = true
-        }
-        lastRustDoc = nil
-        return
-    }
-    shadowDownLatched = false
-    defer { lastRustDoc = doc }
-    guard let prev = lastRustDoc, prev == doc, swiftQuiet else { return }
-    // Raw-CG estimates: slots are padded-logical, Rust frames are raw.
-    var windows: [ShadowPosition] = []
-    windows.reserveCapacity(core.positions.count)
-    for (id, origin) in core.positions {
-        guard let window = roster[CGWindowID(bitPattern: id)] else { continue }
-        windows.append(ShadowPosition(
-            id: id,
-            x: origin.x + window.horizontalPadding,
-            y: origin.y + window.verticalPadding
-        ))
-    }
-    let mismatches = diffShadow(swift: windows, focus: core.focus, rust: doc)
-    if mismatches.isEmpty { return }
-    print("shadow: DIFF \(mismatches.count) item(s)")
-    for mismatch in mismatches.prefix(10) {
-        print("shadow: DIFF \(mismatch)")
     }
 }
 
@@ -630,10 +520,6 @@ struct AdoptedWindow: Sendable {
         window.setPadding(
             hPad: resolved.gapHorizontal / 2, vPad: resolved.gapVertical / 2
         )
-        // Shadow observers latch dry-run at adoption (defense in depth
-        // behind the dispatch gates: adopted windows can never be
-        // written, raised, or focused).
-        window.dryRun = shadowMode
         // Window rules: manage forces adoption past role rejection and
         // dont_focus suppresses focus arrival. Floating and width replay
         // focus-free through LayoutOps; index waits on a strip-position
@@ -1599,33 +1485,30 @@ func tapEvent(_ event: TapEvent) -> DaemonEvent? {
     }
 }
 
-/// No status item in shadow mode: the observer must be invisible.
 /// Main-owned like every AppKit object here. Constructed on the main
 /// thread at startup; assigned (never returned) inside the assumed
 /// actor so nothing non-Sendable crosses a domain.
 nonisolated(unsafe) var menubar: MenuBarController?
-if !shadowMode {
-    MainActor.assumeIsolated {
-        menubar = MenuBarController { command in
-    switch command {
-    case .setWidth(let ratio):
-        pending.append(.command(.window(.setWidth(ratio))))
-        wakeTicker()
-    case .center:
-        pending.append(.command(.window(.center)))
-        wakeTicker()
-    case .toggleManaged:
-        pending.append(.command(.window(.manage)))
-        wakeTicker()
-    case .copyRule:
-        pending.append(.command(.window(.copyRule)))
-        wakeTicker()
-    case .quit:
-        cleanExit()
-    case .openAccessibilitySettings, .showAccessibilityInstructions:
-        break
-    }
-    }
+MainActor.assumeIsolated {
+    menubar = MenuBarController { command in
+switch command {
+case .setWidth(let ratio):
+    pending.append(.command(.window(.setWidth(ratio))))
+    wakeTicker()
+case .center:
+    pending.append(.command(.window(.center)))
+    wakeTicker()
+case .toggleManaged:
+    pending.append(.command(.window(.manage)))
+    wakeTicker()
+case .copyRule:
+    pending.append(.command(.window(.copyRule)))
+    wakeTicker()
+case .quit:
+    cleanExit()
+case .openAccessibilitySettings, .showAccessibilityInstructions:
+    break
+}
 }
 }
 
@@ -2585,11 +2468,7 @@ nonisolated(unsafe) var lastWarpEval = Date.distantPast
     let userMoved = moved && tap.lastMouseMovedAt > lastMffWarpAt
     if moved {
         lastPointerPoll = Date()
-        // Shadow never warps (the evaluation only feeds warps); hover focus
-        // below still runs so arrivals replicate.
-        if !shadowMode {
-            checkWarp(cursor: cursor)
-        }
+        checkWarp(cursor: cursor)
     }
     guard !tap.leftButtonHeld,
           Date().timeIntervalSince(tap.lastSwipe) >= mouseFollowSwipeQuiet,
@@ -3091,8 +2970,6 @@ nonisolated(unsafe) var lastGhostRect: CGRect?
 /// change (or hourly) instead of every slow-duty audit.
 nonisolated(unsafe) var lastAuditFingerprint = ""
 nonisolated(unsafe) var lastAuditPrintAt = Date.distantPast
-/// Shadow heartbeat throttle (30s).
-nonisolated(unsafe) var lastShadowHeartbeatAt = Date.distantPast
 /// Whether this tick ran a slow-cadence duty (set once per tick from the
 /// quiet path or `slowDutyDue`); gates the state file, audit, corner
 /// probe, and tap health so they fire on the same wall-clock cadence
@@ -3180,10 +3057,7 @@ nonisolated(unsafe) var tickCursorPoint: IntPoint?
     return tickCursorPoint
 }
 /// State snapshot path for hand-run diagnostics.
-/// State snapshot path for hand-run diagnostics. Shadow observers write
-/// a separate file so readers never mix replicated truth with live truth.
-let stateFilePath =
-    shadowMode ? "/tmp/paneru-swift-shadow.json" : "/tmp/paneru-swift-state.json"
+let stateFilePath = "/tmp/paneru-swift-state.json"
 
 /// Write core truth for external observers: active workspace, focus,
 /// per-workspace offsets and strips, roster size. Atomic swap; failures
@@ -3458,7 +3332,7 @@ nonisolated(unsafe) var statJobs = 0
     // below stays as hover + backstop.
     if tap.lastMouseMovedAt > lastWarpEval {
         lastWarpEval = tap.lastMouseMovedAt
-        if !shadowMode, let cursor = tickCursor() {
+        if let cursor = tickCursor() {
             checkWarp(cursor: cursor)
         }
     }
@@ -3547,13 +3421,10 @@ nonisolated(unsafe) var statJobs = 0
         restorePlanner = nil
         restoreState = nil
         restoreGraceStarted = false
-        // Crash-gated prune (Rust `tick_restore_grace`): a previous
+        // Crash-gated prune: a previous
         // unclean run preserves the file instead of cementing the
         // degraded post-crash layout as the next boot's baseline.
-        // Never in shadow mode (the live daemon owns the file).
-        if hadPlan, resolved.restoreMissingWindows == .close, !didCrashLastRun,
-           !shadowMode
-        {
+        if hadPlan, resolved.restoreMissingWindows == .close, !didCrashLastRun {
             saveSessionState()
             print("restore: pruned missing windows (re-saved)")
         }
@@ -3716,16 +3587,7 @@ nonisolated(unsafe) var statJobs = 0
         batchBuilder.append((window, job))
     }
     let batch = batchBuilder
-    if shadowMode {
-        // Dry run: acknowledge everything immediately so unacked state
-        // never grows (the stall watchdog must stay meaningful), count
-        // the dropped intents, issue nothing. `LiveWindow.dryRun` latches
-        // the same guarantee one layer down.
-        for job in drainOrder(latest) {
-            core.acknowledge(winID: job.winID, seq: job.seq, epoch: job.epoch)
-        }
-        shadowDroppedJobs += latest.count
-    } else if !batch.isEmpty {
+    if !batch.isEmpty {
         // Capture the lane generation: a retirement before this block
         // runs makes it a no-op for AX (the fresh lane owns convergence),
         // so the old backlog can never fight the new lane.
@@ -3832,16 +3694,13 @@ nonisolated(unsafe) var statJobs = 0
         workerRetirements = 0
         print("ax: worker lane healthy again — retirement budget restored")
     }
-    // Raise intents go straight to AX — unless shadowing, where the
-    // observer never touches another daemon's windows.
-    if !shadowMode {
-        for id in core.raised {
-            if let window = roster[CGWindowID(id)] {
-                window.raise()
-            }
+    // Raise intents go straight to AX.
+    for id in core.raised {
+        if let window = roster[CGWindowID(id)] {
+            window.raise()
         }
     }
-    // Focus-stranding guard (Rust `give_away_focus`, steady-state):
+    // Focus-stranding guard (steady-state):
     // the minimize flip heals transitions, but restore, space return,
     // and arrival races can still rest model focus on a hidden window
     // (minimized, or stashed on an inactive Space) with keybinds
@@ -3886,11 +3745,9 @@ nonisolated(unsafe) var statJobs = 0
     // One-shot cross-display refocus (`refocus`) actuates unconditionally
     // — the moved window must key and raise on its new display even
     // though model focus never changed hands.
-    // Shadow tracks the latch without actuating (no retries storm: the
-    // latch follows the model either way).
-    if shadowMode {
-        prevActuatedFocus = result.refocus ?? result.focus
-    } else if let id = result.refocus, let window = roster[CGWindowID(id)] {
+    // Keyed focus actuates through the app + AX; the latch follows the
+    // model either way.
+    if let id = result.refocus, let window = roster[CGWindowID(id)] {
         if let pid = windowPIDs[id] {
             NSRunningApplication(processIdentifier: pid)?
                 .activate(options: [.activateIgnoringOtherApps])
@@ -3939,16 +3796,12 @@ nonisolated(unsafe) var statJobs = 0
     // Cursor warp requests (display hops) go straight to the tap layer.
     // Shadow drains the request but never moves the cursor.
     if let warp = core.takeMouseWarp() {
-        if shadowMode {
-            print("shadow: hop warp \(warp.x),\(warp.y) (dropped)")
-        } else {
-            warpMouse(to: CGPoint(x: Double(warp.x), y: Double(warp.y)))
-            // Teleports rebase the warp segment: the next evaluation
-            // must measure from the landing, not across the jump.
-            lastWarpSample = (IntPoint(warp.x, warp.y), Date())
-            lastMffWarpAt = Date()
-            print("mouse: hop warp \(warp.x),\(warp.y)")
-        }
+        warpMouse(to: CGPoint(x: Double(warp.x), y: Double(warp.y)))
+        // Teleports rebase the warp segment: the next evaluation
+        // must measure from the landing, not across the jump.
+        lastWarpSample = (IntPoint(warp.x, warp.y), Date())
+        lastMffWarpAt = Date()
+        print("mouse: hop warp \(warp.x),\(warp.y)")
     }
     // Mouse-follows-focus: a **keyboard or explicit-raise** focus arrival
     // warps to the window's center. Ambient arrivals (hover echoes,
@@ -4035,14 +3888,10 @@ nonisolated(unsafe) var statJobs = 0
                         if core.warpLoopNote(landing: target, nowMs: nowMs) {
                             print("mouse: warp loop suspected — cooling down (follow warp)")
                         }
-                        if shadowMode {
-                            print("shadow: follow warp \(target.x),\(target.y) window=\(id) cause=\(cause) (dropped)")
-                        } else {
-                            warpMouse(to: CGPoint(x: Double(target.x), y: Double(target.y)))
-                            lastWarpSample = (target, Date())
-                            lastMffWarpAt = Date()
-                            print("mouse: follow warp \(target.x),\(target.y) window=\(id) cause=\(cause)")
-                        }
+                        warpMouse(to: CGPoint(x: Double(target.x), y: Double(target.y)))
+                        lastWarpSample = (target, Date())
+                        lastMffWarpAt = Date()
+                        print("mouse: follow warp \(target.x),\(target.y) window=\(id) cause=\(cause)")
                     }
                 }
             }
@@ -4068,21 +3917,17 @@ nonisolated(unsafe) var statJobs = 0
         )
         if lastGhostRect != rect {
             lastGhostRect = rect
-            if !shadowMode {
-                // Tick runs on the main runloop, so assuming the actor is
-                // sound (traps loudly otherwise) — and it keeps the
-                // nonisolated tick free of actor hops on every frame.
-                MainActor.assumeIsolated {
-                    Presenter.showDrop(rect: rect, style: focusedStyle)
-                }
+            // Tick runs on the main runloop, so assuming the actor is
+            // sound (traps loudly otherwise) — and it keeps the
+            // nonisolated tick free of actor hops on every frame.
+            MainActor.assumeIsolated {
+                Presenter.showDrop(rect: rect, style: focusedStyle)
             }
         }
     } else if lastGhostRect != nil {
         lastGhostRect = nil
-        if !shadowMode {
-            MainActor.assumeIsolated {
-                Presenter.hideDrop()
-            }
+        MainActor.assumeIsolated {
+            Presenter.hideDrop()
         }
     }
     // Focus history records every arrival (idempotent on steady
@@ -4132,7 +3977,7 @@ nonisolated(unsafe) var statJobs = 0
         stateDirty = true
     }
     // Clipboard delivery for copyRule, edge-triggered.
-    if let rule = core.lastCopiedRule, rule != copiedRuleSent, !shadowMode {
+    if let rule = core.lastCopiedRule, rule != copiedRuleSent {
         NSPasteboard.general.clearContents()
         NSPasteboard.general.setString(rule, forType: .string)
         copiedRuleSent = rule
@@ -4147,20 +3992,16 @@ nonisolated(unsafe) var statJobs = 0
     }
     pendingFlashes.removeAll()
     if let message = flashState.visible(now: Date()) {
-        if !shadowMode {
-            MainActor.assumeIsolated {
-                Presenter.showFlash(
-                    message: message, opacity: 1,
-                    topRight: CGPoint(x: Double(flashAnchor.max.x), y: Double(flashAnchor.min.y))
-                )
-            }
+        MainActor.assumeIsolated {
+            Presenter.showFlash(
+                message: message, opacity: 1,
+                topRight: CGPoint(x: Double(flashAnchor.max.x), y: Double(flashAnchor.min.y))
+            )
         }
         lastFlashMessage = message
     } else if lastFlashMessage != nil {
-        if !shadowMode {
-            MainActor.assumeIsolated {
-                Presenter.removeFlash()
-            }
+        MainActor.assumeIsolated {
+            Presenter.removeFlash()
         }
         lastFlashMessage = nil
     }
@@ -4261,23 +4102,6 @@ nonisolated(unsafe) var statJobs = 0
             lastAuditPrintAt = Date()
         }
     }
-    // Shadow observer poll (cadence): fetch async off-thread, diff at
-    // rest on-thread. The normal path never pays for this.
-    if shadowMode {
-        if slowDutyJustRan {
-            requestShadowPoll()
-        }
-        consumeShadowPoll(swiftQuiet: result.quiescent)
-    }
-    // Shadow heartbeat (30s): dropped-intent count proves the observer
-    // keeps deciding while writing nothing.
-    if shadowMode, Date().timeIntervalSince(lastShadowHeartbeatAt) >= 30 {
-        lastShadowHeartbeatAt = Date()
-        print(
-            "shadow: tick=\(tickCount) droppedJobs=\(shadowDroppedJobs)"
-                + " roster=\(roster.count) focus=\(result.focus.map(String.init) ?? "-")"
-        )
-    }
     // Tap health ladder (~5s cadence): a tap the OS disabled
     // (timeout/user-input) re-arms here instead of silently going deaf
     // for half a minute (during which native gestures win outright).
@@ -4294,10 +4118,9 @@ nonisolated(unsafe) var statJobs = 0
         }
     }
     // Saved-state persistence, ~30s dirty cadence: a quiet interval skips
-    // the write entirely. Shadow never saves (restore reads stay on for
-    // fidelity, but the live daemon owns the file).
+    // the write entirely.
     if Date().timeIntervalSince(lastSessionSaveAt) >= sessionSaveInterval,
-       stateDirty, !shadowMode
+       stateDirty
     {
         stateDirty = false
         lastSessionSaveAt = Date()
@@ -4338,10 +4161,8 @@ nonisolated(unsafe) var statJobs = 0
     if result.focus == nil {
         borderRects.removeAll()
         borderStyles.removeAll()
-        if !shadowMode {
-            MainActor.assumeIsolated {
-                Presenter.syncBorders([])
-            }
+        MainActor.assumeIsolated {
+            Presenter.syncBorders([])
         }
     }
     if !borderPlan.isEmpty {
@@ -4359,17 +4180,15 @@ nonisolated(unsafe) var statJobs = 0
         for (id, style) in borderPlan.reskinned {
             borderStyles[id] = style
         }
-        if !shadowMode {
-            // Sync glass rects, not padded slots: `resolveOverlayItems`
-            // draws `plan.added/moved` rects verbatim, so syncing the raw
-            // plan would float the ring hPad/vPad off the glass.
-            let glassPlan = glassCorrectedPlan(borderPlan, correct: glassForBorder)
-            MainActor.assumeIsolated {
-                Presenter.syncBorders(resolveOverlayItems(
-                    plan: glassPlan,
-                    currentRects: borderRects, currentStyles: borderStyles
-                ))
-            }
+        // Sync glass rects, not padded slots: `resolveOverlayItems`
+        // draws `plan.added/moved` rects verbatim, so syncing the raw
+        // plan would float the ring hPad/vPad off the glass.
+        let glassPlan = glassCorrectedPlan(borderPlan, correct: glassForBorder)
+        MainActor.assumeIsolated {
+            Presenter.syncBorders(resolveOverlayItems(
+                plan: glassPlan,
+                currentRects: borderRects, currentStyles: borderStyles
+            ))
         }
     }
     // Dim the world behind the focused window when configured. Steady
@@ -4400,14 +4219,12 @@ nonisolated(unsafe) var statJobs = 0
                 || !dimCutoutEqual(last.cutout, dimNow.cutout)
         }()
         if dimChanged {
-            if !shadowMode {
-                MainActor.assumeIsolated {
-                    Presenter.updateDim(
-                        opacity: dimNow.opacity,
-                        r: dimNow.r, g: dimNow.g, b: dimNow.b,
-                        cutout: dimNow.cutout as NSRect?, cutoutRadius: dimNow.radius
-                    )
-                }
+            MainActor.assumeIsolated {
+                Presenter.updateDim(
+                    opacity: dimNow.opacity,
+                    r: dimNow.r, g: dimNow.g, b: dimNow.b,
+                    cutout: dimNow.cutout as NSRect?, cutoutRadius: dimNow.radius
+                )
             }
             lastDim = dimNow
         }
@@ -4416,16 +4233,13 @@ nonisolated(unsafe) var statJobs = 0
         // is presenter churn at display rate during busy periods.
         if lastDim != nil {
             lastDim = nil
-            if !shadowMode {
-                MainActor.assumeIsolated {
-                    Presenter.hideDim()
-                }
+            MainActor.assumeIsolated {
+                Presenter.hideDim()
             }
         }
     }
     // Menubar: rows of the active workspace, current row marked. Gated
     // to live frames — the update walks the status item every call.
-    // Absent in shadow mode (nil controller: no status item ever).
     if !result.quiescent || !events.isEmpty {
         let ws = core.activeWorkspace
         let rows = (core.strips[ws] ?? [:]).keys.sorted()
@@ -5055,12 +4869,8 @@ final class CommandListener: NSObject, NSXPCListenerDelegate {
 
 let commandListener = CommandListener()
 let machListener = NSXPCListener(machServiceName: paneruServiceNameResolved())
-// Shadow never serves: no external control may move the replicated model,
-// and the live daemon owns the service name.
-if !shadowMode {
-    machListener.delegate = commandListener
-    machListener.resume()
-}
+machListener.delegate = commandListener
+machListener.resume()
 // Controlled shutdown on launchd stop / Ctrl-C (Rust `Event::Exit`
 // semantics): ignore the default disposition and save on the main queue,
 // where session state and the crash mark are safe to touch.
@@ -5073,9 +4883,6 @@ let terminationSourceINT = DispatchSource.makeSignalSource(signal: SIGINT, queue
 terminationSourceINT.setEventHandler { terminationRequested = true }
 terminationSourceINT.resume()
 print("paneru-swift running (60Hz tick, menubar commands live)")
-if shadowMode {
-    print("shadow: observer mode — replicating only (no AX writes, raise, focus, warps, paint, menubar, XPC, or saves)")
-}
 // Build stamp: which binary is actually live (answers "stale install"
 // confusion in one log line).
 if let exe = Bundle.main.executablePath,

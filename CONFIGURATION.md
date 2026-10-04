@@ -193,8 +193,9 @@ Available modifiers are:
 - `shift`, `lshift`, `rshift`
 - `fn`
 
-For a full list of parseable keys (i.e. `leftarrow`) check the source:
-https://github.com/karinushka/paneru/blob/3790b01f8d65df5d9000142db7cf25f9270dcccc/src/config.rs#L1466-L1601
+For a full list of parseable keys (i.e. `leftarrow`), see the keycode
+tables in `swift-daemon/Sources/KeyChords/` (or run
+`pq run printstate` on a live daemon).
 
 
 ### Window commands
@@ -233,7 +234,7 @@ https://github.com/karinushka/paneru/blob/3790b01f8d65df5d9000142db7cf25f9270dcc
 | `window_togglefloatlayer` | Selectively move the floating windows in front or behind of the workspace windows. |
 | `window_copyrule` | Copy a window rule template for the focused window to the clipboard. |
 | `quit` | Exit Paneru. |
-| `restart` | Restart the Paneru service (`paneru restart`). |
+| `restart` | Restart the Paneru service. |
 
 **Example:**
 ```toml
@@ -285,22 +286,22 @@ window_virtualsendnum_2 = "cmd + alt + shift - 2"
 window_virtualsendnum_3 = "cmd + alt + shift - 3"
 ```
 
-**Example command line:**
+**Example command line (`pq`):**
 ```shell
 # Move to the previous virtual workspace.
-$ paneru send-cmd window virtual north
+$ pq run window virtual north
 # Move the current window to the next virtual workspace.
-$ paneru send-cmd window virtualmove south
+$ pq run window virtualmove south
 # Move directly to virtual workspace 3.
-$ paneru send-cmd window virtualnum 3
+$ pq run window virtualnum 3
 # Move the current window to virtual workspace 3 and follow it.
-$ paneru send-cmd window virtualmovenum 3
+$ pq run window virtualmovenum 3
 # Send the current window to virtual workspace 3 and stay here.
-$ paneru send-cmd window virtualsendnum 3
+$ pq run window virtualsendnum 3
 ```
 
 See [QUERY_AND_SUBSCRIBE_FORMAT.md](QUERY_AND_SUBSCRIBE_FORMAT.md) for the
-structured `paneru query` responses and `paneru subscribe` event stream.
+structured query responses and `pq subscribe` event stream.
 
 ---
 
@@ -334,7 +335,7 @@ bindings_passthrough = ["ctrl-h", "ctrl-l"]
 **Java apps (e.g. DBeaver):** Java windows often report non-standard
 accessibility roles, so Paneru ignores them by default. Force-manage them
 with a bundle-scoped `manage` rule (applies to windows launched both before
-and while Paneru is running — find the Bundle ID via `paneru query`):
+and while Paneru is running — find the Bundle ID via `pq state`):
 ```toml
 [windows.dbeaver]
 title = ".*"

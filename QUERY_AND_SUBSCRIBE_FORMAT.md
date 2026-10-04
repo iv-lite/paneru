@@ -1,19 +1,14 @@
 # Query and Subscribe Format
 
-Paneru exposes structured state over the same IPC channel used by
-`send-cmd` (legacy Rust daemon) and `pq` (shipped Swift daemon): a Mach
-service named `com.github.iv-lite.paneru-swift`. The CLI commands below
-require a running Paneru daemon.
+Paneru exposes structured state over its Mach XPC service named
+`com.github.iv-lite.paneru-swift`. The CLI below (`pq`) requires a running
+Paneru daemon.
 
 **The JSON below is what the CLI prints, not what crosses between processes.**
-Requests and responses travel as typed values in a compact binary encoding
-(`postcard`); `paneru query` and `paneru subscribe` render them as JSON because
-a terminal — and `jq`, and a status bar's shell script — needs text. Anything
-consuming these commands' output sees exactly the shapes documented here.
-
-A client written in Rust can skip the JSON entirely by using the
-`paneru-shared-types` crate: its `wire::Request` and `wire::Response` are the
-protocol, and `paneru-mach-ipc` is the transport.
+Inside the daemon, requests and responses travel as JSON over XPC; `pq`
+renders them as pretty-printed JSON because a terminal — and `jq`, and a
+status bar's shell script — needs text. Anything consuming the CLI's output
+sees exactly the shapes documented here.
 
 All query responses are a single JSON document. `subscribe` emits
 line-delimited JSON, with one complete event object per line.
@@ -21,15 +16,16 @@ line-delimited JSON, with one complete event object per line.
 ## Query Commands
 
 ```shell
-paneru query state --json
-paneru query virtual-workspaces --json
-paneru query active --json
+pq state
+pq active
+pq virtual-workspaces
+pq on-screen
 ```
 
 `--json` is accepted for clarity and is the only output format, so it may be
 omitted; callers should include it anyway, in case another format is ever added.
 
-### `paneru query state --json`
+### `pq state`
 
 Returns the complete state document.
 
@@ -78,7 +74,7 @@ Returns the complete state document.
 }
 ```
 
-### `paneru query virtual-workspaces --json`
+### `pq virtual-workspaces`
 
 Returns only the `virtual_workspaces` array from the complete state document.
 
@@ -114,7 +110,7 @@ Returns only the `virtual_workspaces` array from the complete state document.
 ]
 ```
 
-### `paneru query active --json`
+### `pq active`
 
 Returns only the active display, workspace, and focused-window state.
 
@@ -161,17 +157,17 @@ inside a native workspace so integrations can render stable numbered slots.
 ## Subscribe Command
 
 ```shell
-paneru subscribe --json
+pq subscribe
 ```
 
 `subscribe` keeps its channel open and writes one JSON event per line. The stream
 is intended for integrations such as SketchyBar, so it emits changes that are
 useful for keeping a bar in sync: focus changes, native or virtual workspace
 changes, managed window-list changes, window title changes, and display changes.
-Paneru coalesces duplicate internal events from the same ECS tick and skips
+Paneru coalesces duplicate internal events from the same tick and skips
 events whose relevant state has not changed since the last emitted event.
 Consumers should parse each line independently and then call
-`paneru query state --json` when they need a full refresh.
+`pq state` when they need a full refresh.
 
 ### Event Types
 
@@ -180,7 +176,7 @@ Consumers should parse each line independently and then call
 ```
 
 Emitted after native Space changes and Paneru virtual workspace switches. Paneru
-derives this from both incoming workspace events and ECS active-workspace marker
+derives this from both incoming workspace events and the core's active-workspace
 changes, so integrations receive the event when the visible workspace state
 changes.
 
@@ -198,7 +194,7 @@ emitted `windows_changed` event.
 ```
 
 Emitted when focus changes. Paneru derives this from both incoming focus events
-and ECS focused-window marker changes, so internally handled focus transitions
+and core focus changes, so internally handled focus transitions
 are visible to subscribers. The `window_id`, `bundle_id`, `title`, and
 `virtual_workspace_number` fields are taken from the final active state for the
 tick, so stale lower-level focus notifications are not forwarded with mismatched
@@ -223,9 +219,9 @@ active display id.
 Absolute virtual workspace selection is addressed as a window command:
 
 ```shell
-paneru send-cmd window virtualnum 3
-paneru send-cmd window virtualmovenum 3
-paneru send-cmd window virtualsendnum 3
+pq run window virtualnum 3
+pq run window virtualmovenum 3
+pq run window virtualsendnum 3
 ```
 
 The matching config binding names are:

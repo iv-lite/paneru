@@ -100,8 +100,8 @@ public enum WindowQualification: Equatable, Sendable {
 /// is lock-guarded; the element itself is only ever touched on one lane
 /// at a time (worker for probes/refreshes, main for ordered writes).
 /// `Sendable` is unchecked by design, and the vouch is exactly the two
-/// rules above plus main-thread publication: `dryRun` and
-/// `enhancedUIAbsent` are set at adoption before any worker use, and
+/// rules above plus main-thread publication: `enhancedUIAbsent` is set at
+/// adoption before any worker use, and
 /// the complaints below stay behind their own lock. Padding is also
 /// main-published (adoption, config reload); a worker read racing a
 /// reload observes one aligned word mid-flight at worst — transient
@@ -129,11 +129,8 @@ public final class LiveWindow: @unchecked Sendable {
     public var cachedFullscreen: Bool { frameLock.withLock { _fullscreen } }
     public var horizontalPadding: Int32
     public var verticalPadding: Int32
-    /// Dry-run latch for `--shadow` observers: when set, every write
-    /// below is a silent no-op returning cached truth, so a missed
-    /// dispatch gate upstream can never move another daemon's windows.
-    /// Reads, observers, and frame refreshes are unaffected.
-    public var dryRun = false
+    /// Write latch (always live): every write below goes to the window
+    /// server. Reads, observers, and frame refreshes are unaffected.
     /// Pids whose apps lack the enhanced-UI workaround stay synchronous.
     public var enhancedUIAbsent: Bool
     /// Last reported write failure, lock-guarded (writes run on the
@@ -383,7 +380,6 @@ public final class LiveWindow: @unchecked Sendable {
     /// joins only the AX write itself.
     @discardableResult
     public func reposition(to origin: IntPoint) -> IntRect {
-        guard !dryRun else { return frame }
         // Dead element: the AX call cannot succeed — skip it (and its
         // per-target complaint) until drop + re-adopt replaces the ref.
         // The failure pipeline already recorded this window; the audit
@@ -425,7 +421,6 @@ public final class LiveWindow: @unchecked Sendable {
     /// the pad); padding joins only the AX write itself.
     @discardableResult
     public func resize(to size: IntSize, origin: IntPoint? = nil) -> IntRect {
-        guard !dryRun else { return frame }
         guard !elementDead() else { return frame }
         guard abs(Double(size.x) - Double(frame.width)) > axDeadband
             || abs(Double(size.y) - Double(frame.height)) > axDeadband
@@ -500,7 +495,6 @@ public final class LiveWindow: @unchecked Sendable {
 
     /// Best-effort raise; cannot lift above another app's frontmost.
     public func raise() {
-        guard !dryRun else { return }
         AXUIElementPerformAction(element, kAXRaiseAction as CFString)
     }
 
@@ -509,7 +503,6 @@ public final class LiveWindow: @unchecked Sendable {
     /// it like any managed window.
     @discardableResult
     public func deminimize() -> Bool {
-        guard !dryRun else { return false }
         return withEnhancedUIDisabled {
             AXUIElementSetAttributeValue(
                 element, kAXMinimizedAttribute as CFString, kCFBooleanFalse
@@ -523,7 +516,6 @@ public final class LiveWindow: @unchecked Sendable {
     /// (AppKit-only, like all process control).
     @discardableResult
     public func focusWithoutRaise() -> Bool {
-        guard !dryRun else { return false }
         return AXUIElementSetAttributeValue(
             element, kAXFocusedAttribute as CFString, kCFBooleanTrue
         ) == .success

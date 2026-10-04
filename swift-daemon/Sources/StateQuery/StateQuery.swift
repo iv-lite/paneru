@@ -1,9 +1,9 @@
-// Query documents and subscription events (`crates/shared_types/state.rs`,
-// `json.rs`): what `paneru query …` prints and `paneru subscribe` pushes.
+// Query documents and subscription events: what `pq state` /
+// `pq active` / `pq virtual-workspaces` print and `pq subscribe` pushes.
 // Struct `nil`s are *omitted* by `JSONEncoder` (only dictionary-built
-// bodies spell explicit `null`, as below) — a deliberate delta from
-// `serde_json`, harmless downstream (`jq`/`.get` both see null), but
-// byte-compare against Rust output will differ. Key order is likewise
+// bodies spell explicit `null`, as below) — so a JSON round trip keeps
+// missing keys absent; downstream (`jq`/`.get`) sees null either way.
+// Key order is likewise
 // encoder-defined (JSON objects are unordered — serde field order is
 // not reproducible with `JSONEncoder`). The terminal JSON shape flattens
 // the

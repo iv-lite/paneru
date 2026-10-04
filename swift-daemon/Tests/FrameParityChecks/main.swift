@@ -4,13 +4,15 @@ import Foundation
 import Geometry
 import Presentation
 
-// Frame-parity gate: replays Rust-emitted trace corpora through DaemonCore
-// and diffs rest state frame by frame.
+// Frame-parity gate: replays frozen Rust-truth trace corpora through
+// DaemonCore and diffs rest state frame by frame.
 //
-// Corpus: `PANERU_TRACE_DIR/*.jsonl`, dumped by the Rust trace tests with
-// `PANERU_TRACE_OUT` set to the same directory. Without the env var this
-// prints a skip note and exits 0 (local runs without a corpus are not
-// failures); CI sets it, turning this into a hard gate.
+// Corpus: `PANERU_TRACE_DIR/*.jsonl` wins when set; otherwise the
+// committed corpus beside this runner (`Tests/FrameParityChecks/corpus/`)
+// is used, so a bare `swift run ... FrameParityChecks` is a real gate —
+// it exits 1 without a corpus (fail, never skip). The corpus is FROZEN:
+// the final snapshot from the (now removed) Rust daemon. Extend it
+// deliberately when layout semantics change on purpose.
 //
 // Mapping notes (all deliberate, all documented):
 // - Rust command windows become one `tick` each. Harness spawns happen

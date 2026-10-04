@@ -20,9 +20,8 @@ concurrency:
   group: ${{ github.workflow }}-${{ github.ref }}
   cancel-in-progress: ${{ github.ref != 'refs/heads/main' }}
 
-# Swift-only: the daemon is `swift-daemon/` (product `paneru-swift`). The
-# Rust tree still ships until cutover but is deliberately out of this
-# workflow — no cargo/sccache/nextest, no Rust trace corpus.
+# Swift-only: the daemon is `swift-daemon/` (product `paneru-swift`); the
+# Rust daemon was removed. No cargo/sccache/nextest, no Rust toolchain.
 
 jobs:
   checks:
@@ -48,10 +47,10 @@ jobs:
             echo "== $checks =="
             swift run --package-path swift-daemon "$checks"
           done
-      # Frame parity replays a Rust trace corpus (`PANERU_TRACE_DIR`). No
-      # corpus is produced in this Swift-only workflow, so the runner skips
-      # cleanly — kept here so a future corpus still gates.
-      - name: Frame parity (skips without a corpus)
+      # Frame parity replays the FROZEN Rust-truth corpus
+      # (`swift-daemon/Tests/FrameParityChecks/corpus/`, committed). It
+      # fails — never skips — if the corpus is missing.
+      - name: Frame parity (frozen corpus)
         run: swift run --package-path swift-daemon FrameParityChecks
 
   # Builds the release artifacts concurrently with `checks`; publishing stays
@@ -89,10 +88,10 @@ jobs:
         run: swift build -c release --package-path swift-daemon
 
       - name: Pin code-signing identifier
-        # Ad-hoc with the stable identifier (mirrors the Rust release step):
-        # the installer re-signs with the persistent identity on the host,
-        # so the shipped signature only needs to be well-formed and carry
-        # the identifier TCC expects.
+        # Ad-hoc with the stable identifier: the installer re-signs with
+        # the persistent identity on the host, so the shipped signature
+        # only needs to be well-formed and carry the identifier TCC
+        # expects.
         run: |
           BIN="$(swift build -c release --package-path swift-daemon --show-bin-path)"
           codesign --force --sign - --identifier com.github.iv-lite.paneru-swift "$BIN/paneru-swift"

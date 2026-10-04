@@ -7,8 +7,7 @@
 #   swift-daemon/install-service.sh stop      - stop a running agent
 #
 # Per-user agent (never a system daemon: AX grants and config live in the
-# login session). Swift identity only — the Rust agent
-# (`com.github.karinushka.paneru`, no suffix) is never touched.
+# login session). Swift identity only.
 #
 # Signing: ad-hoc `codesign -s -` embeds a cdhash-only designated
 # requirement, so every rebuild looks like a new app to TCC and voids the
@@ -22,7 +21,7 @@ set -eu
 LABEL="com.github.iv-lite.paneru-swift"
 IDENTIFIER="com.github.iv-lite.paneru-swift"
 # Previous Swift label: one-time migration below stops it and removes
-# its plist/logs on install. The Rust label is not matched.
+# its plist/logs on install.
 OLD_LABEL="com.github.karinushka.paneru.swift"
 BIN_DIR="$HOME/.local/bin"
 BIN="$BIN_DIR/paneru-swift"
@@ -63,8 +62,7 @@ bootstrapped() {
 
 do_install() {
     # Migrate the previous Swift label once: stop it and remove its
-    # plist/logs so two Swift agents never overlap. Rust (unsuffixed)
-    # is out of scope and keeps running.
+    # plist/logs so two Swift agents never overlap.
     if launchctl print "gui/$UID_NUM/$OLD_LABEL" >/dev/null 2>&1; then
         launchctl bootout "gui/$UID_NUM" "$HOME/Library/LaunchAgents/$OLD_LABEL.plist" 2>/dev/null || \
             launchctl kill SIGTERM "gui/$UID_NUM/$OLD_LABEL" 2>/dev/null || true

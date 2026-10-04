@@ -4,16 +4,16 @@
 # Runs, in order:
 #   1. the full-product release build (zero errors, zero warnings),
 #   2. every `*Checks` runner,
-#   3. the frame-parity replay (Rust corpus vs the Swift core) — and it
-#      FAILS on `skipped`, because a silently-skipped parity check is the
-#      exact failure mode this script exists to prevent.
+#   3. the frame-parity replay (frozen Rust-truth corpus vs the Swift
+#      core) — and it FAILS on `skipped`, because a silently-skipped
+#      parity check is the exact failure mode this script exists to
+#      prevent.
 #
 # The corpus is committed at swift-daemon/Tests/FrameParityChecks/corpus/
-# (dumped from the Rust trace tests). Regenerate it with:
-#
-#   trace="$(mktemp -d)"
-#   PANERU_TRACE_OUT="$trace" cargo test --all-targets trace
-#   cp "$trace"/*.jsonl swift-daemon/Tests/FrameParityChecks/corpus/
+# and is FROZEN: it is the final truth snapshot from the (now removed)
+# Rust daemon. It never needs a Rust interpreter to replay. Extend it
+# deliberately when layout semantics change on purpose — FrameParityChecks
+# fails, never skips, when the corpus is missing.
 #
 # Usage: scripts/verify-swift.sh [--release]
 set -eu
@@ -28,7 +28,7 @@ fi
 
 if [ ! -d "$CORPUS" ] || [ -z "$(ls -A "$CORPUS" 2>/dev/null)" ]; then
     echo "verify-swift: no corpus at $CORPUS" >&2
-    echo "verify-swift: run: PANERU_TRACE_OUT=\$(mktemp -d) cargo test --all-targets trace" >&2
+    echo "verify-swift: the frozen parity corpus is missing — restore it or re-add it deliberately" >&2
     exit 1
 fi
 

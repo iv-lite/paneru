@@ -144,7 +144,7 @@ end)
 
 ## 4. Querying State
 
-Inside a `paneru.on` handler or a `paneru.bind` callback, the script can read the same state documents `paneru query …` returns — no round trip, no `io.popen`:
+Inside a `paneru.on` handler or a `paneru.bind` callback, the script can read the same state documents `pq state` returns — no round trip, no `io.popen`:
 
 ```lua
 paneru.on("window_focused", function(event, ws)
