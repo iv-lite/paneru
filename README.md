@@ -121,6 +121,46 @@ inspired by [Niri] and [PaperWM.spoon].
   `sliver_height` options control the size of this sliver. This is a
   workaround for a macOS limitation, not a design choice.
 
+### Installing (recommended): the Swift daemon
+
+The shipped, supported daemon is **`paneru-swift`** — this fork's native
+port: same tiling core, AppKit presentation, XPC command/query/subscribe
+server, Lua binds and event handlers, and a launchd agent — no Rust
+toolchain needed.
+
+```shell
+$ git clone https://github.com/iv-lite/paneru-swift.git
+$ cd paneru-swift
+$ swift-daemon/install-service.sh install
+```
+
+The script builds the release binary, installs it to `~/.local/bin`,
+signs it with a persistent `Paneru Local` code-signing identity (so the
+Accessibility grant survives rebuilds), renders the agent plist, and
+bootstraps it with `launchctl`. Then grant Accessibility (System Settings →
+Privacy & Security → Accessibility) — the daemon exits loudly without it —
+and it tiles on the next login too (`RunAtLoad`).
+
+Start, stop, and remove:
+
+```shell
+$ swift-daemon/install-service.sh start
+$ swift-daemon/install-service.sh stop
+$ swift-daemon/install-service.sh uninstall
+```
+
+Logs land in `/tmp/com.github.iv-lite.paneru-swift_<uid>.out.log`
+(and `.err.log`). New apps open on the display under the cursor and that
+display becomes active; focus-follows-mouse and mouse-follows-focus are
+independent, and animation glide timing is owned by the daemon itself
+(single `animations` toggle — see `CONFIGURATION.md`).
+
+### Legacy Rust daemon (unsupported)
+
+The Rust daemon (`paneru`) remains in-tree as the legacy fallback
+(snap-only — glide timing lives in the Swift daemon) and is no longer the
+supported install path.
+
 ### Installing from Crates.io
 
 Paneru is built using Rust's `cargo`. It can be installed directly from
@@ -189,35 +229,11 @@ NixOS/darwin modules (see below).
 
 ### Installing the Swift daemon
 
-The Swift daemon (`paneru-swift`) is this fork's native port: same tiling
-core, AppKit presentation, XPC command/query/subscribe server, Lua binds and
-event handlers, and a launchd agent — no Rust toolchain needed.
-
-```shell
-$ git clone https://github.com/iv-lite/paneru-swift.git
-$ cd paneru-swift
-$ swift-daemon/install-service.sh install
-```
-
-The script builds the release binary, installs it to `~/.local/bin`, signs
-it with a persistent `Paneru Local` code-signing identity (so the
-Accessibility grant survives rebuilds), renders the agent plist, and
-bootstraps it with `launchctl`. Then grant Accessibility (System Settings →
-Privacy & Security → Accessibility) — the daemon exits loudly without it —
-and it tiles on the next login too (`RunAtLoad`).
-
-Start, stop, and remove:
-
-```shell
-$ swift-daemon/install-service.sh start
-$ swift-daemon/install-service.sh stop
-$ swift-daemon/install-service.sh uninstall
-```
-
-Logs land in `/tmp/com.github.iv-lite.paneru-swift_<uid>.out.log`
-(and `.err.log`). The agent runs beside the Rust one under its own
-label and Mach port, so both can be installed during the transition;
-quit the Rust daemon before trying the Swift one over the same windows.
+See **Installing (recommended): the Swift daemon** at the top of this
+section — `swift-daemon/install-service.sh install` is the shipped path.
+The agent runs under its own label and Mach port
+(com.github.iv-lite.paneru-swift); if a legacy Rust agent is still
+installed, quit it before running the Swift daemon over the same windows.
 
 ### Configuration
 
@@ -292,7 +308,13 @@ configured with `[restore]`; see the
 **[Session Restore](./CONFIGURATION.md#session-restore)** section in the
 configuration guide.
 
-### Running as a service
+### Legacy Rust service, app launcher & `send-cmd`
+
+The sections below drive the **legacy Rust daemon**. On the shipped Swift
+daemon, service management is `swift-daemon/install-service.sh
+start|stop|uninstall` (see above), and the command-line query tool is
+`pq` (built with the daemon; `pq` talks to the same Mach service over
+XPC).
 
 ```shell
 $ paneru install

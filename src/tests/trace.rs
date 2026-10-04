@@ -374,7 +374,7 @@ mod tests {
                 paneru_shared_types::handoff::HandoffColumn::Single(1),
             ]
         );
-        assert!(workspace.floating.is_empty());
+        assert_eq!(workspace.floating.len(), 0);
     }
 
     #[test]

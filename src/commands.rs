@@ -404,6 +404,16 @@ fn focus_fullscreen_west(
     Some(entity)
 }
 
+/// Stamp keyboard/user intent for a focus arrival: the mouse-follows-focus
+/// system warps the cursor only for arrivals whose cause is `Keyboard`, and
+/// `focus_cause` classifies on this stamp (see `src/ecs/focus.rs`). Every
+/// keyboard shortcut that moves focus must stamp here, or its arrival reads
+/// as ambient noise and the cursor never follows the shortcut.
+fn stamp_user_focus(entity: Entity, time: &Time, user_focus: &mut UserFocus) {
+    user_focus.entity = Some(entity);
+    user_focus.at = time.elapsed();
+}
+
 /// Handles the "focus" command, moving focus to a window in a specified direction.
 ///
 /// # Arguments
@@ -471,8 +481,7 @@ fn command_move_focus(
             arrival = Some(entity);
             // Keyboard-issued focus carries user intent: arrival systems may
             // rearrange for it (center, reshuffle). OS echoes never set this.
-            user_focus.entity = Some(entity);
-            user_focus.at = time.elapsed();
+            stamp_user_focus(entity, &time, &mut user_focus);
             continue;
         }
         // North/South fall-through past the strip is handled inline below
@@ -622,12 +631,15 @@ fn focus_move_step(
     None
 }
 
+#[allow(clippy::too_many_arguments)]
 fn command_focus_unmanaged(
     mut messages: MessageReader<Event>,
     windows: Windows,
     active_display: ActiveDisplay,
     window_manager: Res<WindowManager>,
     focus_history: Res<FocusHistory>,
+    time: Res<Time>,
+    mut user_focus: ResMut<UserFocus>,
     mut commands: Commands,
 ) {
     if filter_window_operations(&mut messages, |op| matches!(op, Operation::FocusUnmanaged))
@@ -649,6 +661,7 @@ fn command_focus_unmanaged(
         .or_else(|| visible_floats.into_iter().next());
 
     if let Some(entity) = target {
+        stamp_user_focus(entity, &time, &mut user_focus);
         commands.focus_entity(entity, true);
     }
 }
@@ -657,6 +670,8 @@ fn command_focus_managed(
     mut messages: MessageReader<Event>,
     active_display: ActiveDisplay,
     focus_history: Res<FocusHistory>,
+    time: Res<Time>,
+    mut user_focus: ResMut<UserFocus>,
     mut commands: Commands,
 ) {
     if filter_window_operations(&mut messages, |op| matches!(op, Operation::FocusManaged))
@@ -675,17 +690,21 @@ fn command_focus_managed(
         .or_else(|| active_strip.first_top());
 
     if let Some(entity) = target {
+        stamp_user_focus(entity, &time, &mut user_focus);
         commands.focus_entity(entity, true);
         commands.reshuffle_around(entity);
     }
 }
 
+#[allow(clippy::too_many_arguments)]
 fn command_raise_floating(
     mut messages: MessageReader<Event>,
     windows: Windows,
     active_display: ActiveDisplay,
     window_manager: Res<WindowManager>,
     focus_history: Res<FocusHistory>,
+    time: Res<Time>,
+    mut user_focus: ResMut<UserFocus>,
     mut commands: Commands,
 ) {
     if filter_window_operations(&mut messages, |op| matches!(op, Operation::RaiseFloating))
@@ -716,6 +735,7 @@ fn command_raise_floating(
     }
 
     if let Some(entity) = target {
+        stamp_user_focus(entity, &time, &mut user_focus);
         commands.focus_entity(entity, true);
     }
 }
@@ -724,6 +744,7 @@ fn command_raise_floating(
 /// window above another app's frontmost window, so the target's app must be
 /// made frontmost. Other windows in the new top tier are raised within their
 /// own apps' stacks as a best-effort.
+#[allow(clippy::too_many_arguments)]
 fn command_toggle_floating_layer(
     mut messages: MessageReader<Event>,
     active_display: ActiveDisplay,
@@ -731,6 +752,8 @@ fn command_toggle_floating_layer(
     focus_history: Res<FocusHistory>,
     window_manager: Res<WindowManager>,
     windows: Windows,
+    time: Res<Time>,
+    mut user_focus: ResMut<UserFocus>,
     mut commands: Commands,
 ) {
     if filter_window_operations(&mut messages, |op| {
@@ -791,6 +814,10 @@ fn command_toggle_floating_layer(
                 });
             });
     } else if let Some(entity) = target {
+        // The raise floats the target and the OS then echoes focus back; the
+        // stamp makes that echo classify as a keyboard arrival so the cursor
+        // follows the shortcut rather than reading as ambient.
+        stamp_user_focus(entity, &time, &mut user_focus);
         commands.trigger(RaiseWindow {
             entity,
             with_strip: true,

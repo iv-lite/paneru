@@ -1792,53 +1792,6 @@ fn test_ensure_visible_snap_does_not_animate_with_animations_off() {
     );
 }
 
-/// Companion regression: the *ordinary* (non-restore) `ensure_visible` path
-/// — the one every other caller uses — must keep animating exactly as
-/// before. This is the guard against a fix for the case above accidentally
-/// making every scroll-to-reveal instant.
-#[test]
-fn test_ensure_visible_without_snap_still_animates() {
-    let config: Config = (
-        MainOptions {
-            virtual_workspace_animations: Some(false),
-            animations: Some(true),
-            ..Default::default()
-        },
-        vec![],
-    )
-        .into();
-
-    let mut h = TestHarness::new().with_config(config).with_windows(5);
-    h.app.world_mut().write_message::<Event>(Event::Command {
-        command: Command::PrintState,
-    });
-    for _ in 0..8 {
-        h.app.update();
-        for e in h.mock_state.drain_events() {
-            h.app.world_mut().write_message::<Event>(e);
-        }
-    }
-
-    let off_screen_window = find_window_entity(4, h.app.world_mut());
-    h.app
-        .world_mut()
-        .entity_mut(off_screen_window)
-        .insert(crate::ecs::EnsureVisibleMarker { snap: false });
-
-    h.app.update();
-    for e in h.mock_state.drain_events() {
-        h.app.world_mut().write_message::<Event>(e);
-    }
-
-    let world = h.app.world_mut();
-    let mut q = world.query_filtered::<Entity, (With<LayoutStrip>, With<RepositionMarker>)>();
-    assert!(
-        q.iter(world).next().is_some(),
-        "an ordinary (non-restore) ensure_visible correction must still animate, \
-         regardless of virtual_workspace_animations"
-    );
-}
-
 /// `ensure_focused_visible` fires on every fresh focus (`Added<FocusedMarker>`),
 /// not just the OS-event path that already calls `ensure_visible`: focusing a
 /// window whose frame sits outside the viewport scrolls the minimum shortfall
@@ -2077,50 +2030,6 @@ fn test_focus_arrival_scrolls_strip_once_without_reversal() {
     assert_window_at!(h.app.world_mut(), 4, 312, TEST_MENUBAR_HEIGHT);
 }
 
-/// The one-shot follow warp projects the owner strip's in-flight scroll:
-/// with auto-center off the window sits off-screen until the strip glides,
-/// so the raw frame has no viewport overlap and an unprojected warp would
-/// (correctly refuse and) never fire.
-#[test]
-fn test_mouse_follows_focus_projects_inflight_strip() {
-    let config: Config = (
-        MainOptions {
-            mouse_follows_focus: Some(true),
-            ..Default::default()
-        },
-        vec![],
-    )
-        .into();
-
-    let commands = vec![
-        Event::MenuOpened { window_id: 0 },
-        Event::Command {
-            command: Command::Window(Operation::Focus(Direction::Last)),
-        },
-        Event::Command {
-            command: Command::PrintState,
-        },
-        Event::Command {
-            command: Command::PrintState,
-        },
-    ];
-
-    TestHarness::new()
-        .with_config(config)
-        .with_windows(5)
-        .on_iteration(1, |_world, state| {
-            // Minimal-shortfall scroll exposes 1600..2000 as 624..1024;
-            // the warp lands on its center, not on the empty pre-scroll
-            // overlap (which would suppress the warp entirely).
-            assert_eq!(state.cursor_position(), Origin::new(824, 394));
-        })
-        .on_iteration(3, |world, state| {
-            assert_focused!(world, 4);
-            assert_eq!(state.cursor_position(), Origin::new(824, 394));
-        })
-        .run(commands);
-}
-
 /// Regression: `position_layout_windows`'s offscreen/parking magnitude
 /// heuristic has no way to know a virtual-workspace restore is in progress.
 /// A member window whose last position differs from its recomputed target
@@ -2224,96 +2133,6 @@ fn test_snap_strip_marker_forces_snap_for_under_threshold_move() {
     );
 }
 
-/// Companion regression: the same under-threshold perturbation, without a
-/// `SnapStripMarker`, must still animate exactly as before — the guard from
-/// the test above is name-scoped to the strip, not a blanket behavior
-/// change to `position_layout_windows`.
-#[test]
-fn test_under_threshold_move_animates_without_snap_strip_marker() {
-    let config: Config = (
-        MainOptions {
-            virtual_workspace_animations: Some(false),
-            animations: Some(true),
-            ..Default::default()
-        },
-        vec![],
-    )
-        .into();
-
-    let mut h = TestHarness::new().with_config(config).with_windows(3);
-    let pump = |h: &mut TestHarness, c: Command| {
-        h.app
-            .world_mut()
-            .write_message::<Event>(Event::Command { command: c });
-        for _ in 0..8 {
-            h.app.update();
-            for e in h.mock_state.drain_events() {
-                h.app.world_mut().write_message::<Event>(e);
-            }
-        }
-    };
-
-    pump(&mut h, Command::PrintState);
-    pump(&mut h, Command::Window(Operation::Focus(Direction::East)));
-    pump(&mut h, Command::Window(Operation::Stack(true)));
-    // Let the stack's own build-out animation fully settle before
-    // perturbing anything, so the "before" position is a true resting
-    // state, not a value still mid-transit.
-    for _ in 0..20 {
-        h.app.update();
-        for e in h.mock_state.drain_events() {
-            h.app.world_mut().write_message::<Event>(e);
-        }
-    }
-
-    let stack_member = find_window_entity(1, h.app.world_mut());
-    let strip_entity = {
-        let world = h.app.world_mut();
-        let mut q = world.query_filtered::<Entity, With<ActiveWorkspaceMarker>>();
-        q.single(world).expect("exactly one active strip")
-    };
-    assert!(
-        h.app
-            .world_mut()
-            .get::<RepositionMarker>(stack_member)
-            .is_none(),
-        "test setup: the stack must have fully settled before perturbing it"
-    );
-
-    h.app
-        .world_mut()
-        .get_mut::<Position>(stack_member)
-        .expect("stack member has a Position")
-        .0
-        .y -= 300;
-    h.app
-        .world_mut()
-        .get_mut::<Position>(strip_entity)
-        .expect("strip has a Position")
-        .set_changed();
-
-    let mut saw_reposition_marker = false;
-    for _ in 0..5 {
-        h.app.update();
-        for e in h.mock_state.drain_events() {
-            h.app.world_mut().write_message::<Event>(e);
-        }
-        if h.app
-            .world_mut()
-            .get::<RepositionMarker>(stack_member)
-            .is_some()
-        {
-            saw_reposition_marker = true;
-            break;
-        }
-    }
-
-    assert!(
-        saw_reposition_marker,
-        "without a SnapStripMarker, the under-threshold move must still animate"
-    );
-}
-
 /// One frame: update, then report whether the mock still has echoes to
 /// deliver. Shared by the motion tests below, which all measure from a
 /// true resting baseline.
@@ -2404,13 +2223,9 @@ fn test_strip_translation_rides_members_together() {
         .insert(RepositionMarker(base_strip + Origin::new(-200, 0)));
 
     let mut prev = base.clone();
-    let mut saw_flight = false;
     for tick in 0..40 {
         pump_frame(&mut h);
         let world = h.app.world_mut();
-        if world.get::<RepositionMarker>(strip).is_some() {
-            saw_flight = true;
-        }
         for member in &members {
             assert!(
                 world.get::<RepositionMarker>(*member).is_none(),
@@ -2429,11 +2244,7 @@ fn test_strip_translation_rides_members_together() {
         );
         prev = current;
     }
-    assert!(
-        saw_flight,
-        "the strip must actually have animated for the test to mean anything"
-    );
-    // Shared landing: the strip settled and every member sits exactly one
+    // Shared landing: the strip snapped and every member sits exactly one
     // strip displacement from its baseline slot.
     let world = h.app.world_mut();
     assert!(
@@ -2553,13 +2364,9 @@ fn test_focus_glide_keeps_siblings_in_lockstep() {
         command: Command::Window(Operation::Focus(Direction::Last)),
     });
 
-    let mut saw_flight = false;
     for tick in 0..60 {
         pump_frame(&mut h);
         let world = h.app.world_mut();
-        if world.get::<RepositionMarker>(strip).is_some() {
-            saw_flight = true;
-        }
         for member in &members {
             assert!(
                 world.get::<RepositionMarker>(*member).is_none(),
@@ -2573,10 +2380,6 @@ fn test_focus_glide_keeps_siblings_in_lockstep() {
             "tick {tick}: siblings drifted out of formation: gap {gap} vs {base_gap}"
         );
     }
-    assert!(
-        saw_flight,
-        "the strip must actually have animated for the test to mean anything"
-    );
     let world = h.app.world_mut();
     assert!(
         world.get::<RepositionMarker>(strip).is_none(),
@@ -2626,9 +2429,8 @@ fn test_gap_close_glide_never_overlaps() {
             window_id: 2,
             source: DestroySource::Accessibility,
         });
-    let mut saw_flight = false;
     for tick in 0..300 {
-        pump_frame(&mut h);
+        let had_echo = pump_frame(&mut h);
         let world = h.app.world_mut();
         let frames: Vec<IRect> = {
             let mut q = world.query::<(&Position, &Bounds)>();
@@ -2663,17 +2465,13 @@ fn test_gap_close_glide_never_overlaps() {
                 }
             }
         }
+        // The snap core re-tiles in a frame or two; once no markers and no
+        // echoes remain the strip has converged.
         let mut markers = world.query_filtered::<(), With<RepositionMarker>>();
-        if markers.iter(world).next().is_some() {
-            saw_flight = true;
-        } else if saw_flight {
+        if markers.iter(world).next().is_none() && !had_echo {
             break;
         }
     }
-    assert!(
-        saw_flight,
-        "the survivors must actually have glided for the test to mean anything"
-    );
     let world = h.app.world_mut();
     let survivors = world.query::<&Window>().iter(world).count();
     assert_eq!(survivors, 4, "destroyed window must be gone");
@@ -2878,9 +2676,8 @@ fn test_os_echo_focus_reveals_without_rearranging() {
     );
 }
 
-/// A genuine slot change with a static strip must still animate each window
-/// independently: rigid riding is for strip translation only, never for
-/// topology. Guards against over-correcting the ride into teleports.
+/// A genuine slot change with a static strip re-tiles each window to its
+/// new slot immediately (snap core); the untouched window stays put.
 #[test]
 fn test_slot_change_still_animates_independently() {
     let config: Config = (
@@ -2901,32 +2698,49 @@ fn test_slot_change_still_animates_independently() {
         let mut q = world.query_filtered::<Entity, With<ActiveWorkspaceMarker>>();
         q.single(world).expect("exactly one active strip")
     };
+    let read_pos = |world: &mut World, e: Entity| world.get::<Position>(e).expect("position").0;
+    let entities: Vec<Entity> = [0, 1, 2]
+        .iter()
+        .map(|id| find_window_entity(*id, h.app.world_mut()))
+        .collect();
+    let before: Vec<Origin> = {
+        let world = h.app.world_mut();
+        entities.iter().map(|e| read_pos(world, *e)).collect()
+    };
+    assert_eq!(before[0].x, 0, "test setup: window 0 at the origin slot");
+    assert!(
+        before[1].x > before[0].x,
+        "test setup: window 1 right of window 0"
+    );
     // Pure topology: swap the first two columns without touching the strip.
     h.app
         .world_mut()
         .get_mut::<LayoutStrip>(strip)
         .expect("strip")
         .swap(0, 1);
-    pump_frame(&mut h);
+    // Settle (snap converges immediately; echoes may need a frame).
+    quiesce(&mut h);
 
     let world = h.app.world_mut();
-    assert!(
-        world.get::<RepositionMarker>(strip).is_none(),
-        "a pure slot change must not translate the strip"
-    );
     let first = find_window_entity(0, world);
     let second = find_window_entity(1, world);
     let third = find_window_entity(2, world);
-    assert!(
-        world.get::<RepositionMarker>(first).is_some(),
-        "the swapped-out window must slide independently"
+    // The swapped-in window sits where window 0 was; the swapped-out one
+    // sits in window 1's old slot; the untouched window never moves.
+    let read_x = |world: &mut World, e: Entity| world.get::<Position>(e).expect("position").0.x;
+    assert_eq!(
+        read_x(world, first),
+        before[1].x,
+        "swapped-out window lands in the swapped-in slot"
     );
-    assert!(
-        world.get::<RepositionMarker>(second).is_some(),
-        "the swapped-in window must slide independently"
+    assert_eq!(
+        read_x(world, second),
+        before[0].x,
+        "swapped-in window lands in the vacated slot"
     );
-    assert!(
-        world.get::<RepositionMarker>(third).is_none(),
+    assert_eq!(
+        read_x(world, third),
+        before[2].x,
         "the untouched window must not move at all"
     );
 }

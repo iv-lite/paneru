@@ -110,13 +110,14 @@ private func runScenario(
     daemon.activeWorkspace = workspace
     // Mirror the Rust trace harness (setup_world forces animations:false
     // so 200ms command windows assert exact rest positions): snap instead
-    // of opening 250ms eased glides the 5-tick drain could never converge.
+    // of opening eased glides the 5-tick drain could never converge.
+    // Animation pacing is internal now, so disabling the toggle is the
+    // only lever (and the only one the Rust harness has).
     // Slots abut on both sides (gaps are host-side AX insets, never slot
     // pitch), so gap-configured corpora replay with the same geometry;
     // the mock frames below stand in for padded truth with zero insets.
     // autoCenter mirrors the Rust trace config per scenario.
     daemon.animationsEnabled = false
-    daemon.glideBaseMs = 0
     daemon.autoCenter = autoCenter
     // Seed tick (uncompared): harness spawns pre-run.
     _ = daemon.tick(

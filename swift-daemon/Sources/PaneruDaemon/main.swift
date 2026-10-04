@@ -454,9 +454,6 @@ core.reapEmptyWorkspaces = resolved.reapEmptyWorkspaces
 core.virtualWorkspaceAnimations = resolved.virtualWorkspaceAnimations
 core.insertWindowsMidStrip = resolved.insertWindowsMidStrip
 core.animationsEnabled = resolved.animationsEnabled
-core.glideBaseMs = resolved.animationDurationMs
-core.glideMinMs = resolved.animationMinDurationMs
-core.glideMaxMs = resolved.animationMaxDurationMs
 nonisolated(unsafe) var apps: [pid_t: LiveApp] = [:]
 nonisolated(unsafe) var roster: [CGWindowID: LiveProviders.LiveWindow] = [:]
 /// Roster entries whose AX element died (-25202 in the write drain):
@@ -477,6 +474,10 @@ nonisolated(unsafe) var confirmedVanishes = Set<WindowID>()
 nonisolated(unsafe) var stripLessSyncs: [WindowID: Int] = [:]
 /// Syncs a window must stay strip-less before self-heal re-manages it.
 let stripLessHealSyncs = 3
+/// Sync counter gating native-tab regrouping (Rust runs it every 5s and
+/// on window-added); syncs are ~1s base cadence, so every 5th matches.
+nonisolated(unsafe) var tabRegroupCounter = 0
+let tabRegroupEverySyncs = 5
 nonisolated(unsafe) var observers: [pid_t: LiveObserver] = [:]
 nonisolated(unsafe) var pending: [DaemonEvent] = []
 /// Windows whose rules suppress focus arrival.
@@ -681,9 +682,11 @@ struct AdoptedWindow: Sendable {
             if apps[probe.ownerPID]?.focusedWindowID() == wid {
                 pending.append(.focus(id: windowID(wid)))
             }
-            // Spawn lands on its origin display's workspace (never the
-            // hardcoded ws 1): each display tiles its own strip.
-            let ws = workspaceForFrame(probe.frame)
+            // Spawn lands on the display under the cursor — the one the
+            // user is looking at — so a new app opens where attention is,
+            // not on whichever display the OS put its window. Falls back to
+            // the frame's own display when the cursor can't be read.
+            let ws = workspaceForCursor(fallback: probe.frame)
             pending.append(.appeared(id: windowID(wid), workspace: ws))
             // Native-fullscreen windows float unmanaged (never relocated);
             // rule-floating windows do the same via config.
@@ -925,7 +928,6 @@ nonisolated(unsafe) var rotatedAt: [WorkspaceID: Date] = [:]
     // fresh instead of matching the closed window's memory.
     if prevActuatedFocus == id { prevActuatedFocus = nil }
     if prevMffFocus == id { prevMffFocus = nil }
-    if lastHoverID == id { lastHoverID = nil }
     pending.append(.disappeared(id: id))
     print("window: closed \(id)")
 }
@@ -1103,6 +1105,22 @@ nonisolated(unsafe) var rotatedAt: [WorkspaceID: Date] = [:]
             stripLessSyncs.removeValue(forKey: id)
             pending.append(.appeared(id: id, workspace: ws))
             print("space: re-managed visible window \(id) on ws=\(ws)")
+        }
+    }
+    // Native-tab regrouping: fold background tabs that landed in a column
+    // of their own back into the showing column (Rust
+    // `regroup_stray_native_tabs`). Runs on a slow cadence, not every sync:
+    // the WindowServer on-screen set and frames are the only inputs, and
+    // churn is rare. A regroup re-drives layout around the leader.
+    tabRegroupCounter += 1
+    if tabRegroupCounter >= tabRegroupEverySyncs {
+        tabRegroupCounter = 0
+        let regrouped = core.regroupNativeTabs(
+            onScreen: onScreenIDs,
+            frames: { roster[CGWindowID(bitPattern: $0)]?.frame }
+        )
+        if !regrouped.isEmpty {
+            wakeTicker()
         }
     }
     // Vanish decisions that need a fresh lifecycle read run on the AX
@@ -2097,7 +2115,6 @@ core.wallClockMs = { DispatchTime.now().uptimeNanoseconds / 1_000_000 }
     core.virtualWorkspaceAnimations = resolved.virtualWorkspaceAnimations
     core.insertWindowsMidStrip = resolved.insertWindowsMidStrip
     core.animationsEnabled = resolved.animationsEnabled
-    core.glideBaseMs = resolved.animationDurationMs
     radiusRulesGen += 1
     applyWindowPadding()
     focusedStyle = makeFocusedStyle(resolved)
@@ -2598,8 +2615,6 @@ nonisolated(unsafe) var lastWarpEval = Date.distantPast
         if let hovered, hovered != core.focus {
             if hoverStripRested(hovered) {
                 hoverPendingID = nil
-                lastHoverID = hovered
-                lastHoverAt = Date()
                 pending.append(.focus(id: hovered))
             } else {
                 hoverPendingID = hovered
@@ -2612,8 +2627,6 @@ nonisolated(unsafe) var lastWarpEval = Date.distantPast
     // Still cursor: only a deferred hover retries (never a fresh decision).
     if let id = hoverPendingID, id != core.focus, hoverStripRested(id) {
         hoverPendingID = nil
-        lastHoverID = id
-        lastHoverAt = Date()
         pending.append(.focus(id: id))
     }
 }
@@ -2929,6 +2942,31 @@ nonisolated(unsafe) var frameClock = FrameClock()
     return core.activeWorkspace
 }
 
+/// Workspace whose display currently holds the cursor (the display the
+/// user is looking at). New apps open here, not on the display the OS
+/// happened to spawn their window on. Falls back to the frame's own
+/// display when the cursor cannot be read (headless, CGEvent nil) — the
+/// previous behavior — so a spawn never strands without a home.
+@Sendable func workspaceForCursor(fallback rect: IntRect) -> WorkspaceID {
+    guard let cursor = tickCursor() else { return workspaceForFrame(rect) }
+    let frames = displayScreens.map { screen in
+        IntRect(
+            min: IntPoint(
+                Int32(screen.frame.origin.x.rounded()),
+                Int32(screen.frame.origin.y.rounded())
+            ),
+            max: IntPoint(
+                Int32(screen.frame.maxX.rounded()),
+                Int32(screen.frame.maxY.rounded())
+            )
+        )
+    }
+    if let index = displayIndexForPoint(cursor, in: frames) {
+        return WorkspaceID(index + 1)
+    }
+    return workspaceForFrame(rect)
+}
+
 /// Workspace owning a window id, if it sits in any strip.
 @Sendable func workspaceOfWindow(_ id: WindowID) -> WorkspaceID? {
     for (ws, rows) in core.strips {
@@ -2964,13 +3002,6 @@ nonisolated(unsafe) var prevTickRosterSig = 0
 /// keyboard-caused and always recenter.
 nonisolated(unsafe) var lastKeyCommandAt = Date.distantPast
 nonisolated(unsafe) var prevMffFocus: WindowID?
-/// Last hover-sourced focus (id + poll time): the mouse already sits on
-/// a hovered window, so warping to it only feeds the hover/reveal/warp
-/// flap loop (warp moves the cursor, motion re-polls hover, reveal has
-/// meanwhile scrolled new glass under the point). Arrivals matching a
-/// fresh hover never warp — Rust's skip-reshuffle generation, host-side.
-nonisolated(unsafe) var lastHoverID: WindowID?
-nonisolated(unsafe) var lastHoverAt = Date.distantPast
 /// Last programmatic cursor warp (display hop or mouse-follows-focus). A
 /// warp posts a mouse-move event, so the tap sees it as motion; hover must
 /// not treat that as the user arriving on a window, or the warp → hover →
@@ -2996,12 +3027,6 @@ nonisolated(unsafe) var prevActiveWS: WorkspaceID?
 let mouseFollowPressWindow = 0.4
 let mouseFollowKeyWindow = 0.5
 let mouseFollowSwipeQuiet = 0.6
-/// Hover echoes never warp: the pointer already caused this arrival, so
-/// a warp only moves the cursor onto post-reveal glass and re-polls a
-/// new hover (the flap loop). Covers the arrival tick plus reveal
-/// settle; a later keyboard arrival for the same window still warps
-/// once the echo ages out.
-let mouseFollowHoverEcho = 1.0
 /// Last pointer-poll time: hover and edge checks run ~4Hz but only
 /// after motion, so a still cursor costs no WindowServer round trips.
 nonisolated(unsafe) var lastPointerPoll = Date.distantPast
@@ -3925,13 +3950,12 @@ nonisolated(unsafe) var statJobs = 0
             print("mouse: hop warp \(warp.x),\(warp.y)")
         }
     }
-    // Mouse-follows-focus: a focus arrival the pointer didn't cause
-    // warps to the window's center (simplified
-    // `Added<FocusedMarker>` arrival system). Hover echoes never warp —
-    // the pointer already sits on the window, and warping onto
-    // pre-reveal geometry round-trips into a new hover once reveal
-    // scrolls (the flap loop). Only keyboard and non-hover ambient
-    // arrivals warp. Display hops above land first; the window center
+    // Mouse-follows-focus: a **keyboard or explicit-raise** focus arrival
+    // warps to the window's center. Ambient arrivals (hover echoes,
+    // Cmd-Tab, app self-raise, notifications) never warp: moving the
+    // pointer on those competes with focus-follows-mouse, since the warp
+    // lands the cursor under a different window and re-triggers hover
+    // (the flap loop). Display hops above land first; the window center
     // then wins, like Rust's arrival pass running after the move
     // commands.
     // Cause comes from the core raise latch, not wall-clock: only the
@@ -3945,13 +3969,14 @@ nonisolated(unsafe) var statJobs = 0
     if resolved.mouseFollowsFocus,
        let id = result.focus, id != prevMffFocus,
        !tap.leftButtonHeld,
+       // Keyboard/raise arrivals only — ambient focus never moves the
+       // pointer (see above).
+       arriveCause == .keyboard,
        // Never warp at a window that is hidden this tick: the focus-heal
        // clears it in the same pass, so warping hover-echoes focus right
        // back onto a ghost and the clear→warp→hover→refocus loop never
        // drains. Its glass is off-screen anyway.
        !minimizedWindows.contains(id), !stashedMembers.contains(id),
-       arriveCause == .keyboard || !(id == lastHoverID
-           && Date().timeIntervalSince(lastHoverAt) < mouseFollowHoverEcho),
        Date().timeIntervalSince(tap.lastSwipe) >= mouseFollowSwipeQuiet,
        let window = roster[CGWindowID(bitPattern: id)],
        let ws = workspaceOfWindow(id),
@@ -3971,21 +3996,17 @@ nonisolated(unsafe) var statJobs = 0
                     ))
             } ?? false
         if !pressInside {
-            // Host copy of the core cause (computed above): keyboard
-            // wins over the echo veto — an explicit keyed focus wants
-            // the cursor centered even right after a hover vote.
+            // Only keyboard/raise arrivals reach here (gated above), so
+            // the cursor guards simplify away.
             let cause = arriveCause
-            // An unknown cursor still recenters for keyboard arrivals
-            // (the pure decision ignores it there); ambient ones hold.
-            let cursor = tickCursor()
             // Warp onto the committed slot (model truth), not live
             // glass: chasing unconverged frames recomputes every
             // arrival and ping-pongs the cursor between neighbors.
             let warpFrame = core.predictedFrame(
                 id, frames: { roster[CGWindowID(bitPattern: $0)]?.frame }
             ) ?? frame
-            if cause == .keyboard || cursor != nil,
-               let target = core.followWarpTarget(
+            let cursor = tickCursor()
+            if let target = core.followWarpTarget(
                    focusFrame: warpFrame, viewport: view,
                    cursor: cursor ?? IntPoint(0, 0),
                    cause: cause, enabled: true

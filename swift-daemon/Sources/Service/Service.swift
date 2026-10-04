@@ -7,8 +7,9 @@ import Foundation
 
 // MARK: - Identity
 
-/// Launchd job label. Mirrors `platform::service::ID`.
-public let paneruServiceID = "com.github.karinushka.paneru"
+/// Launchd job label. The shipped Swift daemon's identity (matches
+/// `IPC.paneruServiceName` and `install-service.sh`'s label).
+public let paneruServiceID = "com.github.iv-lite.paneru-swift"
 
 // MARK: - Paths
 

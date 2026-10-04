@@ -1196,9 +1196,10 @@ do {
     checkEqual(daemon.takeMouseWarp(), nil, "lone hops warp nothing")
 }
 
-// Mouse-follow decision is pure: keyboard arrivals always recenter on
-// the full-frame center, ambient ones hold when the cursor is already
-// inside, and slivers/off-screen frames never warp.
+// Mouse-follow decision is pure: only **keyboard** arrivals recenter on
+// the full-frame center; ambient arrivals never move the cursor (they
+// would compete with focus-follows-mouse); slivers/off-screen frames
+// never warp.
 do {
     let daemon = DaemonCore()
     let view = IntRect(0, 0, 1024, 768)
@@ -1206,7 +1207,7 @@ do {
     checkEqual(
         daemon.followWarpTarget(
             focusFrame: frame, viewport: view, cursor: IntPoint(0, 0),
-            cause: .ambient, enabled: false
+            cause: .keyboard, enabled: false
         ), nil, "follow off warps nothing"
     )
     checkEqual(
@@ -1219,7 +1220,7 @@ do {
         daemon.followWarpTarget(
             focusFrame: frame, viewport: view, cursor: IntPoint(200, 200),
             cause: .ambient, enabled: true
-        ), nil, "ambient holds when the cursor is inside"
+        ), nil, "ambient never warps (inside)"
     )
     checkEqual(
         daemon.followWarpTarget(
@@ -1231,12 +1232,18 @@ do {
         daemon.followWarpTarget(
             focusFrame: frame, viewport: view, cursor: IntPoint(900, 700),
             cause: .ambient, enabled: true
-        ), IntPoint(300, 300), "outside cursor warps to the window center"
+        ), nil, "ambient never warps (outside cursor)"
+    )
+    checkEqual(
+        daemon.followWarpTarget(
+            focusFrame: frame, viewport: view, cursor: IntPoint(900, 700),
+            cause: .keyboard, enabled: true
+        ), IntPoint(300, 300), "keyboard warps to the window center (outside cursor)"
     )
     checkEqual(
         daemon.followWarpTarget(
             focusFrame: IntRect(900, 100, 1200, 500), viewport: view,
-            cursor: IntPoint(0, 0), cause: .ambient, enabled: true
+            cursor: IntPoint(0, 0), cause: .keyboard, enabled: true
         ), IntPoint(1050, 300), "half-hung windows warp to the frame center"
     )
     checkEqual(
@@ -5940,6 +5947,98 @@ do {
     check(good.exact && !good.breathed, "size-first keeps the glass gap exact")
     let bad = run(sizeFirst: false)
     check(bad.breathed, "position-first breathes the glass gap (the bug)")
+}
+
+// Native-tab regrouping folds a stray background tab into the showing
+// column: two same-app windows sharing a frame collapse into one `.tabs`
+// column (Rust `regroup_stray_native_tabs`). Without this the background
+// tab holds a column of its own and focus-reveal scrolls to a slot that
+// can never show anything.
+do {
+    var daemon = DaemonCore()
+    daemon.animationsEnabled = false
+    let sameFrame: (Int32) -> IntRect? = { _ in
+        IntRect(min: IntPoint(0, 0), max: IntPoint(400, 700))
+    }
+    _ = daemon.tick(
+        events: [.appeared(id: 0, workspace: 1), .appeared(id: 1, workspace: 1)],
+        frames: sameFrame, viewport: viewport, focusedStyle: style
+    )
+    daemon.windowMetadata[0] = WindowMetadata(bundleID: "com.example.app")
+    daemon.windowMetadata[1] = WindowMetadata(bundleID: "com.example.app")
+    // Window 1 is off-screen (background tab); window 0 shows the column.
+    let regrouped = daemon.regroupNativeTabs(onScreen: [0], frames: sameFrame)
+    checkEqual(regrouped, [1], "background tab folded into the showing column")
+    let columns = daemon.strips[1]?[0]?.columns ?? []
+    checkEqual(columns.count, 1, "tab siblings share one column")
+    if case .tabs(let tabs) = columns.first {
+        checkEqual(Set(tabs), Set([0, 1]), "tab group holds both windows")
+    } else {
+        check(false, "expected a tabs column, got \(columns)")
+    }
+    check(
+        daemon.strips[1]?[0]?.tabbed(1) == true,
+        "follower reports tabbed"
+    )
+}
+
+// A tabbed member is never the reveal target: focusing a background tab
+// must not scroll the strip (the group's column is already showing).
+do {
+    var daemon = DaemonCore()
+    daemon.animationsEnabled = false
+    daemon.autoCenter = true
+    let sameFrame: (Int32) -> IntRect? = { _ in
+        IntRect(min: IntPoint(24, 0), max: IntPoint(424, 700))
+    }
+    _ = daemon.tick(
+        events: [.appeared(id: 0, workspace: 1), .appeared(id: 1, workspace: 1)],
+        frames: sameFrame, viewport: viewport, focusedStyle: style
+    )
+    // Seed a wide strip on the right so a stray reveal would scroll.
+    _ = daemon.tick(
+        events: [.appeared(id: 2, workspace: 1)],
+        frames: { id in
+            let origin = id == 2 ? IntPoint(900, 0) : IntPoint(24, 0)
+            return IntRect(min: origin, max: IntPoint(origin.x + 400, origin.y + 700))
+        },
+        viewport: viewport, focusedStyle: style
+    )
+    daemon.windowMetadata[0] = WindowMetadata(bundleID: "com.example.app")
+    daemon.windowMetadata[1] = WindowMetadata(bundleID: "com.example.app")
+    _ = daemon.regroupNativeTabs(onScreen: [0], frames: { id in
+        let origin = id == 2 ? IntPoint(900, 0) : IntPoint(24, 0)
+        return IntRect(min: origin, max: IntPoint(origin.x + 400, origin.y + 700))
+    })
+    let before = daemon.offsetTarget(for: 1) ?? daemon.offset(for: 1)
+    _ = daemon.tick(
+        events: [.focusKeyed(id: 1)], frames: { id in
+            let origin = id == 2 ? IntPoint(900, 0) : IntPoint(24, 0)
+            return IntRect(min: origin, max: IntPoint(origin.x + 400, origin.y + 700))
+        },
+        viewport: viewport, focusedStyle: style
+    )
+    let after = daemon.offsetTarget(for: 1) ?? daemon.offset(for: 1)
+    checkEqual(after, before, "focusing a tabbed sibling does not scroll the strip")
+}
+
+// A genuinely new window activates the display it lands on.
+do {
+    var daemon = DaemonCore()
+    daemon.animationsEnabled = false
+    _ = daemon.tick(
+        events: [.appeared(id: 0, workspace: 1)],
+        frames: frames(slots: [0: IntPoint(0, 34)]),
+        viewport: viewport, focusedStyle: style
+    )
+    checkEqual(daemon.activeWorkspace, 1, "first spawn keeps workspace 1 active")
+    // Fresh spawn on workspace 2 activates it.
+    _ = daemon.tick(
+        events: [.appeared(id: 1, workspace: 2)],
+        frames: frames(slots: [0: IntPoint(0, 34), 1: IntPoint(0, 34)]),
+        viewport: viewport, focusedStyle: style
+    )
+    checkEqual(daemon.activeWorkspace, 2, "new window activates its display's workspace")
 }
 
 if failures == 0 {

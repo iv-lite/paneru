@@ -46,7 +46,6 @@ use crate::overlay::{FlashMessageManager, OverlayManager};
 use crate::platform::{Modifiers, PlatformCallbacks, WinID, WorkspaceId};
 use crate::snapshot::SnapshotStore;
 
-pub mod animation;
 pub mod display;
 pub mod focus;
 pub mod handoff;
@@ -236,7 +235,6 @@ pub fn register_systems(app: &mut bevy::app::App) {
     app.init_resource::<crate::ecs::PendingValidations>();
     app.init_resource::<crate::ecs::UserFocus>();
     app.init_resource::<crate::ecs::LastPress>();
-    app.init_resource::<crate::ecs::BurstClock>();
     app.init_resource::<crate::ecs::DisplayGeneration>();
     app.init_resource::<crate::ecs::VSyncPhase>();
     app.init_resource::<crate::ax_writer::AxWriteState>();
@@ -427,7 +425,6 @@ pub type AnyWindowInFlight = (
         With<RepositionMarker>,
         With<ResizeMarker>,
         With<PositionDrive>,
-        With<SizeDrive>,
     )>,
 );
 
@@ -479,15 +476,10 @@ pub struct ResendMarker;
 /// by `drop_orphan_drives`.
 #[derive(Component, Debug)]
 pub struct PositionDrive {
-    pub start: Origin,
-    pub target: Origin,
-    pub started: Duration,
-    pub duration: Duration,
     pub phase: DrivePhase,
 }
 
-/// Confirmation phase of a [`PositionDrive`] (mirrored for sizes by removal:
-/// resizes carry no confirm step, so [`SizeDrive`] has no phase).
+/// Confirmation phase of a [`PositionDrive`].
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum DrivePhase {
     /// Gliding toward `target`; owned by the animator.
@@ -501,25 +493,11 @@ pub enum DrivePhase {
 pub const DRIVE_VERIFY_RETRIES: u8 = 3;
 
 impl PositionDrive {
-    /// Fresh leg: glides `start -> target` on the shared burst phase.
-    pub fn animating(start: Origin, target: Origin, started: Duration, duration: Duration) -> Self {
-        Self {
-            start,
-            target,
-            started,
-            duration,
-            phase: DrivePhase::Animating,
-        }
-    }
-
-    /// Pure confirmation leg (no glide): for moves completed without the
-    /// animator (rigid rides, snap assigns, release backstops).
+    /// Pure confirmation leg (no glide): the snap animator assigns the
+    /// target immediately and hands off here so the commit's AX push gets
+    /// confirmed. Glide timing belongs to the Swift daemon.
     pub fn verifying() -> Self {
         Self {
-            start: Origin::ZERO,
-            target: Origin::ZERO,
-            started: Duration::ZERO,
-            duration: Duration::ZERO,
             phase: DrivePhase::Verifying {
                 remaining: DRIVE_VERIFY_RETRIES,
             },
@@ -540,41 +518,6 @@ impl PositionDrive {
             DrivePhase::Animating => false,
         }
     }
-}
-
-/// In-flight tween state for a driven resize. Mirrors [`PositionDrive`]'s
-/// leg without the confirm phase (sizes are confirmed by the resize
-/// verifier trigger instead).
-#[derive(Component, Debug)]
-pub struct SizeDrive {
-    pub start: Size,
-    pub target: Size,
-    pub started: Duration,
-    pub duration: Duration,
-}
-
-/// Shared birth-phase stamp for tween legs (see
-/// [`animation::BURST_JOIN_WINDOW`]): the virtual timestamp at which the
-/// current motion burst opened. Legs born while the burst is young adopt it
-/// so strips, windows and resizes share phase; late births open a fresh
-/// burst instead. Written only by the animator, which owns every leg birth —
-/// see `animate_entities` / `animate_resize_entities`.
-///
-/// `deadline` is the opening leg's landing time: joiners stretch their own
-/// proportional duration to it (see [`animation::join_duration`]) so co-born
-/// legs share pacing as well as phase — siblings on different easing curves
-/// overtake mid-glide, which reads as windows colliding instead of moving
-/// together. Never shortens a leg, so huge late moves keep full glides.
-///
-/// Global rather than per-strip: windows parent to applications, not strips,
-/// so per-strip scoping would need a containment walk per birth in the hot
-/// loop. Co-born legs share phase either way (which is the lockstep that
-/// matters); the worst cross-talk is an unrelated leg adopting a stamp up
-/// to 50ms old, i.e. a slightly shorter glide, never a delay.
-#[derive(Resource, Debug, Default)]
-pub struct BurstClock {
-    pub opened: Option<Duration>,
-    pub deadline: Option<Duration>,
 }
 
 /// Marker component indicating that windows around the marked entity need to be reshuffled.

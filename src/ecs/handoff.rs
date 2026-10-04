@@ -384,7 +384,7 @@ mod tests {
             |_| None,
             |_| false,
         );
-        assert!(stale.workspaces[0].rows[0].columns.is_empty());
+        assert_eq!(stale.workspaces[0].rows[0].columns.len(), 0);
         assert_eq!(stale.focus, None);
         assert_eq!(stale.active_workspace, 9);
         // JSON stability: the flip reads this across processes.

@@ -23,10 +23,10 @@ private func checkEqual<T: Equatable>(_ a: T, _ b: T, _ message: String) {
 do {
     checkEqual(
         launchAgentPlistPath(home: "/Users/test"),
-        "/Users/test/Library/LaunchAgents/com.github.karinushka.paneru.plist",
+        "/Users/test/Library/LaunchAgents/com.github.iv-lite.paneru-swift.plist",
         "canonical plist path"
     )
-    checkEqual(serviceTarget(uid: 501), "gui/501/com.github.karinushka.paneru", "service target")
+    checkEqual(serviceTarget(uid: 501), "gui/501/com.github.iv-lite.paneru-swift", "service target")
     checkEqual(domainTarget(uid: 501), "gui/501", "domain target")
 }
 
@@ -41,7 +41,7 @@ do {
     )
     let plist = launchAgentPlist(spec)
     for key in [
-        "<key>Label</key>", "<string>com.github.karinushka.paneru</string>",
+        "<key>Label</key>", "<string>com.github.iv-lite.paneru-swift</string>",
         "<key>MachServices</key>", "<key>Program</key>",
         "<string>/Users/test/.local/bin/paneru</string>",
         "<key>EnvironmentVariables</key>", "<key>NO_COLOR</key>",
@@ -85,24 +85,24 @@ do {
 do {
     checkEqual(
         startCommands(
-            serviceTarget: "gui/501/com.github.karinushka.paneru",
+            serviceTarget: "gui/501/com.github.iv-lite.paneru-swift",
             domainTarget: "gui/501",
-            plistPath: "/Users/test/Library/LaunchAgents/com.github.karinushka.paneru.plist",
+            plistPath: "/Users/test/Library/LaunchAgents/com.github.iv-lite.paneru-swift.plist",
             bootstrapped: true
         ),
-        [["kickstart", "gui/501/com.github.karinushka.paneru"]],
+        [["kickstart", "gui/501/com.github.iv-lite.paneru-swift"]],
         "bootstrapped kickstarts"
     )
     checkEqual(
         startCommands(
-            serviceTarget: "gui/501/com.github.karinushka.paneru",
+            serviceTarget: "gui/501/com.github.iv-lite.paneru-swift",
             domainTarget: "gui/501",
-            plistPath: "/Users/test/Library/LaunchAgents/com.github.karinushka.paneru.plist",
+            plistPath: "/Users/test/Library/LaunchAgents/com.github.iv-lite.paneru-swift.plist",
             bootstrapped: false
         ),
         [
-            ["enable", "gui/501/com.github.karinushka.paneru"],
-            ["bootstrap", "gui/501", "/Users/test/Library/LaunchAgents/com.github.karinushka.paneru.plist"],
+            ["enable", "gui/501/com.github.iv-lite.paneru-swift"],
+            ["bootstrap", "gui/501", "/Users/test/Library/LaunchAgents/com.github.iv-lite.paneru-swift.plist"],
         ],
         "fresh service enables and bootstraps"
     )

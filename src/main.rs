@@ -52,43 +52,25 @@ use crate::menubar::MenuBarManager;
 use crate::platform::PlatformCallbacks;
 use accessibility_prompt::{AccessibilitySetupAction, show_accessibility_setup};
 
-/// Selects the daemon implementation, mirroring `PANERU_SWIFT_OVERLAY=0`.
-///
-/// Unset (or `0`) runs the Rust core. `1` flips authority to the Swift
-/// daemon and `shadow` runs both side by side on live events, logging
-/// snapshot diffs. Neither mode exists yet — the Swift core proves itself
-/// frame by frame under the parity gate first — so requesting one is a
-/// loud startup error rather than a silent fallback to Rust truth.
+/// The Swift daemon is the shipped/running daemon (`swift-daemon/`, product
+/// `paneru-swift`, installed via `install-service.sh`). This env var is a
+/// legacy-footgun guard: a user setting `PANERU_SWIFT_DAEMON` on the Rust
+/// binary gets a pointer to the shipped binary instead of silently running
+/// the legacy Rust core.
 const SWIFT_DAEMON_ENV: &str = "PANERU_SWIFT_DAEMON";
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-#[allow(
-    dead_code,
-    reason = "Swift/Shadow have no producer yet; the enum documents the cutover target states"
-)]
-enum DaemonCore {
-    Rust,
-    Swift,
-    Shadow,
+fn check_swift_daemon_requested() -> Result<()> {
+    parse_swift_daemon_mode(&std::env::var(SWIFT_DAEMON_ENV).unwrap_or_default())
 }
 
-fn daemon_core() -> Result<DaemonCore> {
-    parse_daemon_core(&std::env::var(SWIFT_DAEMON_ENV).unwrap_or_default())
-}
-
-fn parse_daemon_core(mode: &str) -> Result<DaemonCore> {
+fn parse_swift_daemon_mode(mode: &str) -> Result<()> {
     match mode.trim() {
-        "" | "0" => Ok(DaemonCore::Rust),
-        "1" => Err(crate::errors::Error::InvalidConfig(format!(
-            "{SWIFT_DAEMON_ENV}=1 requests the Swift daemon, which is not \
-             shipped yet (parity gate still red); unset it to run the Rust core"
-        ))),
-        "shadow" => Err(crate::errors::Error::InvalidConfig(format!(
-            "{SWIFT_DAEMON_ENV}=shadow needs the live dual-runner, which is \
-             not wired yet; unset it to run the Rust core"
-        ))),
-        other => Err(crate::errors::Error::InvalidConfig(format!(
-            "{SWIFT_DAEMON_ENV}={other:?}: expected 0, 1, or shadow"
+        "" | "0" => Ok(()),
+        mode => Err(crate::errors::Error::InvalidConfig(format!(
+            "{SWIFT_DAEMON_ENV}={mode:?} requests the Swift daemon; this is the \
+             legacy Rust core. Run the shipped daemon instead: \
+             `swift-daemon/install-service.sh install` (binary `~/bin/paneru-swift`), \
+             then start the service"
         ))),
     }
 }
@@ -99,20 +81,17 @@ mod daemon_core_tests {
 
     #[test]
     fn unset_or_zero_runs_rust() {
-        assert_eq!(parse_daemon_core("").expect("unset"), DaemonCore::Rust);
-        assert_eq!(parse_daemon_core("0").expect("zero"), DaemonCore::Rust);
-        assert_eq!(
-            parse_daemon_core(" 0 ").expect("whitespace"),
-            DaemonCore::Rust
-        );
+        assert!(parse_swift_daemon_mode("").is_ok());
+        assert!(parse_swift_daemon_mode("0").is_ok());
+        assert!(parse_swift_daemon_mode(" 0 ").is_ok());
     }
 
     #[test]
-    fn unshipped_modes_fail_loudly() {
+    fn swift_modes_point_to_the_shipped_binary() {
         for mode in ["1", "shadow", "swift", "2"] {
             assert!(
-                parse_daemon_core(mode).is_err(),
-                "{mode} must not silently run Rust"
+                parse_swift_daemon_mode(mode).is_err(),
+                "{mode} must not silently run the legacy Rust core"
             );
         }
     }
@@ -286,8 +265,9 @@ fn main() -> Result<()> {
 
     match subcmd {
         SubCmd::Launch => {
-            // Cutover gate: only the Rust core ships today.
-            daemon_core()?;
+            // Legacy-core gate: the shipped daemon is `paneru-swift`; this
+            // only guards a mis-set env var from silently running Rust.
+            check_swift_daemon_requested()?;
             let (sender, receiver) = EventSender::new();
             let sender_c = sender.clone();
             // bevy's `TerminalCtrlCHandlerPlugin` was not fast enough. maybe because of its use of `Relaxed` atomic variable?

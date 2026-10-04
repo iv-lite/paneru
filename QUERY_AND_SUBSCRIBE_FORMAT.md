@@ -1,7 +1,8 @@
 # Query and Subscribe Format
 
-Paneru exposes structured state over the same IPC channel used by `send-cmd`:
-a Mach service named `com.github.karinushka.paneru`. The CLI commands below
+Paneru exposes structured state over the same IPC channel used by
+`send-cmd` (legacy Rust daemon) and `pq` (shipped Swift daemon): a Mach
+service named `com.github.iv-lite.paneru-swift`. The CLI commands below
 require a running Paneru daemon.
 
 **The JSON below is what the CLI prints, not what crosses between processes.**

@@ -59,7 +59,7 @@ do {
     checkEqual(c.restoreMissingWindows, .ignore, "missing windows ignored")
     checkEqual(c.presetColumnWidths, [0.25, 0.33333, 0.50, 0.66667, 0.75, 1.0, 1.5, 2.0], "column presets")
     checkEqual(c.presetStackHeights, [0.25, 0.33333, 0.50, 0.66667, 0.75], "stack presets")
-    checkEqual(c.animationDurationMs, 180, "animation default")
+    check(c.animationsEnabled, "animations on by default")
 }
 
 // Clamps mirror the getters.
@@ -88,17 +88,12 @@ do {
     checkEqual(c.defaultWorkspaces, 1, "workspaces floor at 1")
 }
 
-// animations = false snaps instantly regardless of duration.
+// animations = false snaps instantly (duration is internal now).
 do {
     var o = DaemonOptions()
     o.animations = false
-    o.animationDurationMs = 500
     let c = o.resolved()
     check(!c.animationsEnabled, "animations off")
-    checkEqual(c.animationDurationMs, 0, "off snaps instantly")
-    var o2 = DaemonOptions()
-    o2.animationDurationMs = 5000
-    checkEqual(o2.resolved().animationDurationMs, 2000, "duration clamps at 2000")
 }
 
 // Dim activates on color; opacity composes with alpha.
@@ -278,23 +273,16 @@ do {
     checkEqual(clamped.swipeSensitivity, 2.0, "sensitivity clamps high")
     checkEqual(clamped.gapHorizontal, 50, "gaps clamp to maxGapPx")
     checkEqual(clamped.menubarFontSize, 24.0, "font clamps to 24")
-    // Animations tri-state: false kills, true enables without resetting
-    // an existing duration, duration alone only retunes.
+    // Animations is a plain toggle: false disables, true enables.
     var anim = ResolvedConfig()
     var off = DaemonOptions()
     off.animations = false
     off.apply(to: &anim)
     checkEqual(anim.animationsEnabled, false, "false disables")
-    checkEqual(anim.animationDurationMs, 0, "false zeroes duration")
     var on = DaemonOptions()
     on.animations = true
     on.apply(to: &anim)
     checkEqual(anim.animationsEnabled, true, "true re-enables")
-    checkEqual(anim.animationDurationMs, 0, "true alone keeps duration")
-    var retune = DaemonOptions()
-    retune.animationDurationMs = 100
-    retune.apply(to: &anim)
-    checkEqual(anim.animationDurationMs, 100, "duration alone retunes")
     // Dim stays gated on color presence.
     var dim = ResolvedConfig()
     var opacityOnly = DaemonOptions()
@@ -459,7 +447,7 @@ do {
     let root: [String: ScriptValue] = [
         "options": .map([
             "focus_follows_mouse": .bool(true),
-            "animation_duration_ms": .int(100),
+            "animations": .bool(false),
             "preset_column_widths": .list([.float(0.3), .int(1)]),
         ]),
         "padding": .map(["top": .int(8)]),
@@ -500,7 +488,7 @@ do {
     var resolved = ResolvedConfig()
     doc.options.apply(to: &resolved)
     checkEqual(resolved.focusFollowsMouse, true, "setup options apply")
-    checkEqual(resolved.animationDurationMs, 100, "setup ints apply")
+    checkEqual(resolved.animationsEnabled, false, "setup animation toggle applies")
     checkEqual(resolved.presetColumnWidths, [0.3, 1.0], "setup lists apply")
     checkEqual(resolved.paddingTop, 8, "setup padding applies")
     checkEqual(resolved.swipeSensitivity, 0.5, "setup swipe applies")

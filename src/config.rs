@@ -385,21 +385,6 @@ impl Config {
         self.inner().options.clone()
     }
 
-    // Tween length for driven moves: `animation_duration_ms` when set
-    // (clamped to a sane range), else the 250ms default. `animations =
-    // false` snaps instantly (zero duration).
-    pub fn animation_duration(&self) -> std::time::Duration {
-        if self.options().animations == Some(false) {
-            return std::time::Duration::ZERO;
-        }
-        let ms = self
-            .options()
-            .animation_duration_ms
-            .unwrap_or(crate::ecs::animation::DEFAULT_ANIMATION_DURATION_MS)
-            .clamp(0, 2000);
-        std::time::Duration::from_millis(ms)
-    }
-
     /// Finds a keybinding matching the given `keycode` and `modifier` mask.
     ///
     /// # Arguments
@@ -929,6 +914,14 @@ impl Config {
             .is_some_and(|enabled| enabled)
     }
 
+    /// Master animation toggle. Off snaps every driven move instantly. The
+    /// Rust daemon is legacy — glide timing now lives in `swift-daemon/` —
+    /// but this still gates the strip-offset tween so the switch stays
+    /// meaningful here.
+    pub fn animations(&self) -> bool {
+        self.options().animations.is_none_or(|enabled| enabled)
+    }
+
     /// Moves AX position commits onto a dedicated writer thread (per-window
     /// latest coalescing) instead of blocking the main thread per animation
     /// frame. Default-on: the synchronous path remains for dance apps,
@@ -1327,12 +1320,8 @@ pub struct MainOptions {
     #[serde(default = "default_preset_stack_heights")]
     pub preset_stack_heights: Vec<f64>,
     /// Whether driven window moves glide (`true`, default) or snap
-    /// instantly (`false`). Glide length is `animation_duration_ms`.
+    /// instantly (`false`). Glide timing is internal.
     pub animations: Option<bool>,
-    /// Tween length for driven moves in milliseconds. See
-    /// [`Config::animation_duration`]: clamped 0–2000, default 250.
-    /// `animations = false` still snaps instantly regardless.
-    pub animation_duration_ms: Option<u64>,
     /// Automatically center the window when switching focus with keyboard.
     pub auto_center: Option<bool>,
     /// Automatically center a lone column: when a strip holds exactly one
@@ -2355,31 +2344,6 @@ fn test_default_workspaces() {
     // Zero is clamped up to 1 (the physical space always exists).
     let config = Config::try_from(&*format!("default_workspaces = 0\n{base}")).unwrap();
     assert_eq!(config.default_workspaces(), 1);
-}
-
-#[test]
-fn test_animation_duration_knob() {
-    use std::time::Duration;
-
-    let base = "[bindings]\n";
-    let with_options = |keys: &str| format!("{base}[options]\n{keys}");
-    // Unset: the visible default glide.
-    let config = Config::try_from(&*with_options("")).unwrap();
-    assert_eq!(
-        config.animation_duration(),
-        Duration::from_millis(crate::ecs::animation::DEFAULT_ANIMATION_DURATION_MS)
-    );
-    // Explicit value, clamped 0..=2000.
-    let config = Config::try_from(&*with_options("animation_duration_ms = 400\n")).unwrap();
-    assert_eq!(config.animation_duration(), Duration::from_millis(400));
-    let config = Config::try_from(&*with_options("animation_duration_ms = 5000\n")).unwrap();
-    assert_eq!(config.animation_duration(), Duration::from_millis(2000));
-    // Master switch still snaps.
-    let config = Config::try_from(&*with_options(
-        "animations = false\nanimation_duration_ms = 400\n",
-    ))
-    .unwrap();
-    assert_eq!(config.animation_duration(), Duration::ZERO);
 }
 
 #[test]

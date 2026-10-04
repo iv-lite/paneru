@@ -102,9 +102,8 @@ type ResizableWindows<'w, 's> = Populated<
     Without<LayoutStrip>,
 >;
 
-/// Windows as the tweened position animator sees them: the presented frame
-/// to advance, the intent to converge on, whether it paints, and the lazily
-/// seeded leg state (retargeted, never restarted, when the intent moves).
+/// Windows as the position animator sees them: the presented frame to
+/// assign, the intent to converge on, and whether it paints.
 type TweenedPositions<'w, 's> = Populated<
     'w,
     's,
@@ -113,22 +112,12 @@ type TweenedPositions<'w, 's> = Populated<
         Entity,
         &'static RepositionMarker,
         Has<Window>,
-        Option<&'static mut crate::ecs::PositionDrive>,
     ),
 >;
 
-/// Windows as the tweened resize animator sees them. Mirrors
-/// [`TweenedPositions`] for sizes.
-type TweenedSizes<'w, 's> = Populated<
-    'w,
-    's,
-    (
-        &'static mut Bounds,
-        Entity,
-        &'static ResizeMarker,
-        Option<&'static mut crate::ecs::SizeDrive>,
-    ),
->;
+/// Windows as the resize animator sees them. Mirrors [`TweenedPositions`]
+/// for sizes.
+type TweenedSizes<'w, 's> = Populated<'w, 's, (&'static mut Bounds, Entity, &'static ResizeMarker)>;
 
 /// Windows as the commit sees them: changed frames plus dropped-write
 /// resends awaiting another attempt.
@@ -1301,8 +1290,6 @@ pub(super) fn settle_orphan_drives(
         (Entity, &mut crate::ecs::PositionDrive),
         Without<RepositionMarker>,
     >,
-    orphaned_sizes: Populated<Entity, (With<crate::ecs::SizeDrive>, Without<ResizeMarker>)>,
-    mut commands: Commands,
 ) {
     for (_entity, mut drive) in orphaned_positions {
         if drive.is_verifying() {
@@ -1311,11 +1298,6 @@ pub(super) fn settle_orphan_drives(
         drive.phase = crate::ecs::DrivePhase::Verifying {
             remaining: crate::ecs::DRIVE_VERIFY_RETRIES,
         };
-    }
-    for entity in orphaned_sizes {
-        if let Ok(mut entity_commands) = commands.get_entity(entity) {
-            entity_commands.try_remove::<crate::ecs::SizeDrive>();
-        }
     }
 }
 
@@ -1357,166 +1339,35 @@ fn seam_snap_target(current: Origin, target: Origin, displays: &[IRect]) -> Opti
 pub(crate) fn animate_entities(
     animate: TweenedPositions,
     displays: Query<&Display>,
-    time: Res<Time>,
-    config: Res<Config>,
-    phase: Option<Res<crate::ecs::VSyncPhase>>,
-    mut bursts: ResMut<crate::ecs::BurstClock>,
     mut commands: Commands,
 ) {
-    use crate::ecs::animation::{
-        FIRST_TICK_WINDOW, birth_phase, eased_factor, join_duration, kick_start, nudge_landing,
-        proportional_duration, retarget_duration, should_carry_phase, tween_finished, tween_ivec2,
-    };
-
-    // Time-based tween on a shared burst phase: progress derives from the
-    // virtual clock, and legs born into the same young burst share one
-    // `started` stamp — strips, windows and resizes move in lockstep even
-    // when their markers land on adjacent ticks. A stall advances progress
-    // (correct) instead of teleporting (the old uncapped-exponential
-    // failure mode), and the border rides the presented frame. The ease is
-    // ease-out cubic (fast attack, decelerating landing) with a 1px landing
-    // nudge so the tail commits instead of rounding to dead frames.
-    //
-    // Phase prediction: shift `now` forward by the pump's vsync lead so the
-    // committed frame is the retrace-time pose, not one frame stale. The
-    // AX write lands a frame late; without this the glass chases the
-    // tween and the border (painted now) leads it. Bounded to ~50ms by
-    // `VSyncPhase::prediction`; zero without a link, so headless/tests
-    // behave exactly as before.
-    let prediction = phase
-        .as_deref()
-        .map_or(Duration::ZERO, crate::ecs::VSyncPhase::prediction);
-    let now = time.elapsed() + prediction;
-    let base = config.animation_duration();
-    // Seam bounds only matter to windows (strip offsets routinely go
-    // negative without crossing a seam): collect lazily on the first
-    // window so strip-only ticks skip the per-tick allocation entirely.
+    // Rust is the legacy daemon; glide timing belongs to the Swift port
+    // (`swift-daemon/`), which owns the clock for movement, resize, and
+    // translation. Here driven moves snap straight to their target and hand
+    // the marker to the verifier, so the commit's AX push still confirms the
+    // landed pose. Seam crossings snap too: a move spanning two displays
+    // must never paint next door mid-flight.
     let mut display_bounds: Option<Vec<IRect>> = None;
 
-    for (mut position, entity, RepositionMarker(origin), is_window, drive) in animate {
-        // Seam-snapping applies to windows, which paint: a strip
-        // scroll offset is not a frame, so strips always tween (a
-        // negative scroll target is routine, not a seam crossing).
-        // Snapped jumps still verify: the OS must actually land there.
+    for (mut position, entity, RepositionMarker(origin), is_window) in animate {
         if is_window {
             let bounds = display_bounds
                 .get_or_insert_with(|| displays.iter().map(Display::bounds).collect());
             if let Some(snapped) = seam_snap_target(position.0, *origin, bounds) {
                 trace!("entity {entity} seam-snapping to {snapped}");
                 position.0 = snapped;
-                if let Ok(mut entity_commands) = commands.get_entity(entity) {
-                    entity_commands.try_remove::<RepositionMarker>();
-                    entity_commands.try_insert(crate::ecs::PositionDrive::verifying());
-                }
-                continue;
-            }
-        }
-        if base.is_zero() {
-            position.0 = *origin;
-            if let Ok(mut entity_commands) = commands.get_entity(entity) {
-                entity_commands.try_remove::<RepositionMarker>();
-                entity_commands.try_insert(crate::ecs::PositionDrive::verifying());
-            }
-            continue;
-        }
-        // Lazily seed the leg, or retarget when the intent moved under us.
-        // Births join the burst phase while it is young (lockstep) with a
-        // distance-proportional duration so ultrawide traverses get more
-        // time than short nudges without stretching into a slow pan;
-        // retargets carry phase only across a live leg with small drift
-        // (see `should_carry_phase`) so easing bends instead of restarting
-        // at zero velocity every tick — and start over on genuine jumps,
-        // which deserve the full glide. Any retarget resumes driving, even
-        // if the old leg had already entered verifying.
-        let (start, started, duration) = match drive {
-            Some(drive) if drive.target == *origin => (drive.start, drive.started, drive.duration),
-            Some(mut drive) => {
-                let remaining = (origin.as_vec2() - position.0.as_vec2()).length();
-                let total = (origin.as_vec2() - drive.start.as_vec2())
-                    .length()
-                    .max(remaining);
-                // Rejoin the burst deadline like births: a retarget on its
-                // own shortened curve overtakes siblings still on the shared
-                // pace. Never shortens — the join only stretches.
-                let duration = join_duration(
-                    retarget_duration(remaining, total, base),
-                    now,
-                    bursts.deadline,
-                );
-                let drift = (origin.as_vec2() - drive.target.as_vec2()).length();
-                let elapsed = now.saturating_sub(drive.started);
-                let live = drive.phase == crate::ecs::DrivePhase::Animating;
-                let carry = live && should_carry_phase(elapsed, drive.duration, drift);
-                if carry {
-                    trace!("entity {entity} retarget carry drift {drift:.1}px");
-                } else {
-                    trace!("entity {entity} retarget restart drift {drift:.1}px");
-                }
-                let prior = if carry {
-                    (elapsed.as_secs_f32() / drive.duration.as_secs_f32().max(f32::EPSILON))
-                        .clamp(0.0, 1.0)
-                } else {
-                    0.0
-                };
-                let started = now
-                    .checked_sub(Duration::from_secs_f32(prior * duration.as_secs_f32()))
-                    .unwrap_or(now);
-                drive.start = position.0;
-                drive.target = *origin;
-                drive.started = started;
-                drive.duration = duration;
-                drive.phase = crate::ecs::DrivePhase::Animating;
-                (drive.start, drive.started, drive.duration)
-            }
-            None => {
-                let (started, opened) = birth_phase(now, bursts.opened);
-                let travel = (origin.as_vec2() - position.0.as_vec2()).length();
-                let duration =
-                    join_duration(proportional_duration(travel, base), now, bursts.deadline);
-                if opened {
-                    bursts.opened = Some(now);
-                    bursts.deadline = Some(started + duration);
-                }
-                if let Ok(mut entity_commands) = commands.get_entity(entity) {
-                    entity_commands.try_insert(crate::ecs::PositionDrive::animating(
-                        position.0, *origin, started, duration,
-                    ));
-                }
-                (position.0, started, duration)
-            }
-        };
-        let elapsed = now.saturating_sub(started);
-        let t = eased_factor(elapsed, duration);
-        let mut new_pos = tween_ivec2(start, *origin, t);
-        let finished = tween_finished(elapsed, duration);
-        if !finished && new_pos == position.0 && position.0 != *origin {
-            if elapsed <= FIRST_TICK_WINDOW {
-                // Fresh leg rounding to a standstill: guarantee visible motion
-                // so the first animated tick always commits (no dead frames).
-                // Bounded to 2px per axis, one-directional, never overshoots.
-                new_pos = kick_start(position.0, *origin);
             } else {
-                // Tail rounding to a standstill: nudge 1px toward the target
-                // so the landing commits instead of stalling on dead frames.
-                new_pos = nudge_landing(position.0, *origin);
+                position.0 = *origin;
             }
+        } else {
+            position.0 = *origin;
         }
-
-        trace!(
-            "entity {entity} source {} dest {origin} t {t:.3} moving to {new_pos}",
-            position.0,
-        );
-        position.0 = if finished { *origin } else { new_pos };
-        if finished {
-            // Landing hands the leg to the verifier: the marker (intent
-            // delivered to the tween) is dropped and the drive enters
-            // verifying, so the commit's AX push gets confirmed. Seating a
-            // fresh verifying leg (rather than mutating the old one) is
-            // exact here — the glide is over, only the budget matters.
-            if let Ok(mut entity_commands) = commands.get_entity(entity) {
-                entity_commands.try_remove::<RepositionMarker>();
-                entity_commands.try_insert(crate::ecs::PositionDrive::verifying());
-            }
+        // Landing hands the leg to the verifier: the marker (intent
+        // delivered to the tween) is dropped and the drive enters
+        // verifying, so the commit's AX push gets confirmed.
+        if let Ok(mut entity_commands) = commands.get_entity(entity) {
+            entity_commands.try_remove::<RepositionMarker>();
+            entity_commands.try_insert(crate::ecs::PositionDrive::verifying());
         }
     }
 }
@@ -1532,116 +1383,13 @@ pub(crate) fn animate_entities(
 /// * `active_display` - An `ActiveDisplay` system parameter providing immutable access to the active display.
 /// * `commands` - Bevy commands to remove the `ResizeMarker` when resizing is complete.
 #[instrument(level = Level::TRACE, skip_all)]
-pub(super) fn animate_resize_entities(
-    animate: TweenedSizes,
-    time: Res<Time>,
-    config: Res<Config>,
-    phase: Option<Res<crate::ecs::VSyncPhase>>,
-    mut bursts: ResMut<crate::ecs::BurstClock>,
-    mut commands: Commands,
-) {
-    use crate::ecs::animation::{
-        FIRST_TICK_WINDOW, birth_phase, eased_factor, join_duration, kick_start, nudge_landing,
-        proportional_duration, retarget_duration, should_carry_phase, tween_finished, tween_ivec2,
-    };
-
-    // Same shared burst phase as positions so size and origin stay in step:
-    // identical `now` (including vsync prediction) plus the shared deadline,
-    // or co-born resize+move pairs run different easing curves and cross
-    // mid-flight — windows overlapping then converging on every resize.
-    let prediction = phase
-        .as_deref()
-        .map_or(Duration::ZERO, crate::ecs::VSyncPhase::prediction);
-    let now = time.elapsed() + prediction;
-    let base = config.animation_duration();
-
-    for (mut bounds, entity, ResizeMarker(size), tween) in animate {
-        if base.is_zero() {
-            bounds.0 = *size;
-            if let Ok(mut entity_commands) = commands.get_entity(entity) {
-                entity_commands.try_remove::<ResizeMarker>();
-                entity_commands.try_remove::<crate::ecs::SizeDrive>();
-            }
-            continue;
-        }
-        let (start, started, duration) = match tween {
-            Some(tween) if tween.target == *size => (tween.start, tween.started, tween.duration),
-            Some(mut tween) => {
-                let remaining = (size.as_vec2() - bounds.0.as_vec2()).length();
-                let total = (size.as_vec2() - tween.start.as_vec2())
-                    .length()
-                    .max(remaining);
-                // Rejoin the burst deadline like births: a retarget on its
-                // own shortened curve overtakes siblings still on the shared
-                // pace. Never shortens — the join only stretches.
-                let duration = join_duration(
-                    retarget_duration(remaining, total, base),
-                    now,
-                    bursts.deadline,
-                );
-                let drift = (size.as_vec2() - tween.target.as_vec2()).length();
-                let elapsed = now.saturating_sub(tween.started);
-                // Carry only across a live leg: a stale leg (older than its
-                // own duration, re-driven after settling) restarts fresh
-                // instead of teleporting to done — same rule as positions.
-                let carry = should_carry_phase(elapsed, tween.duration, drift);
-                let prior = if carry {
-                    (elapsed.as_secs_f32() / tween.duration.as_secs_f32().max(f32::EPSILON))
-                        .clamp(0.0, 1.0)
-                } else {
-                    0.0
-                };
-                let started = now
-                    .checked_sub(Duration::from_secs_f32(prior * duration.as_secs_f32()))
-                    .unwrap_or(now);
-                tween.start = bounds.0;
-                tween.target = *size;
-                tween.started = started;
-                tween.duration = duration;
-                (tween.start, tween.started, tween.duration)
-            }
-            None => {
-                let (started, opened) = birth_phase(now, bursts.opened);
-                let travel = (size.as_vec2() - bounds.0.as_vec2()).length();
-                let duration =
-                    join_duration(proportional_duration(travel, base), now, bursts.deadline);
-                if opened {
-                    bursts.opened = Some(now);
-                    bursts.deadline = Some(started + duration);
-                }
-                if let Ok(mut entity_commands) = commands.get_entity(entity) {
-                    entity_commands.try_insert(crate::ecs::SizeDrive {
-                        start: bounds.0,
-                        target: *size,
-                        started,
-                        duration,
-                    });
-                }
-                (bounds.0, started, duration)
-            }
-        };
-        let elapsed = now.saturating_sub(started);
-        let t = eased_factor(elapsed, duration);
-        let mut new_size = tween_ivec2(start, *size, t);
-        let finished = tween_finished(elapsed, duration);
-        if !finished && new_size == bounds.0 && bounds.0 != *size {
-            if elapsed <= FIRST_TICK_WINDOW {
-                // Fresh leg rounding to a standstill: guarantee visible motion
-                // so the first animated tick always commits (no dead frames).
-                new_size = kick_start(bounds.0, *size);
-            } else {
-                new_size = nudge_landing(bounds.0, *size);
-            }
-        }
-
-        trace!(
-            "entity {entity} source {} dest {size} t {t:.3} resizing to {new_size}",
-            bounds.0,
-        );
-        bounds.0 = if finished { *size } else { new_size };
-        if finished && let Ok(mut entity_commands) = commands.get_entity(entity) {
+pub(super) fn animate_resize_entities(animate: TweenedSizes, mut commands: Commands) {
+    // Snap-only (see `animate_entities`): the Swift daemon owns glide
+    // timing. Resize targets land immediately and the marker clears.
+    for (mut bounds, entity, ResizeMarker(size)) in animate {
+        bounds.0 = *size;
+        if let Ok(mut entity_commands) = commands.get_entity(entity) {
             entity_commands.try_remove::<ResizeMarker>();
-            entity_commands.try_remove::<crate::ecs::SizeDrive>();
         }
     }
 }
@@ -4319,23 +4067,6 @@ mod seam_tests {
             }
             _ => panic!("expected the four-finger run"),
         }
-    }
-
-    #[test]
-    fn tween_presents_exact_landing_frame() {
-        use crate::ecs::animation::{eased_factor, tween_finished, tween_ivec2};
-        use std::time::Duration;
-        // The border reads the same presented frame the commit writes: at
-        // the deadline the tween sits exactly on target (no chase needed).
-        let start = IRect::new(0, 20, 400, 768).min;
-        let target = IRect::new(100, 20, 500, 768).min;
-        let duration = Duration::from_millis(150);
-        assert_eq!(tween_ivec2(start, target, 0.0), start);
-        assert_eq!(
-            tween_ivec2(start, target, eased_factor(duration, duration)),
-            target
-        );
-        assert!(tween_finished(duration, duration));
     }
 
     #[test]

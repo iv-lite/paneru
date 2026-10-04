@@ -2,8 +2,10 @@ import Foundation
 import Animation
 import Geometry
 
-// Parity ports of `src/ecs/animation.rs` unit tests. Millisecond
-// tolerances mirror the Rust `from_secs_f32` comparisons.
+// Parity ports of `src/ecs/animation.rs` unit tests (the Rust file was
+// removed with the animation-driver teardown; these constants still pin
+// the Swift pacing set). Millisecond tolerances mirror the original Rust
+// `from_secs_f32` comparisons.
 // Exits nonzero on the first mismatch.
 
 private nonisolated(unsafe) var failures = 0 // straight-line runner: nothing concurrent

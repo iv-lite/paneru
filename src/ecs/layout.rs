@@ -1091,7 +1091,7 @@ impl LayoutStrip {
                 let column_width = items
                     .first()
                     .and_then(StackItem::top)
-                    .and_then(&get_window_frame)
+                    .and_then(get_window_frame)
                     .map(|frame| frame.width())?;
 
                 let mut next_y = 0;
@@ -2212,6 +2212,7 @@ fn position_layout_windows(
             // to its target. See `SnapStripMarker`.
             if context.swiping
                 || context.snap_settling
+                || !config.animations()
                 || offscreen_move && !config.virtual_workspace_animations()
             {
                 position.0 = frame.min;

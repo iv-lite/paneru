@@ -31,7 +31,7 @@ use crate::ecs::{
     Scrolling, SendMessageTrigger, SpawnCommandsExt, StrayFocusEvent,
 };
 use crate::events::Event;
-use crate::manager::{Application, Display, Origin, Size, Window, WindowManager, origin_from};
+use crate::manager::{Application, Display, Origin, Size, Window, WindowManager};
 use crate::platform::WorkspaceId;
 
 const REFRESH_WINDOW_CHECK_FREQ_MS: u64 = 1000;
@@ -997,17 +997,15 @@ fn mouse_follows_focus(
             let dest = layout.0 + *strip_target;
             frame = IRect::from_corners(dest, dest + size);
         }
-        // Keyboard intent always recenters: a keyboard move into the window
-        // holding the cursor must still land on its center. Ambient arrivals
-        // (and clicks, already returned above) leave a cursor that is already
-        // inside alone.
-        if !matches!(cause, FocusCause::Keyboard)
-            && window_manager
-                .cursor_position()
-                .is_some_and(|point| frame.contains(origin_from(point)))
-        {
+        // Mouse follows focus on **keyboard shortcuts only**: a keyboard move
+        // always recenters onto the window. Ambient arrivals (hover echoes,
+        // Cmd-Tab, app self-raise, notifications) never move the cursor —
+        // warping on those competes with focus-follows-mouse (the cursor
+        // lands under a different window and re-triggers hover, flapping
+        // focus). Clicks already returned above; they own their cursor.
+        if !matches!(cause, FocusCause::Keyboard) {
             trace!(
-                "cursor already inside window {}, skipping warp",
+                "non-keyboard focus arrival for window {}, skipping warp",
                 window.id()
             );
             continue;

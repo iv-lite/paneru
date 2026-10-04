@@ -308,7 +308,8 @@ let package = Package(
             name: "Service",
             path: "Sources/Service"
         ),
-        // Fixed-duration tween math (`src/ecs/animation.rs`).
+        // Fixed-duration tween math (formerly `src/ecs/animation.rs`;
+        // the Rust file was removed — the Swift daemon owns animation).
         .target(
             name: "Animation",
             dependencies: ["Geometry"],

@@ -94,9 +94,10 @@ This is what keeps `src/lua/runtime.rs` free of any `bevy` import: it reaches th
 
 ## 5b. Target Synchronous Pipeline (Swift Port)
 
-The Bevy schedules stay until cutover, but new logic must fit the explicit
-pass list below so the port is mechanical. Each pass has one owner and runs
-in lexical order — `ingest → layout → commit → paint` — instead of emergent
+The shipped daemon uses the explicit pass list below (the legacy Bevy
+schedules in `src/` are retained for the fallback core). Each pass has
+one owner and runs in lexical order — `ingest → layout → commit → paint`
+— instead of emergent
 `Changed/Added` gating:
 
 | Pass | Today (reactive) | Target (explicit) |
@@ -158,8 +159,11 @@ graph TD
 
 ## 8. Swift Port (`swift-daemon/`)
 
-The native port grows slice by slice alongside the Rust daemon, which ships
-until cutover:
+The native port is the **shipped/running daemon**: `install-service.sh`
+installs it as the supported path and the CI release pipeline publishes
+it. The Rust daemon remains in-tree as the legacy fallback (snap-only
+animation — glide timing is owned by the Swift daemon) and is retained
+until full teardown. Slice status:
 
 - **`Geometry`** (done): the single home for pure rect math — `round_px`,
   viewport clamps, `origin_exposing`, CG↔Cocoa conversion, border rects,
@@ -233,8 +237,9 @@ until cutover:
   gating and the FocusOrVirtual sibling-first contract — from
   `src/ecs/workspace.rs` (verified by `Tests/WorkspaceChecks`).
 - **`Animation`/`Scroll`** (done): tween math, burst phases, swipe
-  physics, snap targets, settle guard, viewport clamp — from
-  `src/ecs/animation.rs` and `src/ecs/scroll.rs` (verified by
+  physics, snap targets, settle guard, viewport clamp — ported from
+  `src/ecs/animation.rs` (now removed — animation ownership moved to the
+  Swift daemon) and `src/ecs/scroll.rs` (verified by
   `Tests/AnimationChecks`, `Tests/ScrollChecks`).
 - **`Session`** (done): Codable state model with version gate + restore
   planner (hard/fallback/geometry matching, compaction) — from
@@ -329,9 +334,10 @@ until cutover:
   `com.github.karinushka.paneru` agent is untouched — install migrates
   the previous `...karinushka.paneru.swift` Swift label away).
 - **nix removal** (done): `nix/`, `flake.nix`/`flake.lock`, `.envrc`
-  deleted; README documents the Swift install. `src/` retires batch by
-  batch behind `PANERU_SWIFT_DAEMON` — nothing there is deleted before
-  its Swift owner proves live.
+  deleted; README documents the Swift install. The Swift daemon is the
+  shipped path; `src/` is retained as the legacy fallback (snap-only
+  animation) until teardown. Only the shipped daemon's behavior is
+  guaranteed here.
 
 ### Host proving runbook (permissioned Mac)
 
@@ -348,7 +354,8 @@ until cutover:
    binds and event handlers from your `init.lua`.
 4. Widen the parity corpora through proven behavior and keep
    `FrameParityChecks` green.
-5. Only then: flip `PANERU_SWIFT_DAEMON` and retire `src/` batches.
+5. Shipped status means the install path (not a Rust-launched subcommand);
+   the Rust tree stays as legacy fallback until teardown.
 
 ### Cold flip runbook (cutover day)
 
@@ -379,8 +386,8 @@ boundary (`BatchSnapshot` per worker message, acked store writes only),
 quiet-frame quiescence invariant (`test_settled_world_is_quiescent`),
 `src/tests/trace.rs` (per-frame `FrameSnapshot` exporter +
 `run_with_trace`, JSONL corpora via `PANERU_TRACE_OUT`), and the
-`PANERU_SWIFT_DAEMON` cutover gate in `main.rs` (unset/`0` runs Rust;
-`1`/`shadow` fail loudly until shipped).
+`PANERU_SWIFT_DAEMON` cutover gate in `main.rs` (unset/`0` runs the
+legacy Rust core; the shipped daemon is the `paneru-swift` binary).
 
 ## 9. Testing Strategy
 1.  **Pure Unit Tests:** Located in `src/tests.rs` and alongside modules. These test layout math and configuration parsing without requiring a macOS environment.

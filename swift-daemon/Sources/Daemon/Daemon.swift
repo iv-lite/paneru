@@ -429,7 +429,8 @@ public struct DaemonCore: Sendable {
         var durationMs: UInt64
     }
     private var glides: [WindowID: GlideLeg] = [:]
-    /// Size legs for eased resizes (Rust `SizeDrive`): the tween twin of
+    /// Size legs for eased resizes (former Rust `SizeDrive`, removed with
+    /// the animation-driver teardown): the tween twin of
     /// `GlideLeg`. A width change that snapped while the position glided
     /// opened the configured gap mid-flight (the glass edge jumped to the
     /// new width while the neighbour was still traveling); easing the size
@@ -451,21 +452,22 @@ public struct DaemonCore: Sendable {
     /// (Rust `BurstClock`), so one focus/swap/reveal lands lockstep.
     private var glideBurstOpenedMs: UInt64?
     private var glideBurstDeadlineMs: UInt64?
-    /// Eased glides on/off (Rust `animations` switch). Off (or a zero
-    /// base duration) snaps exactly like before.
+    /// Eased glides on/off (Rust `animations` switch). Off snaps exactly
+    /// like before. This is the only user-facing animation knob.
     public var animationsEnabled = true
-    /// Base glide duration in ms (stock 180; `animation_duration_ms`
-    /// overrides): proportional pacing shrinks/grows per distance.
-    public var glideBaseMs: UInt64 = 180
-    /// Glide pacing bounds, host-pushed from config (stock 80ms floor,
-    /// 260ms ceiling).
-    public var glideMinMs: UInt64 = 80
-    public var glideMaxMs: UInt64 = 260
+    /// Internal glide pacing: base duration in ms with proportional
+    /// scaling per distance, bounded by tuned floor/ceiling (250/80/320).
+    /// The daemon owns its timing so movement, resize, and translation
+    /// share one clock. Not config-driven — the host never wires these;
+    /// they exist as tunables for the frame checks.
+    public var glideBaseMs: UInt64 = defaultAnimationDurationMs
+    public var glideMinMs: UInt64 = minAnimationDurationMs
+    public var glideMaxMs: UInt64 = maxAnimationDurationMs
     /// Proportional-pacing reference, refreshed per commit from the
     /// active viewport (800px below ~2400px widths, wider above):
     /// ultrawide traverses keep per-pixel pace instead of camping the
     /// ceiling while standard rigs behave exactly as before.
-    public var glideReferencePx: Float = 800
+    public var glideReferencePx: Float = referenceTravelPx
     /// Wall-clock source for tween progress (ms). Nil keeps the
     /// epoch-derived clock (`epoch * 16`), so frame-counted tests stay
     /// deterministic; production injects wall time so main-thread
@@ -871,6 +873,7 @@ public struct DaemonCore: Sendable {
                 // Space return: a parked row holding this window restores
                 // whole (order, stacks, positions) instead of appending
                 // scrambled. Newcomers from other rows merge at the end.
+                var restored = false
                 if let row = parkedRow(containing: id, in: workspace, epoch: epoch),
                    let parked = parkedRows[workspace]?[row]
                 {
@@ -888,6 +891,7 @@ public struct DaemonCore: Sendable {
                         parked.strip, workspace: workspace, row: row,
                         offset: offset
                     )
+                    restored = true
                 } else if let space = spaceOfWorkspace[workspace],
                           let (row, strip) = stashedRow(containing: id, in: space)
                 {
@@ -901,6 +905,7 @@ public struct DaemonCore: Sendable {
                         strip, workspace: workspace, row: row,
                         offset: nil
                     )
+                    restored = true
                 }
                 var strip = strips[workspace]?[activeVirtual[workspace] ?? 0]
                     ?? LayoutStrip(id: workspace, virtualIndex: activeVirtual[workspace] ?? 0)
@@ -914,6 +919,17 @@ public struct DaemonCore: Sendable {
                     positions[id] = frames(id).map {
                         IntPoint($0.min.x, $0.min.y)
                     } ?? IntPoint(0, 0)
+                }
+                // A genuinely new window (not a space-return restore) opens
+                // on the display the user is looking at: activate that
+                // workspace so the new app is focused where it appeared
+                // (mirrors the Rust active-display hop). Restores return to
+                // their own space silently and must not steal the active
+                // display.
+                if !restored, workspace != activeWorkspace {
+                    activeWorkspace = workspace
+                    if activeVirtual[workspace] == nil { activeVirtual[workspace] = 0 }
+                    dirty.formUnion([.layout, .focus])
                 }
                 dirty.formUnion([.layout, .paint])
             case .disappeared(let id):
@@ -2259,6 +2275,7 @@ public struct DaemonCore: Sendable {
             let at = min(max(loc.index, 0), strip.len - 1)
             guard let column = strip.get(at),
                   let top = column.top,
+                  !strip.tabbed(top),
                   let slot = committedSlots[top],
                   let live = frames(top)
             else { continue }
@@ -2346,8 +2363,22 @@ public struct DaemonCore: Sendable {
             }
             return
         }
-        guard strips[owner]?[activeVirtual[owner] ?? 0]?.contains(id) == true else {
+        guard let shownRow = strips[owner]?[activeVirtual[owner] ?? 0] else {
             print("focus: reveal skipped window=\(id) (not on shown row)")
+            return
+        }
+        guard shownRow.contains(id) else {
+            print("focus: reveal skipped window=\(id) (not on shown row)")
+            return
+        }
+        // A window sharing a tab group is shown by its group's column, which
+        // is already on-screen whenever the group is. Scrolling to it would
+        // move the strip under a sibling that is actually showing (Rust
+        // `ensure_focused_visible`/`autocenter_window_on_focus` skip tabbed
+        // entities for exactly this reason). Focus still lands; only the
+        // reveal is suppressed.
+        if shownRow.tabbed(id) {
+            print("focus: reveal skipped window=\(id) (tabbed)")
             return
         }
         // Slotless focused window (frameless, never laid out): scroll
@@ -3982,8 +4013,9 @@ public struct DaemonCore: Sendable {
         return step
     }
 
-    /// One eased step along a size leg (Rust `SizeDrive` / the
-    /// `animate_resize_entities` tween). Shares the position glide's burst
+    /// One eased step along a size leg (former Rust `SizeDrive` / the
+    /// `animate_resize_entities` tween; the Rust driver was removed).
+    /// Shares the position glide's burst
     /// (`glideBurstOpenedMs`/`glideBurstDeadlineMs`), so a core-driven
     /// width change and the neighbour's position shift are born into the
     /// same burst and ease on one curve — the configured gap holds
@@ -4504,26 +4536,27 @@ public struct DaemonCore: Sendable {
     }
 
     /// Mouse-follow decision for one focus arrival (pure): warp the
-    /// cursor to the focused window's visible center (frame ∩ its
-    /// display viewport) when `mouse_follows_focus` owns the pointer.
-    /// Mirrors `src/ecs/focus.rs`: keyboard arrivals always recenter,
-    /// ambient ones skip when the cursor already sits inside the
-    /// visible frame, and parked/hidden slivers (visible area under
-    /// 50×50) never warp. The caller suppresses press arrivals whose
-    /// click landed inside the frame, drags, and swipes — those need
-    /// live tap state the core cannot see.
+    /// cursor to the focused window's visible center only when the
+    /// arrival came from a **keyboard shortcut or explicit raise**.
+    /// Ambient arrivals — hover echoes, Cmd-Tab, app self-raise,
+    /// notifications — never move the pointer: warping on those competes
+    /// with focus-follows-mouse (the cursor lands under a different
+    /// window and re-triggers hover, flapping focus). Parked/hidden
+    /// slivers (visible area under 50×50) never warp either. The caller
+    /// suppresses press arrivals whose click landed inside the frame,
+    /// drags, and swipes — those need live tap state the core cannot see.
     public func followWarpTarget(
         focusFrame: IntRect?, viewport: IntRect, cursor: IntPoint,
         cause: FollowCause, enabled: Bool
     ) -> IntPoint? {
-        guard enabled, let frame = focusFrame else { return nil }
+        guard enabled, cause == .keyboard, let frame = focusFrame else { return nil }
         // Sliver gate on the visible slice: never warp for windows
-        // with ~nothing on-screen, whatever the cause. Keyed arrivals
-        // pass predicted (post-scroll slot) frames, so an offscreen
-        // window the strip just scrolled to still warps.
+        // with ~nothing on-screen. Keyed arrivals pass predicted
+        // (post-scroll slot) frames, so an offscreen window the strip
+        // just scrolled to still warps.
         let visible = frame.intersected(with: viewport)
         guard visible.area >= 50 * 50 else { return nil }
-        if cause != .keyboard, frame.contains(cursor) { return nil }
+        _ = cursor
         // Full-frame center (deliberate Rust divergence — Rust warps to
         // the visible center): the cursor belongs on the window itself,
         // wherever the viewport crops it. Hover uses frame containment
@@ -5258,6 +5291,72 @@ public static func firstExitCrossing(
             if changed { spaceStash[space] = stash }
         }
         return Set(ids.filter { workspaceOf($0) == nil })
+    }
+
+    /// Fold background native tabs back into the column that is showing
+    /// (Rust `detect_tabbed_windows` + `regroup_stray_native_tabs`).
+    ///
+    /// macOS tabbing leaves the sibling windows in the AX tree as
+    /// full-size windows with the leader's frame; without this they land
+    /// in columns of their own — slots that can never show anything, so a
+    /// focus arrival scrolls the strip to an invisible slot and the
+    /// focused window ends up off viewport. Two windows share a frame
+    /// exactly only when they share a column, which is what this repairs.
+    ///
+    /// `onScreen` is the WindowServer's visible set: it reports a
+    /// background tab as **not** on screen while an occluded window still
+    /// counts, which is what disambiguates leader from tab. Called on the
+    /// host sync cadence (not per tick); returns the regrouped followers
+    /// so the caller can reshuffle around them.
+    public mutating func regroupNativeTabs(
+        onScreen: Set<WindowID>,
+        frames: (WindowID) -> IntRect?
+    ) -> [WindowID] {
+        var regrouped: [WindowID] = []
+        for workspace in Array(strips.keys) {
+            for row in Array((strips[workspace] ?? [:]).keys) {
+                guard var strip = strips[workspace]?[row] else { continue }
+                // Column tops only: a window sharing a column is already
+                // grouped, and stacked siblings never share a frame.
+                let tops = strip.columns.compactMap { $0.top }
+                // Only a lone `Single` column can be a stray: pulling a
+                // window out of a stack or an existing tab group would
+                // break a grouping the user set up.
+                let strays = Set(strip.columns.compactMap { column -> WindowID? in
+                    if case .single(let id) = column { return id }
+                    return nil
+                })
+                let candidates = tops.compactMap { id -> (WindowID, Bool, IntRect, String)? in
+                    guard let frame = frames(id) else { return nil }
+                    return (id, onScreen.contains(id), frame, windowMetadata[id]?.bundleID ?? "")
+                }
+                var changed = false
+                for (hidden, hiddenOnScreen, hiddenFrame, app) in candidates
+                    where !hiddenOnScreen && strays.contains(hidden)
+                        && !regrouped.contains(hidden)
+                {
+                    // Leader: an on-screen column of the same app whose
+                    // frame matches to within a pixel.
+                    let leader = candidates.first { candidate in
+                        let (id, onScreenNow, frame, candidateApp) = candidate
+                        return onScreenNow && id != hidden && candidateApp == app
+                            && frame.min.x == hiddenFrame.min.x
+                            && frame.min.y == hiddenFrame.min.y
+                            && frame.width == hiddenFrame.width
+                            && frame.height == hiddenFrame.height
+                    }?.0
+                    guard let leader,
+                          strip.convertToTabs(leader: leader, follower: hidden)
+                    else { continue }
+                    changed = true
+                    regrouped.append(hidden)
+                }
+                if changed {
+                    strips[workspace]?[row] = strip
+                }
+            }
+        }
+        return regrouped
     }
 
     /// Drop slot for a pointer release (readout, pure): the workspace

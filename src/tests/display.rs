@@ -2112,8 +2112,8 @@ fn test_window_press_moves_column_without_arming() {
         .run(commands);
 }
 
-/// `mouse_follows_focus` warps to the newly focused window's visible center
-/// on keyboard focus moves — but only when the cursor is outside it.
+/// `mouse_follows_focus` warps to the newly focused window's center on
+/// keyboard focus moves, whatever the cursor's prior position.
 #[test]
 fn test_mouse_follows_focus_warps_when_cursor_outside() {
     let commands = vec![
@@ -2187,10 +2187,11 @@ fn test_mouse_follows_focus_click_never_warps() {
         .run(commands);
 }
 
-/// Ambient OS focus (no keyboard command, no press) keeps legacy behavior:
-/// an outside cursor warps to the visible center ...
+/// Ambient OS focus (no keyboard command, no press) never moves the cursor:
+/// warping on it competes with focus-follows-mouse. The outside cursor stays
+/// exactly where the user left it.
 #[test]
-fn test_mouse_follows_focus_ambient_warps_outside_cursor() {
+fn test_mouse_follows_focus_ambient_does_not_warp_outside_cursor() {
     let commands = vec![
         Event::MenuOpened { window_id: 0 },
         Event::Command {
@@ -2204,19 +2205,20 @@ fn test_mouse_follows_focus_ambient_warps_outside_cursor() {
 
     TestHarness::new()
         .with_windows(2)
-        .on_iteration(1, move |_world, state| {
+        .on_iteration(1, move |world, state| {
             // Answer the app's focus query with window 1 so the arrival
             // is kept instead of redirected.
             state.set_focused_window(1);
+            // Park the cursor well outside every window.
+            let _ = world;
+            state.set_cursor(Origin::new(-500, -500));
         })
         .on_iteration(3, move |world, state| {
             assert_focused!(world, 1);
-            let entity = find_window_entity(1, world);
-            let position = world.get::<Position>(entity).expect("need position").0;
-            let size = world.get::<Bounds>(entity).expect("need bounds").0;
             assert_eq!(
                 state.cursor_position(),
-                IRect::from_corners(position, position + size).center()
+                Origin::new(-500, -500),
+                "ambient focus must not move the cursor"
             );
         })
         .run(commands);
@@ -3115,9 +3117,9 @@ fn test_close_offscreen_window_closes_strip_gap_promptly() {
         drain(&mut h);
     }
 
-    // The strip is already gliding closed on the same tick — not waiting
-    // for a focus echo that never comes on this path.
-    let strip_entity = {
+    // The strip re-tiles on the same tick — not waiting for a focus echo
+    // that never comes on this path.
+    let _strip_entity = {
         let world = h.app.world_mut();
         let mut strips = world.query::<(Entity, &LayoutStrip)>();
         strips
@@ -3126,15 +3128,8 @@ fn test_close_offscreen_window_closes_strip_gap_promptly() {
             .expect("need test strip")
             .0
     };
-    assert!(
-        h.app
-            .world_mut()
-            .get::<RepositionMarker>(strip_entity)
-            .is_some(),
-        "strip must carry its close-up glide immediately after removal"
-    );
 
-    // Let the glide land: no hole, viewport filled edge to edge.
+    // Let the re-tile complete: no hole, viewport filled edge to edge.
     for _ in 0..30 {
         h.app.update();
         drain(&mut h);

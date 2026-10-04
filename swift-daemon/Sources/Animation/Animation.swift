@@ -2,8 +2,9 @@ import Foundation
 import Geometry
 
 // Fixed-duration tween math for window motion, ported verbatim from
-// `src/ecs/animation.rs` (which is deliberately pure math: no Bevy, no
-// AppKit).
+// `src/ecs/animation.rs` (pure math: no Bevy, no AppKit). The Rust file
+// has since been removed — this module now owns animation timing for the
+// shipped daemon (single `animations` toggle; pacing is internal).
 //
 // A tween has a deadline: progress runs through an ease-out cubic so
 // siblings land on the same tick and the border rides the exact presented
