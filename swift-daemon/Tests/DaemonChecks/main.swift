@@ -5015,6 +5015,65 @@ do {
     checkEqual(daemon.modelWidth(of: 0), 1024, "grow steps from the clamped live (0.59 -> 1.0), not a stale model")
 }
 
+// Resizing one column must keep the strip together: the neighbour stays
+// adjacent (abutting slot pitch == the widened column's width), never
+// stranded far away. Reproduces the "separation" seen after resizing a
+// column past the viewport width.
+do {
+    var daemon = DaemonCore()
+    daemon.animationsEnabled = true
+    daemon.glideBaseMs = 150
+    daemon.maximizeTiledWindows = true
+    daemon.presetWidths = [0.5, 1.0, 2.0]
+    let clock = ManualClock()
+    daemon.wallClockMs = { clock.now }
+    var liveW: [Int32: Int32] = [0: 400, 1: 400]
+    var liveX: [Int32: Int32] = [0: 0, 1: 400]
+    func liveFrames() -> (Int32) -> IntRect? {
+        { id in
+            let x = liveX[id] ?? 0
+            return IntRect(min: IntPoint(x, 34), max: IntPoint(x + (liveW[id] ?? 400), 734))
+        }
+    }
+    _ = daemon.tick(
+        events: [.appeared(id: 0, workspace: 1), .appeared(id: 1, workspace: 1)],
+        frames: liveFrames(), viewport: viewport, focusedStyle: style
+    )
+    _ = daemon.tick(
+        events: [.focusKeyed(id: 0)], frames: liveFrames(), viewport: viewport, focusedStyle: style
+    )
+    // Grow column 0 twice: 0.5 -> 1.0 -> 2.0 (2048, past the 1024 viewport).
+    for _ in 0..<2 {
+        _ = daemon.tick(
+            events: [.command(.window(.resize(.grow)))], frames: liveFrames(), viewport: viewport, focusedStyle: style
+        )
+        for _ in 0..<40 {
+            clock.now += 16
+            let r = daemon.tick(events: [], frames: liveFrames(), viewport: viewport, focusedStyle: style)
+            for job in r.axJobs {
+                if let o = job.origin { liveX[job.winID] = o.x }
+                if let s = job.size { liveW[job.winID] = s.x }
+            }
+        }
+    }
+    // Settle.
+    for _ in 0..<20 {
+        clock.now += 16
+        let r = daemon.tick(events: [], frames: liveFrames(), viewport: viewport, focusedStyle: style)
+        for job in r.axJobs {
+            if let o = job.origin { liveX[job.winID] = o.x }
+            if let s = job.size { liveW[job.winID] = s.x }
+        }
+    }
+    let slot0 = daemon.committedSlot(of: 0)?.x ?? -9
+    let slot1 = daemon.committedSlot(of: 1)?.x ?? -9
+    let w0 = daemon.modelWidth(of: 0) ?? 0
+    check(
+        slot1 - slot0 == w0,
+        "neighbour abuts the resized column (slot0=\(slot0) slot1=\(slot1) w0=\(w0))"
+    )
+}
+
 // Focus ring glued to the window glass through a resize: the ring must be
 // painted at the SAME rect the glass shows every tick, never at the new
 // size/position ahead of the still-easing window ("window lags behind its

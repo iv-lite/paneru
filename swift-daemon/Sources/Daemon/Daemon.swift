@@ -2084,8 +2084,23 @@ public struct DaemonCore: Sendable {
         // given up on (see `applySize`), so a settled/clamped window is
         // hugged exactly (no oversized column) while a mid-resize column
         // stays at its intent (no transient overlap).
-        column.windows.compactMap { modelWidths[$0] }.max()
-            ?? column.windows.compactMap { frames($0)?.width }.max()
+        //
+        // A model that is much wider than a *settled* live frame is a stale
+        // intent (an app that clamped below the tile and never re-adopted,
+        // e.g. a parked window skipped by applySize): hugging the live keeps
+        // the pitch honest so neighbours stay adjacent instead of being
+        // pushed out by a phantom wide column ("the strip separates"). Never
+        // applied mid-tween -- the leg owns the pitch until it lands.
+        let modelW = column.windows.compactMap { modelWidths[$0] }.max()
+        let liveW = column.windows.compactMap { frames($0)?.width }.max()
+        if let modelW, let liveW, liveW > 0,
+           modelW > liveW + max(axDeadbandPx, 8),
+           column.windows.allSatisfy({ sizeLegs[$0] == nil })
+        {
+            return liveW
+        }
+        return modelW
+            ?? liveW
             ?? column.windows.compactMap { sizes[$0]?.x }.max()
     }
 
