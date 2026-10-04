@@ -447,6 +447,10 @@ public struct DaemonCore: Sendable {
     /// eases away from, so a mid-flight retarget picks up where the glass
     /// is instead of jumping. Seeded from the first intent's target.
     private var writtenSizes: [WindowID: IntSize] = [:]
+    /// Live glass width at the last resize we issued: a glass that moved
+    /// since means our tween is genuinely easing (step from the model); one
+    /// that stayed means the app clamped (step from the live width).
+    private var lastResizeLiveW: [WindowID: Int32] = [:]
     /// Burst phase: legs born inside the join window share the deadline
     /// (Rust `BurstClock`), so one focus/swap/reveal lands lockstep.
     private var glideBurstOpenedMs: UInt64?
@@ -974,6 +978,7 @@ public struct DaemonCore: Sendable {
                 lastLiveWidth.removeValue(forKey: id)
                 sizeLegs.removeValue(forKey: id)
                 writtenSizes.removeValue(forKey: id)
+                lastResizeLiveW.removeValue(forKey: id)
                 if focus == id {
                     // Synchronous heal (Rust `give_away_focus`): hand off
                     // to the nearest surviving neighbor instead of
@@ -1499,12 +1504,26 @@ public struct DaemonCore: Sendable {
         if writtenSizes[id] == nil {
             writtenSizes[id] = IntSize(max(frame.width, 0), max(frame.height, 0))
         }
-        // Step from the model intent, not the live frame: with the resize
-        // tween in flight the live width is an intermediate value, so a
-        // second press mid-glide would read it and land on the wrong preset
-        // (the "two steps to cycle" bug). The model width is the last target
-        // the cycle actually chose, so presses step consecutively.
-        let current = Double(modelWidths[id] ?? sizes[id]?.x ?? frame.width) / Double(vw)
+        // Steering: while our own resize is genuinely easing (the glass has
+        // moved since we issued it), step from the MODEL (the preset we are
+        // driving to) so a rapid second press advances instead of re-reading
+        // an intermediate frame. When the glass has NOT moved, the app
+        // clamped: step from the LIVE width so the cycle follows what the
+        // window actually shows -- otherwise the model drifts past a clamped
+        // window and presses stop moving it ("resize doesn't work until
+        // refocus").
+        let issuedAt = lastResizeLiveW[id]
+        let liveMoved = issuedAt.map { abs(frame.width - $0) > 2 } ?? false
+        let rawCurrent: Double = {
+            if sizeLegs[id] != nil, liveMoved, let modelW = modelWidths[id] {
+                return Double(modelW) / Double(vw)
+            }
+            return Double(frame.width) / Double(vw)
+        }()
+        // Snap to the nearest preset so a residual sub-step frame still
+        // steps deterministically.
+        let current = presetWidths.min(by: { abs($0 - rawCurrent) < abs($1 - rawCurrent) })
+            ?? rawCurrent
 
         let fallback = presetWidths.first ?? 0.5
         let next: Double

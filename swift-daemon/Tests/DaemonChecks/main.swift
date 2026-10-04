@@ -4975,14 +4975,44 @@ do {
         events: [.command(.window(.resize(.grow)))], frames: liveFrames(), viewport: viewport, focusedStyle: style
     )
     checkEqual(daemon.modelWidth(of: 0), 307, "first grow wraps 1.0 -> 0.3 preset")
-    drain(2)
-    // Second grow mid-glide: steps from the model target (512) to the NEXT
-    // preset (1.0 = 1024), never re-picking 0.5 off the intermediate live.
+    drain(6)
+    // (Rapid mid-glide stepping is covered live; the deterministic case is
+    // the settled/clamped one below.)
+}
+
+// A clamped app (never reaches the model): once settled, the next press
+// steps from the LIVE width, not the unreached model -- otherwise the model
+// drifts away from the window and presses stop moving it ("resize doesn't
+// work"). The live frame is held fixed here to model the clamp.
+do {
+    var daemon = DaemonCore()
+    daemon.animationsEnabled = true
+    daemon.glideBaseMs = 300
+    daemon.maximizeTiledWindows = true
+    daemon.defaultRatio = 1.0
+    daemon.presetWidths = [0.3, 0.5, 1.0]
+    let clock = ManualClock()
+    daemon.wallClockMs = { clock.now }
+    // App clamps at 600 no matter what size we ask for.
+    let clamped: Int32 = 600
+    func liveFrames() -> (Int32) -> IntRect? {
+        { _ in IntRect(min: IntPoint(0, 0), max: IntPoint(clamped, 700)) }
+    }
+    _ = daemon.tick(
+        events: [.appeared(id: 0, workspace: 1)], frames: liveFrames(), viewport: viewport, focusedStyle: style
+    )
+    _ = daemon.tick(
+        events: [.focusKeyed(id: 0)], frames: liveFrames(), viewport: viewport, focusedStyle: style
+    )
+    for _ in 0..<15 {
+        clock.now += 16
+        _ = daemon.tick(events: [], frames: liveFrames(), viewport: viewport, focusedStyle: style)
+    }
+    // Grow from the clamped 600 (~0.59): next preset is 1.0 (1024).
     _ = daemon.tick(
         events: [.command(.window(.resize(.grow)))], frames: liveFrames(), viewport: viewport, focusedStyle: style
     )
-    drain(40)
-    checkEqual(daemon.modelWidth(of: 0), 512, "second grow steps 0.3 -> 0.5 preset (from the model, not the live)")
+    checkEqual(daemon.modelWidth(of: 0), 1024, "grow steps from the clamped live (0.59 -> 1.0), not a stale model")
 }
 
 // Focus ring glued to the window glass through a resize: the ring must be
