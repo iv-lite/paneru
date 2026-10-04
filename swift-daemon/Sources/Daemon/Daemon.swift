@@ -3514,17 +3514,22 @@ public struct DaemonCore: Sendable {
     /// full-width scrolling columns. Stale/void far slots park too: the
     /// owner-edge park is a valid on-screen target that self-corrects when
     /// the offset settles, so there is nothing to strip.
+    ///
+    /// Recomputed from the slot every tick, like Rust `desired_window_frame`:
+    /// a column parks on a **full** exit and unpins the moment its edge
+    /// re-enters, so a partly-visible column is never left holding the
+    /// sliver corner (which read as a permanent gap -- "windows separate at
+    /// the end and stay separated"). The old "stay parked until fully
+    /// inside" hysteresis kept a re-entering column pinned to the sliver
+    /// long after it should have shown its real position.
     private func wantsPark(
         member: WindowID, slot: IntPoint, width: Int32, height: Int32,
         home: IntRect, union: IntRect?, siblings: [IntRect]
     ) -> Bool {
+        _ = member
         _ = height
         _ = union
         _ = siblings
-        let fullyInside = slot.x >= home.min.x && slot.x + width <= home.max.x
-        if parkedMembers.contains(member) {
-            return !fullyInside
-        }
         let exitedLeft = slot.x + width <= home.min.x
         let exitedRight = slot.x >= home.max.x
         return exitedLeft || exitedRight

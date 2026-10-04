@@ -5694,6 +5694,26 @@ do {
     }
     check(sawTravel, "the reveal actually glided the strip")
     check(!lagged, "no column lags: every column rides one delta each tick")
+    // Settle and inspect the final state: survivors must rest on their slots
+    // (rigid), not left separated by a park.
+    for _ in 0..<40 {
+        clock.now += 16
+        _ = daemon.tick(events: [], frames: liveFrames(), viewport: viewport, focusedStyle: style)
+        for i in 0..<4 { if let p = daemon.positions[Int32(i)] { live[Int32(i)] = p } }
+    }
+    // Every column not fully off the owner viewport must rest on its slot
+    // (a partly-visible column is never left holding the park sliver -- the
+    // "windows separate at the end and stay separated" bug).
+    for i in 0..<4 {
+        guard let slot = daemon.committedSlot(of: Int32(i)) else { continue }
+        let partlyVisible = slot.x + 400 > 0 && slot.x < viewport.width
+        if partlyVisible {
+            checkEqual(
+                daemon.positions[Int32(i)]?.x, slot.x,
+                "partly-visible col \(i) rests on its slot, not the sliver"
+            )
+        }
+    }
 }
 
 // Gap rigid under a combined move+resize: the host AX layer must write
