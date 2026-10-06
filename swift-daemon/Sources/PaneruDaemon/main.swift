@@ -2655,20 +2655,20 @@ nonisolated(unsafe) var lastWarpEval = Date.distantPast
         let kind = core.lastWarpKind
         // void:interior stays silent (common hover above a display);
         // void:nomap is a true dead end worth naming.
-        if kind == "none:seam" || kind == "none:nomap" || kind == "void:nomap" {
+        if kind == "none:seam" || kind == "void:nomap" {
             let cross = core.lastCrossPoint.map { " cross \($0.x),\($0.y)" } ?? ""
             print("mouse: edge warp missed via \(kind) at \(cursor.x),\(cursor.y)\(cross)")
-        } else if kind == "none:outside" {
-            // Rounding-gap footprint: a cursor in no display that hugs
-            // an edge means the rounded frames disagree with the
-            // WindowServer by a pixel — warp cannot evaluate there.
-            // Bucketed + transition-printed so dwellings stay silent.
+        } else if kind == "none:nomap" || kind == "none:outside" {
+            // Outer-edge dead ends (no display-circle wrap anymore) and
+            // rounding-gap footprints: a cursor hugging an edge that
+            // cannot warp is the common quiet case, so bucketed +
+            // transition-printed — dwellings stay silent.
             let frames = fullDisplayFrames()
             let near = frames.contains { r in
                 abs(cursor.x - r.min.x) <= 5 || abs(r.max.x - cursor.x) <= 5
             }
             if near {
-                let line = "mouse: edge warp missed via none:outside"
+                let line = "mouse: edge warp missed via \(kind)"
                     + " near edge at ~\(cursor.x / 100 * 100),\(cursor.y / 100 * 100)"
                 if line != lastWarpMissLine {
                     lastWarpMissLine = line

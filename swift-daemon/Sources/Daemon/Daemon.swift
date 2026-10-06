@@ -4942,12 +4942,10 @@ public struct DaemonCore: Sendable {
     /// farther hit on 3+ display rows).
     ///
     /// Branch order (see `lastWarpKind` for the taken path): signed
-    /// half-plane, then row wrap (circle-first on outer edges so
-    /// endpoint steps stay reachable, and on exposed interior steps so
-    /// mixed-height rows wrap instead of sticking), then opposite
-    /// half-plane, then proportional mapping (fractional-height landings
-    /// for stairs pairs the strict offset-preserving math cannot map),
-    /// then clamped landings in the same order (uniform always-land).
+    /// half-plane, then opposite half-plane, then proportional mapping
+    /// (fractional-height landings for stairs pairs the strict
+    /// offset-preserving math cannot map), then clamped landings in the
+    /// same order (uniform always-land).
     /// Only the 1px band itself evaluates: band-jumping flings are
     /// caught at the crossed edge by `warpForMovement`, so no
     /// anticipation zone is needed.
@@ -5147,20 +5145,6 @@ public struct DaemonCore: Sendable {
             lastWarpKind = kind("primary")
             return landing
         }
-        if let wrapped = rowWrapTarget(
-            current: current,
-            onLeftEdge: evalLeft, onRightEdge: evalRight,
-            displays: displays
-        ),
-           let landing = warpLanding(
-                cursor: clamped, current: current, target: wrapped,
-                onLeftEdge: evalLeft, yOffset: yOffset,
-                velocityX: velocityX, strict: true
-            )
-        {
-            lastWarpKind = kind("row")
-            return landing
-        }
         if let landing = attempt(flipped: true, strict: true) {
             lastWarpKind = kind("fallback")
             return landing
@@ -5179,20 +5163,6 @@ public struct DaemonCore: Sendable {
         }
         if let landing = attempt(flipped: true, strict: false) {
             lastWarpKind = kind("clamp:fallback")
-            return landing
-        }
-        if let wrapped = rowWrapTarget(
-            current: current,
-            onLeftEdge: evalLeft, onRightEdge: evalRight,
-            displays: displays
-        ),
-           let landing = warpLanding(
-                cursor: clamped, current: current, target: wrapped,
-                onLeftEdge: evalLeft, yOffset: yOffset,
-                velocityX: velocityX, strict: false
-            )
-        {
-            lastWarpKind = kind("clamp:row")
             return landing
         }
         lastWarpKind = voidAnchored ? "void:nomap" : "none:nomap"
@@ -5341,42 +5311,6 @@ public struct DaemonCore: Sendable {
         }()
         let base = onLeftEdge ? target.max.x - 6 : target.min.x + 6
         return IntPoint(min(max(base + carry, lo), hi), targetY)
-    }
-
-    /// Row-wrap target: the neighbor around the display circle past a
-    /// left/right edge with no seam neighbor at the cursor Y. Exiting
-    /// left enters at the predecessor's right side, exiting right at
-    /// the successor's left side (displays ordered by left edge, ends
-    /// joined). Global outer edges reduce to the classic wrap-around
-    /// (leftmost-left → rightmost right-inset and vice versa); exposed
-    /// interior steps (wrap A: a short display's edge band past its
-    /// neighbor's end) slip around the step corner onto the neighbor
-    /// instead of sticking like native macOS. Interior shared edges
-    /// never reach here (seam suppression returns first), so native
-    /// display crossings are never yanked. The wrap target must
-    /// vertically overlap the current display (stacked pairs stay nil).
-    /// Sign-independent, and ordered after the bidirectional fallback:
-    /// with no vertical target anywhere, the direction has nothing
-    /// left to select.
-    private func rowWrapTarget(
-        current: IntRect,
-        onLeftEdge: Bool, onRightEdge: Bool,
-        displays: [IntRect]
-    ) -> IntRect? {
-        let order = displays.sorted { $0.min.x < $1.min.x }
-        guard order.count >= 2, let at = order.firstIndex(of: current) else { return nil }
-        let wrapTo: IntRect
-        if onLeftEdge {
-            wrapTo = order[(at + order.count - 1) % order.count]
-        } else if onRightEdge {
-            wrapTo = order[(at + 1) % order.count]
-        } else {
-            return nil
-        }
-        guard wrapTo != current else { return nil }
-        let overlap = min(current.max.y, wrapTo.max.y) - max(current.min.y, wrapTo.min.y)
-        guard overlap > 0 else { return nil }
-        return wrapTo
     }
 
     /// First display-edge exit along a cursor segment, in travel order:

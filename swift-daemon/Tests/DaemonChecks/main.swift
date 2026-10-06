@@ -1569,45 +1569,48 @@ do {
     checkEqual(daemon.lastWarpKind, "clamp:primary", "clamped landing reports its stage")
 }
 
-// Wrap A: exposed interior steps wrap around the display circle instead
-// of sticking. Tops-aligned row with two short displays: the bands past
-// a neighbor's end have no seam, no vertical target either way, and sit
-// off the global extremes — previously a hard nil one way.
+// Wrap A: exposed interior steps and global outer edges never wrap
+// around a display circle — an edge with no half-plane or proportional
+// target simply does not warp. Tops-aligned row with two short
+// displays: the bands past a neighbor's end have no seam, no vertical
+// target either way, and sit off the global extremes.
 do {
     var daemon = DaemonCore()
     let a = IntRect(0, 0, 1920, 1080)
     let b = IntRect(1920, 0, 3840, 900)
     let c = IntRect(3840, 0, 5760, 950)
     let row = [a, b, c]
-    // C's left step below B's bottom slips around the corner onto B.
+    // C's left step below B's bottom has no vertical target and no
+    // circle to slip around: it sticks instead of wrapping.
     checkEqual(
         daemon.edgeWarpLanding(
             cursor: IntPoint(3840, 925), displays: row,
             warpDirection: -1, yOffset: 0
-        ), IntPoint(3834, 899), "exposed left step wraps onto the predecessor"
+        ), nil, "exposed left step never wraps onto the predecessor"
     )
-    checkEqual(daemon.lastWarpKind, "clamp:row", "corner slip reports its stage")
-    // A's right step above B's bottom slips onto B the other way.
+    checkEqual(daemon.lastWarpKind, "none:nomap", "corner slip reports no map")
+    // A's right step above B's bottom sticks the same way.
     checkEqual(
         daemon.edgeWarpLanding(
             cursor: IntPoint(1919, 950), displays: row,
             warpDirection: -1, yOffset: 0
-        ), IntPoint(1926, 899), "exposed right step wraps onto the successor"
+        ), nil, "exposed right step never wraps onto the successor"
     )
-    checkEqual(daemon.lastWarpKind, "clamp:row", "right corner slip reports its stage")
-    // Global outer edges keep classic wrap-around through the same path.
+    checkEqual(daemon.lastWarpKind, "none:nomap", "right corner slip reports no map")
+    // Global outer edges no longer wrap-around: with no vertical target
+    // the push carries natively out of the union.
     checkEqual(
         daemon.edgeWarpLanding(
             cursor: IntPoint(0, 500), displays: row,
             warpDirection: -1, yOffset: 0
-        ), IntPoint(5754, 500), "outer left still wraps to the far end"
+        ), nil, "outer left never wraps to the far end"
     )
-    checkEqual(daemon.lastWarpKind, "row", "outer wrap reports its stage")
+    checkEqual(daemon.lastWarpKind, "none:nomap", "outer miss reports no map")
     checkEqual(
         daemon.edgeWarpLanding(
             cursor: IntPoint(5759, 500), displays: row,
             warpDirection: -1, yOffset: 0
-        ), IntPoint(6, 500), "outer right still wraps to the far end"
+        ), nil, "outer right never wraps to the far end"
     )
     // Shared seams stay native in both directions.
     checkEqual(
@@ -1646,18 +1649,23 @@ do {
             warpDirection: -1, yOffset: 0
         ), IntPoint(1914, 900), "stairs left step lands above"
     )
+    // Outer edges no longer wrap around the row: the primary half-plane
+    // has no target above (left) / below (right), so the opposite
+    // half-plane fallback lands on the nearest stair.
     checkEqual(
         daemon.edgeWarpLanding(
             cursor: IntPoint(0, 500), displays: stairs,
             warpDirection: -1, yOffset: 0
-        ), IntPoint(5346, 1100), "stairs outer left wraps to the far end"
+        ), IntPoint(3834, 800), "stairs outer left falls back to the opposite half-plane"
     )
+    checkEqual(daemon.lastWarpKind, "fallback", "outer left reports the fallback")
     checkEqual(
         daemon.edgeWarpLanding(
             cursor: IntPoint(5351, 1000), displays: stairs,
             warpDirection: -1, yOffset: 0
-        ), IntPoint(6, 400), "stairs outer right wraps to the far end"
+        ), IntPoint(1926, 700), "stairs outer right falls back to the opposite half-plane"
     )
+    checkEqual(daemon.lastWarpKind, "fallback", "outer right reports the fallback")
 }
 
 // Stairs with no shared Y band at the cursor (builtin above an
@@ -2995,8 +3003,9 @@ do {
     checkEqual(daemon.positions[1], IntPoint(400, 34), "glide terminates exactly on the slot")
 }
 
-// Row-wrap fall-through (beyond Rust): outer global edges wrap around
-// a single row; interior shared edges never yank native crossings.
+// Single-row outer edges never wrap around a display circle: with no
+// vertical half-plane target the push carries natively; interior shared
+// edges never yank native crossings.
 do {
     var daemon = DaemonCore()
     let left = IntRect(0, 0, 1920, 1080)
@@ -3006,19 +3015,20 @@ do {
         daemon.edgeWarpLanding(
             cursor: IntPoint(1, 500), displays: row,
             warpDirection: 1, yOffset: 0
-        ), IntPoint(3834, 500), "outer left edge wraps to the far right"
+        ), nil, "outer left edge never wraps to the far right"
     )
+    checkEqual(daemon.lastWarpKind, "none:nomap", "outer left reports no map")
     checkEqual(
         daemon.edgeWarpLanding(
             cursor: IntPoint(3839, 500), displays: row,
             warpDirection: 1, yOffset: 0
-        ), IntPoint(6, 500), "outer right edge wraps to the far left"
+        ), nil, "outer right edge never wraps to the far left"
     )
     checkEqual(
         daemon.edgeWarpLanding(
             cursor: IntPoint(1, 500), displays: row,
             warpDirection: -1, yOffset: 0
-        ), IntPoint(3834, 500), "row wrap ignores the direction sign"
+        ), nil, "outer edge never cycles under either sign"
     )
     checkEqual(
         daemon.edgeWarpLanding(
@@ -3026,28 +3036,10 @@ do {
             warpDirection: 1, yOffset: 0
         ), nil, "shared interior edges cross natively"
     )
-    checkEqual(
-        daemon.edgeWarpLanding(
-            cursor: IntPoint(1, 500), displays: row,
-            warpDirection: 1, yOffset: 0, velocityX: 600
-        ), IntPoint(3836, 500), "velocity carry pushes into the landing"
-    )
-    checkEqual(
-        daemon.edgeWarpLanding(
-            cursor: IntPoint(1, 500), displays: row,
-            warpDirection: 1, yOffset: 0, velocityX: -600
-        ), IntPoint(3816, 500), "negative carry pulls back from the edge"
-    )
-    checkEqual(
-        daemon.edgeWarpLanding(
-            cursor: IntPoint(1, 500), displays: row,
-            warpDirection: 1, yOffset: 0, velocityX: 100_000
-        ), IntPoint(3836, 500), "carry clamps at the inset floor"
-    )
 }
 
 // Stairs wrap table (2-step down-right, both signs): primary
-// half-plane first, opposite fallback second, then row-wrap.
+// half-plane first, opposite fallback second.
 do {
     var daemon = DaemonCore()
     let upper = IntRect(0, 0, 1920, 1080)
@@ -3220,13 +3212,13 @@ do {
         daemon.edgeWarpLanding(
             cursor: IntPoint(3840, 500), displays: [left, right],
             warpDirection: 1, yOffset: 0
-        ), IntPoint(6, 500), "x == global max still evaluates the edge"
+        ), nil, "x == global max evaluates the edge but never cycles"
     )
     checkEqual(
         daemon.edgeWarpLanding(
             cursor: IntPoint(0, 500), displays: [left, right],
             warpDirection: 1, yOffset: 0
-        ), IntPoint(3834, 500), "x == global min wraps"
+        ), nil, "x == global min never wraps"
     )
     // Near miss falls through: short below misses by Y, tall maps.
     let short = IntRect(1920, 300, 3840, 500)
@@ -3365,14 +3357,15 @@ do {
         ) == nil,
         "vertical travel never crosses"
     )
-    // Dwell in the band (no crossing) still warps via the direct sample.
+    // Dwell in the band (no crossing) evaluates directly, but the outer
+    // edge has no vertical target and no circle to wrap: it stays put.
     let dwelled = daemon.warpForMovement(
         prev: IntPoint(1, 400), prevAge: 0.016,
         cur: IntPoint(1, 400), displays: side,
         warpDirection: -1, yOffset: 0
     )
-    checkEqual(dwelled, IntPoint(2042, 400), "dwell wraps around the row")
-    checkEqual(daemon.lastWarpKind, "row", "dwell takes the row path")
+    checkEqual(dwelled, nil, "dwell never wraps around the row")
+    checkEqual(daemon.lastWarpKind, "none:nomap", "dwell reports no map")
 }
 
 // Diagonal exit into a stair void: the direct sample lands nowhere,
@@ -3487,9 +3480,10 @@ do {
     checkEqual(back.refocus, 0, "refocusTouch forces actuation on return")
 }
 
-// Stairs of 3 reachability: outer endpoints wrap around the row
-// (circle-first, skipping the middle); shared step bands cross
-// natively; unshared bands still warp directionally.
+// Stairs of 3 reachability: outer endpoints never wrap around a
+// display circle — the opposite half-plane fallback lands on the
+// nearest stair instead; shared step bands cross natively; unshared
+// bands still warp directionally.
 do {
     var daemon = DaemonCore()
     let a = IntRect(0, 0, 1920, 1080)
@@ -3500,9 +3494,9 @@ do {
         daemon.edgeWarpLanding(
             cursor: IntPoint(1, 500), displays: stairs,
             warpDirection: -1, yOffset: 0
-        ), IntPoint(5754, 1100), "outer endpoint wraps around the row"
+        ), IntPoint(3834, 800), "outer endpoint falls back to the nearest stair"
     )
-    checkEqual(daemon.lastWarpKind, "row", "circle beats the nearer middle step")
+    checkEqual(daemon.lastWarpKind, "fallback", "no circle: fallback serves the nearer middle step")
     checkEqual(
         daemon.edgeWarpLanding(
             cursor: IntPoint(1921, 800), displays: stairs,
@@ -3521,9 +3515,9 @@ do {
         daemon.edgeWarpLanding(
             cursor: IntPoint(5759, 1200), displays: stairs,
             warpDirection: -1, yOffset: 0
-        ), IntPoint(6, 600), "far outer endpoint wraps around the row"
+        ), IntPoint(1926, 900), "far outer endpoint falls back to the nearest stair"
     )
-    checkEqual(daemon.lastWarpKind, "row", "outer edges prefer the circle")
+    checkEqual(daemon.lastWarpKind, "fallback", "no circle: outer edges use the fallback")
 }
 
 // Cross-display moves refocus even without a focus change: the moved
