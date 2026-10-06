@@ -553,7 +553,10 @@ struct AdoptedWindow: Sendable {
         // `horizontal_padding`/`vertical_padding` rule overrides the global
         // gap for this window (0 opts out).
         let insets = windowInsets(title: probe.title, bundleID: bundle)
-        window.setPadding(hPad: insets.hPad, vPad: insets.vPad)
+        window.setInsets(
+            leading: insets.leading, trailing: insets.trailing,
+            top: insets.top, bottom: insets.bottom
+        )
         // Window rules: manage forces adoption past role rejection and
         // dont_focus suppresses focus arrival. Floating, width, index, and
         // grid placement replay focus-free through LayoutOps.
@@ -608,11 +611,9 @@ struct AdoptedWindow: Sendable {
             // `regroupNativeTabs`), never the cursor's display, so clicking
             // a tab can't hop or move the group across displays.
             let ws: WorkspaceID
-            let hPad = resolved.gapHorizontal / 2
-            let vPad = resolved.gapVertical / 2
             let probePadded = IntRect(
-                min: IntPoint(probe.frame.min.x - hPad, probe.frame.min.y - vPad),
-                max: IntPoint(probe.frame.max.x + hPad, probe.frame.max.y + vPad)
+                min: IntPoint(probe.frame.min.x - insets.leading, probe.frame.min.y - insets.top),
+                max: IntPoint(probe.frame.max.x + insets.trailing, probe.frame.max.y + insets.bottom)
             )
             if let leader = roster.first(where: { candidate in
                 candidate.key != wid
@@ -2106,30 +2107,62 @@ func watchTuning(_ path: String) {
 /// neighbours). A rule's `horizontal_padding`/`vertical_padding` overrides
 /// the global gap for that window — `0` opts out entirely. Independent per
 /// axis: the first matching rule carrying each override wins that axis.
-@Sendable func windowInsets(title: String, bundleID: String) -> (hPad: Int32, vPad: Int32) {
+@Sendable func windowInsets(
+    title: String, bundleID: String
+) -> (leading: Int32, trailing: Int32, top: Int32, bottom: Int32) {
     let rules = matchWindowRules(title: title, bundleID: bundleID, in: windowRules)
     let hOverride = rules.first(where: { $0.horizontalPadding != nil })?.horizontalPadding
     let vOverride = rules.first(where: { $0.verticalPadding != nil })?.verticalPadding
-    func half(_ value: Int32?, _ global: Int32) -> Int32 {
-        guard let v = value else { return global / 2 }
-        return min(max(v, 0), maxGapPx) / 2
+    // Origin side takes floor(gap/2), far side the remainder: two abutting
+    // windows then show exactly `gapHorizontal`/`gapVertical` between them,
+    // odd values included.
+    func split(_ value: Int32?, _ global: Int32) -> (leading: Int32, trailing: Int32) {
+        let full = value.map { min(max($0, 0), maxGapPx) } ?? global
+        return (full / 2, full - full / 2)
     }
-    return (half(hOverride, resolved.gapHorizontal), half(vOverride, resolved.gapVertical))
+    let (hLeading, hTrailing) = split(hOverride, resolved.gapHorizontal)
+    let (vTop, vBottom) = split(vOverride, resolved.gapVertical)
+    return (hLeading, hTrailing, vTop, vBottom)
 }
 
 @Sendable func applyWindowPadding() {
+    var changedWindows: [LiveProviders.LiveWindow] = []
     for (wid, window) in roster {
-        // Half the configured gap per side: two abutting slots then show
-        // exactly `gapHorizontal`/`gapVertical` between neighbours. A
-        // per-window `horizontal_padding`/`vertical_padding` rule overrides
-        // the global gap for that window (0 opts out).
-        let insets: (hPad: Int32, vPad: Int32)
+        // Origin side takes floor(gap/2), far side the remainder: two
+        // abutting slots then show exactly the configured gap between
+        // neighbours, odd values included. A per-window
+        // `horizontal_padding`/`vertical_padding` rule overrides the global
+        // gap for that window (0 opts out).
+        let insets: (leading: Int32, trailing: Int32, top: Int32, bottom: Int32)
         if let meta = core.windowMetadata[windowID(wid)] {
             insets = windowInsets(title: meta.title, bundleID: meta.bundleID)
         } else {
-            insets = (resolved.gapHorizontal / 2, resolved.gapVertical / 2)
+            insets = (
+                resolved.gapHorizontal / 2,
+                resolved.gapHorizontal - resolved.gapHorizontal / 2,
+                resolved.gapVertical / 2,
+                resolved.gapVertical - resolved.gapVertical / 2
+            )
         }
-        window.setPadding(hPad: insets.hPad, vPad: insets.vPad)
+        if window.setInsets(
+            leading: insets.leading, trailing: insets.trailing,
+            top: insets.top, bottom: insets.bottom
+        ) {
+            changedWindows.append(window)
+        }
+    }
+    // Push the new insets to the OS immediately: a pure cache re-base
+    // leaves the on-screen glass at the old gap until the next real move
+    // (and a ≤1px change would be swallowed by the write deadband). Runs
+    // on the AX worker, size-then-position, like the commit drain.
+    guard !changedWindows.isEmpty else { return }
+    let laneGen = axLaneGeneration
+    let windows = changedWindows
+    axWorker.async {
+        guard axLaneCurrent(laneGen) else { return }
+        for window in windows {
+            _ = window.rewriteInsets()
+        }
     }
 }
 

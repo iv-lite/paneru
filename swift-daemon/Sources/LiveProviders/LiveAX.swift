@@ -127,8 +127,16 @@ public final class LiveWindow: @unchecked Sendable {
     private var _fullscreen = false
     public var cachedMinimized: Bool { frameLock.withLock { _minimized } }
     public var cachedFullscreen: Bool { frameLock.withLock { _fullscreen } }
+    /// Origin-side (leading/top) gap insets. Kept alongside the far-side
+    /// pair below so the symmetric readers (border/dim glass correction)
+    /// and the `WindowReadable` mock keep their meaning unchanged.
     public var horizontalPadding: Int32
     public var verticalPadding: Int32
+    /// Far-side (trailing/bottom) gap insets: an odd global gap splits
+    /// `gap/2` onto the origin side and the remainder onto the far side,
+    /// so two abutting windows always sum to exactly the configured gap.
+    public var trailingHPad: Int32
+    public var bottomVPad: Int32
     /// Write latch (always live): every write below goes to the window
     /// server. Reads, observers, and frame refreshes are unaffected.
     /// Pids whose apps lack the enhanced-UI workaround stay synchronous.
@@ -149,6 +157,7 @@ public final class LiveWindow: @unchecked Sendable {
     public init(
         id: WindowID, element: AXUIElement, frame: IntRect,
         horizontalPadding: Int32 = 0, verticalPadding: Int32 = 0,
+        trailingHPad: Int32? = nil, bottomVPad: Int32? = nil,
         enhancedUIAbsent: Bool = false
     ) {
         self.id = id
@@ -166,26 +175,79 @@ public final class LiveWindow: @unchecked Sendable {
         self._frame = frame
         self.horizontalPadding = horizontalPadding
         self.verticalPadding = verticalPadding
+        self.trailingHPad = trailingHPad ?? horizontalPadding
+        self.bottomVPad = bottomVPad ?? verticalPadding
         self.enhancedUIAbsent = enhancedUIAbsent
     }
 
     /// Retarget the gap insets (Rust `set_padding`): re-bases the cached
     /// frame through raw CG truth so no AX round trip is needed. Slots
-    /// always abut; the visual gap between neighbors is the sum of the
-    /// adjacent insets.
-    public func setPadding(hPad: Int32, vPad: Int32) {
+    /// always abut; the visual gap between neighbours is the sum of one
+    /// window's trailing inset and the next window's leading inset, so the
+    /// origin side takes `gap/2` and the far side the remainder — an odd
+    /// configured gap lands exactly. Returns true when the insets changed
+    /// (the caller then pushes the new geometry to the OS).
+    @discardableResult
+    public func setInsets(leading: Int32, trailing: Int32, top: Int32, bottom: Int32) -> Bool {
+        let changed = leading != horizontalPadding || trailing != trailingHPad
+            || top != verticalPadding || bottom != bottomVPad
+        guard changed else { return false }
         let rawMin = IntPoint(
             frame.min.x + horizontalPadding, frame.min.y + verticalPadding
         )
         let rawMax = IntPoint(
-            frame.max.x - horizontalPadding, frame.max.y - verticalPadding
+            frame.max.x - trailingHPad, frame.max.y - bottomVPad
         )
-        horizontalPadding = hPad
-        verticalPadding = vPad
+        horizontalPadding = leading
+        trailingHPad = trailing
+        verticalPadding = top
+        bottomVPad = bottom
         frame = IntRect(
-            min: IntPoint(rawMin.x - hPad, rawMin.y - vPad),
-            max: IntPoint(rawMax.x + hPad, rawMax.y + vPad)
+            min: IntPoint(rawMin.x - leading, rawMin.y - top),
+            max: IntPoint(rawMax.x + trailing, rawMax.y + bottom)
         )
+        return true
+    }
+
+    /// Push the current insets onto the OS window immediately: writes raw
+    /// size then position from the cached padded frame, bypassing the 1px
+    /// deadband (a pure re-base alone would leave the OS at the old insets
+    /// until the next real move). Size-then-position matches the commit
+    /// drain's Rust order. No-op for dead elements; call on the AX worker.
+    @discardableResult
+    public func rewriteInsets() -> IntRect {
+        guard !elementDead() else { return frame }
+        let origin = IntPoint(frame.min.x, frame.min.y)
+        let size = IntSize(frame.width, frame.height)
+        var point = CGPoint(
+            x: Double(origin.x + horizontalPadding),
+            y: Double(origin.y + verticalPadding)
+        )
+        var target = CGSize(
+            width: Double(size.x - horizontalPadding - trailingHPad),
+            height: Double(size.y - verticalPadding - bottomVPad)
+        )
+        guard let sizeValue = AXValueCreate(.cgSize, &target),
+              let pointValue = AXValueCreate(.cgPoint, &point)
+        else {
+            complain("rewriteInsets encode failed")
+            return frame
+        }
+        var status = withEnhancedUIDisabled {
+            AXUIElementSetAttributeValue(element, kAXSizeAttribute as CFString, sizeValue)
+        }
+        if status == .success {
+            status = withEnhancedUIDisabled {
+                AXUIElementSetAttributeValue(element, kAXPositionAttribute as CFString, pointValue)
+            }
+        }
+        if status == .success {
+            clearComplaint()
+            _ = updateFrame()
+        } else {
+            denyComplaint("rewriteInsets denied", code: status.rawValue)
+        }
+        return frame
     }
 
     /// Whether the last write failed with a dead element (-25202):
@@ -331,8 +393,8 @@ public final class LiveWindow: @unchecked Sendable {
                 base.min.y - verticalPadding
             ),
             max: IntPoint(
-                base.max.x + horizontalPadding,
-                base.max.y + verticalPadding
+                base.max.x + trailingHPad,
+                base.max.y + bottomVPad
             )
         )
         frame = padded
@@ -452,8 +514,8 @@ public final class LiveWindow: @unchecked Sendable {
             return frame
         }
         let target = CGSize(
-            width: Double(size.x - 2 * horizontalPadding),
-            height: Double(size.y - 2 * verticalPadding)
+            width: Double(size.x - horizontalPadding - trailingHPad),
+            height: Double(size.y - verticalPadding - bottomVPad)
         )
         var attempt = target
         guard let value = AXValueCreate(.cgSize, &attempt) else {
