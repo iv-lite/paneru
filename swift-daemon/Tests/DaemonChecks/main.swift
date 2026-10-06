@@ -5136,6 +5136,50 @@ do {
     checkEqual(daemon.committedSlot(of: 0), IntPoint(0, 34), "grown column rests full width")
 }
 
+// Over-wide model never bleeds: a window whose model width exceeds its
+// owner viewport (e.g. dragged in from a wider display) is clamped to
+// the viewport in both its slot and its resize — its glass never rests
+// past the owner's right edge.
+do {
+    var daemon = DaemonCore()
+    daemon.animationsEnabled = false
+    daemon.glideBaseMs = 0
+    daemon.maximizeTiledWindows = true
+    _ = daemon.tick(
+        events: [.appeared(id: 0, workspace: 1), .focus(id: 0)],
+        frames: frames(slots: [0: IntPoint(0, 34)]),
+        viewport: viewport, focusedStyle: style
+    )
+    let wide: (Int32) -> IntRect? = { _ in
+        IntRect(min: IntPoint(0, 34), max: IntPoint(2048, 734))
+    }
+    let r = daemon.tick(
+        events: [.command(.layout([.setFrame(
+            window: 0, frame: WSFrame(x: 0, y: 34, width: 2048, height: 700))]))],
+        frames: wide, viewport: viewport, focusedStyle: style
+    )
+    // The over-wide model must not emit an over-wide resize.
+    check(
+        !r.axJobs.contains { $0.winID == 0 && ($0.size?.x ?? 0) > viewport.width },
+        "over-wide model never resizes past the viewport"
+    )
+    // The slot stays inside the viewport (no centering into the left
+    // neighbour, no pitch past the right edge).
+    let slot = daemon.committedSlot(of: 0) ?? IntPoint(0, 0)
+    check(
+        slot.x >= viewport.min.x && slot.x < viewport.max.x,
+        "over-wide model slot stays inside the viewport"
+    )
+    // Settle with the clamped glass and confirm it rests at the clamp.
+    let settled = daemon.tick(
+        events: [], frames: wide, viewport: viewport, focusedStyle: style
+    )
+    check(
+        !settled.axJobs.contains { $0.winID == 0 && ($0.size?.x ?? 0) > viewport.width },
+        "settled over-wide window stays clamped"
+    )
+}
+
 // `default_ratio` re-applies when a window is re-managed (float → tile),
 // not only on first spawn (Rust parity): the pre-float model width drops
 // so the ratio re-seeds against the current config.

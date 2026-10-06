@@ -371,6 +371,10 @@ nonisolated(unsafe) var confirmedVanishes = Set<WindowID>()
 nonisolated(unsafe) var stripLessSyncs: [WindowID: Int] = [:]
 /// Syncs a window must stay strip-less before self-heal re-manages it.
 let stripLessHealSyncs = 3
+/// Syncs a stashed (Space-rotated) focused window must persist hidden
+/// before the focus-stranding guard clears it to nil — a transient
+/// rotation must never drop focus without reason.
+let focusClearSyncs = 3
 /// Sync counter gating native-tab regrouping (Rust runs it every 5s and
 /// on window-added); syncs are ~1s base cadence, so every 5th matches.
 nonisolated(unsafe) var tabRegroupCounter = 0
@@ -783,6 +787,10 @@ nonisolated(unsafe) var minimizedWindows = Set<WindowID>()
 /// the stash): invisible but rostered, so Space returns skip the
 /// re-adopt storm. Same treatment as minimized.
 nonisolated(unsafe) var stashedMembers = Set<WindowID>()
+/// Consecutive syncs the focused window sat stashed (not minimized):
+/// gates the focus-stranding clear so a transient Space rotation never
+/// drops focus to nil. Reset on visibility or focus change.
+nonisolated(unsafe) var focusStashedSyncs: [WindowID: Int] = [:]
 /// Last sync's cached frame per window (re-home stability detection).
 /// Declared with the other top-level state: reads-before-declaration
 /// crashed this process at startup.
@@ -1317,6 +1325,15 @@ nonisolated(unsafe) var rotatedAt: [WorkspaceID: Date] = [:]
     // here; adoption in flight (probing) still wins its race.
     core.clearFocusIfGone { id in
         roster[CGWindowID(id)] != nil || probing.contains(CGWindowID(id))
+    }
+    // Count consecutive syncs the focused window sat stashed (a Space
+    // rotation) without being minimized: the stranding guard clears only
+    // after `focusClearSyncs`, so a flaked vote that unstashes within a
+    // sync or two never drops focus. Any other state resets the count.
+    if let f = core.focus, stashedMembers.contains(f), !minimizedWindows.contains(f) {
+        focusStashedSyncs[f, default: 0] += 1
+    } else {
+        focusStashedSyncs.removeAll(keepingCapacity: true)
     }
     // Focus heal: space trips often end with focus nil (no arrival fires
     // for the restored top window), which silently disables keybinds and
@@ -2174,13 +2191,11 @@ func watchTuning(_ path: String) {
         // neighbours, odd values included. A per-window
         // `horizontal_padding`/`vertical_padding` rule overrides the global
         // gap for that window (0 opts out). Maximized / full-tile windows
-        // fill their viewport, so their insets are zero.
+        // keep their insets too: their slot is the viewport, so the glass
+        // is simply inset by the gap instead of filling edge-to-edge.
         let id = windowID(wid)
         let insets: (leading: Int32, trailing: Int32, top: Int32, bottom: Int32)
-        if let home = workspaceViewports()[workspaceOfWindow(id) ?? core.activeWorkspace],
-           let w = core.modelWidth(of: id), w == home.width {
-            insets = (0, 0, 0, 0)
-        } else if let meta = core.windowMetadata[id] {
+        if let meta = core.windowMetadata[id] {
             insets = windowInsets(title: meta.title, bundleID: meta.bundleID)
         } else {
             insets = (
@@ -4002,15 +4017,11 @@ nonisolated(unsafe) var statJobs = 0
             core.acknowledge(winID: job.winID, seq: job.seq, epoch: job.epoch)
             continue
         }
-        // Maximized / full-tile windows fill their owner viewport: zero
-        // their gap insets for this write so the glass reaches the outer
-        // padding instead of carrying the between-window gap on its
-        // screen-facing edges. Everyone else uses their configured insets.
-        let owner = workspaceOfWindow(job.winID) ?? core.activeWorkspace
-        if let home = viewports[owner], let w = core.modelWidth(of: job.winID),
-           w == home.width {
-            job.insets = .zero
-        } else if let meta = core.windowMetadata[job.winID] {
+        // Every window carries its configured gap insets — maximized /
+        // full-tile windows included (their slot is the viewport, so the
+        // glass is inset by the gap on each edge instead of filling
+        // edge-to-edge).
+        if let meta = core.windowMetadata[job.winID] {
             let ins = windowInsets(title: meta.title, bundleID: meta.bundleID)
             job.insets = WindowInset(
                 leading: ins.leading, trailing: ins.trailing,
@@ -4165,12 +4176,21 @@ nonisolated(unsafe) var statJobs = 0
             pending.append(.focus(id: target))
             printHealedOnce("focus: healed to \(target) from hidden \(lost)")
         } else {
-            // Rest the cleared window briefly: refocus arrivals (hover
-            // over unconverged glass, observer echoes) would otherwise
-            // re-land focus here next tick and loop clear→denied-write.
-            core.noteHiddenCleared(lost, epoch: core.currentEpoch)
-            pending.append(.focus(id: nil))
-            printHealedOnce("focus: cleared from hidden \(lost) (no visible neighbor)")
+            // A stashed (Space-rotated) window must persist hidden across
+            // `focusClearSyncs` before focus is dropped to nil: a
+            // transient rotation has no visible neighbor yet and would
+            // otherwise clear focus without reason. Minimized windows
+            // clear immediately (a real user action).
+            let stashedOnly = stashedMembers.contains(lost)
+                && !minimizedWindows.contains(lost)
+            if !stashedOnly || focusStashedSyncs[lost, default: 0] >= focusClearSyncs {
+                // Rest the cleared window briefly: refocus arrivals (hover
+                // over unconverged glass, observer echoes) would otherwise
+                // re-land focus here next tick and loop clear→denied-write.
+                core.noteHiddenCleared(lost, epoch: core.currentEpoch)
+                pending.append(.focus(id: nil))
+                printHealedOnce("focus: cleared from hidden \(lost) (no visible neighbor)")
+            }
         }
     }
     // Focus actuation (Rust `focus_with/without_raise`): the core owns

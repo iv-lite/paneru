@@ -46,7 +46,7 @@ private struct SeqKey: Hashable {
 }
 
 /// Per-side gap insets applied to one write: origin-side (leading/top) and
-/// far-side (trailing/bottom). `.zero` makes the glass fill the viewport.
+/// far-side (trailing/bottom). `.zero` disables the gap for a write.
 public struct WindowInset: Equatable, Sendable {
     public var leading: Int32
     public var trailing: Int32
@@ -68,9 +68,8 @@ public struct AXWriteJob: Equatable, Sendable {
     public var origin: IntPoint?
     public var size: IntSize?
     /// Per-write gap insets; nil keeps the window's current insets. The
-    /// host sets `.zero` for maximized windows so their glass fills the
-    /// viewport instead of carrying the between-window gap on their
-    /// screen-facing edges.
+    /// host applies each window's configured insets (maximized windows
+    /// included) so the glass never fills the viewport edge-to-edge.
     public var insets: WindowInset?
     public var seq: UInt64
     public var epoch: UInt64

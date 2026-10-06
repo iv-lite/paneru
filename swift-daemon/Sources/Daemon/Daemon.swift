@@ -3442,8 +3442,11 @@ public struct DaemonCore: Sendable {
                         }
                     }
                 }
+                // Pitch is viewport-clamped here as well: an over-wide
+                // model must not center a column past the left edge or
+                // push the next column past the right edge (never bleed).
                 let colWidths: [Int32?] = strip.columns.map { column in
-                    columnWidth(column, frames: frames)
+                    columnWidth(column, frames: frames).map { min($0, home.width) }
                 }
                 // NOTE: no fill clamp here. Offsets legitimately rest
                 // outside the fill range (continuous-swipe snap bounds,
@@ -4222,9 +4225,14 @@ public struct DaemonCore: Sendable {
         }
         if maximizeTiledWindows, let modelW = modelWidths[member], modelW > 0 {
             // Grow to the tile's model width (Rust
-            // `maximize_tiled_windows`), height clamped to the viewport.
+            // `maximize_tiled_windows`), width and height clamped to the
+            // viewport so an over-wide model (e.g. a window dragged from
+            // a wider display) never bleeds past the owner's edge.
             applySize(
-                member, to: IntSize(modelW, min(live.height, home.height)),
+                member,
+                to: IntSize(
+                    min(modelW, home.width), min(live.height, home.height)
+                ),
                 epoch: epoch, frames: frames
             )
             return
@@ -4919,21 +4927,12 @@ public struct DaemonCore: Sendable {
     /// landing 6px inside the opposite edge so it can never sit on a
     /// threshold and ping-pong. When the signed half-plane has no
     /// display, the opposite half-plane serves as fallback (each edge
-    /// warps both ways); then the single-row wrap below. The caller passes FULL display frames
+    /// warps both ways). The caller passes FULL display frames
     /// (Rust `Display::bounds`): inset viewports would hide physical
     /// edges and skew cross-display Y math. Mirrors `warp_landing`
     /// including velocity carry (30ms extrapolation, ±80px clamp);
     /// drag arming stays out (Swift has no armed-drag concept:
     /// held-button drags keep native edge behavior).
-    ///
-    /// Row-wrap fall-through (beyond Rust): when no vertical target
-    /// exists, any left/right edge with no seam neighbor at the cursor Y
-    /// wraps around the row — global outer edges (leftmost-left →
-    /// rightmost right-inset and vice versa) as well as exposed interior
-    /// steps (a short display's edge band past its neighbor's end wraps
-    /// instead of sticking like native macOS). Interior shared edges
-    /// always miss so native display crossings are never yanked, and
-    /// stacked pairs stay nil via the vertical-overlap guard.
     ///
     /// Sampling notes: the cursor clamps into the display union first
     /// (half-open containment drops boundary pixels, killing the outer
