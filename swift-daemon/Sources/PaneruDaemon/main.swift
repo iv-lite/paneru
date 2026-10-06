@@ -15,6 +15,7 @@ import Commands
 import Config
 import ConfigFiles
 import CoreGraphics
+import CoreVideo
 import Daemon
 import Darwin
 import Displays
@@ -2689,17 +2690,31 @@ nonisolated(unsafe) var lastWarpEval = Date.distantPast
         .map { $0.uint32Value }
 }
 
-/// Fastest display refresh (Hz) for the tick timer: variable-rate
+/// Fastest display refresh (Hz) for the tick fallback timer: variable-rate
 /// ProMotion panels report 0 and count as 120. Recomputed with the
-/// display set; the timer follows via `rescheduleTickTimer`.
+/// display set; the fallback follows via `rescheduleTickTimer`.
 nonisolated(unsafe) var displayMaxHz = 60.0
-/// The 60–120Hz tick timer, recreated when the fastest display
-/// changes (invalidating the old one first).
+/// Fixed-cadence tick timer, used only when the display link is
+/// unavailable. Recreated when the fastest display changes.
 nonisolated(unsafe) var tickTimer: Timer?
 /// One-shot timer that wakes the daemon from an event-driven idle at the
 /// next slow-cadence duty (display refresh, pointer poll, audit, state
-/// file, tap health). nil while the repeating timer is active.
+/// file, tap health). nil while the pump is active.
 nonisolated(unsafe) var backstopTimer: Timer?
+/// Vsync pump: a CVDisplayLink on the main display replaces the
+/// fixed-interval timer when creation succeeds; nil keeps the timer
+/// fallback. Started/stopped alongside the idle backstop.
+nonisolated(unsafe) var displayLink: CVDisplayLink?
+/// Coalescing mailbox from the display-link thread to the main runloop:
+/// the real-time callback adds data, the main-queue source drains it into
+/// one tick per frame (never re-entrant, never piled up).
+nonisolated(unsafe) var tickMailbox: DispatchSourceUserDataAdd?
+/// C callback for the display link: runs on its real-time thread, so it
+/// only nudges the mailbox (no AppKit, no model state).
+nonisolated(unsafe) let displayLinkCallback: CVDisplayLinkOutputCallback = { _, _, _, _, _, _ in
+    tickMailbox?.add(data: 1)
+    return kCVReturnSuccess
+}
 /// The idle-when-static cadence decision (see `FrameClock`). Main-owned
 /// like every runloop object here.
 nonisolated(unsafe) var frameClock = FrameClock()
@@ -2717,29 +2732,55 @@ nonisolated(unsafe) var frameClock = FrameClock()
     }
 }
 
-/// Main-runloop tick pump: the Timer's target-action API lets the
-/// @MainActor `tick` run without a @Sendable block capturing a
-/// non-Sendable function reference (a selector fires on the runloop the
-/// timer was scheduled on, so the assume is sound).
-final class TickPump: NSObject {
-    @objc func fire(_ timer: Timer) {
-        MainActor.assumeIsolated { tick() }
-    }
+/// Hop one runloop tick onto the @MainActor `tick`. @Sendable so the
+/// runloop/GCD scheduling closures (which cannot capture the non-Sendable
+/// @MainActor function) can reference it without a warning; the timer and
+/// the display-link mailbox both fire on the main runloop, so the assume
+/// is sound.
+@Sendable func fireTick() {
+    MainActor.assumeIsolated { tick() }
 }
-nonisolated(unsafe) let tickPump = TickPump()
 
-/// Start (or restart) the repeating full-cadence timer. Idempotent while
-/// already running at the current rate only when `force` is false: a
-/// cadence change (display refresh) passes `force: true`.
+/// Create the display link and its main-queue mailbox once. Failure
+/// (headless, odd display config) leaves `displayLink` nil so the timer
+/// fallback keeps driving.
+@Sendable func ensureDisplayLink() {
+    guard displayLink == nil else { return }
+    var link: CVDisplayLink?
+    let created: CVReturn
+    if #available(macOS 15.0, *) {
+        created = CVDisplayLinkCreateWithActiveCGDisplays(&link)
+    } else {
+        created = CVDisplayLinkCreateWithCGDisplay(CGMainDisplayID(), &link)
+    }
+    guard created == kCVReturnSuccess, let link else { return }
+    CVDisplayLinkSetOutputCallback(link, displayLinkCallback, nil)
+    displayLink = link
+    let source = DispatchSource.makeUserDataAddSource(queue: .main)
+    source.setEventHandler {
+        fireTick()
+    }
+    tickMailbox = source
+    source.activate()
+}
+
+/// Start (or restart) the vsync pump: the display link when available,
+/// else the fixed-cadence timer. Idempotent while already running.
 @Sendable func startTickTimer() {
     backstopTimer?.invalidate()
     backstopTimer = nil
+    ensureDisplayLink()
+    if let link = displayLink {
+        if !CVDisplayLinkIsRunning(link) {
+            CVDisplayLinkStart(link)
+        }
+        return
+    }
     guard tickTimer == nil else { return }
     let hz = min(max(displayMaxHz, 60.0), 120.0)
-    tickTimer = Timer.scheduledTimer(
-        timeInterval: 1.0 / hz, target: tickPump,
-        selector: #selector(TickPump.fire(_:)), userInfo: nil, repeats: true
-    )
+    tickTimer = Timer.scheduledTimer(withTimeInterval: 1.0 / hz, repeats: true) { _ in
+        fireTick()
+    }
 }
 
 /// Drop the repeating timer and arm a one-shot backstop for `afterMs`
@@ -2749,6 +2790,9 @@ nonisolated(unsafe) let tickPump = TickPump()
 /// edge warp, hover, and the whole model). Called from `tick`'s
 /// quiet-exit path via `FrameClock.settle`.
 @Sendable func sleepTickTimer(afterMs: UInt32) {
+    if let link = displayLink, CVDisplayLinkIsRunning(link) {
+        CVDisplayLinkStop(link)
+    }
     tickTimer?.invalidate()
     tickTimer = nil
     backstopTimer?.invalidate()
@@ -2779,6 +2823,9 @@ nonisolated(unsafe) let tickPump = TickPump()
 /// frames drop to a backstop via `FrameClock`, so the runloop (which
 /// also owns the event tap) is free at rest.
 @Sendable func rescheduleTickTimer() {
+    if let link = displayLink, CVDisplayLinkIsRunning(link) {
+        CVDisplayLinkStop(link)
+    }
     tickTimer?.invalidate()
     tickTimer = nil
     // A display cadence change only matters while running; if the clock
