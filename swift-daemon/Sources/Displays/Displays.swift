@@ -82,6 +82,40 @@ public func displayIndexForPoint(_ point: IntPoint, in frames: [IntRect]) -> Int
     return best?.index
 }
 
+/// Workspace owning a point, resolved through the **stable**
+/// workspace→display mapping — never a raw display index. Maps the
+/// point to a display id (`displayIndexForPoint`, nearest when off a
+/// display), then returns the workspace whose `workspaceDisplay` entry
+/// owns that id. A raw `index+1` desyncs from `assignWorkspaces` after a
+/// sleep/wake or plug/unplug reorder (UUIDs keep a workspace glued to a
+/// physical display), and spawns routed that way land on the wrong
+/// monitor. Unmapped displays (fresh plug pre-refresh) fall back to
+/// their 1-based ring position so a spawn never strands. Nil only when
+/// no display contains the point.
+public func resolveWorkspaceForPoint(
+    _ point: IntPoint,
+    displayFrames: [(id: UInt32, frame: IntRect)],
+    workspaceDisplay: [WorkspaceID: UInt32]
+) -> WorkspaceID? {
+    guard let index = displayIndexForPoint(point, in: displayFrames.map { $0.frame }),
+          index < displayFrames.count
+    else { return nil }
+    let displayID = displayFrames[index].id
+    // Stable mapping first. The ring-position fallback for a display the
+    // mapping does not know yet (fresh plug pre-refresh) only applies when
+    // that number does not already name a different display — an indexed
+    // spacer colliding with a UUID-kept workspace would route the spawn
+    // onto the neighbor monitor.
+    if let ws = workspaceDisplay.first(where: { $0.value == displayID })?.key {
+        return ws
+    }
+    let ring = WorkspaceID(index + 1)
+    if workspaceDisplay[ring].map({ $0 == displayID }) ?? true {
+        return ring
+    }
+    return nil
+}
+
 // MARK: - Display
 
 /// A physical monitor. Mirrors `manager::Display`.

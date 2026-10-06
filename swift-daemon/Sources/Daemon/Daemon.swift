@@ -907,10 +907,24 @@ public struct DaemonCore: Sendable {
                     )
                     restored = true
                 }
+                // A genuinely brand-new window (not a space-return restore)
+                // into a workspace that holds no windows restarts the strip
+                // at rest: a scrolled offset (kept, say, through the active
+                // empty row) or an orphaned eased target would ease the
+                // fresh window off-screen — the unreachable first-window
+                // glide. Restores own their parked scroll instead
+                // (see `restoreRow`).
+                let workspaceEmptyBefore =
+                    (strips[workspace] ?? [:]).values.allSatisfy { $0.allWindows.isEmpty }
                 var strip = strips[workspace]?[activeVirtual[workspace] ?? 0]
                     ?? LayoutStrip(id: workspace, virtualIndex: activeVirtual[workspace] ?? 0)
                 strip.append(id)
                 strips[workspace, default: [:]][strip.virtualIndex] = strip
+                if !restored, workspaceEmptyBefore {
+                    offsets.removeValue(forKey: workspace)
+                    offsetTargets.removeValue(forKey: workspace)
+                    offsetLegs.removeValue(forKey: workspace)
+                }
                 // Seed model truth from the live frame, never (0, 0): the
                 // commit pass only enqueues moves where the slot differs
                 // from `positions`, so a (0, 0) seed equals a (0, y) slot
@@ -2235,6 +2249,12 @@ public struct DaemonCore: Sendable {
     /// this their park intents read as bogus wrong-display targets and
     /// the windows never park).
     private var sliverParked = Set<WindowID>()
+    /// Sliver-parked members whose hidden body would paint on a
+    /// contiguous sibling display (a horizontal seam, rather than the
+    /// stairs void): their presented width clips to `offscreenSliverWidth`
+    /// so no glass ever rests next door. The model size is untouched;
+    /// un-parking restores it.
+    private var sliverClipped = Set<WindowID>()
     /// Stable hide-park membership: a member that has parked stays parked
     /// until its whole frame is back inside the owner viewport, so the
     /// exit boundary cannot flip the target tick to tick (each flip is a
@@ -3078,6 +3098,13 @@ public struct DaemonCore: Sendable {
                 if strips[workspace]?.isEmpty == true {
                     strips.removeValue(forKey: workspace)
                     offsets.removeValue(forKey: workspace)
+                    // A stripped workspace owns no scroll: drop its eased
+                    // target and legs with it. Left behind, a stale target
+                    // glides a later first window off toward it (the
+                    // unreachable-spawn glide) — `offsets` was already
+                    // cleared, the target must not survive alone.
+                    offsetTargets.removeValue(forKey: workspace)
+                    offsetLegs.removeValue(forKey: workspace)
                 }
             }
         }
@@ -3574,12 +3601,24 @@ public struct DaemonCore: Sendable {
         home: IntRect, union: IntRect?, siblings: [IntRect]
     ) -> Bool {
         _ = member
-        _ = height
         _ = union
-        _ = siblings
         let exitedLeft = slot.x + width <= home.min.x
         let exitedRight = slot.x >= home.max.x
-        return exitedLeft || exitedRight
+        if exitedLeft || exitedRight { return true }
+        // Straddle: the slot spans the owner edge without a full exit. In
+        // the stairs void the overflow is invisible and harmless, but at a
+        // contiguous seam it paints on the neighbor — park then too. The
+        // overlap check is x AND y, so void overhangs (no sibling in the
+        // band) stay untouched and never leave a reserved-slot hole.
+        guard !siblings.isEmpty else { return false }
+        let frame = IntRect(
+            min: slot,
+            max: IntPoint(slot.x + width, slot.y + height)
+        )
+        return siblings.contains { sibling in
+            frame.max.x > sibling.min.x && frame.min.x < sibling.max.x
+                && frame.max.y > sibling.min.y && frame.min.y < sibling.max.y
+        }
     }
 
     /// Hide-park x/y for a slot the caller already decided to park: the
@@ -3635,6 +3674,7 @@ public struct DaemonCore: Sendable {
         // below decide; a window fully inside the owner never parks.
         guard width > 0, height > 0 else {
             parkedMembers.remove(member)
+            sliverClipped.remove(member)
             return nil
         }
         guard wantsPark(
@@ -3642,10 +3682,32 @@ public struct DaemonCore: Sendable {
             home: home, union: union, siblings: siblings
         ) else {
             parkedMembers.remove(member)
+            sliverClipped.remove(member)
             return nil
         }
         parkedMembers.insert(member)
-        return parkTarget(slot: slot, width: width, height: height, home: home)
+        let fullPark = parkTarget(slot: slot, width: width, height: height, home: home)
+        // Body bleed: the full-width park keeps a sliver on the owner and
+        // lets the body hang off. In the stairs void the body is invisible
+        // (and the frozen parity pins it); at a contiguous seam the body
+        // paints on the neighbor, so clip the presented width to the
+        // sliver and re-anchor its origin on the exited edge.
+        let body = IntRect(
+            min: fullPark,
+            max: IntPoint(fullPark.x + width, fullPark.y + height)
+        )
+        let bleeds = siblings.contains { sibling in
+            body.max.x > sibling.min.x && body.min.x < sibling.max.x
+                && body.max.y > sibling.min.y && body.min.y < sibling.max.y
+        }
+        if bleeds {
+            sliverClipped.insert(member)
+            let x = slot.x < home.min.x
+                ? home.min.x : home.max.x - offscreenSliverWidth
+            return IntPoint(x, fullPark.y)
+        }
+        sliverClipped.remove(member)
+        return fullPark
     }
 
     /// Move intent with homing/hand/convergence handling (extracted
@@ -3672,6 +3734,7 @@ public struct DaemonCore: Sendable {
         if heldMembers.contains(member) {
             target = slot
             sliverParked.remove(member)
+            sliverClipped.remove(member)
         } else if !rideStripOffset,
                   let parked = parkOffscreen(member, slot: slot, home: home, union: union, siblings: siblings, frames: frames)
         {
@@ -3686,6 +3749,7 @@ public struct DaemonCore: Sendable {
         } else {
             target = slot
             sliverParked.remove(member)
+            sliverClipped.remove(member)
         }
         if homing.contains(member) {
             // Release homing restores the slot immediately (the animated
@@ -3899,6 +3963,19 @@ public struct DaemonCore: Sendable {
         frames: (WindowID) -> IntRect?
     ) {
         guard let live = frames(member) else { return }
+        if sliverClipped.contains(member) {
+            // Hide-park at a contiguous seam: present a `offscreenSliverWidth`
+            // sliver so no body paints next door. `enqueueResize` (not
+            // `applySize`) so the native-shrink adoption below never mistakes
+            // the sliver for a user resize and shrinks the model width; the
+            // model width stays intact and un-parking restores it.
+            enqueueResize(
+                member,
+                to: IntSize(offscreenSliverWidth, min(live.height, home.height)),
+                epoch: epoch
+            )
+            return
+        }
         if fullWidth[member] != nil {
             applySize(
                 member, to: IntSize(home.width, home.height),

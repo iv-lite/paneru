@@ -445,6 +445,97 @@ do {
     checkEqual(daemon.activeWorkspace, 1, "follow retargets active")
 }
 
+// A re-emptied workspace greets its first window at rest: the scrolled
+// offset (and any eased target) left by previous tenants must not chase
+// the fresh spawn off-screen. The ACTIVE workspace keeps its emptied row
+// after the last close, so the reset must not depend on reaping a gone
+// workspace.
+do {
+    var daemon = DaemonCore()
+    daemon.reapEmptyWorkspaces = true
+    // Make ws1 non-active at its first spawn so `activeVirtual[1]` is
+    // seeded: the emptied ACTIVE row is then keep-protected, which is
+    // exactly the branch that strands a scrolled offset without the fix.
+    daemon.activeWorkspace = 2
+    _ = daemon.tick(
+        events: [.appeared(id: 0, workspace: 1), .appeared(id: 1, workspace: 1)],
+        frames: frames(slots: [0: IntPoint(0, 0), 1: IntPoint(0, 0)]),
+        viewports: [1: viewport, 2: viewport], focusedStyle: style
+    )
+    _ = daemon.tick(
+        events: [.swipe(delta: 0.5, fingers: 3)],
+        frames: frames(slots: [0: IntPoint(0, 34), 1: IntPoint(400, 34)]),
+        viewports: [1: viewport, 2: viewport], focusedStyle: style
+    )
+    check((daemon.offsets[1] ?? 0) != 0, "strip scrolled before the close")
+    _ = daemon.tick(
+        events: [.disappeared(id: 0), .disappeared(id: 1)],
+        frames: { _ in nil }, viewports: [1: viewport, 2: viewport], focusedStyle: style
+    )
+    _ = daemon.tick(
+        events: [], frames: { _ in nil },
+        viewports: [1: viewport, 2: viewport], focusedStyle: style
+    )
+    check(daemon.strips[1] != nil, "emptied active row is keep-protected (the stale-offset branch)")
+    let fresh = daemon.tick(
+        events: [.appeared(id: 2, workspace: 1)],
+        frames: frames(slots: [2: IntPoint(0, 0)]),
+        viewports: [1: viewport, 2: viewport], focusedStyle: style
+    )
+    checkEqual(daemon.offsets[1] ?? 0, 0, "first window on an emptied workspace starts at rest")
+    check(
+        daemon.offsetTarget(for: 1).map({ $0 == 0 }) ?? true,
+        "no eased target chases the first window"
+    )
+    checkEqual(daemon.committedSlot(of: 2), IntPoint(0, 34), "first window slots at the home edge")
+    check(fresh.axJobs.contains { $0.winID == 2 && $0.origin != nil }, "fresh spawn still issues its move intent")
+}
+
+// Reaping an emptied NON-active workspace drops its offset target with
+// it: the orphaned target would glide a later first window off-screen.
+do {
+    var daemon = DaemonCore()
+    daemon.reapEmptyWorkspaces = true
+    daemon.workspaceRing = [1, 2]
+    let left = IntRect(0, 0, 1024, 768)
+    let right = IntRect(1024, 0, 2048, 768)
+    _ = daemon.tick(
+        events: [.appeared(id: 0, workspace: 1)],
+        frames: frames(slots: [0: IntPoint(0, 0)]),
+        viewports: [1: left, 2: right], focusedStyle: style
+    )
+    _ = daemon.tick(
+        events: [.appeared(id: 2, workspace: 2), .appeared(id: 3, workspace: 2), .focus(id: 3)],
+        frames: frames(slots: [0: IntPoint(0, 0), 2: IntPoint(1024, 0), 3: IntPoint(1424, 0)]),
+        viewports: [1: left, 2: right], focusedStyle: style
+    )
+    _ = daemon.tick(
+        events: [.swipe(delta: 0.5, fingers: 3)],
+        frames: frames(slots: [0: IntPoint(0, 34), 2: IntPoint(1024, 34), 3: IntPoint(1424, 34)]),
+        viewports: [1: left, 2: right], focusedStyle: style
+    )
+    check((daemon.offsets[2] ?? 0) < 0, "ws2 scrolled")
+    // Active hops back to ws1; ws2's windows close while ws2 is inactive.
+    _ = daemon.tick(
+        events: [.focus(id: 0)],
+        frames: frames(slots: [0: IntPoint(0, 34), 2: IntPoint(1024, 34), 3: IntPoint(1424, 34)]),
+        viewports: [1: left, 2: right], focusedStyle: style
+    )
+    checkEqual(daemon.activeWorkspace, 1, "focus retargets ws1")
+    _ = daemon.tick(
+        events: [.disappeared(id: 2), .disappeared(id: 3)],
+        frames: frames(slots: [0: IntPoint(0, 34)]),
+        viewports: [1: left, 2: right], focusedStyle: style
+    )
+    _ = daemon.tick(
+        events: [], frames: frames(slots: [0: IntPoint(0, 34)]),
+        viewports: [1: left, 2: right], focusedStyle: style
+    )
+    check(daemon.strips[2] == nil, "empty non-active workspace reaped")
+    check(daemon.offsetTarget(for: 2) == nil, "reap drops the eased target")
+    checkEqual(daemon.offsets[2] ?? 0, 0, "reap drops the scrolled offset")
+}
+
 // Reveal stands down while gesture energy is fresh: a same-tick swipe
 // plus focus arrival keeps the pure swipe offset (reveal would scroll
 // another -176 to expose the now-shortfall window).
@@ -4600,10 +4691,11 @@ do {
     checkEqual(daemon.activeWorkspace, 2, "follow retargets the active display")
 }
 
-// A partly-visible window is left in place: the strip scrolls rigidly, so
-// hiding a straddler would leave a reserved-slot hole the size of the
-// window. Only a full exit parks. (On the stairs rig a straddle overhang
-// falls into the void, not a neighbour's band.)
+// A straddling column on a CONTIGUOUS seam is hide-parked: in a horizontal
+// arrangement the overhang paints on the neighbour, so (unlike the stairs
+// void, where it is invisible and the column stays put) the straddler must
+// park at the owner edge. Its MODEL slot is preserved — only the presented
+// target parks and clips to a sliver — so scroll-back resumes it in place.
 do {
     var daemon = DaemonCore()
     daemon.animationsEnabled = false
@@ -4628,15 +4720,101 @@ do {
     let r = daemon.tick(
         events: [], frames: live, viewports: views, focusedStyle: style
     )
-    // Window 2 straddles the seam ([600,1000) over the 800 edge): it stays
-    // put so the visible columns keep their gaps.
+    // Window 2 straddles the seam ([600,1000) over the 800 edge): it parks
+    // at the owner edge sliver (800 - 9 = 791) and clips to a sliver width,
+    // instead of painting onto ws2's strip.
     check(
-        !r.axJobs.contains(where: { $0.winID == 2 && $0.origin == IntPoint(791, 0) }),
-        "straddling member is not hidden mid-run"
+        r.axJobs.contains(where: { $0.winID == 2 && $0.origin == IntPoint(791, 0) }),
+        "straddling member parks at the seam"
     )
-    checkEqual(daemon.positions[2], IntPoint(600, 0), "straddle stays in place")
-    checkEqual(daemon.committedSlot(of: 2), IntPoint(600, 0), "straddle slot modeled")
+    checkEqual(daemon.positions[2], IntPoint(791, 0), "straddle presented target parks at the edge")
+    checkEqual(daemon.committedSlot(of: 2), IntPoint(600, 0), "straddle model slot preserved")
+    check(
+        r.axJobs.contains(where: { $0.winID == 2 && $0.size?.x == 9 }),
+        "straddle park clips the body to a sliver"
+    )
+    // No emitted target rests on the neighbour: the parked sliver
+    // [791, 800) ends exactly at the seam, and its clipped 9px body stays
+    // fully on the owner.
+    for job in r.axJobs where job.winID == 2 {
+        guard let o = job.origin else { continue }
+        let w = job.size?.x ?? 400
+        let f = IntRect(min: o, max: IntPoint(o.x + w, o.y + 700))
+        let hit = f.intersected(with: right)
+        check(
+            !(hit.width > 0 && hit.height > 0),
+            "straddle park must not rest on the neighbour (origin \(o), width \(w))"
+        )
+    }
 }
+
+// Clean vertical stack (X-aligned column): the above/below warp maps
+// strictly — no diagonal "proportional" fallback — and the display circle
+// stays inert (no vertical overlap between stacked displays).
+do {
+    var daemon = DaemonCore()
+    let upper = IntRect(0, 0, 1920, 1080)
+    let lower = IntRect(0, 1080, 1920, 2160)
+    let stack = [upper, lower]
+    checkEqual(
+        daemon.edgeWarpLanding(
+            cursor: IntPoint(1, 500), displays: stack, warpDirection: 1, yOffset: 0
+        ), IntPoint(1914, 1580), "vertical stack: left edge goes down"
+    )
+    checkEqual(daemon.lastWarpKind, "primary", "vertical landing reports its stage (strict, not proportional)")
+    checkEqual(
+        daemon.edgeWarpLanding(
+            cursor: IntPoint(1919, 1500), displays: stack, warpDirection: 1, yOffset: 0
+        ), IntPoint(6, 420), "vertical stack: right edge goes up"
+    )
+    checkEqual(
+        daemon.edgeWarpLanding(
+            cursor: IntPoint(1, 500), displays: stack, warpDirection: -1, yOffset: 0
+        ), IntPoint(1914, 1580), "vertical stack: left edge falls back below"
+    )
+}
+
+// Vertical stack hide-park: an off-screen column on the upper display parks
+// with its body in the side gutter (void), never in the lower display's
+// band — strips stay separated with no cross-display bleed.
+do {
+    var daemon = DaemonCore()
+    daemon.animationsEnabled = false
+    daemon.glideBaseMs = 0
+    daemon.offscreenSliverWidth = 9
+    let upper = IntRect(0, 0, 1920, 1080)
+    let lower = IntRect(0, 1080, 1920, 2160)
+    let views: [WorkspaceID: IntRect] = [1: upper, 2: lower]
+    let live: (Int32) -> IntRect? = { id in
+        let x: Int32 = id == 0 ? 0 : 400
+        return IntRect(min: IntPoint(x, 0), max: IntPoint(x + 400, 700))
+    }
+    // Two columns on ws1; swipe the strip fully to the left so window 0
+    // exits the owner's left edge and parks.
+    _ = daemon.tick(
+        events: [.appeared(id: 0, workspace: 1), .appeared(id: 1, workspace: 1)],
+        frames: live, viewports: views, focusedStyle: style
+    )
+    for _ in 0..<6 {
+        _ = daemon.tick(
+            events: [.swipe(delta: -0.5, fingers: 3)],
+            frames: live, viewports: views, focusedStyle: style
+        )
+    }
+    // Window 0 is parked at the left edge sliver; its body must not rest in
+    // the lower display's band.
+    guard let parked = daemon.positions[0] else {
+        check(false, "parked window has a position")
+        exit(1)
+    }
+    let body = IntRect(min: parked, max: IntPoint(parked.x + 400, parked.y + 700))
+    let hit = body.intersected(with: lower)
+    check(
+        !(hit.width > 0 && hit.height > 0),
+        "vertical hide-park must not bleed into the lower display (origin \(parked))"
+    )
+}
+
 
 // Invariant: no emitted move target may come to rest on a sibling
 // display. The stairs arrangement (vertically disjoint bands) is what

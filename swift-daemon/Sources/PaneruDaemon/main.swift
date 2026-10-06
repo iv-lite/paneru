@@ -501,7 +501,22 @@ struct AdoptedWindow: Sendable {
 /// Adopt probed newcomers into the roster (main thread): metadata, rules,
 /// role qualification, observer wiring. `elements` carries the live
 /// `AXUIElement` per adopted window for roster ownership.
+/// Adopt-probe results carry this for native-tab grouping decisions.
 @Sendable func adoptNewcomers(_ adopted: [(AdoptedWindow, AXUIElement)]) {
+    // Native-tab batch affinity: same-app same-frame windows adopted in
+    // one pass are tabs of one leader (macOS tabbing leaves the sibling
+    // windows in the AX tree sharing the leader's frame). They must all
+    // land on the leader's workspace — never cursor-routed per window —
+    // or a click on a background tab focuses a strip on another display
+    // and hops the active workspace. The first member of a batch whose
+    // leader has no workspace yet takes the cursor display; the rest
+    // follow it (the leader's `.appeared` is ingested on a later tick).
+    struct TabBatchKey: Hashable {
+        var pid: pid_t
+        var frame: IntRect
+    }
+    var tabBatchWorkspace: [TabBatchKey: WorkspaceID] = [:]
+    var tabSiblingAdopted = false
     for (probe, element) in adopted {
         let wid = probe.wid
         probing.remove(wid)
@@ -578,7 +593,42 @@ struct AdoptedWindow: Sendable {
             // user is looking at — so a new app opens where attention is,
             // not on whichever display the OS put its window. Falls back to
             // the frame's own display when the cursor can't be read.
-            let ws = workspaceForCursor(fallback: probe.frame)
+            // Native-tab exception: a window duplicating an already-tiled
+            // window's frame (same app) is the tab group's follower — it
+            // joins the leader's workspace (and column via
+            // `regroupNativeTabs`), never the cursor's display, so clicking
+            // a tab can't hop or move the group across displays.
+            let ws: WorkspaceID
+            let hPad = resolved.gapHorizontal / 2
+            let vPad = resolved.gapVertical / 2
+            let probePadded = IntRect(
+                min: IntPoint(probe.frame.min.x - hPad, probe.frame.min.y - vPad),
+                max: IntPoint(probe.frame.max.x + hPad, probe.frame.max.y + vPad)
+            )
+            if let leader = roster.first(where: { candidate in
+                candidate.key != wid
+                    && windowPIDs[windowID(candidate.key)] == probe.ownerPID
+                    && candidate.value.frame == probePadded
+                    && workspaceOfWindow(windowID(candidate.key)) != nil
+            }), let owner = workspaceOfWindow(windowID(leader.key)) {
+                ws = owner
+                tabSiblingAdopted = true
+                print("tab: adopted window=\(windowID(wid)) as native-tab sibling of \(windowID(leader.key)) on ws=\(owner)")
+            } else if let shared = tabBatchWorkspace[TabBatchKey(pid: probe.ownerPID, frame: probePadded)] {
+                ws = shared
+                tabSiblingAdopted = true
+            } else {
+                // First sight of a brand-new window: make sure the display
+                // set is fresh (the first roster sync often runs before the
+                // first tick refreshed geometry; a stale/empty list would
+                // route every spawn to ws 1 regardless of the cursor).
+                if displayScreens.isEmpty || workspaceDisplay.isEmpty {
+                    refreshDisplays()
+                }
+                let chosen = workspaceForCursor(fallback: probe.frame)
+                tabBatchWorkspace[TabBatchKey(pid: probe.ownerPID, frame: probePadded)] = chosen
+                ws = chosen
+            }
             pending.append(.appeared(id: windowID(wid), workspace: ws))
             // Native-fullscreen windows float unmanaged (never relocated);
             // rule-floating windows do the same via config.
@@ -632,6 +682,13 @@ struct AdoptedWindow: Sendable {
                 ])))
             }
         }
+    }
+    // Tab followers land as their own column until folded: run the
+    // native-tab regroup on the next roster sync instead of waiting out
+    // the slow cadence (a click on the tab before then would focus an
+    // ungrouped column — the bug this adoption routing fixes).
+    if tabSiblingAdopted {
+        tabRegroupCounter = tabRegroupEverySyncs
     }
 }
 
@@ -2878,8 +2935,17 @@ nonisolated(unsafe) var frameClock = FrameClock()
             )
         )
     }
-    if let index = displayIndexForPoint(cursor, in: frames) {
-        return WorkspaceID(index + 1)
+    // Resolve through the stable workspace→display mapping (`assignWorkspaces'),
+    // never a raw ring index: a UUID-kept workspace can name a different
+    // physical display than `displayScreens[N-1]` after a reorder, and a
+    // spawn routed that way tiles on the wrong monitor.
+    let displayFrames = displayScreens.indices.map { i -> (id: UInt32, frame: IntRect) in
+        (displayScreens[i].id, frames[i])
+    }
+    if let ws = resolveWorkspaceForPoint(
+        cursor, displayFrames: displayFrames, workspaceDisplay: workspaceDisplay
+    ) {
+        return ws
     }
     return workspaceForFrame(rect)
 }

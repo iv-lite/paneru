@@ -132,6 +132,48 @@ do {
     checkEqual(plus.mapping[4], 40, "newcomer takes the next number")
 }
 
+// Spawn-point routing goes through the STABLE workspace→display mapping,
+// never a raw ring index: a UUID-kept reorder must not route a cursor on
+// display 30 to the workspace number that names a different monitor.
+do {
+    let frames: [(id: UInt32, frame: IntRect)] = [
+        (id: 10, frame: IntRect(0, 0, 1024, 768)),
+        (id: 20, frame: IntRect(1024, 0, 2048, 768)),
+        (id: 30, frame: IntRect(2048, 0, 3072, 768)),
+    ]
+    // UUID assignment outlived a sleep/wake numeric reorder: ws2 now owns
+    // display 30, ws3 owns 20 — the ring position (index+1) would say the
+    // reverse.
+    let reordered: [WorkspaceID: UInt32] = [1: 10, 2: 30, 3: 20]
+    checkEqual(
+        resolveWorkspaceForPoint(IntPoint(100, 100), displayFrames: frames, workspaceDisplay: reordered),
+        1, "named mapping resolves ws1"
+    )
+    checkEqual(
+        resolveWorkspaceForPoint(IntPoint(2400, 100), displayFrames: frames, workspaceDisplay: reordered),
+        2, "cursor on display 30 resolves through UUIDs, not index"
+    )
+    checkEqual(
+        resolveWorkspaceForPoint(IntPoint(1500, 100), displayFrames: frames, workspaceDisplay: reordered),
+        3, "cursor on display 20 owns ws3 after the reorder"
+    )
+    // An unmapped display (fresh plug, pre-refresh) falls back to its
+    // ring position so a spawn never strands.
+    checkEqual(
+        resolveWorkspaceForPoint(IntPoint(2400, 100), displayFrames: frames, workspaceDisplay: [1: 10, 2: 20]),
+        3, "unmapped display falls back to ring position"
+    )
+    // Off-display points snap to the nearest owned display.
+    checkEqual(
+        resolveWorkspaceForPoint(IntPoint(-50, 100), displayFrames: frames, workspaceDisplay: reordered),
+        1, "off-screen point snaps to the nearest owned display"
+    )
+    checkEqual(
+        resolveWorkspaceForPoint(IntPoint(100, 100), displayFrames: [], workspaceDisplay: reordered),
+        nil, "no displays resolves nil"
+    )
+}
+
 // SpaceVoter: one flaky SLS read must never rotate layouts; real
 // switches apply promptly; rotations cool down silent flapping.
 do {

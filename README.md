@@ -103,18 +103,22 @@ inspired by [Niri] and [PaperWM.spoon].
 - Check your System Settings for "Displays have separate spaces" option. It
   should be enabled - this allows Paneru to manage the workspaces independently.
 
-- **Multiple displays**. Paneru is moving the windows off-screen, hiding them
-  to the left or right. If you have multiple displays, for example your laptop
-  open when docked to an external monitor you may experience weird behavior.
-  The issue is that when MacOS notices a window being moved too far off-screen
-  it will relocate it to a different display - which confuses Paneru! The
-  solution is to change the spatial arrangement of your additional display -
-  instead of having it to the left or right, move it above or below your main
-  display.
+- **Multiple displays**. Paneru hides windows off-screen to the left or right.
+  If you have multiple displays — for example your laptop open when docked to
+  an external monitor — you may experience weird behavior: when macOS notices a
+  window being moved too far off-screen it relocates it to a different display,
+  which confuses Paneru. The solution is to change the spatial arrangement of
+  your additional displays: instead of placing them left/right, stack them in a
+  **clean vertical column** (X-aligned, one directly above/below the other).
+  The off-screen windows then hide in the empty side gutters rather than on the
+  neighbouring display.
   A [similar situation](https://nikitabobko.github.io/AeroSpace/guide#proper-monitor-arrangement)
   exists with Aerospace window manager.
-  An option exists (`horizontal_mouse_warp`) which can make a vertical
-  arrangement of displays "feel" horizontal.
+  An option exists (`horizontal_mouse_warp`) which makes this vertical
+  arrangement of displays "feel" horizontal, since your monitors are physically
+  side-by-side. The edge-warp *display circle* (wrap-around at the outer edges)
+  only applies to horizontally-overlapping rows and is inert in a vertical
+  column, so it is optional.
 
 - **Off-screen window slivers**. Because macOS will forcibly relocate windows
   that are moved fully off-screen, Paneru keeps a thin sliver of each
