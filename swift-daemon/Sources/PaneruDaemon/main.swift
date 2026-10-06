@@ -2173,9 +2173,14 @@ func watchTuning(_ path: String) {
         // abutting slots then show exactly the configured gap between
         // neighbours, odd values included. A per-window
         // `horizontal_padding`/`vertical_padding` rule overrides the global
-        // gap for that window (0 opts out).
+        // gap for that window (0 opts out). Maximized / full-tile windows
+        // fill their viewport, so their insets are zero.
+        let id = windowID(wid)
         let insets: (leading: Int32, trailing: Int32, top: Int32, bottom: Int32)
-        if let meta = core.windowMetadata[windowID(wid)] {
+        if let home = workspaceViewports()[workspaceOfWindow(id) ?? core.activeWorkspace],
+           let w = core.modelWidth(of: id), w == home.width {
+            insets = (0, 0, 0, 0)
+        } else if let meta = core.windowMetadata[id] {
             insets = windowInsets(title: meta.title, bundleID: meta.bundleID)
         } else {
             insets = (
@@ -3650,6 +3655,14 @@ nonisolated(unsafe) var statJobs = 0
         // Per-call denial capture: a later success clears the shared slot,
         // so read the code before the next call.
         var denied: Int32?
+        // Apply the job's insets first (idempotent): a maximized window
+        // writes with zero insets, a normal one with its configured gap.
+        if let insets = job.insets {
+            window.setInsets(
+                leading: insets.leading, trailing: insets.trailing,
+                top: insets.top, bottom: insets.bottom
+            )
+        }
         // Size before position (Rust `resize` order): a job that changes
         // both must never occupy (new origin, old size) — that intermediate
         // frame moves the glass edge relative to the neighbour and breathes
@@ -3968,7 +3981,7 @@ nonisolated(unsafe) var statJobs = 0
     // tick via the box (see top of tick).
     var batchBuilder: [(LiveProviders.LiveWindow, AXWriteJob)] = []
     batchBuilder.reserveCapacity(result.axJobs.count)
-    for job in result.axJobs {
+    for var job in result.axJobs {
         guard let window = roster[CGWindowID(job.winID)] else {
             core.acknowledge(winID: job.winID, seq: job.seq, epoch: job.epoch)
             continue
@@ -3988,6 +4001,28 @@ nonisolated(unsafe) var statJobs = 0
         guard !stashedMembers.contains(job.winID) else {
             core.acknowledge(winID: job.winID, seq: job.seq, epoch: job.epoch)
             continue
+        }
+        // Maximized / full-tile windows fill their owner viewport: zero
+        // their gap insets for this write so the glass reaches the outer
+        // padding instead of carrying the between-window gap on its
+        // screen-facing edges. Everyone else uses their configured insets.
+        let owner = workspaceOfWindow(job.winID) ?? core.activeWorkspace
+        if let home = viewports[owner], let w = core.modelWidth(of: job.winID),
+           w == home.width {
+            job.insets = .zero
+        } else if let meta = core.windowMetadata[job.winID] {
+            let ins = windowInsets(title: meta.title, bundleID: meta.bundleID)
+            job.insets = WindowInset(
+                leading: ins.leading, trailing: ins.trailing,
+                top: ins.top, bottom: ins.bottom
+            )
+        } else {
+            job.insets = WindowInset(
+                leading: resolved.gapHorizontal / 2,
+                trailing: resolved.gapHorizontal - resolved.gapHorizontal / 2,
+                top: resolved.gapVertical / 2,
+                bottom: resolved.gapVertical - resolved.gapVertical / 2
+            )
         }
         batchBuilder.append((window, job))
     }

@@ -45,14 +45,33 @@ private struct SeqKey: Hashable {
     var seq: UInt64
 }
 
+/// Per-side gap insets applied to one write: origin-side (leading/top) and
+/// far-side (trailing/bottom). `.zero` makes the glass fill the viewport.
+public struct WindowInset: Equatable, Sendable {
+    public var leading: Int32
+    public var trailing: Int32
+    public var top: Int32
+    public var bottom: Int32
+    public static let zero = WindowInset(leading: 0, trailing: 0, top: 0, bottom: 0)
+    public init(leading: Int32 = 0, trailing: Int32 = 0, top: Int32 = 0, bottom: Int32 = 0) {
+        self.leading = leading
+        self.trailing = trailing
+        self.top = top
+        self.bottom = bottom
+    }
+}
+
 /// One async write: a position move, a resize, or both (merged on drain).
 /// Latest per window wins; `epoch` tags the issuing commit frame.
 public struct AXWriteJob: Equatable, Sendable {
     public var winID: WindowID
     public var origin: IntPoint?
     public var size: IntSize?
-    public var hPad: Int32
-    public var vPad: Int32
+    /// Per-write gap insets; nil keeps the window's current insets. The
+    /// host sets `.zero` for maximized windows so their glass fills the
+    /// viewport instead of carrying the between-window gap on their
+    /// screen-facing edges.
+    public var insets: WindowInset?
     public var seq: UInt64
     public var epoch: UInt64
     /// Focused window's write: drained ahead of the batch.
@@ -60,14 +79,13 @@ public struct AXWriteJob: Equatable, Sendable {
 
     public init(
         winID: WindowID, origin: IntPoint? = nil, size: IntSize? = nil,
-        hPad: Int32 = 0, vPad: Int32 = 0, seq: UInt64 = 0, epoch: UInt64 = 0,
+        insets: WindowInset? = nil, seq: UInt64 = 0, epoch: UInt64 = 0,
         priority: Bool = false
     ) {
         self.winID = winID
         self.origin = origin
         self.size = size
-        self.hPad = hPad
-        self.vPad = vPad
+        self.insets = insets
         self.seq = seq
         self.epoch = epoch
         self.priority = priority
