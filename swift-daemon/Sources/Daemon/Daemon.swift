@@ -3562,7 +3562,7 @@ public struct DaemonCore: Sendable {
     ) {
         for (id, job) in batch {
             guard id != held, glides[id] == nil, !sliverParked.contains(id),
-                  !ridingMembers.contains(id), let origin = job.origin
+                  !ridingMembers.contains(id), !gestureFresh, let origin = job.origin
             else { continue }
             // (1) Off-union: strip the bogus origin.
             if let union,
@@ -3958,7 +3958,7 @@ public struct DaemonCore: Sendable {
             parkingNow = false
             sliverParked.remove(member)
             sliverClipped.remove(member)
-        } else if !rideStripOffset,
+        } else if !rideStripOffset && !gestureFresh,
                   let parked = parkOffscreen(member, slot: slot, home: home, union: union, siblings: siblings, frames: frames)
         {
             // Park only when the strip is at rest. Mid-glide every shown-row

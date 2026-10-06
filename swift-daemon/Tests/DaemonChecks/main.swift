@@ -5728,17 +5728,27 @@ do {
         frames: full, viewports: views, focusedStyle: style
     )
     // Natural swipe right scrolls the strip fully past the owner edge.
+    // The swipe rides the window's off-viewport slot (scrolling together
+    // never parks mid-gesture); it hide-parks at the owner edge once the
+    // strip rests.
     let shifted = daemon.tick(
         events: [.swipe(delta: -1.0, fingers: 3)],
         frames: full, viewports: views, focusedStyle: style
     )
     check(
-        shifted.axJobs.contains { $0.winID == 0 && $0.origin == IntPoint(1015, 34) },
-        "full-width window parks at the owner edge, not the sibling"
+        shifted.axJobs.contains { $0.winID == 0 && $0.origin == IntPoint(1024, 34) },
+        "full-width window rides its off-viewport slot during the swipe"
     )
     check(
-        !shifted.axJobs.contains { $0.winID == 0 && $0.origin == IntPoint(1024, 34) },
-        "full-width window never keeps its off-viewport slot"
+        !shifted.axJobs.contains { $0.winID == 0 && $0.origin == IntPoint(1015, 34) },
+        "full-width window never parks mid-swipe"
+    )
+    let settled = daemon.tick(
+        events: [], frames: full, viewports: views, focusedStyle: style
+    )
+    check(
+        settled.axJobs.contains { $0.winID == 0 && $0.origin == IntPoint(1015, 34) },
+        "full-width window parks at the owner edge, not the sibling"
     )
 }
 
@@ -5770,7 +5780,16 @@ do {
         frames: full(at: 0), viewports: views, focusedStyle: style
     )
     check(
-        parked.axJobs.contains { $0.winID == 0 && $0.origin == IntPoint(1015, 34) },
+        parked.axJobs.contains { $0.winID == 0 && $0.origin == IntPoint(1024, 34) },
+        "window rides its off-viewport slot during the swipe"
+    )
+    // One rest tick parks the window at the owner edge before macOS
+    // relocates it (scrolling together never parks mid-gesture).
+    let atRest = daemon.tick(
+        events: [], frames: full(at: 0), viewports: views, focusedStyle: style
+    )
+    check(
+        atRest.axJobs.contains { $0.winID == 0 && $0.origin == IntPoint(1015, 34) },
         "window parks before relocation"
     )
     // Simulate macOS relocating the parked window onto the sibling display.
