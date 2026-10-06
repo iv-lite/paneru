@@ -132,7 +132,7 @@ do {
 do {
     let glass = glassRect(
         CGRect(origin: CGPoint(x: 0.0, y: 34.0), size: CGSize(width: 416.0, height: 734.0)),
-        hPad: 8.0, vPad: 8.0
+        leading: 8.0, trailing: 8.0, top: 8.0, bottom: 8.0
     )
     checkClose(glass.origin.x, 8.0, "glass x")
     checkClose(glass.origin.y, 42.0, "glass y")
@@ -144,7 +144,7 @@ do {
 do {
     let glass = glassRect(
         CGRect(origin: CGPoint(x: 0.0, y: 0.0), size: CGSize(width: 10.0, height: 10.0)),
-        hPad: 8.0, vPad: 8.0
+        leading: 8.0, trailing: 8.0, top: 8.0, bottom: 8.0
     )
     checkClose(glass.size.width, 0.0, "glass clamps w")
     checkClose(glass.size.height, 0.0, "glass clamps h")
@@ -155,7 +155,7 @@ do {
 // stays outside the ring, never between glass and ring.
 do {
     let padded = CGRect(origin: CGPoint(x: 0.0, y: 34.0), size: CGSize(width: 416.0, height: 734.0))
-    let glass = glassRect(padded, hPad: 8.0, vPad: 8.0)
+    let glass = glassRect(padded, leading: 8.0, trailing: 8.0, top: 8.0, bottom: 8.0)
     let ring = borderWindowRect(glass, width: 2.0)
     checkClose(glass.origin.x, 8.0, "pipeline glass x")
     checkClose(glass.size.width, 400.0, "pipeline glass w")

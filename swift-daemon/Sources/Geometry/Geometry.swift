@@ -292,12 +292,15 @@ public func borderWindowRect(_ window: CGRect, width: CGFloat) -> CGRect {
 /// compositor shows is inset by exactly that padding. Borders and dim
 /// cutouts must hug the glass, not the slot — otherwise a gap of
 /// `hPad`/`vPad` opens between decoration and window.
-public func glassRect(_ padded: CGRect, hPad: CGFloat, vPad: CGFloat) -> CGRect {
+public func glassRect(
+    _ padded: CGRect, leading: CGFloat, trailing: CGFloat,
+    top: CGFloat, bottom: CGFloat
+) -> CGRect {
     CGRect(
-        x: padded.origin.x + hPad,
-        y: padded.origin.y + vPad,
-        width: max(0, padded.size.width - 2 * hPad),
-        height: max(0, padded.size.height - 2 * vPad)
+        x: padded.origin.x + leading,
+        y: padded.origin.y + top,
+        width: max(0, padded.size.width - leading - trailing),
+        height: max(0, padded.size.height - top - bottom)
     )
 }
 

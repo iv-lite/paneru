@@ -340,6 +340,10 @@ core.centerSingleColumn = resolved.centerSingleColumn
 // Parked glass keeps `sliver_width` px visible: the slot-space hide
 // width folds the gap insets the host adds on write.
 core.offscreenSliverWidth = resolved.sliverWidth + resolved.gapHorizontal / 2
+core.offscreenSliverWidthLeading =
+    resolved.sliverWidth + resolved.gapHorizontal - resolved.gapHorizontal / 2
+core.sliverClipMinPadded = resolved.gapHorizontal + 1
+core.sliverClipMinPaddedVertical = resolved.gapVertical + 1
 core.offscreenSliverHeightRatio = resolved.sliverHeight
 core.defaultRatio = resolved.defaultRatio
 core.maximizeTiledWindows = resolved.maximizeTiledWindows
@@ -2222,6 +2226,10 @@ core.wallClockMs = { DispatchTime.now().uptimeNanoseconds / 1_000_000 }
     // Slots abut; gaps live in per-window AX padding (see applyWindowPadding).
     core.centerSingleColumn = resolved.centerSingleColumn
     core.offscreenSliverWidth = resolved.sliverWidth + resolved.gapHorizontal / 2
+    core.offscreenSliverWidthLeading =
+        resolved.sliverWidth + resolved.gapHorizontal - resolved.gapHorizontal / 2
+    core.sliverClipMinPadded = resolved.gapHorizontal + 1
+    core.sliverClipMinPaddedVertical = resolved.gapVertical + 1
     core.offscreenSliverHeightRatio = resolved.sliverHeight
     core.defaultRatio = resolved.defaultRatio
     core.maximizeTiledWindows = resolved.maximizeTiledWindows
@@ -4520,8 +4528,10 @@ nonisolated(unsafe) var statJobs = 0
         guard let window = roster[CGWindowID(id)] else { return rect }
         return glassRect(
             rect,
-            hPad: CGFloat(window.horizontalPadding),
-            vPad: CGFloat(window.verticalPadding)
+            leading: CGFloat(window.horizontalPadding),
+            trailing: CGFloat(window.trailingHPad),
+            top: CGFloat(window.verticalPadding),
+            bottom: CGFloat(window.bottomVPad)
         )
     }
     // No rings on native-fullscreen windows: viewport-sized glass on
@@ -4582,8 +4592,10 @@ nonisolated(unsafe) var statJobs = 0
             roster[CGWindowID(id)].map { window in
                 glassRect(
                     cgRect(window.frame),
-                    hPad: CGFloat(window.horizontalPadding),
-                    vPad: CGFloat(window.verticalPadding)
+                    leading: CGFloat(window.horizontalPadding),
+                    trailing: CGFloat(window.trailingHPad),
+                    top: CGFloat(window.verticalPadding),
+                    bottom: CGFloat(window.bottomVPad)
                 )
             }
         }

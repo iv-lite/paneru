@@ -421,6 +421,17 @@ public struct DaemonCore: Sendable {
     /// relocates it to another display. Default matches the product
     /// defaults (1 + 8).
     public var offscreenSliverWidth: Int32 = 9
+    /// Left-side hide-park width: a left exit's visible extent is governed
+    /// by the far (trailing) inset, so an odd global gap needs
+    /// `sliverWidth + ceil(gap/2)` here while the right sliver needs
+    /// `sliverWidth + floor(gap/2)`. Host-pushed; defaults symmetric.
+    public var offscreenSliverWidthLeading: Int32 = 9
+    /// Minimum padded width/height for a seam-clipped sliver: the AX write
+    /// subtracts the full gap, so the padded size must be at least
+    /// `gap + 1` to leave one visible raw pixel (a smaller value collapses
+    /// to 0/negative glass and the WindowServer rejects the write).
+    public var sliverClipMinPadded: Int32 = 1
+    public var sliverClipMinPaddedVertical: Int32 = 1
     /// Vertical fraction of a seam-clipped sliver kept visible (Rust
     /// `sliver_height`, default 1.0): the parked glass height is the
     /// viewport-clamped live height scaled by this, so the host can keep
@@ -3834,7 +3845,7 @@ public struct DaemonCore: Sendable {
     ) -> IntPoint {
         let x: Int32
         if slot.x < home.min.x {
-            x = home.min.x - width + offscreenSliverWidth
+            x = home.min.x - width + offscreenSliverWidthLeading
         } else {
             x = home.max.x - offscreenSliverWidth
         }
@@ -4194,7 +4205,10 @@ public struct DaemonCore: Sendable {
             let sliverH = max(1, Int32(clamped * offscreenSliverHeightRatio))
             enqueueResize(
                 member,
-                to: IntSize(offscreenSliverWidth, sliverH),
+                to: IntSize(
+                    max(offscreenSliverWidth, sliverClipMinPadded),
+                    max(sliverH, sliverClipMinPaddedVertical)
+                ),
                 epoch: epoch
             )
             return
