@@ -5450,6 +5450,38 @@ do {
     )
 }
 
+// Resize keeps a fully-visible window in place: growing a column that
+// already fits must not recenter it (the strip offset stays put); only an
+// overflow/underflow clamp may shift. Pin the no-shift case.
+do {
+    var daemon = DaemonCore()
+    daemon.animationsEnabled = false
+    daemon.presetWidths = [0.5, 1.0]
+    var live: [Int32: IntPoint] = [
+        0: .init(0, 0), 1: .init(400, 0), 2: .init(800, 0),
+    ]
+    func liveFrames() -> (Int32) -> IntRect? { frames(slots: live) }
+    _ = daemon.tick(
+        events: (0..<3).map { .appeared(id: Int32($0), workspace: 1) },
+        frames: liveFrames(), viewport: viewport, focusedStyle: style
+    )
+    _ = daemon.tick(
+        events: [.focusKeyed(id: 1)], frames: liveFrames(), viewport: viewport, focusedStyle: style
+    )
+    let offsetBefore = daemon.offsetTarget(for: 1) ?? daemon.offset(for: 1)
+    _ = daemon.tick(
+        events: [.command(.window(.resize(.grow)))],
+        frames: liveFrames(), viewport: viewport, focusedStyle: style
+    )
+    let offsetAfter = daemon.offsetTarget(for: 1) ?? daemon.offset(for: 1)
+    checkEqual(
+        offsetAfter, offsetBefore,
+        "resizing a fully-visible column does not recenter the strip"
+    )
+    let slot1 = daemon.committedSlot(of: 1)
+    checkEqual(slot1?.x, 400, "resized column keeps its left edge")
+}
+
 // Focus ring glued to the window glass through a resize: the ring must be
 // painted at the SAME rect the glass shows every tick, never at the new
 // size/position ahead of the still-easing window ("window lags behind its

@@ -1704,6 +1704,8 @@ public struct DaemonCore: Sendable {
         let newWidth = roundPx(next * Double(vw))
         setModelWidth(id, newWidth)
         let size = IntSize(newWidth, frame.height)
+        // Centered origin for the floating/non-strip branch below; a strip
+        // window never recenters on resize (see the multi-column branch).
         let center = IntPoint(
             (frame.min.x + frame.max.x) / 2, (frame.min.y + frame.max.y) / 2
         )
@@ -1721,7 +1723,20 @@ public struct DaemonCore: Sendable {
                 offsets[activeWorkspace] = 0
                 offsetTargets[activeWorkspace] = 0
             } else {
-                let shift = origin.x - frame.min.x
+                // Stay in place unless the new width leaves the viewport:
+                // a fully-visible window is never recentered by a resize.
+                // Only the overflow/underflow clamp shifts the strip.
+                let keepX = frame.min.x
+                let rightEdge = frame.min.x + newWidth
+                let desiredX: Int32
+                if rightEdge > viewport.max.x {
+                    desiredX = viewport.max.x - newWidth
+                } else if keepX < viewport.min.x {
+                    desiredX = viewport.min.x
+                } else {
+                    desiredX = keepX
+                }
+                let shift = desiredX - frame.min.x
                 if shift != 0 {
                     offsetTargets[activeWorkspace, default: offsets[activeWorkspace] ?? 0] += shift
                 }
