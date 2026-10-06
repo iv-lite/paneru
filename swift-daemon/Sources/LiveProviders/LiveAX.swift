@@ -355,6 +355,19 @@ public final class LiveWindow: @unchecked Sendable {
 
     // MARK: Writes
 
+    /// Read the owning app's `AXEnhancedUserInterface` attribute once at
+    /// adoption: apps where it is absent (error/nil) skip the per-write
+    /// probe in `withEnhancedUIDisabled`. The attribute is a static app
+    /// capability, so one read at adoption is sound.
+    public func enhancedUIAbsentAtApp() -> Bool {
+        let app = AXUIElementCreateApplication(pidOfElement())
+        var value: CFTypeRef?
+        let status = AXUIElementCopyAttributeValue(
+            app, "AXEnhancedUserInterface" as CFString, &value
+        )
+        return status != .success || value == nil
+    }
+
     private func withEnhancedUIDisabled(_ body: () -> AXError) -> AXError {
         if enhancedUIAbsent { return body() }
         let app = AXUIElementCreateApplication(pidOfElement())

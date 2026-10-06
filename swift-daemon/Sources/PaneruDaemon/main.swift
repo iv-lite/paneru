@@ -498,6 +498,9 @@ struct AdoptedWindow: Sendable {
     /// Native-fullscreen windows never relocate (Rust
     /// `NativeFullscreenMarker`); they float unmanaged instead.
     var isFullscreen: Bool
+    /// The app lacks `AXEnhancedUserInterface` (probed once at adoption):
+    /// writes then skip the per-write enhanced-UI probe.
+    var enhancedUIAbsent: Bool
 }
 
 /// Adopt probed newcomers into the roster (main thread): metadata, rules,
@@ -534,7 +537,10 @@ struct AdoptedWindow: Sendable {
                 observers[probe.ownerPID] = observer
             }
         }
-        let window = LiveWindow(id: windowID(wid), element: element, frame: probe.frame)
+        let window = LiveWindow(
+            id: windowID(wid), element: element, frame: probe.frame,
+            enhancedUIAbsent: probe.enhancedUIAbsent
+        )
         // Slots abut; the between-window gap is this per-window AX inset
         // (Rust `set_padding`). The probe frame is raw CG truth, so the
         // cached frame expands by exactly the insets here. The inset is
@@ -998,7 +1004,8 @@ nonisolated(unsafe) var rotatedAt: [WorkspaceID: Date] = [:]
                             title: probe.title ?? "", appName: "", bundleID: "",
                             role: probe.role ?? "", subrole: probe.subrole ?? "",
                             identifier: probe.identifier ?? "main",
-                            isFullscreen: probe.isFullscreen
+                            isFullscreen: probe.isFullscreen,
+                            enhancedUIAbsent: probe.enhancedUIAbsentAtApp()
                         ),
                         element
                     ))
@@ -3728,19 +3735,14 @@ nonisolated(unsafe) var statJobs = 0
     let t4: Date? = perfTimingEnabled ? Date() : nil
     // AX writes ride the serial worker, never the tick (the runloop also
     // owns the event tap — blocking it on AX round trips stalls all
-    // input). Latest-per-window coalescing, then one dispatch; skipped
-    // jobs (minimized/missing) ack immediately so unacked state never
-    // leaks across the stall watchdog. Completions ack next tick via
-    // the box (see top of tick).
-    var latest: [WindowID: AXWriteJob] = [:]
-    for job in result.axJobs {
-        coalesceJobs(&latest, job)
-    }
-    // Frozen before the worker takes it: a captured `var` warns even
-    // for reads, and the batch never mutates after this point.
+    // input). The commit pass already emits latest-per-window jobs in
+    // stable order, so dispatch them directly — no second coalesce/sort
+    // here. Skipped jobs (minimized/missing) ack immediately so unacked
+    // state never leaks across the stall watchdog. Completions ack next
+    // tick via the box (see top of tick).
     var batchBuilder: [(LiveProviders.LiveWindow, AXWriteJob)] = []
-    batchBuilder.reserveCapacity(latest.count)
-    for job in drainOrder(latest) {
+    batchBuilder.reserveCapacity(result.axJobs.count)
+    for job in result.axJobs {
         guard let window = roster[CGWindowID(job.winID)] else {
             core.acknowledge(winID: job.winID, seq: job.seq, epoch: job.epoch)
             continue
@@ -4165,7 +4167,9 @@ nonisolated(unsafe) var statJobs = 0
     // just count, so same-count swaps still persist. The 30s cadence
     // by the tap ladder does the write; a crash loses at most one
     // interval.
-    let rosterSig = roster.keys.sorted().reduce(0) { ($0 &* 31) &+ Int($1) }
+    // Order-independent membership signature (XOR): a same-count swap
+    // still changes it, without sorting the whole roster every tick.
+    let rosterSig = roster.keys.reduce(0) { $0 ^ Int($1) }
     if !result.quiescent || result.focus != prevTickFocus
         || core.activeVirtual[core.activeWorkspace] != prevTickRow
         || rosterSig != prevTickRosterSig
