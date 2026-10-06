@@ -6255,6 +6255,51 @@ do {
     }
 }
 
+// Off-edge columns keep their AX writes through the reveal glide: the
+// model rides rigidly, but the off-union drain once stripped any origin
+// past the display union (origin-only check), freezing columns one-by-one
+// at the viewport edge while the rest of the strip kept moving — the
+// "one by one" regression, and the gap it opened between frozen and
+// moving columns. Pin the WRITTEN origin of the leftmost column: it must
+// keep advancing past the union while the strip glides.
+do {
+    var daemon = DaemonCore()
+    daemon.animationsEnabled = true
+    daemon.glideBaseMs = 200
+    daemon.autoCenter = false
+    let clock = ManualClock()
+    daemon.wallClockMs = { clock.now }
+    var live: [Int32: IntPoint] = [
+        0: .init(0, 0), 1: .init(400, 0), 2: .init(800, 0), 3: .init(1200, 0),
+    ]
+    func liveFrames() -> (Int32) -> IntRect? { frames(slots: live) }
+    _ = daemon.tick(
+        events: (0..<4).map { .appeared(id: Int32($0), workspace: 1) },
+        frames: liveFrames(), viewport: viewport, focusedStyle: style
+    )
+    for _ in 0..<20 {
+        clock.now += 16
+        _ = daemon.tick(events: [], frames: liveFrames(), viewport: viewport, focusedStyle: style)
+        for i in 0..<4 { if let p = daemon.positions[Int32(i)] { live[Int32(i)] = p } }
+    }
+    _ = daemon.tick(events: [.focusKeyed(id: 3)], frames: liveFrames(), viewport: viewport, focusedStyle: style)
+    var wroteTicks = 0
+    var minWritten0: Int32 = 0
+    for _ in 1...12 {
+        clock.now += 16
+        let beforeOff = daemon.offsets[1] ?? 0
+        let r = daemon.tick(events: [], frames: liveFrames(), viewport: viewport, focusedStyle: style)
+        let stripMoving = (daemon.offsets[1] ?? 0) != beforeOff
+        if stripMoving, let origin = r.axJobs.first(where: { $0.winID == 0 })?.origin {
+            wroteTicks += 1
+            minWritten0 = min(minWritten0, origin.x)
+        }
+        for i in 0..<4 { if let p = daemon.positions[Int32(i)] { live[Int32(i)] = p } }
+    }
+    check(wroteTicks >= 2, "off-edge column keeps its write through the glide (wrote \(wroteTicks) ticks)")
+    check(minWritten0 < -10, "off-edge column keeps writing past the display union (min \(minWritten0))")
+}
+
 // Gap rigid under a combined move+resize: the host AX layer must write
 // size before position (Rust `resize` order), or a window briefly
 // occupies (new origin, old size) and breathes the inter-window glass

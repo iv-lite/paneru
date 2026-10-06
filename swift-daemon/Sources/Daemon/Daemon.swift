@@ -2446,6 +2446,12 @@ public struct DaemonCore: Sendable {
     /// advance rigidly with the single offset tween rather than chasing it
     /// independently. Set per workspace in `commitPass`.
     private var rideStripOffset = false
+    /// Members that rode the strip offset THIS commit (snapped onto the
+    /// eased slot while `rideStripOffset`). Their off-union origins are
+    /// legitimate mid-glide travel, so `reconcileDrain` must not strip or
+    /// re-park them — that would freeze columns one-by-one at the viewport
+    /// edge while the rest of the strip keeps moving.
+    private var ridingMembers = Set<WindowID>()
 
     /// Apply pending transfer-centerings against fresh slots: the
     /// window now at each hole scrolls to viewport center over the next
@@ -3285,6 +3291,7 @@ public struct DaemonCore: Sendable {
         // Members of the held column, if any: the hand owns their truth
         // until release; everything else snaps to its slot.
         var heldMembers = Set<WindowID>()
+        ridingMembers.removeAll(keepingCapacity: true)
         if let held {
             for strip in strips.values.flatMap({ $0.values }) {
                 if let index = strip.index(of: held), let column = strip.get(index) {
@@ -3523,7 +3530,7 @@ public struct DaemonCore: Sendable {
     ) {
         for (id, job) in batch {
             guard id != held, glides[id] == nil, !sliverParked.contains(id),
-                  let origin = job.origin
+                  !ridingMembers.contains(id), let origin = job.origin
             else { continue }
             // (1) Off-union: strip the bogus origin.
             if let union,
@@ -3968,6 +3975,7 @@ public struct DaemonCore: Sendable {
                 enqueueMove(member, to: target, epoch: epoch)
                 positions[member] = target
                 glides.removeValue(forKey: member)
+                if rideStripOffset { ridingMembers.insert(member) }
             } else {
                 let from = positions[member] ?? target
                 let step = glideStep(member, from: from, to: target, epoch: epoch, displays: [home] + siblings)
