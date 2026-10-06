@@ -261,7 +261,7 @@ public final class LiveWindow: @unchecked Sendable {
     public var role: String? { stringAttribute(kAXRoleAttribute as String) }
     public var subrole: String? { stringAttribute(kAXSubroleAttribute as String) }
     public var title: String? { stringAttribute(kAXTitleAttribute as String) }
-    public var identifier: String? { stringAttribute("AXIdentifier") }
+    public var identifier: String? { stringAttribute(kAXIdentifierAttribute as String) }
     public var isMinimized: Bool { boolAttribute(kAXMinimizedAttribute as String) }
     public var isFullscreen: Bool { boolAttribute("AXFullScreen") }
 

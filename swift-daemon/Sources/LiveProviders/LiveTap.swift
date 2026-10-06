@@ -73,21 +73,36 @@ public struct TapModifiers: OptionSet, Sendable {
     }
 }
 
+/// NX key flag bits: the `NX_*` constants are C macros (unimportable into
+/// Swift), so the tap folds the flag word against these named masks.
+private enum NXFlag: UInt64 {
+    case leftShift = 0x02
+    case rightShift = 0x04
+    case leftControl = 0x01
+    case rightControl = 0x2000
+    case leftAlternate = 0x20
+    case rightAlternate = 0x40
+    case leftCommand = 0x08
+    case rightCommand = 0x10
+    /// Bare FN (exactly the FN bit) reports function.
+    case function = 0x0080_0100
+}
+
 /// Fold the NX flag word into device modifiers. Bare FN (exactly the FN
 /// bit) reports function; anything else folds the side bits.
 public func tapModifiers(flags: UInt64) -> TapModifiers {
-    if flags == 0x0080_0100 {
+    if flags == NXFlag.function.rawValue {
         return .function
     }
     var modifiers = TapModifiers()
-    if flags & 0x02 != 0 { modifiers.insert(.leftShift) }
-    if flags & 0x04 != 0 { modifiers.insert(.rightShift) }
-    if flags & 0x01 != 0 { modifiers.insert(.leftControl) }
-    if flags & 0x2000 != 0 { modifiers.insert(.rightControl) }
-    if flags & 0x20 != 0 { modifiers.insert(.leftAlternate) }
-    if flags & 0x40 != 0 { modifiers.insert(.rightAlternate) }
-    if flags & 0x08 != 0 { modifiers.insert(.leftCommand) }
-    if flags & 0x10 != 0 { modifiers.insert(.rightCommand) }
+    if flags & NXFlag.leftShift.rawValue != 0 { modifiers.insert(.leftShift) }
+    if flags & NXFlag.rightShift.rawValue != 0 { modifiers.insert(.rightShift) }
+    if flags & NXFlag.leftControl.rawValue != 0 { modifiers.insert(.leftControl) }
+    if flags & NXFlag.rightControl.rawValue != 0 { modifiers.insert(.rightControl) }
+    if flags & NXFlag.leftAlternate.rawValue != 0 { modifiers.insert(.leftAlternate) }
+    if flags & NXFlag.rightAlternate.rawValue != 0 { modifiers.insert(.rightAlternate) }
+    if flags & NXFlag.leftCommand.rawValue != 0 { modifiers.insert(.leftCommand) }
+    if flags & NXFlag.rightCommand.rawValue != 0 { modifiers.insert(.rightCommand) }
     return modifiers
 }
 

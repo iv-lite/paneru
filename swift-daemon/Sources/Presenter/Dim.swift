@@ -44,7 +44,7 @@ final class DimManager {
         let primaryH = Screens.primaryHeight()
         if surfaces.count != screens.count {
             for s in surfaces {
-                MainActor.assumeIsolated { s.window.orderOut(nil) }
+                s.window.orderOut(nil)
             }
             surfaces = []
         }
@@ -61,7 +61,7 @@ final class DimManager {
                 guard let shape = view.layer as? CAShapeLayer else { continue }
                 shape.fillRule = .evenOdd
                 shape.frame = CGRect(x: 0, y: 0, width: frame.width, height: frame.height)
-                MainActor.assumeIsolated { window.orderFront(nil) }
+                window.orderFront(nil)
                 surfaces.append(Surface(
                     window: window, opacity: -1, color: (-1, -1, -1),
                     shape: shape, cutout: nil, radius: -1
@@ -117,7 +117,7 @@ final class DimManager {
                 surfaces[idx].radius = cutoutRadius
             }
             if !window.isVisible {
-                MainActor.assumeIsolated { window.orderFront(nil) }
+                window.orderFront(nil)
             }
             surfaces[idx].opacity = opacity
             surfaces[idx].color = (r, g, b)
@@ -132,7 +132,7 @@ final class DimManager {
             return
         }
         for s in surfaces {
-            MainActor.assumeIsolated { s.window.orderOut(nil) }
+            s.window.orderOut(nil)
         }
         hidden = true
     }
@@ -141,7 +141,7 @@ final class DimManager {
     func remove() {
         dispatchPrecondition(condition: .onQueue(.main))
         for s in surfaces {
-            MainActor.assumeIsolated { s.window.orderOut(nil) }
+            s.window.orderOut(nil)
         }
         surfaces = []
         hidden = false

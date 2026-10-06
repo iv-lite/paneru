@@ -31,7 +31,7 @@ final class BorderPool {
         // every tick (O(n) alloc at display rate during glides).
         for id in entries.keys where !wanted.contains(id) {
             if let __paneruWindow = entries[id]?.window {
-                MainActor.assumeIsolated { __paneruWindow.orderOut(nil) }
+                __paneruWindow.orderOut(nil)
             }
             entries.removeValue(forKey: id)
         }
@@ -59,7 +59,7 @@ final class BorderPool {
                     entry.params = item.style
                 }
                 if !entry.window.isVisible {
-                    MainActor.assumeIsolated { entry.window.orderFront(nil) }
+                    entry.window.orderFront(nil)
                     hidden = false
                 }
                 entries[item.id] = entry
@@ -69,7 +69,7 @@ final class BorderPool {
                 view.wantsLayer = true
                 window.contentView = view
                 view.applyBorder(style: item.style)
-                MainActor.assumeIsolated { window.orderFront(nil) }
+                window.orderFront(nil)
                 entries[item.id] = Entry(window: window, rect: cocoa, params: item.style)
                 hidden = false
             }
@@ -83,7 +83,7 @@ final class BorderPool {
             return
         }
         for entry in entries.values {
-            MainActor.assumeIsolated { entry.window.orderOut(nil) }
+            entry.window.orderOut(nil)
         }
         hidden = true
     }
