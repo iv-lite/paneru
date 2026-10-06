@@ -694,17 +694,20 @@ private final class ObserverContext {
 
 // MARK: - Enumeration
 
-/// On-screen window numbers via the WindowServer list.
-public func onScreenWindowIDs() -> [CGWindowID]? {
+/// On-screen (window number, owner pid) pairs via the WindowServer list.
+/// The pid rides the same walk that produced the id, so callers never pay
+/// a second per-window `CGWindowListCopyWindowInfo` round trip.
+public func onScreenWindowIDs() -> [(id: CGWindowID, pid: pid_t)]? {
     guard let list = CGWindowListCopyWindowInfo(
         [.optionOnScreenOnly, .excludeDesktopElements], kCGNullWindowID
     ) as? [[String: Any]] else {
         return nil
     }
     return list.compactMap { dict in
-        (dict[kCGWindowNumber as String] as? NSNumber).map {
-            CGWindowID($0.uint32Value)
-        }
+        guard let number = dict[kCGWindowNumber as String] as? NSNumber,
+              let pid = (dict[kCGWindowOwnerPID as String] as? NSNumber)?.int32Value
+        else { return nil }
+        return (CGWindowID(number.uint32Value), pid)
     }
 }
 

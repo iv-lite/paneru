@@ -523,6 +523,16 @@ struct AdoptedWindow: Sendable {
     }
     var tabBatchWorkspace: [TabBatchKey: WorkspaceID] = [:]
     var tabSiblingAdopted = false
+    // Batch index for the native-tab leader scan: a rostered window with a
+    // workspace, keyed by (pid, padded frame), replaces the per-newcomer
+    // O(roster) linear scan plus its workspaceOfWindow walk.
+    var rosteredByFrame: [TabBatchKey: CGWindowID] = [:]
+    for (key, window) in roster {
+        let id = windowID(key)
+        guard workspaceOfWindow(id) != nil else { continue }
+        rosteredByFrame[TabBatchKey(pid: windowPIDs[id] ?? 0, frame: window.frame)] = key
+    }
+    var appMetaCache: [pid_t: (bundle: String, name: String)] = [:]
     for (probe, element) in adopted {
         let wid = probe.wid
         probing.remove(wid)
@@ -546,9 +556,15 @@ struct AdoptedWindow: Sendable {
         // (Rust `set_padding`). The probe frame is raw CG truth, so the
         // cached frame expands by exactly the insets here. The inset is
         // half the configured gap (per-window or global).
-        let runningApp = NSRunningApplication(processIdentifier: probe.ownerPID)
-        let bundle = runningApp?.bundleIdentifier ?? ""
-        let appName = runningApp?.localizedName ?? ""
+        let (bundle, appName): (String, String)
+        if let cached = appMetaCache[probe.ownerPID] {
+            (bundle, appName) = cached
+        } else {
+            let runningApp = NSRunningApplication(processIdentifier: probe.ownerPID)
+            let cached = (runningApp?.bundleIdentifier ?? "", runningApp?.localizedName ?? "")
+            appMetaCache[probe.ownerPID] = cached
+            (bundle, appName) = cached
+        }
         // `gapHorizontal`/`gapVertical` between neighbours; a per-window
         // `horizontal_padding`/`vertical_padding` rule overrides the global
         // gap for this window (0 opts out).
@@ -615,15 +631,12 @@ struct AdoptedWindow: Sendable {
                 min: IntPoint(probe.frame.min.x - insets.leading, probe.frame.min.y - insets.top),
                 max: IntPoint(probe.frame.max.x + insets.trailing, probe.frame.max.y + insets.bottom)
             )
-            if let leader = roster.first(where: { candidate in
-                candidate.key != wid
-                    && windowPIDs[windowID(candidate.key)] == probe.ownerPID
-                    && candidate.value.frame == probePadded
-                    && workspaceOfWindow(windowID(candidate.key)) != nil
-            }), let owner = workspaceOfWindow(windowID(leader.key)) {
+            if let leaderKey = rosteredByFrame[TabBatchKey(pid: probe.ownerPID, frame: probePadded)],
+               leaderKey != wid,
+               let owner = workspaceOfWindow(windowID(leaderKey)) {
                 ws = owner
                 tabSiblingAdopted = true
-                print("tab: adopted window=\(windowID(wid)) as native-tab sibling of \(windowID(leader.key)) on ws=\(owner)")
+                print("tab: adopted window=\(windowID(wid)) as native-tab sibling of \(windowID(leaderKey)) on ws=\(owner)")
             } else if let shared = tabBatchWorkspace[TabBatchKey(pid: probe.ownerPID, frame: probePadded)] {
                 ws = shared
                 tabSiblingAdopted = true
@@ -944,7 +957,7 @@ nonisolated(unsafe) var rotatedAt: [WorkspaceID: Date] = [:]
     rosterSyncedOnce = true
     // Cache the front-to-back order for the hover poll: it runs at ~4Hz
     // and doesn't need its own `CGWindowListCopyWindowInfo` walk per poll.
-    cachedOnScreenOrder = onScreen.map { windowID($0) }
+    cachedOnScreenOrder = onScreen.map { windowID($0.id) }
     // Signal- vs backstop-driven: notificationless backstops still
     // vanish-drop and adopt, but skip the per-window AX flip reads
     // (fullscreen/minimize probes across the whole roster). Missed
@@ -957,12 +970,14 @@ nonisolated(unsafe) var rotatedAt: [WorkspaceID: Date] = [:]
     if fullFlips { flipCheckCounter = 0 }
     refreshSpaces()
     let known = Set(roster.keys)
-    let current = Set(onScreen)
+    let current = Set(onScreen.map { $0.id })
     // Windows with a probe already in flight adopt when it lands;
-    // re-probing them here would double-adopt on slow apps.
-    let newcomers = current.subtracting(known).subtracting(probing).compactMap { wid -> (CGWindowID, pid_t)? in
-        guard let info = windowInfo(wid) else { return nil }
-        return (wid, info.ownerPID)
+    // re-probing them here would double-adopt on slow apps. The pid comes
+    // from the same WindowServer walk that produced the id (no extra
+    // per-window round trip).
+    let newcomers: [(CGWindowID, pid_t)] = onScreen.compactMap { entry in
+        guard !known.contains(entry.id), !probing.contains(entry.id) else { return nil }
+        return (entry.id, entry.pid)
     }
     // Snapshot roster refs for the worker BEFORE dispatch (roster is
     // main-owned; the worker must never touch it directly).
@@ -981,14 +996,30 @@ nonisolated(unsafe) var rotatedAt: [WorkspaceID: Date] = [:]
             let laneAlive = axLaneCurrent(laneGen)
             var adopted: [(AdoptedWindow, AXUIElement)] = []
             if laneAlive {
+                // Per-batch caches: a multi-window app's AX window list,
+                // enhanced-UI capability, and app root are read once per
+                // pid instead of once per newcomer.
+                var appCache: [pid_t: LiveApp] = [:]
+                var windowListCache: [pid_t: [AXUIElement]] = [:]
+                var enhancedUICache: [pid_t: Bool] = [:]
                 for (wid, pid) in newcomers {
                     // Re-check per window: a retirement lands while the old
                     // lane drains; stale work must stop issuing AX (the
                     // fresh lane re-adopts) while still clearing `probing`
                     // on the completion hop below.
                     guard axLaneCurrent(laneGen) else { break }
-                    let app = LiveApp(pid: pid)
-                    guard let element = app.windowListElements()?.first(where: {
+                    let app = appCache[pid] ?? LiveApp(pid: pid)
+                    appCache[pid] = app
+                    let elements: [AXUIElement]
+                    if let cached = windowListCache[pid] {
+                        elements = cached
+                    } else if let list = app.windowListElements() {
+                        elements = list
+                        windowListCache[pid] = list
+                    } else {
+                        continue
+                    }
+                    guard let element = elements.first(where: {
                         LiveWindow.windowID(of: $0) == wid
                     }) else { continue }
                     let probe = LiveWindow(
@@ -996,6 +1027,8 @@ nonisolated(unsafe) var rotatedAt: [WorkspaceID: Date] = [:]
                         frame: IntRect(min: IntPoint(0, 0), max: IntPoint(0, 0))
                     )
                     guard let raw = probe.readRawFrame() else { continue }
+                    let enhancedAbsent = enhancedUICache[pid] ?? probe.enhancedUIAbsentAtApp()
+                    enhancedUICache[pid] = enhancedAbsent
                     adopted.append((
                         AdoptedWindow(
                             wid: wid, ownerPID: pid,
@@ -1007,7 +1040,7 @@ nonisolated(unsafe) var rotatedAt: [WorkspaceID: Date] = [:]
                             role: probe.role ?? "", subrole: probe.subrole ?? "",
                             identifier: probe.identifier ?? "main",
                             isFullscreen: probe.isFullscreen,
-                            enhancedUIAbsent: probe.enhancedUIAbsentAtApp()
+                            enhancedUIAbsent: enhancedAbsent
                         ),
                         element
                     ))
@@ -1365,20 +1398,6 @@ nonisolated(unsafe) var rotatedAt: [WorkspaceID: Date] = [:]
 }
 
 
-
-struct WindowInfo {
-    var ownerPID: pid_t
-}
-
-@Sendable func windowInfo(_ wid: CGWindowID) -> WindowInfo? {
-    guard let list = CGWindowListCopyWindowInfo(
-        [.optionIncludingWindow], wid
-    ) as? [[String: Any]],
-        let dict = list.first,
-        let pid = (dict[kCGWindowOwnerPID as String] as? NSNumber)?.int32Value
-    else { return nil }
-    return WindowInfo(ownerPID: pid)
-}
 
 @Sendable func observeFired(app: LiveApp) {
     // Real OS notification: wake the idle clock so the resync runs now.
@@ -3339,7 +3358,7 @@ func dragResize(modifiers: TapModifiers) -> Bool {
 func dragHitTest(_ point: CGPoint) -> WindowID? {
     let cursor = IntPoint(Int32(point.x.rounded()), Int32(point.y.rounded()))
     let draggable = draggableWindows()
-    return (onScreenWindowIDs() ?? []).compactMap { windowID($0) }.first { id in
+    return (onScreenWindowIDs() ?? []).map { windowID($0.id) }.first { id in
         draggable.contains(id)
             && (roster[CGWindowID(bitPattern: id)]?.frame.contains(cursor) ?? false)
     }
@@ -4756,7 +4775,10 @@ if resolved.restoreEnabled {
         didCrashLastRun = true
         print("restore: previous run ended uncleanly (state may lag up to one interval)")
     }
-    markSessionRunning(statePath: sessionStatePath())
+    let markPath = sessionStatePath()
+    DispatchQueue.global(qos: .utility).async {
+        markSessionRunning(statePath: markPath)
+    }
 }
 
 // MARK: - Session restore
