@@ -8,6 +8,7 @@ import Geometry
 import Layout
 import Presentation
 import Scripting
+import Scroll
 import Snippets
 import WindowSet
 import Workspace
@@ -216,6 +217,27 @@ public struct DaemonCore: Sendable {
     /// commit (the inertia tail), so the tick reads active like the Rust
     /// `Scrolling` state does. Cleared on ticks without gesture input.
     private var gestureFresh = false
+    /// Residual swipe velocity per workspace (viewport widths/second,
+    /// finger-signed) driving the post-gesture inertia glide. Decayed
+    /// exponentially by `swipeDeceleration`; cleared once it drops below
+    /// the stop thresholds in `advanceInertia`.
+    private var swipeVelocity: [WorkspaceID: Double] = [:]
+    /// EMA-smoothed per-event velocity during a live gesture, folded into
+    /// the residual glide velocity when the fingers lift.
+    private var smoothedVelocity: [WorkspaceID: Double] = [:]
+    /// Wall-ms of the previous swipe sample per workspace (per-event dt
+    /// source). A single sample never derives a velocity, so an isolated
+    /// synthetic swipe steps without an inertial tail.
+    private var lastSwipeSampleMs: [WorkspaceID: UInt64] = [:]
+    /// Wall-ms of the last inertia integration per workspace (dt source).
+    private var lastInertiaMs: [WorkspaceID: UInt64] = [:]
+    /// Glide stops below this many px/s (imperceptible) to bound the
+    /// exponential tail from a very fast fling.
+    private let swipeInertiaStopPxS: Double = 10.0
+    /// Release-velocity cap in viewport widths/second: a single-sample
+    /// gesture (or an absurdly fast flick) must not launch the strip
+    /// many screens.
+    private let maxSwipeVelocity: Double = 4.0
     /// Members owed one home intent after release (positions already
     /// restored by `glideHome`, so the commit would otherwise see no diff
     /// while the OS window still sits at the hand position).
@@ -380,6 +402,9 @@ public struct DaemonCore: Sendable {
     /// Reversed (+1) mirrors it. Host-pushed from config; the ingest
     /// multiplies gesture deltas by this instead of a baked constant.
     public var swipeDirectionSign: Double = -1.0
+    /// Exponential swipe-inertia decay rate (Rust `swipe_deceleration`,
+    /// host-pushed): higher stops the post-gesture glide sooner.
+    public var swipeDeceleration: Double = 4.0
     /// Center a lone column in the viewport (Rust `center_single_column`).
     public var centerSingleColumn = false
     /// Hide-park width for shown-row members scrolled fully off their
@@ -390,6 +415,11 @@ public struct DaemonCore: Sendable {
     /// relocates it to another display. Default matches the product
     /// defaults (1 + 8).
     public var offscreenSliverWidth: Int32 = 9
+    /// Vertical fraction of a seam-clipped sliver kept visible (Rust
+    /// `sliver_height`, default 1.0): the parked glass height is the
+    /// viewport-clamped live height scaled by this, so the host can keep
+    /// only a sliver of an oversized window on screen.
+    public var offscreenSliverHeightRatio: Double = 1.0
     /// New-column width ratio (Rust `default_ratio`): a member with no
     /// model width yet adopts this fraction of its viewport width. Nil
     /// keeps the window's OS-given width.
@@ -1148,7 +1178,7 @@ public struct DaemonCore: Sendable {
                 settleReleased(frames: frames)
             case .command(let command):
                 ingestCommand(command, frames: frames, viewports: viewports, epoch: epoch)
-            case .swipe(let delta, _), .scroll(let delta):
+            case .swipe(let delta, _):
                 // Fractional viewport widths, direction-signed (Natural:
                 // finger-left moves the strip left; Reversed mirrors).
                 // Integer truncation matches the pixel-quantized model
@@ -1167,6 +1197,120 @@ public struct DaemonCore: Sendable {
                     offsetTargets[ws] = offsets[ws]
                     clampSwipeTravel(ws, viewport: active, frames: frames)
                 }
+                // Fold this slice into the per-event velocity (EMA):
+                // the residual speed on lift drives the inertia glide
+                // (owned by the single `animations` toggle: off = no glide).
+                if animationsEnabled {
+                    let nowMs = wallClockMs?() ?? epoch &* 16
+                    if let prevMs = lastSwipeSampleMs[ws] {
+                        let dtSecs = max(Double(nowMs &- prevMs) / 1000.0, Double(minStepSecs))
+                        let sample = gestureVelocity(gestureDelta: delta, dtSecs: dtSecs)
+                        smoothedVelocity[ws] = smoothVelocity(
+                            smoothedVelocity[ws] ?? 0, sample: sample
+                        )
+                    }
+                    lastSwipeSampleMs[ws] = nowMs
+                }
+                gestureFresh = true
+                dirty.formUnion([.layout, .motion])
+            case .scroll(let delta):
+                // Wheel ticks already carry macOS momentum; they never
+                // seed inertia (the frozen fold maps native momentum to
+                // 0.0). Same immediate travel as a swipe slice.
+                let active = viewport(for: activeWorkspace, in: viewports)
+                let width = Double(max(active.width, 1))
+                let step = Int32((delta * width * swipeDirectionSign).rounded())
+                let ws = activeWorkspace
+                if step != 0 {
+                    offsets[ws, default: 0] += step
+                    offsetTargets[ws] = offsets[ws]
+                    clampSwipeTravel(ws, viewport: active, frames: frames)
+                }
+                gestureFresh = true
+                dirty.formUnion([.layout, .motion])
+            }
+        }
+        advanceInertia(viewports: viewports, frames: frames, epoch: epoch)
+    }
+
+    /// Release-velocity fold + inertia glide. On the first tick without
+    /// swipe input, the accumulated gesture travel folds into a residual
+    /// velocity (EMA-smoothed against the previous fling); every frame
+    /// after, the strip advances by the decaying velocity until it rests.
+    /// Mirrors the frozen `Scroll` physics (`gestureVelocity`,
+    /// `smoothVelocity`, `integrateScroll` semantics) plus exponential
+    /// `swipeDeceleration`. Wheel scroll never seeds inertia.
+    private mutating func advanceInertia(
+        viewports: [WorkspaceID: IntRect],
+        frames: (WindowID) -> IntRect?,
+        epoch: UInt64
+    ) {
+        // Inertia is strip translation, so it obeys the single
+        // `animations` toggle: off clears any residual glide immediately.
+        guard animationsEnabled else {
+            swipeVelocity.removeAll()
+            smoothedVelocity.removeAll()
+            lastSwipeSampleMs.removeAll()
+            lastInertiaMs.removeAll()
+            return
+        }
+        let nowMs = wallClockMs?() ?? epoch &* 16
+        // Release: no swipe this tick but a gesture was in flight.
+        if !gestureFresh {
+            for ws in Array(smoothedVelocity.keys) {
+                let v = min(max(smoothedVelocity[ws] ?? 0, -maxSwipeVelocity), maxSwipeVelocity)
+                if abs(v) > velocityRestEpsilon {
+                    swipeVelocity[ws] = v
+                    lastInertiaMs[ws] = nowMs
+                }
+            }
+            smoothedVelocity.removeAll()
+            lastSwipeSampleMs.removeAll()
+        }
+        // Integrate + decay every workspace still gliding.
+        for ws in Array(swipeVelocity.keys) {
+            guard let velocity = swipeVelocity[ws],
+                  abs(velocity) > velocityRestEpsilon
+            else {
+                swipeVelocity.removeValue(forKey: ws)
+                continue
+            }
+            let row = activeVirtual[ws] ?? 0
+            guard let strip = strips[ws]?[row], !strip.columns.isEmpty else {
+                // The workspace no longer owns a strip (reaped/emptied):
+                // the residual glide dies with it instead of leaking onto
+                // a dead workspace's offsets.
+                swipeVelocity.removeValue(forKey: ws)
+                continue
+            }
+            if let target = offsetTargets[ws], target != offsets[ws] {
+                // A programmatic glide (reveal/center/restore) owns the
+                // strip: cancel the residual inertia instead of stomping
+                // the eased target mid-flight.
+                swipeVelocity.removeValue(forKey: ws)
+                continue
+            }
+            let viewport = viewport(for: ws, in: viewports)
+            guard viewport.width > 0 else { continue }
+            let prevMs = lastInertiaMs[ws] ?? nowMs
+            let dtSecs = min(Double(nowMs &- prevMs) / 1000.0, Double(maxStepSecs))
+            lastInertiaMs[ws] = nowMs
+            let travel = velocity * dtSecs * Double(viewport.width) * swipeDirectionSign
+            let step = Int32(travel.rounded())
+            if step != 0 {
+                offsets[ws, default: 0] += step
+                offsetTargets[ws] = offsets[ws]
+                clampSwipeTravel(ws, viewport: viewport, frames: frames)
+            }
+            let decayed = velocity * exp(-swipeDeceleration * dtSecs)
+            if abs(decayed) <= velocityRestEpsilon
+                || abs(decayed) * Double(viewport.width) < swipeInertiaStopPxS
+            {
+                swipeVelocity.removeValue(forKey: ws)
+            } else {
+                swipeVelocity[ws] = decayed
+                // Keep the frame flagged as moving so the tick never
+                // reports quiescent mid-glide and reveals stand down.
                 gestureFresh = true
                 dirty.formUnion([.layout, .motion])
             }
@@ -1781,6 +1925,10 @@ public struct DaemonCore: Sendable {
                 strip.append(id)
                 setActiveStrip(strip)
             }
+            // Re-managed windows re-seed their width from `default_ratio`
+            // (Rust applies the ratio on first spawn AND on re-manage);
+            // a kept stale model width would preserve the pre-float size.
+            modelWidths.removeValue(forKey: id)
         } else {
             unmanaged.insert(id)
             if strip.contains(id) {
@@ -2020,8 +2168,23 @@ public struct DaemonCore: Sendable {
                 {
                     strip.append(id)
                     setActiveStrip(strip)
+                    // Re-tiling re-seeds the width from `default_ratio`
+                    // (Rust applies the ratio on re-manage too).
+                    modelWidths.removeValue(forKey: id)
                 }
                 dirty.formUnion([.layout, .motion, .paint])
+            case .setIndex(let id, let index):
+                // Preferred strip position (Rust `index` window rule):
+                // relocate the column to `min(index, len)` in the active
+                // row. Clamped: negative → 0, past-end → append.
+                var strip = activeStrip()
+                guard let current = strip.index(of: id),
+                      let column = strip.removeColumn(at: current)
+                else { continue }
+                let at = min(max(index, 0), strip.len)
+                strip.insertColumn(at: at, column)
+                setActiveStrip(strip)
+                dirty.formUnion([.layout, .paint])
             case .setManaged:
                 break
             case .moveToWorkspace(let id, let row, let follow):
@@ -3968,10 +4131,14 @@ public struct DaemonCore: Sendable {
             // sliver so no body paints next door. `enqueueResize` (not
             // `applySize`) so the native-shrink adoption below never mistakes
             // the sliver for a user resize and shrinks the model width; the
-            // model width stays intact and un-parking restores it.
+            // model width stays intact and un-parking restores it. Height is
+            // the viewport-clamped live height scaled by the host's
+            // `offscreenSliverHeightRatio` (Rust `sliver_height`).
+            let clamped = Double(min(live.height, home.height))
+            let sliverH = max(1, Int32(clamped * offscreenSliverHeightRatio))
             enqueueResize(
                 member,
-                to: IntSize(offscreenSliverWidth, min(live.height, home.height)),
+                to: IntSize(offscreenSliverWidth, sliverH),
                 epoch: epoch
             )
             return

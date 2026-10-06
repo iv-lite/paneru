@@ -437,6 +437,36 @@ do {
         let bad = try! resolveWindowsTable(["neg": ["title": ".*", "spawn_width": "-1"]])
         checkEqual(bad.first?.spawnWidth, nil, "non-positive spawn widths drop")
     }
+    // Per-window gap insets decode (`0` is meaningful: it opts out of the
+    // global gap); negatives drop like every other non-positive width.
+    do {
+        let rules = try! resolveWindowsTable(["app": [
+            "title": ".*",
+            "horizontal_padding": "0", "vertical_padding": "12",
+        ]])
+        let rule = rules.first!
+        checkEqual(rule.horizontalPadding, 0, "zero padding opts out")
+        checkEqual(rule.verticalPadding, 12, "padding decodes")
+        let bad = try! resolveWindowsTable(["neg": [
+            "title": ".*", "horizontal_padding": "-4",
+        ]])
+        checkEqual(bad.first?.horizontalPadding, nil, "negative padding drops")
+        checkEqual(bad.first?.verticalPadding, nil, "absent padding stays nil")
+    }
+    // Grid placement parses and validates; malformed specs drop.
+    do {
+        let g = parseGridSpec("3:2:1:0:2:1")
+        check(g != nil, "grid parses")
+        checkEqual(g?.cols, 3, "grid cols")
+        checkEqual(g?.rows, 2, "grid rows")
+        checkEqual(g?.x, 1, "grid x")
+        checkEqual(g?.w, 2, "grid span width")
+        checkEqual(g?.h, 1, "grid span height")
+        check(parseGridSpec("3:2:1:0:3:1") == nil, "grid span past the edge drops")
+        check(parseGridSpec("3:2:1") == nil, "short grid drops")
+        check(parseGridSpec("3:2:1:0:0:1") == nil, "zero span drops")
+        check(parseGridSpec("a:b:c:d:e:f") == nil, "non-integer grid drops")
+    }
 }
 
 // `paneru.setup` decodes into the same three layers as TOML: options

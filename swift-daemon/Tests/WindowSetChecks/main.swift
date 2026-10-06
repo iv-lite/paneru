@@ -169,6 +169,12 @@ do {
     )
     let decoded = try! JSONDecoder().decode(LayoutOp.self, from: encoded)
     checkEqual(decoded, .focus(1), "ops round-trip")
+    let setIdx = try! JSONEncoder().encode(LayoutOp.setIndex(window: 3, index: 1))
+    checkEqual(
+        try! JSONDecoder().decode(LayoutOp.self, from: setIdx),
+        .setIndex(window: 3, index: 1),
+        "setIndex round-trips"
+    )
     let setData = try! JSONEncoder().encode(fixture().focus(0))
     let revived = try! JSONDecoder().decode(WindowSet.self, from: setData)
     check(revived == fixture().focus(0), "sets round-trip the tree without the log")

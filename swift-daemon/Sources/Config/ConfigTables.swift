@@ -97,12 +97,13 @@ public func findBinding(
 
 // MARK: - Window rules
 
-/// One `[windows.<name>]` rule. Only the slice the daemon applies today:
-/// regex title + exact bundle match, float/manage/dont-focus flags,
-/// initial width ratio, per-window border-radius override, and the
-/// spawn-time width pin (`spawn_width`, gated on a minimum landing
-/// size). `grid` and per-rule paddings parse but wait for a core that
-/// can place them.
+/// One `[windows.<name>]` rule: regex title + exact bundle match,
+/// float/manage/dont-focus flags, initial width ratio, per-window
+/// border-radius override, per-window gap insets (`horizontal_padding` /
+/// `vertical_padding`), the floating-placement `grid`, the preferred strip
+/// `index`, and the spawn-time width pin (`spawn_width`, gated on a
+/// minimum landing size). `index` and `grid` parse here; the host applies
+/// them at adoption.
 public struct WindowRule: Sendable {
     public var name: String
     public var title: NSRegularExpression
@@ -113,6 +114,14 @@ public struct WindowRule: Sendable {
     public var dontFocus: Bool
     public var width: Double?
     public var grid: String?
+    /// Per-window horizontal gap (left+right combined, same unit as
+    /// `[gaps] horizontal`); nil falls back to the global gap. Applied
+    /// half per side; `0` opts out.
+    public var horizontalPadding: Int32?
+    /// Per-window vertical gap (top+bottom combined, same unit as
+    /// `[gaps] vertical`); nil falls back to the global gap. Applied
+    /// half per side; `0` opts out.
+    public var verticalPadding: Int32?
     public var borderRadius: Double?
     public var passthrough: [(UInt8, KeyModifiers)]
     /// Spawn-time width ratio, applied once when the window lands (the
@@ -127,6 +136,7 @@ public struct WindowRule: Sendable {
         name: String, title: NSRegularExpression, bundleID: String? = nil,
         floating: Bool = false, manage: Bool = false, index: Int? = nil,
         dontFocus: Bool = false, width: Double? = nil, grid: String? = nil,
+        horizontalPadding: Int32? = nil, verticalPadding: Int32? = nil,
         borderRadius: Double? = nil,
         passthrough: [(UInt8, KeyModifiers)] = [],
         spawnWidth: Double? = nil, spawnMinWidth: Int32? = nil,
@@ -141,6 +151,8 @@ public struct WindowRule: Sendable {
         self.dontFocus = dontFocus
         self.width = width
         self.grid = grid
+        self.horizontalPadding = horizontalPadding
+        self.verticalPadding = verticalPadding
         self.borderRadius = borderRadius
         self.passthrough = passthrough
         self.spawnWidth = spawnWidth
@@ -170,6 +182,36 @@ public func matchWindowRules(
         let range = NSRange(title.startIndex..., in: title)
         return rule.title.firstMatch(in: title, range: range) != nil
     }
+}
+
+// MARK: - Grid placement
+
+/// Parsed `grid` window-rule placement (`"cols:rows:x:y:w:h"`): a grid of
+/// `cols`×`rows` cells with the window occupying `w`×`h` cells anchored
+/// at column `x`, row `y` (zero-based, cell units).
+public struct GridSpec: Equatable, Sendable {
+    public var cols: Int
+    public var rows: Int
+    public var x: Int
+    public var y: Int
+    public var w: Int
+    public var h: Int
+}
+
+/// Parse a `grid` rule value. Malformed strings (wrong arity, non-integer
+/// fields) and out-of-range specs (non-positive span, cell outside the
+/// grid) return nil — the window then keeps its OS placement.
+public func parseGridSpec(_ text: String) -> GridSpec? {
+    let nums = text.split(separator: ":").compactMap {
+        Int($0.trimmingCharacters(in: .whitespaces))
+    }
+    guard nums.count == 6 else { return nil }
+    let cols = nums[0], rows = nums[1], x = nums[2], y = nums[3]
+    let w = nums[4], h = nums[5]
+    guard cols > 0, rows > 0, w > 0, h > 0,
+          x >= 0, y >= 0, x + w <= cols, y + h <= rows
+    else { return nil }
+    return GridSpec(cols: cols, rows: rows, x: x, y: y, w: w, h: h)
 }
 
 // MARK: - TOML subset
@@ -303,7 +345,12 @@ public func resolveWindowsTable(
             index: parseInt(fields["index"]),
             dontFocus: parseBool(fields["dont_focus"]),
             width: parseDouble(fields["width"]).flatMap { $0 > 0 ? $0 : nil },
-            grid: fields["grid"], borderRadius: parseDouble(fields["border_radius"]),
+            grid: fields["grid"],
+            horizontalPadding: parseInt(fields["horizontal_padding"])
+                .flatMap { Int32(exactly: $0) }.flatMap { $0 >= 0 ? $0 : nil },
+            verticalPadding: parseInt(fields["vertical_padding"])
+                .flatMap { Int32(exactly: $0) }.flatMap { $0 >= 0 ? $0 : nil },
+            borderRadius: parseDouble(fields["border_radius"]),
             passthrough: passthrough,
             spawnWidth: parseDouble(fields["spawn_width"]).flatMap { $0 > 0 ? $0 : nil },
             spawnMinWidth: parseInt(fields["spawn_min_width"]).flatMap { Int32(exactly: $0) },

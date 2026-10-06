@@ -827,6 +827,121 @@ do {
     checkEqual(daemon.offsets[1], 0, "reveal glides the partial window home")
 }
 
+// Swipe inertia: a multi-sample gesture leaves a decaying glide after the
+// fingers lift (a single-sample swipe steps without a tail). The glide
+// keeps the frame non-quiescent, moves the strip in the gesture direction
+// past the release position, and settles back to rest.
+do {
+    var daemon = DaemonCore()
+    daemon.workspaceRing = [1]
+    var cur: Int32 = 0
+    let live: (Int32) -> IntRect? = { id in
+        let x = cur + id * 400
+        return IntRect(min: IntPoint(x, 34), max: IntPoint(x + 400, 734))
+    }
+    _ = daemon.tick(
+        events: [
+            .appeared(id: 0, workspace: 1), .appeared(id: 1, workspace: 1),
+            .appeared(id: 2, workspace: 1), .appeared(id: 3, workspace: 1),
+            .appeared(id: 4, workspace: 1),
+        ],
+        frames: live, viewport: viewport, focusedStyle: style
+    )
+    for _ in 0..<40 {
+        _ = daemon.tick(events: [], frames: live, viewport: viewport, focusedStyle: style)
+        cur = daemon.offsets[1] ?? 0
+    }
+    // Two samples seed a release velocity; one sample alone would not.
+    _ = daemon.tick(
+        events: [.swipe(delta: 0.2, fingers: 3)],
+        frames: live, viewport: viewport, focusedStyle: style
+    )
+    cur = daemon.offsets[1] ?? 0
+    let r2 = daemon.tick(
+        events: [.swipe(delta: 0.3, fingers: 3)],
+        frames: live, viewport: viewport, focusedStyle: style
+    )
+    cur = daemon.offsets[1] ?? 0
+    let before = cur
+    check(before < 0, "gesture scrolled the strip left")
+    check(!r2.quiescent, "gesture tick is not quiescent")
+    var glided = false
+    var rests = false
+    for _ in 0..<300 {
+        let r = daemon.tick(events: [], frames: live, viewport: viewport, focusedStyle: style)
+        cur = daemon.offsets[1] ?? 0
+        if cur < before { glided = true }
+        if r.quiescent { rests = true; break }
+    }
+    check(glided, "inertia glides past the release position")
+    check(rests, "inertia settles back to rest")
+    // A single-sample swipe steps with no inertial tail: the very next
+    // empty tick is already at rest.
+    var solo = DaemonCore()
+    solo.workspaceRing = [1]
+    var scur: Int32 = 0
+    let slive: (Int32) -> IntRect? = { id in
+        let x = scur + id * 400
+        return IntRect(min: IntPoint(x, 34), max: IntPoint(x + 400, 734))
+    }
+    _ = solo.tick(
+        events: [
+            .appeared(id: 0, workspace: 1), .appeared(id: 1, workspace: 1),
+            .appeared(id: 2, workspace: 1),
+        ],
+        frames: slive, viewport: viewport, focusedStyle: style
+    )
+    for _ in 0..<40 {
+        _ = solo.tick(events: [], frames: slive, viewport: viewport, focusedStyle: style)
+        scur = solo.offsets[1] ?? 0
+    }
+    _ = solo.tick(
+        events: [.swipe(delta: 0.3, fingers: 3)],
+        frames: slive, viewport: viewport, focusedStyle: style
+    )
+    scur = solo.offsets[1] ?? 0
+    let after = scur
+    let rested = solo.tick(
+        events: [], frames: slive, viewport: viewport, focusedStyle: style
+    )
+    scur = solo.offsets[1] ?? 0
+    checkEqual(scur, after, "single-sample swipe steps without a tail")
+    check(rested.quiescent, "single-sample swipe rests immediately")
+}
+
+// `index` rule: a setIndex op relocates the column to the preferred strip
+// position, clamped into the valid range (negative floors to 0, past-end
+// appends).
+do {
+    var daemon = DaemonCore()
+    daemon.animationsEnabled = false
+    daemon.glideBaseMs = 0
+    let placed: [Int32: IntPoint] = [0: IntPoint(0, 34), 1: IntPoint(400, 34), 2: IntPoint(800, 34)]
+    _ = daemon.tick(
+        events: [
+            .appeared(id: 0, workspace: 1), .appeared(id: 1, workspace: 1),
+            .appeared(id: 2, workspace: 1),
+        ],
+        frames: frames(slots: placed), viewport: viewport, focusedStyle: style
+    )
+    _ = daemon.tick(
+        events: [.command(.layout([.setIndex(window: 1, index: 0)]))],
+        frames: frames(slots: placed), viewport: viewport, focusedStyle: style
+    )
+    checkEqual(
+        daemon.strips[1]?[0]?.allWindows, [1, 0, 2],
+        "setIndex moves the column to position 0"
+    )
+    _ = daemon.tick(
+        events: [.command(.layout([.setIndex(window: 1, index: 99)]))],
+        frames: frames(slots: placed), viewport: viewport, focusedStyle: style
+    )
+    checkEqual(
+        daemon.strips[1]?[0]?.allWindows, [0, 2, 1],
+        "setIndex past-end appends"
+    )
+}
+
 // East/west at the strip edge steps across displays: nearest viewport
 // in that direction, first window of its active row, active follows.
 // Single-display setups and empty neighbors stay put.
@@ -4748,6 +4863,40 @@ do {
     }
 }
 
+// Sliver height ratio scales the seam-clipped body (Rust `sliver_height`):
+// the presented sliver keeps only the configured vertical fraction.
+do {
+    var daemon = DaemonCore()
+    daemon.animationsEnabled = false
+    daemon.glideBaseMs = 0
+    daemon.offscreenSliverWidth = 9
+    daemon.offscreenSliverHeightRatio = 0.5
+    let left = IntRect(0, 0, 800, 600)
+    let right = IntRect(800, 0, 1600, 600)
+    let views: [WorkspaceID: IntRect] = [1: left, 2: right]
+    let document = """
+        {"v":1,"active_workspace":1,"focus":1,"workspaces":[{"workspace_id":1,"active_row":0,"rows":[{"virtual_index":0,"offset_x":-200,"offset_y":0,"active":true,"columns":[{"Single":0},{"Single":1},{"Single":2}]}],"floating":[]}]}
+        """
+    guard let doc = HandoffDoc.decode(Data(document.utf8)) else {
+        check(false, "sliver-height handoff decodes")
+        exit(1)
+    }
+    let live: (Int32) -> IntRect? = { id in
+        let origins = [IntPoint(-200, 0), IntPoint(200, 0), IntPoint(600, 0)]
+        let o = origins[Int(id)]
+        return IntRect(min: o, max: IntPoint(o.x + 400, o.y + 700))
+    }
+    daemon.applyHandoff(doc, frames: live, viewports: views)
+    let r = daemon.tick(
+        events: [], frames: live, viewports: views, focusedStyle: style
+    )
+    // Window 2's seam-clipped body keeps half of the 600px-clamped height.
+    check(
+        r.axJobs.contains(where: { $0.winID == 2 && $0.size?.y == 300 }),
+        "sliver height ratio scales the seam-clipped body"
+    )
+}
+
 // Clean vertical stack (X-aligned column): the above/below warp maps
 // strictly — no diagonal "proportional" fallback — and the display circle
 // stays inert (no vertical overlap between stacked displays).
@@ -4991,6 +5140,38 @@ do {
         viewport: viewport, focusedStyle: style
     )
     checkEqual(daemon.committedSlot(of: 0), IntPoint(0, 34), "grown column rests full width")
+}
+
+// `default_ratio` re-applies when a window is re-managed (float → tile),
+// not only on first spawn (Rust parity): the pre-float model width drops
+// so the ratio re-seeds against the current config.
+do {
+    var daemon = DaemonCore()
+    daemon.animationsEnabled = false
+    daemon.glideBaseMs = 0
+    daemon.maximizeTiledWindows = true
+    daemon.defaultRatio = 1.0
+    let full = { IntRect(min: IntPoint(0, 34), max: IntPoint(1024, 734)) }
+    _ = daemon.tick(
+        events: [.appeared(id: 0, workspace: 1), .focus(id: 0)],
+        frames: frames(slots: [0: IntPoint(0, 34)]),
+        viewport: viewport, focusedStyle: style
+    )
+    _ = daemon.tick(events: [], frames: { _ in full() }, viewport: viewport, focusedStyle: style)
+    _ = daemon.tick(
+        events: [.command(.layout([.setFloating(window: 0, floating: true)]))],
+        frames: { _ in full() }, viewport: viewport, focusedStyle: style
+    )
+    // Re-manage with a new ratio: the stale 1.0 width must not survive.
+    daemon.defaultRatio = 0.5
+    let r = daemon.tick(
+        events: [.command(.layout([.setFloating(window: 0, floating: false)]))],
+        frames: { _ in full() }, viewport: viewport, focusedStyle: style
+    )
+    check(
+        r.axJobs.contains { $0.winID == 0 && $0.size == IntSize(512, 700) },
+        "re-managed window re-seeds its width from default_ratio"
+    )
 }
 
 // Native shrink adoption (Rust `window_resized_update_frame`): an app that

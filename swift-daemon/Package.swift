@@ -327,7 +327,7 @@ let package = Package(
             dependencies: [
                 "Geometry", "Layout", "AXClient", "Animation", "EventCore",
                 "Presentation", "Scripting", "Commands", "Focus",
-                "Workspace", "WindowSet", "Snippets",
+                "Workspace", "WindowSet", "Snippets", "Scroll",
             ],
             path: "Sources/Daemon"
         ),

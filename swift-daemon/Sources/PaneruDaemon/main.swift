@@ -330,14 +330,16 @@ core.windowHiddenRatio = resolved.windowHiddenRatio
 core.createWorkspaceAutomatically = resolved.createWorkspaceAutomatically
 core.autoCenter = resolved.autoCenter
 core.swipeDirectionSign = resolved.swipeDirection == .reversed ? 1.0 : -1.0
+core.swipeDeceleration = resolved.swipeDeceleration
 // Tweens run on wall time (epoch dilation under load stretches no
 // glide); the harness leaves this nil and stays frame-counted.
 core.wallClockMs = { DispatchTime.now().uptimeNanoseconds / 1_000_000 }
 // Slots abut; gaps live in per-window AX padding (see applyWindowPadding).
 core.centerSingleColumn = resolved.centerSingleColumn
-// Parked glass keeps a single invisible pixel: the slot-space hide
+// Parked glass keeps `sliver_width` px visible: the slot-space hide
 // width folds the gap insets the host adds on write.
-core.offscreenSliverWidth = 1 + resolved.gapHorizontal / 2
+core.offscreenSliverWidth = resolved.sliverWidth + resolved.gapHorizontal / 2
+core.offscreenSliverHeightRatio = resolved.sliverHeight
 core.defaultRatio = resolved.defaultRatio
 core.maximizeTiledWindows = resolved.maximizeTiledWindows
 core.reapEmptyWorkspaces = resolved.reapEmptyWorkspaces
@@ -536,18 +538,18 @@ struct AdoptedWindow: Sendable {
         // Slots abut; the between-window gap is this per-window AX inset
         // (Rust `set_padding`). The probe frame is raw CG truth, so the
         // cached frame expands by exactly the insets here. The inset is
-        // half the configured gap: two abutting slots then show exactly
-        // `gapHorizontal`/`gapVertical` between neighbours.
-        window.setPadding(
-            hPad: resolved.gapHorizontal / 2, vPad: resolved.gapVertical / 2
-        )
-        // Window rules: manage forces adoption past role rejection and
-        // dont_focus suppresses focus arrival. Floating and width replay
-        // focus-free through LayoutOps; index waits on a strip-position
-        // API in the core.
+        // half the configured gap (per-window or global).
         let runningApp = NSRunningApplication(processIdentifier: probe.ownerPID)
         let bundle = runningApp?.bundleIdentifier ?? ""
         let appName = runningApp?.localizedName ?? ""
+        // `gapHorizontal`/`gapVertical` between neighbours; a per-window
+        // `horizontal_padding`/`vertical_padding` rule overrides the global
+        // gap for this window (0 opts out).
+        let insets = windowInsets(title: probe.title, bundleID: bundle)
+        window.setPadding(hPad: insets.hPad, vPad: insets.vPad)
+        // Window rules: manage forces adoption past role rejection and
+        // dont_focus suppresses focus arrival. Floating, width, index, and
+        // grid placement replay focus-free through LayoutOps.
         core.windowMetadata[windowID(wid)] = WindowMetadata(
             appName: appName, bundleID: bundle, title: probe.title,
             role: probe.role.isEmpty ? nil : probe.role,
@@ -646,6 +648,39 @@ struct AdoptedWindow: Sendable {
                         .setWidth(window: windowID(wid), ratio: ratio),
                     ])))
                 }
+            }
+            // Preferred strip position (Rust `index` rule): applied after
+            // the window lands in its row. Floats, fullscreen floats, and
+            // restore-grace adoptions skip it (the saved layout owns
+            // placement during restore).
+            if let index = rules.first(where: { $0.index != nil })?.index,
+               qualified == .tile,
+               !rules.contains(where: { $0.floating }),
+               !probe.isFullscreen,
+               restorePlanner == nil
+            {
+                pending.append(.command(.layout([
+                    .setIndex(window: windowID(wid), index: index),
+                ])))
+            }
+            // Floating grid placement (Rust `grid` rule): a float keeps
+            // membership only, so place its frame explicitly in the
+            // landing workspace's viewport.
+            if rules.contains(where: { $0.floating }),
+               let spec = rules.compactMap({ $0.grid.flatMap(parseGridSpec) }).first,
+               let viewport = workspaceViewports()[ws]
+            {
+                let cellW = Double(viewport.width) / Double(spec.cols)
+                let cellH = Double(viewport.height) / Double(spec.rows)
+                let frame = WSFrame(
+                    x: viewport.min.x + Int32((Double(spec.x) * cellW).rounded()),
+                    y: viewport.min.y + Int32((Double(spec.y) * cellH).rounded()),
+                    width: Int32((Double(spec.w) * cellW).rounded()),
+                    height: Int32((Double(spec.h) * cellH).rounded())
+                )
+                pending.append(.command(.layout([
+                    .setFrame(window: windowID(wid), frame: frame),
+                ])))
             }
             // Restore placement defers past this tick's `.appeared`
             // ingest (placing now gets undone when the event lands —
@@ -1482,11 +1517,12 @@ func tapEvent(_ event: TapEvent) -> DaemonEvent? {
         // (`swipeDirectionSign`, host-pushed from config).
         return .swipe(delta: delta * resolved.swipeSensitivity, fingers: 3)
     case .scroll(let delta):
-        // Wheel deltas ride the sensitivity-scaled fold, same as Rust
-        // (`delta * scrollScale * sensitivity`).
+        // Wheel deltas ride the wheel-to-finger gain for the configured
+        // sensitivity (`scrollScale` maps sensitivity into the fold's
+        // gain domain — applying `sensitivity` again would double-fold it).
+        // The direction sign lives in the core (`swipeDirectionSign`).
         return .scroll(
             delta: delta * scrollScale(sensitivity: resolved.swipeSensitivity)
-                * resolved.swipeSensitivity
         )
     case .keybind(let command):
         // Every resolved key command marks keyboard cause for the
@@ -2057,13 +2093,35 @@ func watchTuning(_ path: String) {
 ///
 /// Retargets every rostered window's gap insets from the resolved config
 /// (Rust `set_padding`): pure cached-frame re-basing, no AX round trips.
+/// Per-window horizontal/vertical gap, half per side (the global `[gaps]`
+/// convention: `horizontal`/`vertical` are the full gap between two
+/// neighbours). A rule's `horizontal_padding`/`vertical_padding` overrides
+/// the global gap for that window — `0` opts out entirely. Independent per
+/// axis: the first matching rule carrying each override wins that axis.
+@Sendable func windowInsets(title: String, bundleID: String) -> (hPad: Int32, vPad: Int32) {
+    let rules = matchWindowRules(title: title, bundleID: bundleID, in: windowRules)
+    let hOverride = rules.first(where: { $0.horizontalPadding != nil })?.horizontalPadding
+    let vOverride = rules.first(where: { $0.verticalPadding != nil })?.verticalPadding
+    func half(_ value: Int32?, _ global: Int32) -> Int32 {
+        guard let v = value else { return global / 2 }
+        return min(max(v, 0), maxGapPx) / 2
+    }
+    return (half(hOverride, resolved.gapHorizontal), half(vOverride, resolved.gapVertical))
+}
+
 @Sendable func applyWindowPadding() {
-    for window in roster.values {
+    for (wid, window) in roster {
         // Half the configured gap per side: two abutting slots then show
-        // exactly `gapHorizontal`/`gapVertical` between neighbours.
-        window.setPadding(
-            hPad: resolved.gapHorizontal / 2, vPad: resolved.gapVertical / 2
-        )
+        // exactly `gapHorizontal`/`gapVertical` between neighbours. A
+        // per-window `horizontal_padding`/`vertical_padding` rule overrides
+        // the global gap for that window (0 opts out).
+        let insets: (hPad: Int32, vPad: Int32)
+        if let meta = core.windowMetadata[windowID(wid)] {
+            insets = windowInsets(title: meta.title, bundleID: meta.bundleID)
+        } else {
+            insets = (resolved.gapHorizontal / 2, resolved.gapVertical / 2)
+        }
+        window.setPadding(hPad: insets.hPad, vPad: insets.vPad)
     }
 }
 
@@ -2076,12 +2134,14 @@ func watchTuning(_ path: String) {
     core.createWorkspaceAutomatically = resolved.createWorkspaceAutomatically
     core.autoCenter = resolved.autoCenter
 core.swipeDirectionSign = resolved.swipeDirection == .reversed ? 1.0 : -1.0
+core.swipeDeceleration = resolved.swipeDeceleration
 // Tweens run on wall time (epoch dilation under load stretches no
 // glide); the harness leaves this nil and stays frame-counted.
 core.wallClockMs = { DispatchTime.now().uptimeNanoseconds / 1_000_000 }
     // Slots abut; gaps live in per-window AX padding (see applyWindowPadding).
     core.centerSingleColumn = resolved.centerSingleColumn
-    core.offscreenSliverWidth = 1 + resolved.gapHorizontal / 2
+    core.offscreenSliverWidth = resolved.sliverWidth + resolved.gapHorizontal / 2
+    core.offscreenSliverHeightRatio = resolved.sliverHeight
     core.defaultRatio = resolved.defaultRatio
     core.maximizeTiledWindows = resolved.maximizeTiledWindows
     core.reapEmptyWorkspaces = resolved.reapEmptyWorkspaces

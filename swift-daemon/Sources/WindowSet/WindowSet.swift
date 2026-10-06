@@ -44,6 +44,9 @@ public enum LayoutOp: Equatable, Sendable {
     case setManaged(window: WindowID, managed: Bool)
     case setWidth(window: WindowID, ratio: Double)
     case setFrame(window: WindowID, frame: WSFrame)
+    /// Move a managed column to a preferred strip position (Rust `index`
+    /// window rule): the column relocates to `min(index, len)`.
+    case setIndex(window: WindowID, index: Int)
     case stack(window: WindowID, onto: WindowID, tabs: Bool)
     case unstack(WindowID)
 
@@ -59,6 +62,7 @@ public enum LayoutOp: Equatable, Sendable {
         case .setManaged(let w, _): return w
         case .setWidth(let w, _): return w
         case .setFrame(let w, _): return w
+        case .setIndex(let w, _): return w
         case .stack(let w, _, _): return w
         case .unstack(let w): return w
         }
@@ -84,6 +88,7 @@ extension LayoutOp: Codable {
         case setFloating = "set_floating"
         case setManaged = "set_managed"
         case setWidth = "set_width"
+        case setIndex = "set_index"
         case setFrame = "set_frame"
         case stack, unstack
     }
@@ -130,6 +135,12 @@ extension LayoutOp: Codable {
             try container.encode(
                 FrameBody(window: w, frame: frame),
                 forKey: LayoutOpKey(verbatim: Tag.setFrame.rawValue)
+            )
+        case .setIndex(let w, let index):
+            struct IndexBody: Encodable { var window: WindowID; var index: Int }
+            try container.encode(
+                IndexBody(window: w, index: index),
+                forKey: LayoutOpKey(verbatim: Tag.setIndex.rawValue)
             )
         case .stack(let w, let onto, let tabs):
             struct StackBody: Encodable { var window: WindowID; var onto: WindowID; var tabs: Bool }
@@ -187,6 +198,10 @@ extension LayoutOp: Codable {
             struct WidthBody: Decodable { var window: WindowID; var ratio: Double }
             let body = try container.decode(WidthBody.self, forKey: key)
             self = .setWidth(window: body.window, ratio: body.ratio)
+        case .setIndex:
+            struct IndexBody: Decodable { var window: WindowID; var index: Int }
+            let body = try container.decode(IndexBody.self, forKey: key)
+            self = .setIndex(window: body.window, index: body.index)
         case .setFrame:
             struct FrameBody: Decodable { var window: WindowID; var frame: WSFrame }
             let body = try container.decode(FrameBody.self, forKey: key)
