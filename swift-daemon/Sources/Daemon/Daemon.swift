@@ -3302,6 +3302,12 @@ public struct DaemonCore: Sendable {
         glideReferencePx = max(800, Float(refHome.width) / 3.0)
         // Programmatic offset targets ease first, so this tick's slots
         // already account for strip travel (members ride composed).
+        // A workspace whose offset leg FINISHES this tick still rides:
+        // the final eased step must land as one rigid snap, never a
+        // per-window re-tween of the residual (the "one column lags"
+        // tail). Snapshot the legs before easing so the finishing-tick
+        // members still snap together below.
+        let offsetLegsActive = Set(offsetLegs.keys)
         easeOffsets(epoch: epoch)        // Display union once: slot reachability gates the fast-path
         // redrive below, and the drain vets origins against it.
         let union = writeUnion(Array(viewports.values))
@@ -3312,9 +3318,13 @@ public struct DaemonCore: Sendable {
             // hide-park; slots in a void (stairs gaps) stay put.
             let siblings = viewports.filter { $0.key != ws }.map { $0.value }
             // Strip mid-glide: members ride the offset rigidly (see
-            // `rideStripOffset`) so columns advance together.
+            // `rideStripOffset`) so columns advance together. The
+            // finishing tick still rides (offsetLegsActive) so the final
+            // eased step lands as one rigid snap instead of re-tweening
+            // per window.
             rideStripOffset =
-                (offsetTargets[ws] ?? offsets[ws] ?? 0) != (offsets[ws] ?? 0)
+                offsetLegsActive.contains(ws)
+                || (offsetTargets[ws] ?? offsets[ws] ?? 0) != (offsets[ws] ?? 0)
             // Sanity-clamp offsets every commit: swipe snap bounds and
             // reveal composition legitimately rest outside the fill range
             // (see the NOTE below), but thousands of px past the content
@@ -3899,8 +3909,10 @@ public struct DaemonCore: Sendable {
         // the slot with one intent. Held hand truth never parks
         // (cross-display drags are transfers).
         let target: IntPoint
+        let parkingNow: Bool
         if heldMembers.contains(member) {
             target = slot
+            parkingNow = false
             sliverParked.remove(member)
             sliverClipped.remove(member)
         } else if !rideStripOffset,
@@ -3911,11 +3923,17 @@ public struct DaemonCore: Sendable {
             // parked column holds a fixed sliver corner, so parking during a
             // glide left it behind and it *jumped* when the slot crossed back
             // on-screen -- the "one column lags" bug. At rest the off-screen
-            // column parks normally.
+            // column parks normally. The park itself lands in lockstep
+            // (snapped below, not re-tweened): the window is fully off its
+            // owner viewport during the transition, so easing it would only
+            // read as a trailing second motion after the strip already
+            // stopped.
             target = parked
+            parkingNow = true
             sliverParked.insert(member)
         } else {
             target = slot
+            parkingNow = false
             sliverParked.remove(member)
             sliverClipped.remove(member)
         }
@@ -3944,8 +3962,8 @@ public struct DaemonCore: Sendable {
             {
                 positions[member] = target
                 glides.removeValue(forKey: member)
-            } else if snapMovesThisTick || rideStripOffset || !animationsEnabled
-                        || glideBaseMs == 0
+            } else if snapMovesThisTick || rideStripOffset || parkingNow
+                        || !animationsEnabled || glideBaseMs == 0
             {
                 enqueueMove(member, to: target, epoch: epoch)
                 positions[member] = target

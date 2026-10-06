@@ -6201,11 +6201,10 @@ do {
             }
         }
         // While the strip offset moves, every column rides the SAME delta
-        // (rigid). Once it lands, off-edge columns park (their own ease) —
-        // that is expected, not a lag.
+        // (rigid). Once it lands, off-edge columns park in a single snap.
         if stripMoving {
             // Rigid while the strip makes real travel; the last 1-2px tick
-            // and the parking ease at the edge are below this and not a lag.
+            // is below this and not a lag.
             if let first = deltas.first, abs(first) >= 4 {
                 sawTravel = true
                 if deltas.contains(where: { abs($0 - first) > 2 }) { lagged = true }
@@ -6215,13 +6214,32 @@ do {
     }
     check(sawTravel, "the reveal actually glided the strip")
     check(!lagged, "no column lags: every column rides one delta each tick")
-    // Settle and inspect the final state: survivors must rest on their slots
-    // (rigid), not left separated by a park.
+    // Settle: survivors must rest on their slots (rigid), and the fully-exited
+    // column must park in exactly ONE snap — no multi-tick eased tail after
+    // the strip stops (the "one column lags" regression).
+    var parkTailTicks = 0
+    var resting = false
     for _ in 0..<40 {
         clock.now += 16
+        let beforeOff = daemon.offsets[1] ?? 0
         _ = daemon.tick(events: [], frames: liveFrames(), viewport: viewport, focusedStyle: style)
+        let stripMoving = (daemon.offsets[1] ?? 0) != beforeOff
+        var movedAny = false
+        for i in 0..<4 {
+            if let after = daemon.positions[Int32(i)]?.x {
+                if let before = prev[Int32(i)], before != after { movedAny = true }
+                prev[Int32(i)] = after
+            }
+        }
+        if stripMoving {
+            resting = false
+        } else if movedAny {
+            if resting { parkTailTicks += 1 }
+            resting = true
+        }
         for i in 0..<4 { if let p = daemon.positions[Int32(i)] { live[Int32(i)] = p } }
     }
+    check(parkTailTicks == 0, "off-edge column parks in a single snap (no eased tail)")
     // Every column not fully off the owner viewport must rest on its slot
     // (a partly-visible column is never left holding the park sliver -- the
     // "windows separate at the end and stay separated" bug).
