@@ -2717,6 +2717,17 @@ nonisolated(unsafe) var frameClock = FrameClock()
     }
 }
 
+/// Main-runloop tick pump: the Timer's target-action API lets the
+/// @MainActor `tick` run without a @Sendable block capturing a
+/// non-Sendable function reference (a selector fires on the runloop the
+/// timer was scheduled on, so the assume is sound).
+final class TickPump: NSObject {
+    @objc func fire(_ timer: Timer) {
+        MainActor.assumeIsolated { tick() }
+    }
+}
+nonisolated(unsafe) let tickPump = TickPump()
+
 /// Start (or restart) the repeating full-cadence timer. Idempotent while
 /// already running at the current rate only when `force` is false: a
 /// cadence change (display refresh) passes `force: true`.
@@ -2725,9 +2736,10 @@ nonisolated(unsafe) var frameClock = FrameClock()
     backstopTimer = nil
     guard tickTimer == nil else { return }
     let hz = min(max(displayMaxHz, 60.0), 120.0)
-    tickTimer = Timer.scheduledTimer(withTimeInterval: 1.0 / hz, repeats: true) { _ in
-        tick()
-    }
+    tickTimer = Timer.scheduledTimer(
+        timeInterval: 1.0 / hz, target: tickPump,
+        selector: #selector(TickPump.fire(_:)), userInfo: nil, repeats: true
+    )
 }
 
 /// Drop the repeating timer and arm a one-shot backstop for `afterMs`
@@ -3497,10 +3509,11 @@ nonisolated(unsafe) var statMaxNanos: UInt64 = 0
 nonisolated(unsafe) var statOver16 = 0
 nonisolated(unsafe) var statJobs = 0
 
-@Sendable func tick() {
+@MainActor func tick() {
     // Main-confinement contract: the tick is driven by a main-runloop
     // Timer (or the idle backstop), and the worker hops re-enter via
-    // `DispatchQueue.main`. Trap on a future off-main caller.
+    // `DispatchQueue.main`. The runtime precondition stays as a
+    // defense-in-depth trap on a future off-main caller.
     dispatchPrecondition(condition: .onQueue(.main))
     tickCount += 1
     // Invalidate last tick's workspace index: the pre-core paths (adoption,
@@ -4157,18 +4170,11 @@ nonisolated(unsafe) var statJobs = 0
         )
         if lastGhostRect != rect {
             lastGhostRect = rect
-            // Tick runs on the main runloop, so assuming the actor is
-            // sound (traps loudly otherwise) — and it keeps the
-            // nonisolated tick free of actor hops on every frame.
-            MainActor.assumeIsolated {
-                Presenter.showDrop(rect: rect, style: focusedStyle)
-            }
+            Presenter.showDrop(rect: rect, style: focusedStyle)
         }
     } else if lastGhostRect != nil {
         lastGhostRect = nil
-        MainActor.assumeIsolated {
-            Presenter.hideDrop()
-        }
+        Presenter.hideDrop()
     }
     // Focus history records every arrival (idempotent on steady
     // focus); the reader below spends it on focusless workspace
@@ -4234,17 +4240,13 @@ nonisolated(unsafe) var statJobs = 0
     }
     pendingFlashes.removeAll()
     if let message = flashState.visible(now: Date()) {
-        MainActor.assumeIsolated {
-            Presenter.showFlash(
-                message: message, opacity: 1,
-                topRight: CGPoint(x: Double(flashAnchor.max.x), y: Double(flashAnchor.min.y))
-            )
-        }
+        Presenter.showFlash(
+            message: message, opacity: 1,
+            topRight: CGPoint(x: Double(flashAnchor.max.x), y: Double(flashAnchor.min.y))
+        )
         lastFlashMessage = message
     } else if lastFlashMessage != nil {
-        MainActor.assumeIsolated {
-            Presenter.removeFlash()
-        }
+        Presenter.removeFlash()
         lastFlashMessage = nil
     }
     // Frame refresh on the AX worker, staggered halves (~1Hz per window):
@@ -4403,9 +4405,7 @@ nonisolated(unsafe) var statJobs = 0
     if result.focus == nil {
         borderRects.removeAll()
         borderStyles.removeAll()
-        MainActor.assumeIsolated {
-            Presenter.syncBorders([])
-        }
+        Presenter.syncBorders([])
     }
     if !borderPlan.isEmpty {
         for id in borderPlan.removed {
@@ -4426,12 +4426,10 @@ nonisolated(unsafe) var statJobs = 0
         // draws `plan.added/moved` rects verbatim, so syncing the raw
         // plan would float the ring hPad/vPad off the glass.
         let glassPlan = glassCorrectedPlan(borderPlan, correct: glassForBorder)
-        MainActor.assumeIsolated {
-            Presenter.syncBorders(resolveOverlayItems(
-                plan: glassPlan,
-                currentRects: borderRects, currentStyles: borderStyles
-            ))
-        }
+        Presenter.syncBorders(resolveOverlayItems(
+            plan: glassPlan,
+            currentRects: borderRects, currentStyles: borderStyles
+        ))
     }
     // Dim the world behind the focused window when configured. Steady
     // ticks skip the presenter: the old code rewrote the background
@@ -4461,13 +4459,11 @@ nonisolated(unsafe) var statJobs = 0
                 || !dimCutoutEqual(last.cutout, dimNow.cutout)
         }()
         if dimChanged {
-            MainActor.assumeIsolated {
-                Presenter.updateDim(
-                    opacity: dimNow.opacity,
-                    r: dimNow.r, g: dimNow.g, b: dimNow.b,
-                    cutout: dimNow.cutout as NSRect?, cutoutRadius: dimNow.radius
-                )
-            }
+            Presenter.updateDim(
+                opacity: dimNow.opacity,
+                r: dimNow.r, g: dimNow.g, b: dimNow.b,
+                cutout: dimNow.cutout as NSRect?, cutoutRadius: dimNow.radius
+            )
             lastDim = dimNow
         }
     } else {
@@ -4475,9 +4471,7 @@ nonisolated(unsafe) var statJobs = 0
         // is presenter churn at display rate during busy periods.
         if lastDim != nil {
             lastDim = nil
-            MainActor.assumeIsolated {
-                Presenter.hideDim()
-            }
+            Presenter.hideDim()
         }
     }
     // Menubar: rows of the active workspace, current row marked. Gated
@@ -4487,28 +4481,26 @@ nonisolated(unsafe) var statJobs = 0
         let rows = (core.strips[ws] ?? [:]).keys.sorted()
         let currentRow = core.activeVirtual[ws] ?? 0
         let position = rows.firstIndex(of: currentRow).map(UInt32.init) ?? 0
-        MainActor.assumeIsolated {
-            menubar?.update(
-                cells: buildIndicatorCells(
-                    style: resolved.menubarIndicatorStyle,
-                    format: resolved.menubarIndicatorFormat,
-                    current: rows.isEmpty ? nil : position,
-                    all: rows.indices.map { UInt32($0) },
-                    activeCharacter: resolved.menubarActiveCharacter,
-                    inactiveCharacter: resolved.menubarInactiveCharacter
-                ) ?? [],
-                descriptor: buildDescriptor(
-                    style: resolved.menubarDescriptorStyle,
-                    text: resolved.menubarDescriptorText,
-                    symbol: resolved.menubarDescriptorSymbol
-                ),
-                orientation: resolved.menubarOrientation,
-                widths: [],
-                focusedWidthRatio: nil,
-                hasFocusedWindow: result.focus != nil,
-                fontSize: resolved.menubarFontSize
-            )
-        }
+        menubar?.update(
+            cells: buildIndicatorCells(
+                style: resolved.menubarIndicatorStyle,
+                format: resolved.menubarIndicatorFormat,
+                current: rows.isEmpty ? nil : position,
+                all: rows.indices.map { UInt32($0) },
+                activeCharacter: resolved.menubarActiveCharacter,
+                inactiveCharacter: resolved.menubarInactiveCharacter
+            ) ?? [],
+            descriptor: buildDescriptor(
+                style: resolved.menubarDescriptorStyle,
+                text: resolved.menubarDescriptorText,
+                symbol: resolved.menubarDescriptorSymbol
+            ),
+            orientation: resolved.menubarOrientation,
+            widths: [],
+            focusedWidthRatio: nil,
+            hasFocusedWindow: result.focus != nil,
+            fontSize: resolved.menubarFontSize
+        )
     }
     // Focused passthrough: the focused window's rules name chords the
     // tap must deliver natively.
