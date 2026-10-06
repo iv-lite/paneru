@@ -270,6 +270,14 @@ public final class MenuBarController {
         rebuildMenu(widths: [])
     }
 
+    /// Show/hide the status item (config `workspace_menu_status`). The item
+    /// is created once; visibility toggles in place so the menu keeps
+    /// working when re-shown.
+    @MainActor
+    public func setVisible(_ visible: Bool) {
+        statusItem.isVisible = visible
+    }
+
     deinit {
         NSStatusBar.system.removeStatusItem(statusItem)
     }

@@ -128,7 +128,7 @@ public struct ResolvedConfig: Equatable, Sendable {
     public var paddingRight: Int32 = 0
     public var gapHorizontal: Int32 = 8
     public var gapVertical: Int32 = 8
-    public var borderActive = false
+    public var borderActive = true
     public var borderInactive = false
     public var borderColor = (1.0, 1.0, 1.0)
     public var inactiveBorderColor: (Double, Double, Double)?
@@ -266,7 +266,7 @@ extension DaemonOptions {
         if let v = paddingRight { out.paddingRight = Int32(v) }
         if let v = gapHorizontal { out.gapHorizontal = min(max(Int32(v), 0), maxGapPx) }
         if let v = gapVertical { out.gapVertical = min(max(Int32(v), 0), maxGapPx) }
-        if borderActive == true { out.borderActive = true }
+        if let v = borderActive { out.borderActive = v }
         if borderInactive == true { out.borderInactive = true }
         if let c = borderColor { out.borderColor = parseHexColor(c) }
         if let c = inactiveBorderColor { out.inactiveBorderColor = parseHexColor(c) }
@@ -353,7 +353,7 @@ extension DaemonOptions {
         if let v = paddingRight { config.paddingRight = Int32(v) }
         if let v = gapHorizontal { config.gapHorizontal = min(max(Int32(v), 0), maxGapPx) }
         if let v = gapVertical { config.gapVertical = min(max(Int32(v), 0), maxGapPx) }
-        if borderActive == true { config.borderActive = true }
+        if let v = borderActive { config.borderActive = v }
         if borderInactive == true { config.borderInactive = true }
         if let c = borderColor { config.borderColor = parseHexColor(c) }
         if let c = inactiveBorderColor { config.inactiveBorderColor = parseHexColor(c) }

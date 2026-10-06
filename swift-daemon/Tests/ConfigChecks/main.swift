@@ -36,7 +36,7 @@ do {
     checkEqual(c.sliverWidth, 5, "sliver width default")
     checkEqual(c.sliverHeight, 1.0, "sliver height default")
     checkEqual2((c.gapHorizontal, c.gapVertical), (8, 8), "gaps default 8/8")
-    check(!c.borderActive, "borders default off")
+    check(c.borderActive, "borders default on")
     checkEqual3(c.borderColor, (1.0, 1.0, 1.0), "border defaults white")
     checkEqual(c.borderOpacity, 1.0, "opacity default")
     checkEqual(c.borderWidth, 2.0, "width default")

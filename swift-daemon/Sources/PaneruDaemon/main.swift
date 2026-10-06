@@ -381,7 +381,12 @@ nonisolated(unsafe) var borderStyles: [WindowID: BorderStyle] = [:]
 /// Focused-window paint from resolved border config. Recomputed on
 /// tuning reload; the `auto` radius matches the Rust-side default.
 @Sendable func makeFocusedStyle(_ resolved: ResolvedConfig) -> BorderStyle {
-    BorderStyle(
+    guard resolved.borderActive else {
+        // `decorations.active.border.enabled = false` disables the focus
+        // ring entirely (opacity 0 collapses the presenter layer).
+        return BorderStyle(r: 0, g: 0, b: 0, opacity: 0, width: 0, radius: 0)
+    }
+    return BorderStyle(
         r: resolved.borderColor.0, g: resolved.borderColor.1, b: resolved.borderColor.2,
         opacity: resolved.borderOpacity * resolved.borderAlpha,
         width: resolved.borderWidth,
@@ -1664,6 +1669,7 @@ case .openAccessibilitySettings, .showAccessibilityInstructions:
     break
 }
 }
+    menubar?.setVisible(resolved.workspaceMenuStatus)
 }
 
 // MARK: - Query snapshot
@@ -2214,6 +2220,9 @@ core.wallClockMs = { DispatchTime.now().uptimeNanoseconds / 1_000_000 }
     radiusRulesGen += 1
     applyWindowPadding()
     focusedStyle = makeFocusedStyle(resolved)
+    MainActor.assumeIsolated {
+        menubar?.setVisible(resolved.workspaceMenuStatus)
+    }
     tap.tuning = TapTuning(
         swipeFingers: resolved.swipeFingers,
         swipeVertical: resolved.swipeVertical,
@@ -3608,6 +3617,48 @@ nonisolated(unsafe) var statMaxNanos: UInt64 = 0
 nonisolated(unsafe) var statOver16 = 0
 nonisolated(unsafe) var statJobs = 0
 
+/// Perform one AX write batch (size-then-position per job) and return the
+/// newly-dead window ids. Thread-agnostic: the async path runs it on the
+/// AX worker, the `ax_writer=false` sync path runs it on main. Acks go to
+/// the thread-safe `ackBox`; the caller owns the main-confined
+/// `deadElements` insertion.
+@Sendable func performAXWrites(
+    _ batch: [(LiveProviders.LiveWindow, AXWriteJob)]
+) -> [CGWindowID] {
+    var newlyDead: [CGWindowID] = []
+    for (window, job) in batch {
+        // Per-call denial capture: a later success clears the shared slot,
+        // so read the code before the next call.
+        var denied: Int32?
+        // Size before position (Rust `resize` order): a job that changes
+        // both must never occupy (new origin, old size) — that intermediate
+        // frame moves the glass edge relative to the neighbour and breathes
+        // the inter-window gap mid-glide. Rust writes `set_ax_size` then
+        // `set_ax_position`; match it.
+        if let size = job.size {
+            _ = window.resize(to: size, origin: job.origin)
+            denied = window.lastDeniedCode()
+        }
+        if let origin = job.origin {
+            _ = window.reposition(to: origin)
+            if denied == nil {
+                denied = window.lastDeniedCode()
+            }
+        }
+        // Dead element: flag for drop + re-adopt on the next roster sync
+        // (a parked window reads glass through the same dead ref, so it can
+        // never re-arm on its own).
+        if let code = denied, code == AXError.invalidUIElement.rawValue {
+            newlyDead.append(CGWindowID(job.winID))
+        }
+        ackBox.append(AXWriteAck(
+            winID: job.winID, seq: job.seq, epoch: job.epoch,
+            ok: denied == nil
+        ))
+    }
+    return newlyDead
+}
+
 @MainActor func tick() {
     // Main-confinement contract: the tick is driven by a main-runloop
     // Timer (or the idle backstop), and the worker hops re-enter via
@@ -3921,68 +3972,45 @@ nonisolated(unsafe) var statJobs = 0
     }
     let batch = batchBuilder
     if !batch.isEmpty {
-        // Capture the lane generation: a retirement before this block
-        // runs makes it a no-op for AX (the fresh lane owns convergence),
-        // so the old backlog can never fight the new lane.
-        let laneGen = axLaneGeneration
-        axWorker.async {
-            guard axLaneCurrent(laneGen) else {
-                // Stale lane: converge the sequences so the watchdog's
-                // unacked state does not leak, but issue nothing. The
-                // fresh lane re-issues the live intents.
-                for (_, job) in batch {
-                    ackBox.append(AXWriteAck(
-                        winID: job.winID, seq: job.seq, epoch: job.epoch,
-                        ok: true
-                    ))
-                }
-                DispatchQueue.main.async { wakeTicker() }
-                return
-            }
-            // Dead element flags found on the worker: `deadElements` is
-            // main-owned, so collect here and insert on the main hop below
-            // (a direct insert would race `syncRoster`'s read-and-clear).
-            var newlyDead: [CGWindowID] = []
-            for (window, job) in batch {
-                // Per-call denial capture: a later success clears the
-                // shared slot, so read the code before the next call.
-                var denied: Int32?
-                // Size before position (Rust `resize` order): a job that
-                // changes both must never occupy (new origin, old size) —
-                // that intermediate frame moves the glass edge relative to
-                // the neighbour and breathes the inter-window gap mid-glide.
-                // Rust writes `set_ax_size` then `set_ax_position`; match it.
-                if let size = job.size {
-                    _ = window.resize(to: size, origin: job.origin)
-                    denied = window.lastDeniedCode()
-                }
-                if let origin = job.origin {
-                    _ = window.reposition(to: origin)
-                    if denied == nil {
-                        denied = window.lastDeniedCode()
+        if resolved.axWriterEnabled {
+            // Capture the lane generation: a retirement before this block
+            // runs makes it a no-op for AX (the fresh lane owns convergence),
+            // so the old backlog can never fight the new lane.
+            let laneGen = axLaneGeneration
+            axWorker.async {
+                guard axLaneCurrent(laneGen) else {
+                    // Stale lane: converge the sequences so the watchdog's
+                    // unacked state does not leak, but issue nothing. The
+                    // fresh lane re-issues the live intents.
+                    for (_, job) in batch {
+                        ackBox.append(AXWriteAck(
+                            winID: job.winID, seq: job.seq, epoch: job.epoch,
+                            ok: true
+                        ))
                     }
+                    DispatchQueue.main.async { wakeTicker() }
+                    return
                 }
-                // Dead element: flag for drop + re-adopt on the next
-                // roster sync (a parked window reads glass through the
-                // same dead ref, so it can never re-arm on its own).
-                if let code = denied, code == AXError.invalidUIElement.rawValue {
-                    newlyDead.append(CGWindowID(job.winID))
+                // Dead element flags found on the worker: `deadElements` is
+                // main-owned, so collect here and insert on the main hop
+                // below (a direct insert would race `syncRoster`'s
+                // read-and-clear).
+                let dead = performAXWrites(batch)
+                DispatchQueue.main.async {
+                    for id in dead where deadElements.insert(id).inserted {
+                        print("ax: window=\(id) element dead (-25202); re-adopting")
+                    }
+                    wakeTicker()
                 }
-                ackBox.append(AXWriteAck(
-                    winID: job.winID, seq: job.seq, epoch: job.epoch,
-                    ok: denied == nil
-                ))
             }
-            // Completions land on the worker: wake the idle clock so the
-            // tick drains acks (and re-evaluates convergence) now rather
-            // than at the next backstop. Main queue by construction; the
-            // dead-element flags apply here so they stay main-confined.
-            let dead = newlyDead
-            DispatchQueue.main.async {
-                for id in dead where deadElements.insert(id).inserted {
-                    print("ax: window=\(id) element dead (-25202); re-adopting")
-                }
-                wakeTicker()
+        } else {
+            // `ax_writer=false`: write inline on the main thread (the
+            // testing/degrade knob) — same size-then-position order and ack
+            // semantics, but no lane hop, so AX latency lands on the tick
+            // instead of the worker.
+            let dead = performAXWrites(batch)
+            for id in dead where deadElements.insert(id).inserted {
+                print("ax: window=\(id) element dead (-25202); re-adopting")
             }
         }
     }
