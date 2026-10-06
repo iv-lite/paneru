@@ -6,17 +6,6 @@ import QuartzCore
 /// manager methods.
 @MainActor
 extension NSView {
-    func applyBorder(style: BorderStyle) {
-        wantsLayer = true
-        guard let layer else { return }
-        layer.backgroundColor = NSColor.clear.cgColor
-        layer.borderWidth = style.width
-        layer.borderColor = NSColor(
-            srgbRed: style.r, green: style.g, blue: style.b, alpha: style.opacity
-        ).cgColor
-        layer.cornerRadius = style.radius + style.width / 2
-    }
-
     func applyDropPreview(style: BorderStyle) {
         wantsLayer = true
         guard let layer else { return }
