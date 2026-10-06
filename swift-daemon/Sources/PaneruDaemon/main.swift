@@ -2133,6 +2133,9 @@ func watchTuning(_ path: String) {
 }
 
 @Sendable func refreshDerivedConfig() {
+    // Padding changes the viewports (`viewportForScreen`): the cached
+    // per-workspace rects are stale until rebuilt.
+    cachedWorkspaceViewports = nil
     core.presetWidths = resolved.presetColumnWidths
     core.presetHeights = resolved.presetStackHeights
     core.resizeCycle = resolved.windowResizeCycle
@@ -2900,6 +2903,10 @@ nonisolated(unsafe) var frameClock = FrameClock()
 /// exclude menubar/notch/Dock, so no extra reserve applies on top.
 /// Orphan workspaces (unplugged displays) fall back to the main
 /// viewport so their parked windows stay reachable.
+/// Cached `workspaceViewports()` result; invalidated on display change
+/// (the probe below) and config reload (`refreshDerivedConfig`).
+nonisolated(unsafe) var cachedWorkspaceViewports: [WorkspaceID: IntRect]?
+
 @Sendable func workspaceViewports() -> [WorkspaceID: IntRect] {
     // Re-probe screen geometry only when it changed (notification) or on
     // a ~1s wall-clock backstop; the cached `displayScreens`/`displayUsable`
@@ -2909,6 +2916,10 @@ nonisolated(unsafe) var frameClock = FrameClock()
         displaysDirty = false
         lastDisplayProbeAt = now
         refreshDisplays()
+        cachedWorkspaceViewports = nil
+    }
+    if let cached = cachedWorkspaceViewports {
+        return cached
     }
     var out: [WorkspaceID: IntRect] = [:]
     let mainFrame = displayScreens.first?.frame
@@ -2931,6 +2942,7 @@ nonisolated(unsafe) var frameClock = FrameClock()
             NSScreen.screens.first?.frame ?? .zero
         )
     }
+    cachedWorkspaceViewports = out
     return out
 }
 
@@ -3017,8 +3029,28 @@ nonisolated(unsafe) var frameClock = FrameClock()
     return workspaceForFrame(rect)
 }
 
+/// One O(windows) pass over every strip: window id → owning workspace.
+/// The post-commit presenter calls look the focused window's workspace up
+/// several times per tick; this index turns those scans into lookups.
+@Sendable func buildWorkspaceIndex() -> [WindowID: WorkspaceID] {
+    var index: [WindowID: WorkspaceID] = [:]
+    for (ws, rows) in core.strips {
+        for strip in rows.values {
+            for id in strip.allWindows {
+                index[id] = ws
+            }
+        }
+    }
+    return index
+}
+
 /// Workspace owning a window id, if it sits in any strip.
 @Sendable func workspaceOfWindow(_ id: WindowID) -> WorkspaceID? {
+    // Post-commit lookups hit the per-tick index; cold paths (adoption,
+    // pre-core filtering) scan the strips directly.
+    if let index = tickWorkspaceIndex {
+        return index[id]
+    }
     for (ws, rows) in core.strips {
         for strip in rows.values where strip.contains(id) {
             return ws
@@ -3028,6 +3060,10 @@ nonisolated(unsafe) var frameClock = FrameClock()
 }
 
 nonisolated(unsafe) var tickCount = 0
+/// Fresh window→workspace index built after each `core.tick()`; the
+/// post-commit presenter reads it. Nil outside that window (cold paths
+/// scan instead), so a stale index can never answer.
+nonisolated(unsafe) var tickWorkspaceIndex: [WindowID: WorkspaceID]?
 /// Quiescence of the last full tick: gates the idle backoff (quiet ticks
 /// skip the scan/present work). Starts false so boot runs fully.
 nonisolated(unsafe) var lastQuiescent = false
@@ -3467,6 +3503,9 @@ nonisolated(unsafe) var statJobs = 0
     // `DispatchQueue.main`. Trap on a future off-main caller.
     dispatchPrecondition(condition: .onQueue(.main))
     tickCount += 1
+    // Invalidate last tick's workspace index: the pre-core paths (adoption,
+    // focus filter) scan the live strips instead of a stale lookup.
+    tickWorkspaceIndex = nil
     // Slow-tick phase timing (diagnostics only): with PANERU_PERF set,
     // full ticks slower than the threshold log one phase breakdown
     // line (ack+warp / sync admin / lua drain / core / post+present),
@@ -3732,6 +3771,9 @@ nonisolated(unsafe) var statJobs = 0
         frames: { roster[CGWindowID(bitPattern: $0)]?.frame },
         viewports: viewports, focusedStyle: focusedStyle
     )
+    // Fresh window→workspace index for the post-commit presenter: the
+    // border/dim/flash/menubar paths look the focus up several times.
+    tickWorkspaceIndex = buildWorkspaceIndex()
     let t4: Date? = perfTimingEnabled ? Date() : nil
     // AX writes ride the serial worker, never the tick (the runloop also
     // owns the event tap — blocking it on AX round trips stalls all

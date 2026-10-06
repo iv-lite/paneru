@@ -1295,8 +1295,13 @@ public struct DaemonCore: Sendable {
             let prevMs = lastInertiaMs[ws] ?? nowMs
             let dtSecs = min(Double(nowMs &- prevMs) / 1000.0, Double(maxStepSecs))
             lastInertiaMs[ws] = nowMs
-            let travel = velocity * dtSecs * Double(viewport.width) * swipeDirectionSign
-            let step = Int32(travel.rounded())
+            let newPosition = integrateScroll(
+                position: Double(offsets[ws] ?? 0),
+                velocity: velocity, dtSecs: dtSecs,
+                viewportWidth: Double(viewport.width),
+                directionSign: swipeDirectionSign
+            )
+            let step = Int32(newPosition.rounded()) - (offsets[ws] ?? 0)
             if step != 0 {
                 offsets[ws, default: 0] += step
                 offsetTargets[ws] = offsets[ws]
