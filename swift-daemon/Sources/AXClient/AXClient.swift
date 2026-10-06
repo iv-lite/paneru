@@ -46,13 +46,12 @@ private struct SeqKey: Hashable {
 }
 
 /// Per-side gap insets applied to one write: origin-side (leading/top) and
-/// far-side (trailing/bottom). `.zero` disables the gap for a write.
+/// far-side (trailing/bottom).
 public struct WindowInset: Equatable, Sendable {
     public var leading: Int32
     public var trailing: Int32
     public var top: Int32
     public var bottom: Int32
-    public static let zero = WindowInset(leading: 0, trailing: 0, top: 0, bottom: 0)
     public init(leading: Int32 = 0, trailing: Int32 = 0, top: Int32 = 0, bottom: Int32 = 0) {
         self.leading = leading
         self.trailing = trailing

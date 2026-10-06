@@ -2154,33 +2154,52 @@ func watchTuning(_ path: String) {
     }
 }
 
-/// Refresh every derived consumer from the resolved config (core
-/// presets, border style, tap tuning) and re-log effective tuning.
-/// Called after each rebuild once the owners exist.
-///
-/// Retargets every rostered window's gap insets from the resolved config
-/// (Rust `set_padding`): pure cached-frame re-basing, no AX round trips.
-/// Per-window horizontal/vertical gap, half per side (the global `[gaps]`
-/// convention: `horizontal`/`vertical` are the full gap between two
-/// neighbours). A rule's `horizontal_padding`/`vertical_padding` overrides
-/// the global gap for that window — `0` opts out entirely. Independent per
-/// axis: the first matching rule carrying each override wins that axis.
-@Sendable func windowInsets(
+/// Resolved full per-axis gap for a window: a rule's
+/// `horizontal_padding`/`vertical_padding` overrides the global gap
+/// (`0` opts out entirely), clamped to `maxGapPx`. Independent per axis:
+/// the first matching rule carrying each override wins that axis.
+@Sendable func windowGap(
     title: String, bundleID: String
-) -> (leading: Int32, trailing: Int32, top: Int32, bottom: Int32) {
+) -> (horizontal: Int32, vertical: Int32) {
     let rules = matchWindowRules(title: title, bundleID: bundleID, in: windowRules)
     let hOverride = rules.first(where: { $0.horizontalPadding != nil })?.horizontalPadding
     let vOverride = rules.first(where: { $0.verticalPadding != nil })?.verticalPadding
-    // Origin side takes floor(gap/2), far side the remainder: two abutting
-    // windows then show exactly `gapHorizontal`/`gapVertical` between them,
-    // odd values included.
-    func split(_ value: Int32?, _ global: Int32) -> (leading: Int32, trailing: Int32) {
-        let full = value.map { min(max($0, 0), maxGapPx) } ?? global
-        return (full / 2, full - full / 2)
+    let h = hOverride.map { min(max($0, 0), maxGapPx) } ?? resolved.gapHorizontal
+    let v = vOverride.map { min(max($0, 0), maxGapPx) } ?? resolved.gapVertical
+    return (h, v)
+}
+
+/// Half-per-side gap insets for a window: origin side takes floor(gap/2),
+/// far side the remainder, so two abutting windows show exactly the full
+/// gap between them, odd values included (Rust `set_padding`).
+@Sendable func windowInsets(
+    title: String, bundleID: String
+) -> (leading: Int32, trailing: Int32, top: Int32, bottom: Int32) {
+    let (h, v) = windowGap(title: title, bundleID: bundleID)
+    return (h / 2, h - h / 2, v / 2, v - v / 2)
+}
+
+/// Per-window gap insets with the maximized rule: a full-tile window
+/// (model width == viewport width) carries the FULL gap on every
+/// screen-facing edge (no neighbour to share with); everyone else splits
+/// the gap between neighbours.
+@Sendable func resolvedInsets(
+    for id: WindowID, viewports: [WorkspaceID: IntRect]
+) -> (leading: Int32, trailing: Int32, top: Int32, bottom: Int32) {
+    let owner = workspaceOfWindow(id) ?? core.activeWorkspace
+    let maximized = viewports[owner].map { home in
+        core.modelWidth(of: id).map { $0 == home.width } ?? false
+    } ?? false
+    let (h, v): (Int32, Int32)
+    if let meta = core.windowMetadata[id] {
+        (h, v) = windowGap(title: meta.title, bundleID: meta.bundleID)
+    } else {
+        (h, v) = (resolved.gapHorizontal, resolved.gapVertical)
     }
-    let (hLeading, hTrailing) = split(hOverride, resolved.gapHorizontal)
-    let (vTop, vBottom) = split(vOverride, resolved.gapVertical)
-    return (hLeading, hTrailing, vTop, vBottom)
+    if maximized {
+        return (h, h, v, v)
+    }
+    return (h / 2, h - h / 2, v / 2, v - v / 2)
 }
 
 @Sendable func applyWindowPadding() {
@@ -2191,20 +2210,10 @@ func watchTuning(_ path: String) {
         // neighbours, odd values included. A per-window
         // `horizontal_padding`/`vertical_padding` rule overrides the global
         // gap for that window (0 opts out). Maximized / full-tile windows
-        // keep their insets too: their slot is the viewport, so the glass
-        // is simply inset by the gap instead of filling edge-to-edge.
+        // carry the FULL gap on every screen-facing edge (no neighbour to
+        // share with).
         let id = windowID(wid)
-        let insets: (leading: Int32, trailing: Int32, top: Int32, bottom: Int32)
-        if let meta = core.windowMetadata[id] {
-            insets = windowInsets(title: meta.title, bundleID: meta.bundleID)
-        } else {
-            insets = (
-                resolved.gapHorizontal / 2,
-                resolved.gapHorizontal - resolved.gapHorizontal / 2,
-                resolved.gapVertical / 2,
-                resolved.gapVertical - resolved.gapVertical / 2
-            )
-        }
+        let insets = resolvedInsets(for: id, viewports: workspaceViewports())
         if window.setInsets(
             leading: insets.leading, trailing: insets.trailing,
             top: insets.top, bottom: insets.bottom
@@ -3670,8 +3679,8 @@ nonisolated(unsafe) var statJobs = 0
         // Per-call denial capture: a later success clears the shared slot,
         // so read the code before the next call.
         var denied: Int32?
-        // Apply the job's insets first (idempotent): a maximized window
-        // writes with zero insets, a normal one with its configured gap.
+        // Apply the job's insets first (idempotent): each window writes
+        // with its configured gap insets, maximized windows included.
         if let insets = job.insets {
             window.setInsets(
                 leading: insets.leading, trailing: insets.trailing,
@@ -4018,23 +4027,13 @@ nonisolated(unsafe) var statJobs = 0
             continue
         }
         // Every window carries its configured gap insets — maximized /
-        // full-tile windows included (their slot is the viewport, so the
-        // glass is inset by the gap on each edge instead of filling
-        // edge-to-edge).
-        if let meta = core.windowMetadata[job.winID] {
-            let ins = windowInsets(title: meta.title, bundleID: meta.bundleID)
-            job.insets = WindowInset(
-                leading: ins.leading, trailing: ins.trailing,
-                top: ins.top, bottom: ins.bottom
-            )
-        } else {
-            job.insets = WindowInset(
-                leading: resolved.gapHorizontal / 2,
-                trailing: resolved.gapHorizontal - resolved.gapHorizontal / 2,
-                top: resolved.gapVertical / 2,
-                bottom: resolved.gapVertical - resolved.gapVertical / 2
-            )
-        }
+        // full-tile windows get the FULL gap on each screen-facing edge,
+        // everyone else the half-per-side split.
+        let ins = resolvedInsets(for: job.winID, viewports: viewports)
+        job.insets = WindowInset(
+            leading: ins.leading, trailing: ins.trailing,
+            top: ins.top, bottom: ins.bottom
+        )
         batchBuilder.append((window, job))
     }
     let batch = batchBuilder
@@ -5096,12 +5095,15 @@ func loadRestoreState() {
     for ref in restorePending {
         if !restoreAdopted(ref: ref, plan: plan) {
             remaining.insert(ref)
-        } else {
-            core.restoreHeld.remove(WindowID(truncatingIfNeeded: ref))
         }
     }
     restorePending = remaining
     if remaining.isEmpty {
+        // Release every restore-hold at once now that the whole layout is
+        // placed: all windows glide to their final slots in a single
+        // commit instead of settling one-by-one as later columns land
+        // (the startup left-right bounce).
+        core.restoreHeld.removeAll()
         // Apply the saved active rows as soon as every pending window is
         // placed, so the correct row shows on the first commit instead of
         // re-parking the whole workspace at grace expiry (~2s later).

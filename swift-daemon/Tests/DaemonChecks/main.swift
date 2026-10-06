@@ -3803,6 +3803,65 @@ do {
     checkEqual(daemon.offsets[1], -488, "centered strip does not jog")
 }
 
+// Resize never recenters a fully-visible window: the resize-aware reveal
+// re-pend only re-fires when the new width leaves the window not fully
+// inside its viewport. A width change with the window still fully visible
+// holds the strip still.
+do {
+    var daemon = DaemonCore()
+    daemon.animationsEnabled = false
+    daemon.glideBaseMs = 0
+    daemon.autoCenter = true
+    let settled: [Int32: IntPoint] = [
+        0: IntPoint(0, 0), 1: IntPoint(400, 0), 2: IntPoint(800, 0),
+    ]
+    _ = daemon.tick(
+        events: [
+            .appeared(id: 0, workspace: 1), .appeared(id: 1, workspace: 1),
+            .appeared(id: 2, workspace: 1),
+        ],
+        frames: frames(slots: settled),
+        viewports: [1: viewport], focusedStyle: style
+    )
+    for _ in 0..<40 {
+        _ = daemon.tick(
+            events: [], frames: frames(slots: settled),
+            viewports: [1: viewport], focusedStyle: style
+        )
+    }
+    _ = daemon.tick(
+        events: [.focus(id: 1)],
+        frames: frames(slots: settled),
+        viewports: [1: viewport], focusedStyle: style
+    )
+    _ = daemon.tick(
+        events: [.command(.window(.focus(.east)))],
+        frames: frames(slots: settled),
+        viewports: [1: viewport], focusedStyle: style
+    )
+    let before = daemon.offsetTarget(for: 1) ?? 0
+    checkEqual(before, -488, "keyed focus centers the window")
+    // Window 2 (focused) sits fully visible at slot 312; a shrink to 512
+    // keeps it fully visible, so the strip must not recenter.
+    let centered: [Int32: IntPoint] = [
+        0: IntPoint(-488, 0), 1: IntPoint(-88, 0), 2: IntPoint(312, 0),
+    ]
+    let resized: (Int32) -> IntRect? = { id in
+        let origin = centered[id] ?? IntPoint(0, 0)
+        let w: Int32 = id == 2 ? 512 : 400
+        return IntRect(min: origin, max: IntPoint(origin.x + w, origin.y + 700))
+    }
+    _ = daemon.tick(
+        events: [.command(.window(.setWidth(0.5)))],
+        frames: resized,
+        viewports: [1: viewport], focusedStyle: style
+    )
+    checkEqual(
+        daemon.offsetTarget(for: 1), before,
+        "resize never recenters a fully-visible window"
+    )
+}
+
 // Handoff seed: a Rust flip document lands strips, offsets, and focus
 // verbatim; a tick over converged frames issues no AX jobs (zero-motion
 // flip), while the focus border still plans (borders paint on day one).

@@ -261,7 +261,8 @@ public struct DaemonCore: Sendable {
     /// `restorePlace` slots them into the saved position: their first
     /// commit must NOT glide toward the probe-order append slot, or a
     /// startup restore plays as two moves (append slot, then saved slot).
-    /// Cleared by the host on placement or grace expiry.
+    /// Cleared by the host atomically once every restore window is placed
+    /// (so the whole strip settles in one commit) or at grace expiry.
     public var restoreHeld = Set<WindowID>()
     /// Full-width marker: width ratio (of the viewport) to restore when
     /// the toggle flips off. Mirrors `FullWidthMarker`.
@@ -740,8 +741,20 @@ public struct DaemonCore: Sendable {
            let width = frames(id)?.width
         {
             if let last = lastRevealWidth, last.id == id, last.width != width {
-                pendingReveals.insert(id)
-                pendingRevealRaise[id] = lastFocusRaise
+                // A fully-visible window is never recentered by a resize:
+                // re-pend only when the new width leaves it not fully
+                // inside its owner viewport (a grow past the edge still
+                // reveals).
+                let owner = workspaceOf(id) ?? activeWorkspace
+                let view = viewports[owner]
+                let slotX = committedSlots[id]?.x
+                let fullyVisible = view.map { v in
+                    slotX.map { $0 >= v.min.x && $0 + width <= v.max.x } ?? false
+                } ?? false
+                if !fullyVisible {
+                    pendingReveals.insert(id)
+                    pendingRevealRaise[id] = lastFocusRaise
+                }
             }
             lastRevealWidth = (id, width)
         } else {
@@ -4824,7 +4837,9 @@ public struct DaemonCore: Sendable {
             ?? LayoutStrip(id: workspace, virtualIndex: row)
         target.insertColumn(at: min(max(column, 0), target.len), moving)
         strips[workspace, default: [:]][row] = target
-        restoreHeld.remove(id)
+        // The hold is released atomically once every restore window is
+        // placed (see `drainRestorePending`), so the whole strip glides to
+        // its final layout in one commit instead of per-window settles.
         if activeVirtual[workspace] == nil {
             activeVirtual[workspace] = row
         }
