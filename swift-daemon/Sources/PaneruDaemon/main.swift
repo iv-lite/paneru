@@ -632,6 +632,7 @@ struct AdoptedWindow: Sendable {
             // `regroupNativeTabs`), never the cursor's display, so clicking
             // a tab can't hop or move the group across displays.
             let ws: WorkspaceID
+            var stackOnto: WindowID? = nil
             let probePadded = IntRect(
                 min: IntPoint(probe.frame.min.x - insets.leading, probe.frame.min.y - insets.top),
                 max: IntPoint(probe.frame.max.x + insets.trailing, probe.frame.max.y + insets.bottom)
@@ -640,6 +641,7 @@ struct AdoptedWindow: Sendable {
                leaderKey != wid,
                let owner = workspaceOfWindow(windowID(leaderKey)) {
                 ws = owner
+                stackOnto = windowID(leaderKey)
                 tabSiblingAdopted = true
                 print("tab: adopted window=\(windowID(wid)) as native-tab sibling of \(windowID(leaderKey)) on ws=\(owner)")
             } else if let shared = tabBatchWorkspace[TabBatchKey(pid: probe.ownerPID, frame: probePadded)] {
@@ -658,6 +660,15 @@ struct AdoptedWindow: Sendable {
                 ws = chosen
             }
             pending.append(.appeared(id: windowID(wid), workspace: ws))
+            // A follower of an already-rostered tab leader stacks straight
+            // into the leader's column (no intermediate own-column glide and
+            // later fold) — the leader is live in the core, so the stack op
+            // resolves on the same tick as the `.appeared`.
+            if let leader = stackOnto {
+                pending.append(.command(.layout([
+                    .stack(window: windowID(wid), onto: leader, tabs: true),
+                ])))
+            }
             // Native-fullscreen windows float unmanaged (never relocated);
             // rule-floating windows do the same via config.
             if probe.isFullscreen {
@@ -716,6 +727,7 @@ struct AdoptedWindow: Sendable {
                !probe.isFullscreen, restorePlanner != nil
             {
                 restorePending.insert(Int(wid))
+                core.restoreHeld.insert(windowID(wid))
                 // First arrival arms the grace window (process-start
                 // probing no longer consumes it).
                 if !restoreGraceStarted {
@@ -3807,6 +3819,7 @@ nonisolated(unsafe) var statJobs = 0
         restorePlanner = nil
         restoreState = nil
         restoreGraceStarted = false
+        core.restoreHeld.removeAll()
         // Crash-gated prune: a previous
         // unclean run preserves the file instead of cementing the
         // degraded post-crash layout as the next boot's baseline.
@@ -5016,9 +5029,17 @@ func loadRestoreState() {
     for ref in restorePending {
         if !restoreAdopted(ref: ref, plan: plan) {
             remaining.insert(ref)
+        } else {
+            core.restoreHeld.remove(WindowID(truncatingIfNeeded: ref))
         }
     }
     restorePending = remaining
+    if remaining.isEmpty {
+        // Apply the saved active rows as soon as every pending window is
+        // placed, so the correct row shows on the first commit instead of
+        // re-parking the whole workspace at grace expiry (~2s later).
+        applyRestoreActiveRows()
+    }
 }
 
 /// Members of a planned column, flattened (stack items concatenate).

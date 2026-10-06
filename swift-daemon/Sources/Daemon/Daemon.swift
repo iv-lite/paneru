@@ -257,6 +257,12 @@ public struct DaemonCore: Sendable {
     /// cursor still (the hands-off oscillation). Keyed focus goes through
     /// commands, which deminimize on arrival, so it bypasses this.
     public var hiddenFromAmbientFocus: Set<WindowID> = []
+    /// Restore-pending windows the host holds at their native seed until
+    /// `restorePlace` slots them into the saved position: their first
+    /// commit must NOT glide toward the probe-order append slot, or a
+    /// startup restore plays as two moves (append slot, then saved slot).
+    /// Cleared by the host on placement or grace expiry.
+    public var restoreHeld = Set<WindowID>()
     /// Full-width marker: width ratio (of the viewport) to restore when
     /// the toggle flips off. Mirrors `FullWidthMarker`.
     private var fullWidth: [WindowID: Double] = [:]
@@ -3923,6 +3929,10 @@ public struct DaemonCore: Sendable {
         // Heal-cleared hidden windows rest: the guard already decided
         // they drive nothing until the block lapses.
         guard !hiddenBlocked(member, epoch: epoch) else { return }
+        // Restore-held windows stay at their native seed until the host
+        // places them in the saved slot (`restorePlace`), so a startup
+        // adoption never glides toward the probe-order append slot first.
+        guard !restoreHeld.contains(member) else { return }
         // Sliver-parked presented target: a shown-row member scrolled fully
         // off its owner viewport would otherwise hold its slot on a
         // neighboring display (Rust `desired_window_frame` offscreen arms).
@@ -4792,6 +4802,7 @@ public struct DaemonCore: Sendable {
             ?? LayoutStrip(id: workspace, virtualIndex: row)
         target.insertColumn(at: min(max(column, 0), target.len), moving)
         strips[workspace, default: [:]][row] = target
+        restoreHeld.remove(id)
         if activeVirtual[workspace] == nil {
             activeVirtual[workspace] = row
         }

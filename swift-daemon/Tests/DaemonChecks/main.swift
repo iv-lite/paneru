@@ -5457,7 +5457,7 @@ do {
     var daemon = DaemonCore()
     daemon.animationsEnabled = false
     daemon.presetWidths = [0.5, 1.0]
-    var live: [Int32: IntPoint] = [
+    let live: [Int32: IntPoint] = [
         0: .init(0, 0), 1: .init(400, 0), 2: .init(800, 0),
     ]
     func liveFrames() -> (Int32) -> IntRect? { frames(slots: live) }
