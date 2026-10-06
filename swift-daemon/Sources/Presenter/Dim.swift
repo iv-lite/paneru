@@ -2,23 +2,32 @@ import AppKit
 import QuartzCore
 
 /// Fullscreen per-display dim with a transparent hole for the focused
-/// window. GPU-composited: the dim is a plain background color and the hole
-/// is a `CAShapeLayer` even-odd mask (fullscreen rect + rounded cutout), so
-/// cutout motion updates a path — never re-rasters. Indexed lockstep with
-/// `NSScreen.screens`; rebuilt when the count changes.
+/// window. GPU-composited without a mask: the dim view's backing layer is
+/// a `CAShapeLayer` whose even-odd path is the fullscreen rect plus the
+/// rounded cutout, so cutout motion updates a path and never re-rasters —
+/// and never pays the full-screen offscreen render a layer mask forces.
+/// Indexed lockstep with `NSScreen.screens`; rebuilt when the count
+/// changes.
 /// Main-thread-only: every entry asserts `.onQueue(.main)`, so
 /// misuse crashes loudly instead of racing silently. The shared
 /// accessor vouches this explicitly; the class itself stays
 /// non-`Sendable` so its AppKit bodies keep checking exactly as
 /// before (an `@unchecked` class would make every call inside
 /// suspect instead).
+
+/// A view whose backing layer is a shape layer, so the dim can fill
+/// and cut its hole in one path (no separate mask layer).
+private final class DimShapeView: NSView {
+    override func makeBackingLayer() -> CALayer { CAShapeLayer() }
+}
+
 final class DimManager {
     nonisolated(unsafe) static let shared = DimManager()
     private struct Surface {
         var window: NSWindow
         var opacity: Float
         var color: (Double, Double, Double)
-        var mask: CAShapeLayer
+        var shape: CAShapeLayer
         var cutout: NSRect?
         var radius: Double
     }
@@ -46,36 +55,37 @@ final class DimManager {
                 idx = i
             } else {
                 let window = Screens.makeOverlayWindow(frame: frame)
-                window.contentView?.wantsLayer = true
+                let view = DimShapeView(frame: NSRect(origin: .zero, size: frame.size))
+                view.wantsLayer = true
+                window.contentView = view
+                guard let shape = view.layer as? CAShapeLayer else { continue }
+                shape.fillRule = .evenOdd
+                shape.frame = CGRect(x: 0, y: 0, width: frame.width, height: frame.height)
                 MainActor.assumeIsolated { window.orderFront(nil) }
-                let mask = CAShapeLayer()
-                mask.frame = CGRect(x: 0, y: 0, width: frame.width, height: frame.height)
-                mask.fillRule = .evenOdd
-                window.contentView?.layer?.mask = mask
                 surfaces.append(Surface(
                     window: window, opacity: -1, color: (-1, -1, -1),
-                    mask: mask, cutout: nil, radius: -1
+                    shape: shape, cutout: nil, radius: -1
                 ))
                 idx = surfaces.count - 1
             }
             let window = surfaces[idx].window
-            guard let layer = window.contentView?.layer else { continue }
-            // Steady ticks must not recomposite: rewriting the background
-            // color every frame costs a composite at display rate even at
-            // rest. The tick-level cache above already skips most of these;
+            let shape = surfaces[idx].shape
+            // Steady ticks must not recomposite: rewriting the fill color
+            // every frame costs a composite at display rate even at rest.
+            // The tick-level cache above already skips most of these;
             // this guards direct callers too.
             if surfaces[idx].opacity != opacity || surfaces[idx].color != (r, g, b) {
-                layer.backgroundColor = NSColor(
+                shape.fillColor = NSColor(
                     srgbRed: r, green: g, blue: b, alpha: Double(opacity)
                 ).cgColor
             }
-            // Mask path rebuilds only when the hole moves: same fullscreen
-            // rect plus rounded cutout, even-odd filled. This is the GPU
-            // win — no view re-raster, ever.
+            // Path rebuilds only when the hole moves: same fullscreen rect
+            // plus rounded cutout, even-odd filled. This is the GPU win —
+            // no view re-raster and no offscreen mask, ever.
             let w = frame.width, h = frame.height
             if window.frame != frame {
                 window.setFrame(frame, display: false)
-                surfaces[idx].mask.frame = CGRect(x: 0, y: 0, width: w, height: h)
+                shape.frame = CGRect(x: 0, y: 0, width: w, height: h)
             }
             var hole: NSRect?
             if let cutout {
@@ -93,7 +103,7 @@ final class DimManager {
             }
             // Rebuild only when the hole, radius, or surface size changed —
             // steady ticks touch nothing but the background color above.
-            let sized = surfaces[idx].mask.bounds.size
+            let sized = shape.bounds.size
             if hole != surfaces[idx].cutout || cutoutRadius != surfaces[idx].radius
                 || sized.width != w || sized.height != h
             {
@@ -102,7 +112,7 @@ final class DimManager {
                 if let hole {
                     path.addPath(roundedRectPath(hole, radius: cutoutRadius))
                 }
-                surfaces[idx].mask.path = path
+                shape.path = path
                 surfaces[idx].cutout = hole
                 surfaces[idx].radius = cutoutRadius
             }
