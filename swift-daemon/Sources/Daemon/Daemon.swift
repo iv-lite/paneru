@@ -1415,22 +1415,46 @@ public struct DaemonCore: Sendable {
         switch op {
         case .focus(let direction):
             // No anchor, no step (mirrors the Rust caller, which skips
-            // anchorless presses; entry from the side below still applies
-            // when focus sits off the active strip).
+            // anchorless presses).
             guard let anchor = focus else { return }
-            switch sameStripStep(
-                direction: direction, focused: anchor,
-                activeStrip: strip, siblingStrips: []
-            ) {
-            case .focus(let target):
-                setFocus(target, raise: true)
-            case .fallThrough:
-                // East/west at the strip edge steps across displays into
-                // the neighboring workspace's strip (single-display
-                // setups have no neighbor and stay put). North/south
-                // belong to virtual rows, handled by focusOrVirtual.
-                if direction == .east || direction == .west {
-                    focusNeighborDisplay(direction: direction, viewports: viewports)
+            // Anchor on the FOCUSED window's strip, not the active
+            // workspace's: clicking an empty display leaves the active
+            // workspace there while focus sits on another display, and
+            // stepping on the active (empty) strip would no-op forever.
+            let focusStrip = workspaceOf(anchor).flatMap { ws in
+                strips[ws]?[activeVirtual[ws] ?? 0]
+            } ?? activeStrip()
+            switch direction {
+            case .east, .west:
+                // Display-local walk with wrap, skipping hidden windows
+                // (minimized/stashed): landing focus on one hands it
+                // straight to the host's focus-stranding guard, which
+                // clears focus to nil when no visible neighbor exists —
+                // "focus dies". Never hops to another display.
+                var cursor = anchor
+                var target: WindowID?
+                for _ in 0..<max(focusStrip.len, 1) {
+                    let next = windowInDirection(direction, from: cursor, strip: focusStrip)
+                        ?? (direction == .west
+                            ? focusStrip.last()?.top
+                            : focusStrip.first()?.top)
+                    guard let next else { break }
+                    if !hiddenFromAmbientFocus.contains(next) {
+                        target = next
+                        break
+                    }
+                    cursor = next
+                }
+                if let target { setFocus(target, raise: true) }
+            default:
+                switch sameStripStep(
+                    direction: direction, focused: anchor,
+                    activeStrip: focusStrip, siblingStrips: []
+                ) {
+                case .focus(let target):
+                    setFocus(target, raise: true)
+                case .fallThrough:
+                    break
                 }
             }
         case .stack(let on):
@@ -1758,10 +1782,11 @@ public struct DaemonCore: Sendable {
                 // Only the overflow/underflow clamp shifts the strip.
                 let keepX = frame.min.x
                 let rightEdge = frame.min.x + newWidth
+                let growing = newWidth > frame.width
                 let desiredX: Int32
                 if rightEdge > viewport.max.x {
                     desiredX = viewport.max.x - newWidth
-                } else if keepX < viewport.min.x {
+                } else if growing && keepX < viewport.min.x {
                     desiredX = viewport.min.x
                 } else {
                     desiredX = keepX
@@ -1771,12 +1796,15 @@ public struct DaemonCore: Sendable {
                     offsetTargets[activeWorkspace, default: offsets[activeWorkspace] ?? 0] += shift
                 }
                 // A strip that now fits the viewport reels home so no
-                // whitespace is left after a shrink.
+                // whitespace is left after a shrink. The total uses the
+                // MODEL pitch (the final width): the live-hugging pitch
+                // above still reads the pre-shrink glass this tick. Only
+                // the eased target moves — the offset glides home with the
+                // glass instead of snapping.
                 let total = strip.columns.reduce(Int32(0)) { acc, col in
-                    acc + (columnWidth(col, frames: frames) ?? 0)
+                    acc + (modelColumnWidth(col) ?? columnWidth(col, frames: frames) ?? 0)
                 }
                 if total <= viewport.width {
-                    offsets[activeWorkspace] = 0
                     offsetTargets[activeWorkspace] = 0
                 }
             }
@@ -2006,37 +2034,6 @@ public struct DaemonCore: Sendable {
             offsetTargets[activeWorkspace, default: offsets[activeWorkspace] ?? 0] += shift
         }
         dirty.formUnion([.layout, .motion, .paint])
-    }
-
-    /// Focus the nearest window on the neighboring display in `direction`
-    /// (east = smallest viewport gap to the right, west mirrored),
-    /// skipping empty workspaces. Retargets the active workspace so
-    /// gestures and reveal follow the eyes.
-    private mutating func focusNeighborDisplay(
-        direction: Direction, viewports: [WorkspaceID: IntRect]
-    ) {
-        guard direction == .east || direction == .west else { return }
-        let home = viewport(for: activeWorkspace, in: viewports)
-        var best: (ws: WorkspaceID, gap: Int32)?
-        for (ws, viewport) in viewports where ws != activeWorkspace {
-            let gap: Int32
-            if direction == .east {
-                guard viewport.min.x >= home.max.x else { continue }
-                gap = viewport.min.x - home.max.x
-            } else {
-                guard viewport.max.x <= home.min.x else { continue }
-                gap = home.min.x - viewport.max.x
-            }
-            if best.map({ gap < $0.gap }) ?? true {
-                best = (ws, gap)
-            }
-        }
-        guard let best else { return }
-        let row = activeVirtual[best.ws] ?? 0
-        guard let target = strips[best.ws]?[row]?.first()?.top else { return }
-        setFocus(target, raise: true)
-        activeWorkspace = best.ws
-        dirty.formUnion([.focus, .paint])
     }
 
     /// Move the focused window's whole column to another workspace row,
@@ -2318,11 +2315,22 @@ public struct DaemonCore: Sendable {
         // applied mid-tween -- the leg owns the pitch until it lands.
         let modelW = column.windows.compactMap { modelWidths[$0] }.max()
         let liveW = column.windows.compactMap { frames($0)?.width }.max()
-        if let modelW, let liveW, liveW > 0,
-           modelW > liveW + max(axDeadbandPx, 8),
-           column.windows.allSatisfy({ sizeLegs[$0] == nil })
-        {
-            return liveW
+        let deadband = max(axDeadbandPx, 8)
+        if let modelW, let liveW, liveW > 0 {
+            // Shrink in flight: the pitch hugs the ACTUAL narrowing glass
+            // so the neighbour rides the window's real right edge — no
+            // overlap, no gap — and a clamp-holding app (live never
+            // follows) is never overlapped by the neighbour sliding in.
+            if modelW < liveW - deadband {
+                return liveW
+            }
+            // Stale wide model (settled/clamped): hug live (existing).
+            if modelW > liveW + deadband,
+               column.windows.allSatisfy({ sizeLegs[$0] == nil })
+            {
+                return liveW
+            }
+            return modelW
         }
         return modelW
             ?? liveW
@@ -3675,7 +3683,13 @@ public struct DaemonCore: Sendable {
                 // geometry.
                 guard frames(member) != nil else { continue }
                 let slot: IntPoint
-                if fullWidth[member] != nil {
+                if fullWidth[member] != nil
+                    || (maximizeTiledWindows && modelWidths[member] != nil)
+                {
+                    // Full-height targets top-align: centering by the
+                    // live (short) height would park the window low and
+                    // hang its bottom past the viewport edge once the
+                    // maximize resize lands.
                     slot = IntPoint(x, home.min.y)
                 } else {
                     slot = centeredSlot(member, x: x, home: home, frames: frames)
@@ -4237,15 +4251,17 @@ public struct DaemonCore: Sendable {
             return
         }
         if maximizeTiledWindows, let modelW = modelWidths[member], modelW > 0 {
-            // Grow to the tile's model width (Rust
-            // `maximize_tiled_windows`), width and height clamped to the
-            // viewport so an over-wide model (e.g. a window dragged from
-            // a wider display) never bleeds past the owner's edge.
+            // Grow to the tile (Rust `maximize_tiled_windows`): width is
+            // the column's model width and height is the full tile
+            // height, so a short window fills its tile instead of sitting
+            // vertically centered. Width clamps to the viewport so an
+            // over-wide model (e.g. a window dragged from a wider
+            // display) never bleeds past the owner's edge; an app that
+            // refuses to grow falls back to live truth through the size
+            // re-drive streak.
             applySize(
                 member,
-                to: IntSize(
-                    min(modelW, home.width), min(live.height, home.height)
-                ),
+                to: IntSize(min(modelW, home.width), home.height),
                 epoch: epoch, frames: frames
             )
             return
@@ -4640,9 +4656,18 @@ public struct DaemonCore: Sendable {
         auditSurvivors[id] = min((auditSurvivors[id] ?? 0) + 1, 100)
         ax.invalidateSent(id)
         glides.removeValue(forKey: id)
-        if (auditSurvivors[id] ?? 0) >= auditParkAfter,
-           let live = frames(id) {
+        // A refusal is definitive for this intent: park the window's
+        // writes immediately instead of re-issuing through the audit
+        // ladder. Each retry hits the same refused AX path and keeps the
+        // serial writer lane N epochs behind — the "writer stall" that
+        // made tiling/re-home lag (native-fullscreen / APIDisabled
+        // windows deny every reposition). Glass movement re-arms through
+        // the audit circuit breaker, so a transient refusal recovers.
+        if let live = frames(id) {
             auditParkedLive[id] = live
+            if let slot = committedSlots[id] {
+                auditParkedSlot[id] = slot
+            }
         }
     }
 
@@ -4940,9 +4965,9 @@ public struct DaemonCore: Sendable {
     /// warp sign (positive: left edge goes down, right edge up; negative
     /// mirrored), preserving relative Y plus the signed offset and
     /// landing 6px inside the opposite edge so it can never sit on a
-    /// threshold and ping-pong. When the signed half-plane has no
-    /// display, the opposite half-plane serves as fallback (each edge
-    /// warps both ways). The caller passes FULL display frames
+    /// threshold and ping-pong. An edge with no display in the signed
+    /// half-plane simply does not warp (no display-circle wrap). The
+    /// caller passes FULL display frames
     /// (Rust `Display::bounds`): inset viewports would hide physical
     /// edges and skew cross-display Y math. Mirrors `warp_landing`
     /// including velocity carry (30ms extrapolation, ±80px clamp);
@@ -4956,10 +4981,9 @@ public struct DaemonCore: Sendable {
     /// farther hit on 3+ display rows).
     ///
     /// Branch order (see `lastWarpKind` for the taken path): signed
-    /// half-plane, then opposite half-plane, then proportional mapping
-    /// (fractional-height landings for stairs pairs the strict
-    /// offset-preserving math cannot map), then clamped landings in the
-    /// same order (uniform always-land).
+    /// half-plane, then proportional mapping (fractional-height
+    /// landings for stairs pairs the strict offset-preserving math
+    /// cannot map).
     /// Only the 1px band itself evaluates: band-jumping flings are
     /// caught at the crossed edge by `warpForMovement`, so no
     /// anticipation zone is needed.
@@ -5114,37 +5138,39 @@ public struct DaemonCore: Sendable {
             lastWarpKind = "none:seam"
             return nil
         }
-        // Half-plane polarity per edge+sign; flipped = the opposite
-        // half-plane (each edge warps both ways, primary first).
-        func polarity(_ display: IntRect, flipped: Bool) -> Bool {
+        // Half-plane polarity per edge+sign: only the SIGNED half-plane
+        // may warp — no opposite-half-plane fallback, no display-circle
+        // wrap. An edge with no display in the signed direction simply
+        // does not warp.
+        func polarity(_ display: IntRect) -> Bool {
             guard display != current else { return false }
             let above = display.min.y < current.min.y
             let below = display.min.y > current.min.y
             let wantBelow: Bool
             if evalLeft {
-                wantBelow = (warpDirection > 0) != flipped
+                wantBelow = warpDirection > 0
             } else {
-                wantBelow = (warpDirection <= 0) != flipped
+                wantBelow = warpDirection <= 0
             }
             return wantBelow ? below : above
         }
         let ordered = displays.filter { $0 != current }.sorted {
             abs($0.min.y - current.min.y) < abs($1.min.y - current.min.y)
         }
-        func attempt(flipped: Bool, strict: Bool) -> IntPoint? {
-            for candidate in ordered where polarity(candidate, flipped: flipped) {
+        func attempt() -> IntPoint? {
+            for candidate in ordered where polarity(candidate) {
                 if let landing = warpLanding(
                     cursor: clamped, current: current, target: candidate,
                     onLeftEdge: evalLeft, yOffset: yOffset,
-                    velocityX: velocityX, strict: strict
+                    velocityX: velocityX, strict: true
                 ) {
                     return landing
                 }
             }
             return nil
         }
-        func attemptProportional(flipped: Bool) -> IntPoint? {
-            for candidate in ordered where polarity(candidate, flipped: flipped) {
+        func attemptProportional() -> IntPoint? {
+            for candidate in ordered where polarity(candidate) {
                 if let landing = warpLandingProportional(
                     cursor: clamped, current: current, target: candidate,
                     onLeftEdge: evalLeft, yOffset: yOffset,
@@ -5155,28 +5181,12 @@ public struct DaemonCore: Sendable {
             }
             return nil
         }
-        if let landing = attempt(flipped: false, strict: true) {
+        if let landing = attempt() {
             lastWarpKind = kind("primary")
             return landing
         }
-        if let landing = attempt(flipped: true, strict: true) {
-            lastWarpKind = kind("fallback")
-            return landing
-        }
-        if let landing = attemptProportional(flipped: false) {
+        if let landing = attemptProportional() {
             lastWarpKind = kind("proportional:primary")
-            return landing
-        }
-        if let landing = attemptProportional(flipped: true) {
-            lastWarpKind = kind("proportional:fallback")
-            return landing
-        }
-        if let landing = attempt(flipped: false, strict: false) {
-            lastWarpKind = kind("clamp:primary")
-            return landing
-        }
-        if let landing = attempt(flipped: true, strict: false) {
-            lastWarpKind = kind("clamp:fallback")
             return landing
         }
         lastWarpKind = voidAnchored ? "void:nomap" : "none:nomap"

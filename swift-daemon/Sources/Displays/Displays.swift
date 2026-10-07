@@ -229,16 +229,18 @@ public struct SpaceVoter: Equatable, Sendable {
     public var voteSpace: SpaceID?
     public var voteSeen: Int
     public var cooldownUntil: Date?
-    /// Space we last rotated away from: a silent read returning to it is
-    /// the A↔B ping-pong, not a real switch, and must not rotate back
-    /// without a corroborating signal.
-    public var lastFrom: SpaceID?
+    /// Spaces rotated away from, most recent first: a silent read
+    /// returning to any of them is the multi-way ping-pong (A→B→C→A),
+    /// not a real switch, and must not rotate without a corroborating
+    /// signal. Bounded (2) so a genuine return to a space left several
+    /// switches ago still rotates.
+    public var leftSpaces: [SpaceID]
 
     public init() {
         voteSpace = nil
         voteSeen = 0
         cooldownUntil = nil
-        lastFrom = nil
+        leftSpaces = []
     }
 
     /// Seconds of post-rotation silence for uncorroborated reads.
@@ -269,7 +271,7 @@ public struct SpaceVoter: Equatable, Sendable {
             voteSpace = nil
             voteSeen = 0
             cooldownUntil = now.addingTimeInterval(Self.cooldownSecs)
-            lastFrom = old
+            leftSpaces = [old] + leftSpaces.prefix(1)
             return .rotate
         }
         if let until = cooldownUntil, now < until {
@@ -289,17 +291,17 @@ public struct SpaceVoter: Equatable, Sendable {
             voteSeen = 1
         }
         guard voteSeen >= 2 else { return .hold }
-        // Flap-back guard: a silent read returning to the space we just
-        // rotated away from is the A↔B ping-pong; only a real switch
+        // Flap-back guard: a silent read returning to any recently-left
+        // space is the multi-way ping-pong (A→B→C→A); only a real switch
         // signal may go back.
-        if read == lastFrom {
+        if leftSpaces.contains(read) {
             voteSpace = nil
             voteSeen = 0
             return .ignore
         }
         voteSpace = nil
         voteSeen = 0
-        lastFrom = old
+        leftSpaces = [old] + leftSpaces.prefix(1)
         cooldownUntil = now.addingTimeInterval(Self.cooldownSecs)
         return .rotate
     }

@@ -942,9 +942,8 @@ do {
     )
 }
 
-// East/west at the strip edge steps across displays: nearest viewport
-// in that direction, first window of its active row, active follows.
-// Single-display setups and empty neighbors stay put.
+// East/west at the strip edge stays display-local: focus never hops to
+// a window on another display and never retargets the active workspace.
 do {
     var daemon = DaemonCore()
     daemon.workspaceRing = [1, 2]
@@ -952,7 +951,7 @@ do {
     let right = IntRect(1024, 0, 2048, 768)
     _ = daemon.tick(
         events: [.appeared(id: 0, workspace: 1), .appeared(id: 1, workspace: 2), .focus(id: 0)],
-        frames: frames(slots: [0: IntPoint(0, 0), 1: IntPoint(0, 0)]),
+        frames: frames(slots: [0: IntPoint(0, 0), 1: IntPoint(1024, 0)]),
         viewports: [1: left, 2: right], focusedStyle: style
     )
     _ = daemon.tick(
@@ -960,27 +959,15 @@ do {
         frames: frames(slots: [0: IntPoint(0, 0), 1: IntPoint(1024, 0)]),
         viewports: [1: left, 2: right], focusedStyle: style
     )
-    checkEqual(daemon.focus, 1, "east at the edge enters the next display")
-    checkEqual(daemon.activeWorkspace, 2, "active follows across displays")
+    checkEqual(daemon.focus, 0, "east at the edge stays display-local")
+    checkEqual(daemon.activeWorkspace, 1, "focus east never retargets active")
     _ = daemon.tick(
         events: [.command(.window(.focus(.west)))],
         frames: frames(slots: [0: IntPoint(0, 0), 1: IntPoint(1024, 0)]),
         viewports: [1: left, 2: right], focusedStyle: style
     )
-    checkEqual(daemon.focus, 0, "west steps back across displays")
-    checkEqual(daemon.activeWorkspace, 1, "active follows back")
-    // Empty neighbor: stay put.
-    _ = daemon.tick(
-        events: [.disappeared(id: 1)],
-        frames: frames(slots: [0: IntPoint(0, 0)]),
-        viewports: [1: left, 2: right], focusedStyle: style
-    )
-    _ = daemon.tick(
-        events: [.command(.window(.focus(.east)))],
-        frames: frames(slots: [0: IntPoint(0, 0)]),
-        viewports: [1: left, 2: right], focusedStyle: style
-    )
-    checkEqual(daemon.focus, 0, "empty neighbors hold focus")
+    checkEqual(daemon.focus, 0, "west at the edge stays display-local")
+    checkEqual(daemon.activeWorkspace, 1, "focus west never retargets active")
 }
 
 // Focus arrivals for hidden windows never drag the workspace: a
@@ -1527,7 +1514,7 @@ do {
         daemon.edgeWarpLanding(
             cursor: IntPoint(1, 500), displays: displays,
             warpDirection: -1, yOffset: 0
-        ), IntPoint(3834, 1580), "negative warp: left edge falls back below"
+        ), nil, "negative warp: left edge with no display above does not warp"
     )
     checkEqual(
         daemon.edgeWarpLanding(
@@ -1559,14 +1546,14 @@ do {
     )
     checkEqual(daemon.lastWarpKind, "proportional:primary", "proportional landing reports its stage")
     // A large configured offset pushes even the proportional mapping
-    // out of range, so the clamped chain still always lands.
+    // out of range; with no clamp chain, the edge simply does not warp.
     checkEqual(
         daemon.edgeWarpLanding(
             cursor: IntPoint(1, 1000), displays: [upper, short],
             warpDirection: 1, yOffset: 500
-        ), IntPoint(3834, 1499), "offset-pushed heights clamp into range"
+        ), nil, "offset-pushed heights do not clamp into range"
     )
-    checkEqual(daemon.lastWarpKind, "clamp:primary", "clamped landing reports its stage")
+    checkEqual(daemon.lastWarpKind, "none:nomap", "no clamp landing without a target")
 }
 
 // Wrap A: exposed interior steps and global outer edges never wrap
@@ -1629,7 +1616,7 @@ do {
 }
 
 // Stairs descending left to right (60Hz, 60Hz, builtin): half-plane
-// landings keep working in both directions, outer edges wrap around.
+// landings keep working in both directions; outer edges no longer wrap.
 do {
     var daemon = DaemonCore()
     let a = IntRect(0, 0, 1920, 1080)
@@ -1649,42 +1636,39 @@ do {
             warpDirection: -1, yOffset: 0
         ), IntPoint(1914, 900), "stairs left step lands above"
     )
-    // Outer edges no longer wrap around the row: the primary half-plane
-    // has no target above (left) / below (right), so the opposite
-    // half-plane fallback lands on the nearest stair.
+    // Outer edges never wrap around the row: the primary half-plane has
+    // no target above (left) / below (right), so they do not warp.
     checkEqual(
         daemon.edgeWarpLanding(
             cursor: IntPoint(0, 500), displays: stairs,
             warpDirection: -1, yOffset: 0
-        ), IntPoint(3834, 800), "stairs outer left falls back to the opposite half-plane"
+        ), nil, "stairs outer left does not warp (no display above)"
     )
-    checkEqual(daemon.lastWarpKind, "fallback", "outer left reports the fallback")
+    checkEqual(daemon.lastWarpKind, "none:nomap", "outer left reports no map")
     checkEqual(
         daemon.edgeWarpLanding(
             cursor: IntPoint(5351, 1000), displays: stairs,
             warpDirection: -1, yOffset: 0
-        ), IntPoint(1926, 700), "stairs outer right falls back to the opposite half-plane"
+        ), nil, "stairs outer right does not warp (no display below)"
     )
-    checkEqual(daemon.lastWarpKind, "fallback", "outer right reports the fallback")
+    checkEqual(daemon.lastWarpKind, "none:nomap", "outer right reports no map")
 }
 
 // Stairs with no shared Y band at the cursor (builtin above an
-// ultrawide step corner): the strict offset math cannot map, so the
-// proportional branch lands by fractional height instead of sticking.
+// ultrawide step corner): the strict offset math cannot map, and the
+// signed half-plane is empty, so the edge simply does not warp.
 do {
     var daemon = DaemonCore()
     let builtin = IntRect(0, 0, 1512, 944)
     let wide = IntRect(1512, 944, 4952, 1582)
     let steps = [builtin, wide]
-    // Strict misses (944+900 off the 638-tall target); proportional maps
-    // 900/944 of 638 onto the step: 944+608.
     checkEqual(
         daemon.edgeWarpLanding(
             cursor: IntPoint(1511, 900), displays: steps,
             warpDirection: 1, yOffset: 0
-        ), IntPoint(1518, 1552), "stairs step maps proportionally"
+        ), nil, "stairs step with no target in the signed half-plane does not warp"
     )
-    checkEqual(daemon.lastWarpKind, "proportional:fallback", "stairs landing reports its stage")
+    checkEqual(daemon.lastWarpKind, "none:nomap", "stairs landing reports no map")
     // The way back still maps strictly (556 lands inside the builtin).
     checkEqual(
         daemon.edgeWarpLanding(
@@ -1829,19 +1813,20 @@ do {
 }
 
 // Honest acks: an answered refusal converges the sequence, feeds the
-// watch list, and parks at threshold with live glass known.
+// watch list, and parks immediately with live glass known (a denied
+// write is definitive — the audit retry ladder kept the writer lane N
+// epochs behind).
 do {
     var daemon = DaemonCore()
-    daemon.auditParkAfter = 2
     let frame: (Int32) -> IntRect? = { _ in
         IntRect(min: IntPoint(200, 200), max: IntPoint(600, 900))
     }
     daemon.noteWriteFailed(0, seq: 1, epoch: 1, frames: frame)
     checkEqual(daemon.auditSurvivors[0], 1, "refusal feeds the watch list")
-    check(daemon.auditParkedLive[0] == nil, "below threshold stays unparked")
+    check(daemon.auditParkedLive[0] != nil, "first refusal parks with live glass")
     check(!daemon.isUnacked(0), "refusal converges the sequence")
     daemon.noteWriteFailed(0, seq: 2, epoch: 2, frames: frame)
-    check(daemon.auditParkedLive[0] != nil, "threshold parks with live glass")
+    check(daemon.auditParkedLive[0] != nil, "parked window stays parked")
 }
 
 // Timed-out unacked members count toward parking (hung lane: nothing
@@ -3073,7 +3058,7 @@ do {
         daemon.edgeWarpLanding(
             cursor: IntPoint(3839, 800), displays: stairs,
             warpDirection: -1, yOffset: 0
-        ), IntPoint(6, 500), "stairs: mirrored sign still lands (fallback)"
+        ), nil, "stairs: mirrored sign with no display below does not warp"
     )
 }
 
@@ -3306,11 +3291,11 @@ do {
         frames: live, viewports: [1: left, 2: right], focusedStyle: style
     )
     _ = daemon.tick(
-        events: [.command(.window(.focus(.east)))],
+        events: [.focusKeyed(id: 1)],
         frames: live, viewports: [1: left, 2: right], focusedStyle: style
     )
-    checkEqual(daemon.focus, 1, "command crosses to the next display")
-    checkEqual(daemon.activeWorkspace, 2, "command retargets active")
+    checkEqual(daemon.focus, 1, "keyed focus crosses to the next display")
+    checkEqual(daemon.activeWorkspace, 2, "keyed focus retargets active")
     _ = daemon.tick(
         events: [.focus(id: 0)],
         frames: live, viewports: [1: left, 2: right], focusedStyle: style
@@ -3481,9 +3466,9 @@ do {
 }
 
 // Stairs of 3 reachability: outer endpoints never wrap around a
-// display circle — the opposite half-plane fallback lands on the
-// nearest stair instead; shared step bands cross natively; unshared
-// bands still warp directionally.
+// display circle — an edge with no display in the signed half-plane
+// does not warp; shared step bands cross natively; unshared bands
+// still warp directionally.
 do {
     var daemon = DaemonCore()
     let a = IntRect(0, 0, 1920, 1080)
@@ -3494,9 +3479,9 @@ do {
         daemon.edgeWarpLanding(
             cursor: IntPoint(1, 500), displays: stairs,
             warpDirection: -1, yOffset: 0
-        ), IntPoint(3834, 800), "outer endpoint falls back to the nearest stair"
+        ), nil, "outer endpoint does not warp (no display above)"
     )
-    checkEqual(daemon.lastWarpKind, "fallback", "no circle: fallback serves the nearer middle step")
+    checkEqual(daemon.lastWarpKind, "none:nomap", "no circle: outer left reports no map")
     checkEqual(
         daemon.edgeWarpLanding(
             cursor: IntPoint(1921, 800), displays: stairs,
@@ -3515,9 +3500,9 @@ do {
         daemon.edgeWarpLanding(
             cursor: IntPoint(5759, 1200), displays: stairs,
             warpDirection: -1, yOffset: 0
-        ), IntPoint(1926, 900), "far outer endpoint falls back to the nearest stair"
+        ), nil, "far outer endpoint does not warp (no display below)"
     )
-    checkEqual(daemon.lastWarpKind, "fallback", "no circle: outer edges use the fallback")
+    checkEqual(daemon.lastWarpKind, "none:nomap", "no circle: outer right reports no map")
 }
 
 // Cross-display moves refocus even without a focus change: the moved
@@ -4972,7 +4957,7 @@ do {
     checkEqual(
         daemon.edgeWarpLanding(
             cursor: IntPoint(1, 500), displays: stack, warpDirection: -1, yOffset: 0
-        ), IntPoint(1914, 1580), "vertical stack: left edge falls back below"
+        ), nil, "vertical stack: left edge with no display above does not warp"
     )
 }
 
@@ -5163,36 +5148,36 @@ do {
     daemon.maximizeTiledWindows = true
     let spawned = daemon.tick(
         events: [.appeared(id: 0, workspace: 1), .focus(id: 0)],
-        frames: frames(slots: [0: IntPoint(0, 34)]),
+        frames: frames(slots: [0: IntPoint(0, 0)]),
         viewport: viewport, focusedStyle: style
     )
     check(
-        spawned.axJobs.contains { $0.winID == 0 && $0.size == IntSize(1024, 700) },
-        "fresh column grows to its ratio"
+        spawned.axJobs.contains { $0.winID == 0 && $0.size == IntSize(1024, 768) },
+        "fresh column grows to its tile (width and height)"
     )
     // Clamped app (live stays 400): the column hugs the actual width, so
     // no oversized column is left around the window.
     let clamped = daemon.tick(
         events: [],
-        frames: frames(slots: [0: IntPoint(0, 34)]),
+        frames: frames(slots: [0: IntPoint(0, 0)]),
         viewport: viewport, focusedStyle: style
     )
     checkEqual(
-        daemon.committedSlot(of: 0), IntPoint(0, 34),
+        daemon.committedSlot(of: 0), IntPoint(0, 0),
         "clamped column hugs the window (no oversized column)"
     )
     check(
-        clamped.axJobs.contains { $0.winID == 0 && $0.size == IntSize(1024, 700) }
+        clamped.axJobs.contains { $0.winID == 0 && $0.size == IntSize(1024, 768) }
             || clamped.axJobs.isEmpty,
         "clamped grow is deduped, never a per-tick storm"
     )
     // App accepts: glass reaches full width and the column rests at 0.
     _ = daemon.tick(
         events: [],
-        frames: { _ in IntRect(min: IntPoint(0, 34), max: IntPoint(1024, 734)) },
+        frames: { _ in IntRect(min: IntPoint(0, 0), max: IntPoint(1024, 734)) },
         viewport: viewport, focusedStyle: style
     )
-    checkEqual(daemon.committedSlot(of: 0), IntPoint(0, 34), "grown column rests full width")
+    checkEqual(daemon.committedSlot(of: 0), IntPoint(0, 0), "grown column rests full width")
 }
 
 // Over-wide model never bleeds: a window whose model width exceeds its
@@ -5266,7 +5251,7 @@ do {
         frames: { _ in full() }, viewport: viewport, focusedStyle: style
     )
     check(
-        r.axJobs.contains { $0.winID == 0 && $0.size == IntSize(512, 700) },
+        r.axJobs.contains { $0.winID == 0 && $0.size == IntSize(512, 768) },
         "re-managed window re-seeds its width from default_ratio"
     )
 }
@@ -5396,6 +5381,179 @@ do {
     check(
         maxGapDrift <= 2 && maxGapDrift >= -2,
         "gap stays shut through a width-change glide (max drift \(maxGapDrift))"
+    )
+}
+
+// Shrink keeps the pitch on the glass: a core-driven width shrink must let
+// the column pitch hug the actual narrowing width instead of snapping to the
+// final width, so the neighbour's committed slot never lands inside the
+// still-wide glass. Frames track the written size (a real app shrinks).
+do {
+    var daemon = DaemonCore()
+    daemon.animationsEnabled = true
+    daemon.glideBaseMs = 300
+    daemon.autoCenter = false
+    daemon.maximizeTiledWindows = true
+    daemon.presetWidths = [0.25, 0.5]
+    let clock = ManualClock()
+    daemon.wallClockMs = { clock.now }
+    let wide = IntRect(0, 0, 2048, 768)
+    var live: [Int32: IntPoint] = [0: .init(0, 34), 1: .init(1024, 34)]
+    var liveW: [Int32: Int32] = [0: 1024, 1: 1024]
+    func liveFrames() -> (Int32) -> IntRect? {
+        { id in
+            let o = live[id] ?? .init(0, 0)
+            return IntRect(min: o, max: IntPoint(o.x + (liveW[id] ?? 1024), o.y + 700))
+        }
+    }
+    _ = daemon.tick(
+        events: [.appeared(id: 0, workspace: 1), .appeared(id: 1, workspace: 1), .focus(id: 0)],
+        frames: liveFrames(), viewport: wide, focusedStyle: style
+    )
+    for _ in 0..<20 {
+        clock.now += 16
+        let r = daemon.tick(events: [], frames: liveFrames(), viewport: wide, focusedStyle: style)
+        for job in r.axJobs {
+            if let o = job.origin { live[job.winID] = o }
+            if let s = job.size { liveW[job.winID] = s.x }
+        }
+    }
+    // Shrink column 0 0.5 -> 0.25 (512). On the shrink tick the glass is
+    // still 1024, so the neighbour's slot must ride it (1024), not snap to
+    // the final 512 underneath the wide glass.
+    let shrinkTick = daemon.tick(
+        events: [.command(.window(.resize(.shrink)))],
+        frames: liveFrames(), viewport: wide, focusedStyle: style
+    )
+    for job in shrinkTick.axJobs {
+        if let o = job.origin { live[job.winID] = o }
+        if let s = job.size { liveW[job.winID] = s.x }
+    }
+    let slotAfter = daemon.committedSlot(of: 1)?.x ?? -1
+    check(
+        slotAfter > 512,
+        "neighbour slot hugs the un-shrunk glass on the shrink tick (slot \(slotAfter), final 512)"
+    )
+    // Settle: the glass lands at 512 and the slot lands with it.
+    for _ in 0..<40 {
+        clock.now += 16
+        let r = daemon.tick(events: [], frames: liveFrames(), viewport: wide, focusedStyle: style)
+        for job in r.axJobs {
+            if let o = job.origin { live[job.winID] = o }
+            if let s = job.size { liveW[job.winID] = s.x }
+        }
+    }
+    checkEqual(daemon.committedSlot(of: 1)?.x, 512, "slot lands at the final width")
+}
+
+// A shrink that makes the strip fit reels the offset home by glide, not a
+// snap: the eased target moves to zero while the live offset still rests
+// scrolled, so the strip slides home fluidly instead of jumping.
+do {
+    var daemon = DaemonCore()
+    daemon.animationsEnabled = true
+    daemon.glideBaseMs = 200
+    daemon.autoCenter = false
+    daemon.continuousSwipe = false
+    let clock = ManualClock()
+    daemon.wallClockMs = { clock.now }
+    var live: [Int32: IntPoint] = [0: .init(0, 34), 1: .init(800, 34)]
+    func liveFrames() -> (Int32) -> IntRect? {
+        { id in
+            let o = live[id] ?? .init(0, 0)
+            let w: Int32 = id == 0 ? 800 : 400
+            return IntRect(min: o, max: IntPoint(o.x + w, o.y + 700))
+        }
+    }
+    _ = daemon.tick(
+        events: [.appeared(id: 0, workspace: 1), .appeared(id: 1, workspace: 1), .focus(id: 0)],
+        frames: liveFrames(), viewport: viewport, focusedStyle: style
+    )
+    for _ in 0..<30 {
+        clock.now += 16
+        let r = daemon.tick(events: [], frames: liveFrames(), viewport: viewport, focusedStyle: style)
+        for job in r.axJobs { if let o = job.origin { live[job.winID] = o } }
+    }
+    // Scroll right so column 0 rides partially off-screen left (offset -176).
+    let swipeTick = daemon.tick(
+        events: [.swipe(delta: 1.0, fingers: 3)],
+        frames: liveFrames(), viewport: viewport, focusedStyle: style
+    )
+    for job in swipeTick.axJobs { if let o = job.origin { live[job.winID] = o } }
+    for _ in 0..<30 {
+        clock.now += 16
+        let r = daemon.tick(events: [], frames: liveFrames(), viewport: viewport, focusedStyle: style)
+        for job in r.axJobs { if let o = job.origin { live[job.winID] = o } }
+    }
+    let scrolled = daemon.offsets[1] ?? 0
+    check(scrolled != 0, "strip rests scrolled before the shrink (got \(scrolled))")
+    // Shrink column 0 to 0.5 (512): total 512+400 = 912 fits, so the offset
+    // reels home — by easing, never by snapping.
+    _ = daemon.tick(
+        events: [.command(.window(.setWidth(0.5)))],
+        frames: liveFrames(), viewport: viewport, focusedStyle: style
+    )
+    checkEqual(daemon.offsetTarget(for: 1), 0, "shrink-that-fits targets offset zero")
+    check(
+        daemon.offsets[1] != 0,
+        "shrink-that-fits glides the offset (still \(daemon.offsets[1] ?? 0) on the shrink tick)"
+    )
+    for _ in 0..<40 {
+        clock.now += 16
+        _ = daemon.tick(events: [], frames: liveFrames(), viewport: viewport, focusedStyle: style)
+    }
+    checkEqual(daemon.offsets[1], 0, "offset glides home after the strip fits")
+}
+
+// A shrink never yanks the strip right to re-expose a scrolled window: only
+// a grow applies the underflow clamp (keep the left edge in view). A shrink
+// holds the window's edge so the freed space reveals the neighbour instead
+// of hiding it.
+do {
+    var daemon = DaemonCore()
+    daemon.animationsEnabled = false
+    daemon.glideBaseMs = 0
+    daemon.autoCenter = false
+    daemon.continuousSwipe = false
+    var live: [Int32: IntPoint] = [
+        0: .init(0, 34), 1: .init(800, 34), 2: .init(1200, 34),
+    ]
+    func liveFrames() -> (Int32) -> IntRect? {
+        { id in
+            let o = live[id] ?? .init(0, 0)
+            let w: Int32 = id == 0 ? 800 : 400
+            return IntRect(min: o, max: IntPoint(o.x + w, o.y + 700))
+        }
+    }
+    _ = daemon.tick(
+        events: [
+            .appeared(id: 0, workspace: 1), .appeared(id: 1, workspace: 1),
+            .appeared(id: 2, workspace: 1), .focus(id: 0),
+        ],
+        frames: liveFrames(), viewport: viewport, focusedStyle: style
+    )
+    for _ in 0..<5 {
+        let r = daemon.tick(events: [], frames: liveFrames(), viewport: viewport, focusedStyle: style)
+        for job in r.axJobs { if let o = job.origin { live[job.winID] = o } }
+    }
+    // Scroll right: column 0 rides partially off-screen left (offset -576).
+    let swipeTick = daemon.tick(
+        events: [.swipe(delta: 1.0, fingers: 3)],
+        frames: liveFrames(), viewport: viewport, focusedStyle: style
+    )
+    for job in swipeTick.axJobs { if let o = job.origin { live[job.winID] = o } }
+    let scrolled = daemon.offsets[1] ?? 0
+    check(scrolled < 0, "strip rests scrolled (got \(scrolled))")
+    // Shrink column 0 to 0.4 (409): total 409+400+400 = 1209 still overflows,
+    // so no reel-home — and the shrink must hold the left edge, never yank
+    // the strip right to re-expose it.
+    _ = daemon.tick(
+        events: [.command(.window(.setWidth(0.4)))],
+        frames: liveFrames(), viewport: viewport, focusedStyle: style
+    )
+    checkEqual(
+        daemon.offsetTarget(for: 1), scrolled,
+        "shrink holds the scrolled offset (no underflow yank)"
     )
 }
 
@@ -5770,7 +5928,7 @@ do {
         events: [], frames: live, viewport: viewport, focusedStyle: style
     )
     check(
-        !second.axJobs.contains { $0.winID == 0 && $0.size == IntSize(1024, 700) },
+        !second.axJobs.contains { $0.winID == 0 && $0.size == IntSize(1024, 768) },
         "clamped grow is not re-sent every tick"
     )
 }
@@ -6609,6 +6767,138 @@ do {
         viewport: viewport, focusedStyle: style
     )
     checkEqual(daemon.activeWorkspace, 2, "new window activates its display's workspace")
+}
+
+// maximize_tiled_windows fills the full tile: a short single grows to the
+// viewport height (top-aligned), not just the tile width.
+do {
+    var daemon = DaemonCore()
+    daemon.animationsEnabled = false
+    daemon.glideBaseMs = 0
+    daemon.maximizeTiledWindows = true
+    daemon.defaultRatio = 1.0
+    let short: (Int32) -> IntRect? = { _ in
+        IntRect(min: IntPoint(0, 34), max: IntPoint(400, 500))
+    }
+    let r = daemon.tick(
+        events: [.appeared(id: 0, workspace: 1), .focus(id: 0)],
+        frames: short, viewport: viewport, focusedStyle: style
+    )
+    check(
+        r.axJobs.contains { $0.winID == 0 && $0.size == IntSize(1024, 768) },
+        "maximize fills the tile width and height"
+    )
+    checkEqual(
+        daemon.committedSlot(of: 0), IntPoint(0, 0),
+        "maximized window top-aligns instead of centering short"
+    )
+}
+
+// Focus east/west at the strip edge wraps within the same display: east
+// past the last window cycles to the first, west past the first cycles to
+// the last. The focus shortcut never hops to a window on another display.
+do {
+    var daemon = DaemonCore()
+    daemon.animationsEnabled = false
+    daemon.glideBaseMs = 0
+    daemon.workspaceRing = [1, 2]
+    let views: [WorkspaceID: IntRect] = [
+        1: IntRect(0, 0, 1024, 768), 2: IntRect(1024, 0, 2048, 768),
+    ]
+    let live = frames(slots: [0: IntPoint(0, 0), 1: IntPoint(400, 0), 2: IntPoint(1024, 0)])
+    _ = daemon.tick(
+        events: [
+            .appeared(id: 0, workspace: 1), .appeared(id: 1, workspace: 1),
+            .appeared(id: 2, workspace: 2),
+        ],
+        frames: live, viewports: views, focusedStyle: style
+    )
+    // Anchor on ws1's rightmost window; focusing hops active back to ws1.
+    _ = daemon.tick(events: [.focus(id: 1)], frames: live, viewports: views, focusedStyle: style)
+    checkEqual(daemon.activeWorkspace, 1, "focus anchors on its own display")
+    // East past the last window wraps to the first, staying on ws1.
+    let east = daemon.tick(
+        events: [.command(.window(.focus(.east)))],
+        frames: live, viewports: views, focusedStyle: style
+    )
+    checkEqual(east.focus, 0, "focus east at the edge wraps to the first window")
+    checkEqual(daemon.activeWorkspace, 1, "focus east never hops displays")
+    // West from the first window wraps to the last.
+    let west = daemon.tick(
+        events: [.command(.window(.focus(.west)))],
+        frames: live, viewports: views, focusedStyle: style
+    )
+    checkEqual(west.focus, 1, "focus west at the edge wraps to the last window")
+    checkEqual(daemon.activeWorkspace, 1, "focus west never hops displays")
+}
+
+// Focus steps on the focused window's own strip even when the active
+// workspace is a different, empty display (clicking an empty display
+// leaves the active workspace there while focus sits elsewhere).
+do {
+    var daemon = DaemonCore()
+    daemon.animationsEnabled = false
+    daemon.glideBaseMs = 0
+    daemon.workspaceRing = [1, 2]
+    let views: [WorkspaceID: IntRect] = [
+        1: IntRect(0, 0, 1024, 768), 2: IntRect(1024, 0, 2048, 768),
+    ]
+    let live = frames(slots: [0: IntPoint(0, 0), 1: IntPoint(400, 0)])
+    _ = daemon.tick(
+        events: [.appeared(id: 0, workspace: 1), .appeared(id: 1, workspace: 1)],
+        frames: live, viewports: views, focusedStyle: style
+    )
+    // Focus ws1's first window, then move the active workspace to the
+    // empty ws2 without changing focus — the stranded state.
+    _ = daemon.tick(events: [.focus(id: 0)], frames: live, viewports: views, focusedStyle: style)
+    _ = daemon.tick(
+        events: [.command(.mouse(.toNextDisplay))],
+        frames: live, viewports: views, focusedStyle: style
+    )
+    checkEqual(daemon.activeWorkspace, 2, "active workspace moved to the empty display")
+    // Focus east must still step within ws1's strip.
+    let r = daemon.tick(
+        events: [.command(.window(.focus(.east)))],
+        frames: live, viewports: views, focusedStyle: style
+    )
+    checkEqual(r.focus, 1, "focus east steps even when active is an empty display")
+}
+
+// Focus stepping skips hidden (minimized/stashed) windows so focus never
+// lands on one — the host's focus-stranding guard would clear it to nil.
+do {
+    var daemon = DaemonCore()
+    daemon.animationsEnabled = false
+    daemon.glideBaseMs = 0
+    let live = frames(slots: [0: IntPoint(0, 0), 1: IntPoint(400, 0), 2: IntPoint(800, 0)])
+    _ = daemon.tick(
+        events: [
+            .appeared(id: 0, workspace: 1), .appeared(id: 1, workspace: 1),
+            .appeared(id: 2, workspace: 1), .focus(id: 0),
+        ],
+        frames: live, viewport: viewport, focusedStyle: style
+    )
+    // Window 1 is hidden (minimized/stashed, host-synced).
+    daemon.hiddenFromAmbientFocus = [1]
+    let east = daemon.tick(
+        events: [.command(.window(.focus(.east)))],
+        frames: live, viewport: viewport, focusedStyle: style
+    )
+    checkEqual(east.focus, 2, "focus east skips the hidden neighbor")
+    // West from 2 wraps past the hidden 1 back to 0.
+    let back = daemon.tick(
+        events: [.command(.window(.focus(.west)))],
+        frames: live, viewport: viewport, focusedStyle: style
+    )
+    checkEqual(back.focus, 0, "focus west wraps past the hidden neighbor")
+    // When every candidate is hidden, focus stays put instead of landing
+    // on a hidden window.
+    daemon.hiddenFromAmbientFocus = [0, 1, 2]
+    let stuck = daemon.tick(
+        events: [.command(.window(.focus(.east)))],
+        frames: live, viewport: viewport, focusedStyle: style
+    )
+    checkEqual(stuck.focus, 0, "all-hidden strip leaves focus unchanged")
 }
 
 if failures == 0 {

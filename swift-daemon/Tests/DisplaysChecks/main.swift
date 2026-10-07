@@ -272,6 +272,44 @@ do {
     )
 }
 
+// Multi-way ping-pong: silent rotations that keep returning to
+// recently-left spaces never close the A→B→C→A loop — each leg after the
+// first is ignored without a corroborating signal.
+do {
+    let t0 = Date()
+    func at(_ secs: Double) -> Date { t0.addingTimeInterval(secs) }
+    var ring = SpaceVoter()
+    // A→B (silent, two agreeing reads): rotates, leftSpaces = [A].
+    checkEqual(
+        ring.evaluate(old: 1, read: 2, corroborated: false, managed: [1, 2, 3], now: at(0)),
+        .hold, "ring: first silent read votes"
+    )
+    checkEqual(
+        ring.evaluate(old: 1, read: 2, corroborated: false, managed: [1, 2, 3], now: at(0)),
+        .rotate, "ring: A->B rotates"
+    )
+    // B→C after cooldown: rotates, leftSpaces = [B, A].
+    checkEqual(
+        ring.evaluate(old: 2, read: 3, corroborated: false, managed: [1, 2, 3], now: at(11)),
+        .hold, "ring: B->C first read votes"
+    )
+    checkEqual(
+        ring.evaluate(old: 2, read: 3, corroborated: false, managed: [1, 2, 3], now: at(11)),
+        .rotate, "ring: B->C rotates"
+    )
+    // C→A after cooldown: A is still a recently-left space, so the silent
+    // vote accumulates but never rotates — the loop cannot close without a
+    // corroborating signal.
+    checkEqual(
+        ring.evaluate(old: 3, read: 1, corroborated: false, managed: [1, 2, 3], now: at(22)),
+        .hold, "ring: C->A first read votes"
+    )
+    checkEqual(
+        ring.evaluate(old: 3, read: 1, corroborated: false, managed: [1, 2, 3], now: at(22)),
+        .ignore, "ring: C->A flap is ignored"
+    )
+}
+
 if failures == 0 {
     print("DisplaysChecks: all checks passed")
 } else {

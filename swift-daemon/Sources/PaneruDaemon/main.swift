@@ -2640,6 +2640,15 @@ nonisolated(unsafe) var lastWarpSample = (point: IntPoint(0, 0), at: Date.distan
 
 /// Last motion signal consumed by the snappy warp path below.
 nonisolated(unsafe) var lastWarpEval = Date.distantPast
+/// Last issued edge-warp landing (point + time): a warp teleports the
+/// cursor, which posts a mouse-move the tap reads as motion — without a
+/// post-landing immunity the reverse edge re-evaluates instantly and the
+/// warp cycles at a staircase corner. Suppressed while the cursor still
+/// sits at the landing; motion away re-arms immediately.
+nonisolated(unsafe) var lastWarpLandPoint: IntPoint?
+nonisolated(unsafe) var lastWarpLandAt = Date.distantPast
+/// Post-landing immunity window (documented 350ms in CONFIGURATION.md).
+let warpLandingImmunity: TimeInterval = 0.35
 
 /// Edge-warp evaluation for one cursor sample: velocity from the
 /// trail, landing decision in core, warp + rebase on success.
@@ -2666,6 +2675,15 @@ nonisolated(unsafe) var lastWarpEval = Date.distantPast
     // behaves natively instead of teleport-spamming the same spot.
     let nowMs = UInt64(now.timeIntervalSince1970 * 1000)
     guard core.warpLoopAllow(cursor: cursor, nowMs: nowMs) else { return }
+    // Post-landing immunity: while the cursor rests at the previous
+    // landing (the warp's own motion event, or a still push), do not
+    // re-evaluate — the reverse edge would warp back and the staircase
+    // corner cycles. Re-arms once the pointer leaves the landing.
+    if let land = lastWarpLandPoint,
+       now.timeIntervalSince(lastWarpLandAt) < warpLandingImmunity,
+       abs(cursor.x - land.x) <= 4 && abs(cursor.y - land.y) <= 4 {
+        return
+    }
     guard let landing = core.warpForMovement(
         prev: prev, prevAge: dt, cur: cursor, displays: fullDisplayFrames(),
         warpDirection: warp,
@@ -2704,6 +2722,8 @@ nonisolated(unsafe) var lastWarpEval = Date.distantPast
     }
     warpMouse(to: CGPoint(x: Double(landing.x), y: Double(landing.y)))
     lastWarpSample = (landing, now)
+    lastWarpLandPoint = landing
+    lastWarpLandAt = now
     lastWarpMissLine = ""
     if core.warpLoopNote(landing: landing, nowMs: nowMs) {
         print("mouse: warp loop suspected —"
@@ -3158,8 +3178,18 @@ nonisolated(unsafe) var cachedWorkspaceViewports: [WorkspaceID: IntRect]?
     let center = IntPoint(
         rect.min.x + rect.width / 2, rect.min.y + rect.height / 2
     )
-    if let index = displayIndexForPoint(center, in: frames) {
-        return WorkspaceID(index + 1)
+    // Resolve through the stable workspace→display mapping, never a raw
+    // ring index: after a sleep/wake or plug/unplug reorder a UUID-kept
+    // workspace can own a different physical display than
+    // `displayScreens[N-1]`, and a re-home/spawn routed by `index+1` lands
+    // on the wrong monitor.
+    let displayFrames = displayScreens.indices.map { i -> (id: UInt32, frame: IntRect) in
+        (displayScreens[i].id, frames[i])
+    }
+    if let ws = resolveWorkspaceForPoint(
+        center, displayFrames: displayFrames, workspaceDisplay: workspaceDisplay
+    ) {
+        return ws
     }
     return core.activeWorkspace
 }
